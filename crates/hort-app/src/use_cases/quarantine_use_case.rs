@@ -2527,6 +2527,161 @@ impl QuarantineUseCase {
 
         Ok(())
     }
+
+    /// Put an artifact whose scan reached **no verdict for a condition
+    /// that may clear** into the recoverable hold, and leave it there.
+    ///
+    /// The one caller is
+    /// [`ScanOrchestrationUseCase::record_outcome`](crate::use_cases::scan_orchestration::ScanOrchestrationUseCase::record_outcome)'s
+    /// `CompositionNotProduced` arm: the manifest's composition — its
+    /// unit of filesystem assessment (ADR 0064 D1) — was never produced
+    /// inside the job's attempt budget, because a store or an upstream
+    /// did not answer.
+    ///
+    /// # Why this is not [`Self::record_scan_indeterminate`]
+    ///
+    /// Both withhold the artifact and neither mints release authority,
+    /// so fail-closed is satisfied either way; what differs is how the
+    /// hold lifts. `ScanIndeterminate` is the one withheld state with
+    /// **no ADR 0039 hold-read exemption for any caller, including
+    /// write-granted**, and no `Retry-After`. On a pull-through
+    /// repository the client's own authenticated pull is one of the two
+    /// things that drive the absent constituents into CAS — the other
+    /// being hort's own acquisition on the next scan — so that state
+    /// closes the half that does not wait on a sweep the chart ships
+    /// disabled, and closes it for an operator holding `Write` as firmly
+    /// as for an anonymous client. `Quarantined` withholds an ordinary
+    /// client just as strictly, carries the exemption, advertises a
+    /// `Retry-After`, and is re-asked by
+    /// `RescanCandidatesRepository::select_stranded` (whose predicate is
+    /// "quarantined, last scan job failed or absent" — and this run's row
+    /// is `failed`). ADR 0065 D4: where both directions look restrictive,
+    /// recoverability decides.
+    ///
+    /// # What it does per prior status
+    ///
+    /// - **`None`** — the permissive ingest default
+    ///   (`quarantineDuration: 0`), where the artifact is downloadable
+    ///   and has no window to fall back into. One `ArtifactQuarantined`
+    ///   is appended and the status transitions, because leaving it alone
+    ///   would serve an image whose filesystem nothing assessed. The
+    ///   window anchor is the artifact's own `created_at`, its ingest
+    ///   instant — the domain's documented default for the anchor, and
+    ///   the conservative choice of the two (a later anchor is a longer
+    ///   remaining window; ADR 0054's content-level evidence only ever
+    ///   moves it earlier). The
+    ///   deadline is not a release authority in any case: with no
+    ///   `ScanCompleted` on the stream the timer release's fail-closed
+    ///   predicate refuses however long ago the window elapsed.
+    /// - **`Quarantined`** — already in the hold this method exists to
+    ///   reach. Nothing is appended and nothing is written, exactly as
+    ///   the retry-exhausted scanner-outage path leaves such an artifact:
+    ///   a second `ArtifactQuarantined` would claim a transition that did
+    ///   not happen.
+    /// - **Terminal (`Released` / `Rejected` / `ScanIndeterminate`)** — a
+    ///   recoverable skip. The artifact already carries a verdict (or an
+    ///   earlier absent one), and a scan that reached none has no
+    ///   standing to overwrite it; `Artifact::quarantine` refuses these
+    ///   states by construction and this method does not ask it to.
+    ///
+    /// No actor parameter — [`system_actor`], because a hold taken for
+    /// want of an assessment is a system-driven reaction and not an
+    /// operator action (mirrors [`Self::record_scan_indeterminate`]).
+    ///
+    /// `reason` is the operator-visible text the job row already carries
+    /// on `last_error`; it is logged here and deliberately not persisted
+    /// on the event, because `ArtifactQuarantined` records a hold and not
+    /// a verdict. The durable per-run record of *why* the composition was
+    /// absent is the `composite_scan_observations` row the composite path
+    /// writes on every run, including this one (ADR 0064 D2).
+    #[tracing::instrument(skip(self, reason))]
+    pub async fn hold_for_unproduced_composition(
+        &self,
+        artifact_id: Uuid,
+        reason: String,
+    ) -> AppResult<()> {
+        let stream_id = StreamId::artifact(artifact_id);
+        let correlation_id = Uuid::new_v4();
+
+        // Version paired with the load: `Artifact::quarantine`'s
+        // source-state guard — and the status check below it — decide
+        // from the state this load observed, so the append has to be
+        // ordered against the same observation.
+        let mut paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Refuse,
+        )
+        .await?;
+        let expected_version = paired.expected_version();
+        let prior_status = paired.artifact().quarantine_status;
+
+        // Already held, or already carrying a verdict: nothing to write.
+        // Asked before `Artifact::quarantine` rather than after, because
+        // the three terminal states and `Quarantined` all reach the same
+        // `Invariant` from that guard and only one of them is the
+        // "already where this wanted it" case an operator should read in
+        // the log.
+        if prior_status != QuarantineStatus::None {
+            tracing::debug!(
+                artifact_id = %artifact_id,
+                status = %prior_status,
+                reason = %truncate_reason(&reason),
+                "a scan that produced no composition leaves the artifact's existing \
+                 state alone — it is already withheld, or already carries a verdict \
+                 a verdict-less run may not overwrite"
+            );
+            return Ok(());
+        }
+
+        // One `ArtifactQuarantined`, and a repeatable one: the sweep or a
+        // curator can release this artifact and a later exhausted
+        // composite scan reaches here again, so the cap is checked at the
+        // append rather than assumed away. `OverCapStream::Refuse` above
+        // rejects a stream already past the cap; this rejects the append
+        // that would take a stream sitting exactly on it past.
+        refuse_append_past_cap(paired.stream_id(), paired.stream_len(), 1)?;
+        let repository_id = paired.artifact().repository_id;
+        let window_start = paired.artifact().created_at;
+        let event_payload = paired.artifact_mut().quarantine(window_start)?;
+        let artifact = paired.into_artifact();
+
+        // none → quarantined: the same count bump every other entry into
+        // the hold makes.
+        let score_delta = RepoSecurityScoreProjector::compute_quarantined_delta();
+
+        self.lifecycle
+            .commit_transition_with_score(
+                &artifact,
+                AppendEvents {
+                    stream_id,
+                    expected_version,
+                    events: vec![EventToAppend::new(DomainEvent::ArtifactQuarantined(
+                        event_payload,
+                    ))],
+                    correlation_id,
+                    causation_id: None,
+                    actor: system_actor(),
+                },
+                None, // a hold does not overwrite ingest metadata
+                Some((repository_id, score_delta)),
+            )
+            .await?;
+
+        // A withheld artifact is a security-relevant state change and an
+        // expected outcome, not an error — the same posture
+        // `record_scan_indeterminate`'s audit line takes.
+        tracing::info!(
+            artifact_id = %artifact_id,
+            reason = %truncate_reason(&reason),
+            "artifact quarantined: its composed image was never produced within the \
+             scan's attempt budget, so no verdict exists to release it on \
+             (fail-closed, recoverable)"
+        );
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2592,8 +2747,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode,
-        ScanPolicyProjection, SeverityThreshold,
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection,
+        SeverityThreshold,
     };
     use hort_domain::events::{
         system_actor, Actor, DomainEvent, PersistedEvent, PolicyResult, PolicyScope, ReleaseReason,
@@ -3166,7 +3321,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -10287,6 +10441,181 @@ spec:
                 "no duplicate event/transition for already-{status} artifact"
             );
         }
+    }
+
+    // -- the recoverable hold for an unproduced composition ---------------
+    //
+    // `hold_for_unproduced_composition`'s counterpart to the three
+    // `record_scan_indeterminate` tests above, and the contrast is the
+    // whole point: both withhold the artifact and neither mints release
+    // authority, but only one of them leaves a state a write-granted
+    // read and a later scan can both still reach (ADR 0065 D4).
+
+    /// Permissive mode (`quarantineDuration: 0`): the artifact is
+    /// downloadable with no window to fall back into, so the hold is
+    /// *taken* — anything else would serve an image whose filesystem
+    /// nothing assessed. It is the recoverable hold, not the terminal
+    /// one, and its window is anchored at the ingest instant.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_takes_a_hold_from_the_permissive_default() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
+        let ingested_at = artifacts.get(artifact_id).expect("artifact").created_at;
+
+        uc.hold_for_unproduced_composition(artifact_id, "upstream:timeout".into())
+            .await
+            .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, metadata) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "the recoverable hold, never the terminal one — the condition that \
+             refused the composition may clear"
+        );
+        assert!(
+            !saved.is_downloadable(),
+            "and it is a hold: nothing is served unassessed"
+        );
+        assert_eq!(saved.quarantine_window_start, Some(ingested_at));
+        assert_eq!(batch.events.len(), 1);
+        // The whole event rather than two of its fields: the payload has
+        // exactly those two, so equality pins the variant and both of
+        // them in one assertion — and leaves no unexercised
+        // wrong-variant arm behind.
+        assert_eq!(
+            batch.events[0].event,
+            DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: ingested_at,
+            }),
+        );
+        // System actor — a hold taken for want of an assessment is a
+        // system reaction, not an operator action (mirrors
+        // `record_scan_indeterminate`).
+        assert_eq!(batch.actor, system_actor());
+        assert!(
+            metadata.is_none(),
+            "a hold does not overwrite ingest metadata"
+        );
+        assert_eq!(
+            lifecycle.score_deltas().len(),
+            1,
+            "none → quarantined is the same count bump every other entry into the \
+             hold makes"
+        );
+    }
+
+    /// No `ScanCompleted` is written, which is what keeps the release
+    /// gate closed however long the observation window has been elapsed:
+    /// the timer release is authorized by a scan-axis authority and the
+    /// hold supplies none.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_mints_no_release_authority() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
+
+        uc.hold_for_unproduced_composition(artifact_id, "storage did not answer".into())
+            .await
+            .unwrap();
+
+        let committed: Vec<DomainEvent> = lifecycle
+            .committed_transitions()
+            .into_iter()
+            .flat_map(|(_, batch, _)| batch.events.into_iter().map(|e| e.event))
+            .collect();
+        assert!(
+            !committed
+                .iter()
+                .any(|e| matches!(e, DomainEvent::ScanCompleted(_))),
+            "a run that produced no composition records no verdict: {committed:?}"
+        );
+        assert!(
+            !committed
+                .iter()
+                .any(|e| matches!(e, DomainEvent::ArtifactReleased(_))),
+            "and releases nothing: {committed:?}"
+        );
+    }
+
+    /// An artifact already in the hold is already where this method
+    /// wants it: nothing is appended and the observation window is not
+    /// restarted. A second `ArtifactQuarantined` would claim a transition
+    /// that did not happen.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_leaves_an_existing_hold_untouched() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let before = artifacts.get(artifact_id).expect("artifact");
+
+        uc.hold_for_unproduced_composition(artifact_id, "upstream:timeout".into())
+            .await
+            .unwrap();
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no second hold on an artifact that is already held"
+        );
+        let after = artifacts.get(artifact_id).expect("artifact");
+        assert_eq!(after.quarantine_status, QuarantineStatus::Quarantined);
+        assert_eq!(
+            after.quarantine_window_start,
+            before.quarantine_window_start
+        );
+    }
+
+    /// An artifact that already carries a verdict — including an earlier
+    /// absent one — is a recoverable skip. A scan that reached no verdict
+    /// has no standing to overwrite one that was reached, and
+    /// `scan_indeterminate` specifically has its own exits (the curator's
+    /// re-evaluation, the provenance-misrejection repair, a later scan
+    /// that supersedes it); this is not one of them.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_leaves_a_terminal_artifact_alone() {
+        for status in [
+            QuarantineStatus::ScanIndeterminate,
+            QuarantineStatus::Rejected,
+            QuarantineStatus::Released,
+        ] {
+            let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+            let artifact_id = seed_artifact_with_repo(&artifacts, &repositories, status);
+
+            uc.hold_for_unproduced_composition(artifact_id, "upstream:timeout".into())
+                .await
+                .unwrap();
+
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "no transition on an already-{status} artifact"
+            );
+            assert_eq!(
+                artifacts
+                    .get(artifact_id)
+                    .expect("artifact")
+                    .quarantine_status,
+                status,
+            );
+        }
+    }
+
+    /// A missing artifact propagates, exactly as the terminal path's load
+    /// failure does: the orchestrator reports a retryable failure rather
+    /// than recording a hold that never landed.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_load_failure_propagates() {
+        let (uc, _artifacts, _events, lifecycle, _repositories, _projections) = make_use_case();
+
+        let err = uc
+            .hold_for_unproduced_composition(Uuid::new_v4(), "upstream:timeout".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("artifact"));
+        assert!(lifecycle.committed_transitions().is_empty());
     }
 
     /// Load failure (artifact not found) propagates as an error — the

@@ -13,12 +13,21 @@ spec:
   #     carries the signature across in one op with no fresh readback);
   # (b) adopters `helm install` the chart the moment a release ships — a quarantine
   #     window on our own signed first-party chart is pure friction with no upside;
-  #     trust here comes from the keyless cosign signature, not a quarantine/scan.
-  # NOTE: with NO ScanPolicy the repo would inherit the 24h DEFAULT quarantine, so
-  # this policy MUST exist to set 0. See issue #71.
+  #     trust here comes from the keyless cosign signature, which is what a
+  #     consumer verifies before installing.
+  # With NO ScanPolicy the repo would inherit the 24h DEFAULT quarantine, so this
+  # policy MUST exist to set 0.
+  #
+  # `scanBackends` is deliberately omitted rather than declared: an omitted list
+  # inherits the built-in default `[trivy]`, which is what an OCI repository must
+  # have — an empty list waives scanning for a format whose artifacts are assessed
+  # as a composed image, and apply refuses that pairing. Nothing changes for a
+  # chart: a Helm chart is an OCI *artifact* manifest whose config declares no
+  # layered root filesystem, so there is no composition for a verdict to be about
+  # and no composite verdict is produced for it. The assessment is recorded as
+  # not-applicable, which opens the release gate exactly as a clean verdict does.
   quarantineDuration: 0
   severityThreshold: high
   requireApproval: false
   provenanceMode: off
-  scanBackends: []
   licensePolicy: {}

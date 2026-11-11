@@ -110,7 +110,7 @@ use hort_app::use_cases::test_support::{
 use hort_app::use_cases::CallerPrivileges;
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+    NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
 };
 use hort_domain::error::DomainResult;
 use hort_domain::events::Actor;
@@ -359,7 +359,6 @@ fn sample_create_policy_command() -> CreatePolicyCommand {
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
     }
 }
 

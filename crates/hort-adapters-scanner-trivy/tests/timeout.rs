@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{ScanTarget, ScanUnit, ScannerPort};
+use hort_domain::ports::scanner::{LayerRole, ScanTarget, ScanUnit, ScannerPort};
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ByteRange, ContentHash};
@@ -110,6 +110,8 @@ async fn trivy_scan_timeout_kills_hung_child_within_configured_window() {
         format: "maven",
         coords: &coords,
         kind: ArtifactKind::MavenJar,
+        // A Java archive is nobody's image layer; the role asks nothing.
+        layer_role: LayerRole::Unknown,
     };
 
     let started = Instant::now();

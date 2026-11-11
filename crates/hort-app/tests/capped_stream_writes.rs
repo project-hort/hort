@@ -212,7 +212,14 @@ const EXPECTED_SITES: &[(&str, usize)] = &[
         2,
     ),
     ("crates/hort-app/src/use_cases/purge_use_case.rs", 1),
-    ("crates/hort-app/src/use_cases/quarantine_use_case.rs", 4),
+    // 5: `quarantine_artifact`, `commit_scan_result_dual_write`,
+    // `release_expired`, `record_scan_indeterminate` and
+    // `hold_for_unproduced_composition` — the last being the recoverable
+    // hold a scan takes when the manifest's composition was never
+    // produced inside the attempt budget. Repeatable like
+    // `quarantine_artifact` beside it: the sweep or a curator can release
+    // the artifact and a later exhausted composite scan reaches it again.
+    ("crates/hort-app/src/use_cases/quarantine_use_case.rs", 5),
     ("crates/hort-app/src/use_cases/retention_use_case.rs", 1),
 ];
 
@@ -241,7 +248,7 @@ const EXPECTED_REFUSAL_CALLS: &[(&str, usize)] = &[
         "crates/hort-app/src/use_cases/provenance_orchestration.rs",
         1,
     ),
-    ("crates/hort-app/src/use_cases/quarantine_use_case.rs", 4),
+    ("crates/hort-app/src/use_cases/quarantine_use_case.rs", 5),
     ("crates/hort-app/src/use_cases/retention_use_case.rs", 1),
 ];
 

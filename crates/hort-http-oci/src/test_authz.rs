@@ -26,8 +26,7 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-    SeverityThreshold,
+    NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::events::PolicyScope;
 use hort_domain::ports::identity_provider::IdentityProvider;
@@ -300,7 +299,6 @@ pub(crate) fn seed_required_provenance_policy(
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -349,7 +347,6 @@ pub(crate) fn quarantining_policy_with_window(
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,

@@ -21,15 +21,41 @@
 //! `hort-app` validator AND the composition root's capability sets;
 //! `hort-config`'s own `alpha_fixtures` guard can reach only the first
 //! (it depends on `hort-domain` alone, so the linter is out of its
-//! sight).
+//! sight). `hort-config`'s per-tree guards
+//! (`compose_example_config_tree`, `public_deploy_gitops_tree`) run
+//! `DesiredState::validate()` — row 0 — and **cannot** reach a linter
+//! row, because `hort-config` must not depend on `hort-app`. So a row
+//! that rejects a shipped tree is green there and red only here; reading
+//! those two as the tree's gate is how an OCI-scope row landed against
+//! ten checked-in policies with the four-crate unit gate still green.
+//!
+//! # A rejection names the document
+//!
+//! A linter finding names the **envelope** that offends — a policy, a
+//! repository — and an envelope name is not a path. Resolving it is the
+//! search the next reader would otherwise repeat by hand, and
+//! `DesiredState::source_files` already holds the `(kind, name) → path`
+//! map, so [`render_findings`] does it: every finding prints with the
+//! on-disk file of each envelope it names. [`declared_in`] is generic
+//! over the rule set — it reads the backtick-quoted names out of the
+//! rendered message — so a new row is covered with no edit here, which
+//! is the same property the validator construction above has.
+//!
+//! # Every tree, not the first one that fails
+//!
+//! The walk collects per-tree failures and panics once at the end. A
+//! panic inside the loop reports the first failing tree and leaves the
+//! rest unexamined, which is at its worst exactly when it matters: one
+//! rule typically rejects *several* trees, and a reader who fixes the
+//! one named gets the next one on the following run.
 //!
 //! No DB required: the validator is pure over its inputs.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hort_app::lint::{LintConfig, StaticConfigValidator};
+use hort_app::lint::{LintConfig, LintFinding, StaticConfigValidator};
 use hort_app::storage_backend::EffectiveStorageBackend;
 use hort_config::DesiredState;
 
@@ -96,6 +122,63 @@ fn trees() -> Vec<(&'static str, EffectiveStorageBackend)> {
     ]
 }
 
+/// The on-disk files declaring the envelopes a finding's message names,
+/// workspace-relative, sorted.
+///
+/// The message is the operator-facing string, and every row renders the
+/// offending envelope's `metadata.name` inside backticks. So the names
+/// are read back out of it rather than threaded through `LintFinding`:
+/// that keeps this generic over all eighteen rows — a new row needs no
+/// entry here — and it costs nothing a structured field would have
+/// bought, because the rendered message is what a reader sees anyway.
+///
+/// Matched on the name across **every** kind, deliberately: a row-18
+/// finding names both the policy and the repository whose `format` made
+/// it OCI, and both documents are part of the operator's fix. The kind
+/// is printed beside each path so a name two kinds share reads as two
+/// entries rather than one ambiguous path.
+///
+/// A name that resolves to nothing contributes nothing — the message
+/// still prints in full. That is the honest degradation: a row quoting
+/// something that is not an envelope name (a field, a suggested value)
+/// must not make the whole line disappear. What must not degrade
+/// silently is the *useful* case, which is why
+/// `the_mutated_tree_is_rejected_and_the_rejection_names_the_file`
+/// asserts a real path comes back.
+fn declared_in(desired: &DesiredState, finding: &LintFinding) -> Vec<String> {
+    // Backtick-quoted spans are the odd indices of a split on '`'.
+    let quoted: HashSet<&str> = finding.message.split('`').skip(1).step_by(2).collect();
+    let root = workspace_root();
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for (key, paths) in &desired.source_files {
+        if !quoted.contains(key.name.as_str()) {
+            continue;
+        }
+        for path in paths {
+            let shown = path.strip_prefix(&root).unwrap_or(path);
+            out.insert(format!("{} `{}` → {}", key.kind, key.name, shown.display()));
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// Render a rule's findings for a panic message: the rule, the message,
+/// and the document(s) the message names.
+fn render_findings(desired: &DesiredState, findings: &[LintFinding]) -> String {
+    findings
+        .iter()
+        .map(|f| {
+            let mut block = format!("  [{:?}] {}", f.rule, f.message);
+            for decl in declared_in(desired, f) {
+                block.push_str("\n      declared in: ");
+                block.push_str(&decl);
+            }
+            block
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The validator the offline CLI builds — same constructor, same
 /// compiled-in facts, row 8 enabled at the secure default.
 fn cli_validator(backend: EffectiveStorageBackend) -> StaticConfigValidator {
@@ -115,6 +198,11 @@ fn cli_validator(backend: EffectiveStorageBackend) -> StaticConfigValidator {
 
 #[test]
 fn every_shipped_gitops_tree_passes_the_static_linter() {
+    // Collected, not panicked per tree: one rule usually rejects more
+    // than one of these trees, and reporting only the first makes the
+    // next one a second run's surprise. See the module docs.
+    let mut failures: Vec<String> = Vec::new();
+
     for (rel, backend) in trees() {
         let root = workspace_root().join(rel);
         let mut files = Vec::new();
@@ -131,7 +219,13 @@ fn every_shipped_gitops_tree_passes_the_static_linter() {
         // reached by nothing else, and a shipped tree that fails row 0
         // parks a real deployment not-ready at boot.
         if let Err(errs) = desired.validate() {
-            panic!("{rel}: shipped gitops tree must clear row 0 — fix the tree:\n{errs}");
+            failures.push(format!(
+                "{rel}: shipped gitops tree must clear row 0 — fix the tree:\n{errs}"
+            ));
+            // Row 0 failing makes the lint rows' verdict unreliable (a
+            // dangling reference changes which pairings resolve), so
+            // this tree contributes one failure and stops here.
+            continue;
         }
 
         // Sanity: the corpus actually carries the surface the rows lint.
@@ -143,18 +237,22 @@ fn every_shipped_gitops_tree_passes_the_static_linter() {
         );
 
         let report = cli_validator(backend).validate(&desired);
-        assert!(
-            report.errors.is_empty(),
-            "{rel}: shipped gitops tree must clear the static linter — \
-             fix the tree, never the rule. Findings:\n{}",
-            report
-                .errors
-                .iter()
-                .map(|f| format!("  [{:?}] {}", f.rule, f.message))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        if !report.errors.is_empty() {
+            failures.push(format!(
+                "{rel}: shipped gitops tree must clear the static linter — \
+                 fix the tree, never the rule. Findings:\n{}",
+                render_findings(&desired, &report.errors),
+            ));
+        }
     }
+
+    assert!(
+        failures.is_empty(),
+        "{} of {} shipped gitops trees are rejected by the static linter:\n\n{}",
+        failures.len(),
+        trees().len(),
+        failures.join("\n\n"),
+    );
 }
 
 /// The host-test smokes do not ship a tree of their own: they copy
@@ -200,12 +298,7 @@ spec:
         "the host-test overlay must still apply cleanly — a new example-config \
          repository on a non-SBOM format with no scoped ScanPolicy would break \
          the smokes at boot, not in this assertion's absence. Findings:\n{}",
-        report
-            .errors
-            .iter()
-            .map(|f| format!("  [{:?}] {}", f.rule, f.message))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        render_findings(&desired, &report.errors),
     );
 }
 
@@ -258,12 +351,7 @@ fn the_checked_in_gitops_policies_overlay_still_validates_against_the_compose_tr
         report.errors.is_empty(),
         "the checked-in gitops-policies overlay must still apply cleanly — fix the \
          fixture, never the rule. Findings:\n{}",
-        report
-            .errors
-            .iter()
-            .map(|f| format!("  [{:?}] {}", f.rule, f.message))
-            .collect::<Vec<_>>()
-            .join("\n"),
+        render_findings(&desired, &report.errors),
     );
 }
 
@@ -308,4 +396,98 @@ fn the_alpha_tree_would_be_rejected_if_its_global_policy_named_osv_over_oci() {
         assert!(msg.contains("entry `osv`"), "{msg}");
         assert!(msg.contains("format `oci`"), "{msg}");
     }
+}
+
+/// **Break the compose tree on purpose and watch the guard say which
+/// document.** The mutation check for the OCI-scope waiver row and, in
+/// the same assertion, for the file-naming above — a guard nobody has
+/// seen fail is a guard whose message nobody has read.
+///
+/// The mutation is the exact shape the ten checked-in policies carried
+/// before they were corrected: an empty `scanBackends` on a policy
+/// scoped to a `format: oci` repository. It is applied to the **real**
+/// on-disk tree and to a policy *found* by its resolved scope rather
+/// than named by path, so renaming a file or moving the waiver to a
+/// different OCI repository follows automatically.
+///
+/// Two things are asserted, and the second is the one that cannot be
+/// got from the row's own unit tests: the finding fires, **and** the
+/// rendered panic text carries the offending policy's on-disk path. A
+/// `declared_in` that silently resolved nothing would leave the first
+/// assertion passing and the guard back to costing the reader a search.
+#[test]
+fn the_mutated_tree_is_rejected_and_the_rejection_names_the_file() {
+    use hort_app::lint::LinterRule;
+
+    let root = workspace_root().join("deploy/compose/example-config");
+    let mut files = Vec::new();
+    collect_yaml_files(&root, &mut files);
+    let mut desired = DesiredState::parse_files(files).expect("compose example-config parses");
+
+    // Find a policy scoped to an OCI repository the same way the row
+    // resolves it: the declared format lives on the repository envelope,
+    // never on the policy's scope.
+    let oci_repos: HashSet<&str> = desired
+        .repositories
+        .iter()
+        .filter(|r| r.spec.format == "oci")
+        .map(|r| r.metadata.name.as_str())
+        .collect();
+    assert!(
+        !oci_repos.is_empty(),
+        "the compose tree must declare at least one OCI repository for this mutation to mean \
+         anything"
+    );
+    let target = desired
+        .scan_policies
+        .iter()
+        .find(|env| {
+            env.spec
+                .scope
+                .repository_name()
+                .is_some_and(|r| oci_repos.contains(r))
+        })
+        .map(|env| env.metadata.name.clone())
+        .expect("the compose tree scopes a ScanPolicy to an OCI repository");
+
+    // Pre-condition: unmutated, the tree is clean. Without this the
+    // mutation could be credited with a finding the tree already had.
+    let before = cli_validator(EffectiveStorageBackend::Filesystem).validate(&desired);
+    assert!(
+        before.errors.is_empty(),
+        "the compose tree must be clean before the mutation:\n{}",
+        render_findings(&desired, &before.errors),
+    );
+
+    for env in &mut desired.scan_policies {
+        if env.metadata.name == target {
+            env.spec.scan_backends = Vec::new();
+        }
+    }
+
+    let report = cli_validator(EffectiveStorageBackend::Filesystem).validate(&desired);
+    let hits: Vec<&LintFinding> = report
+        .errors
+        .iter()
+        .filter(|f| f.rule == LinterRule::OciRepositoryRequiresScanBackends)
+        .collect();
+    assert!(
+        !hits.is_empty(),
+        "an empty `scanBackends` on an OCI-scoped policy must be rejected — if this is green \
+         the row has been neutered and `every_shipped_gitops_tree_passes_the_static_linter` \
+         is passing for the wrong reason: {:?}",
+        report.errors
+    );
+
+    // The guard's own output, as a reader would see it.
+    let rendered = render_findings(&desired, &report.errors);
+    assert!(
+        rendered.contains(&format!("ScanPolicy `{target}` → ")),
+        "the rejection must name the offending document, not just the envelope: {rendered}"
+    );
+    let declared = declared_in(&desired, hits[0]);
+    assert!(
+        declared.iter().any(|d| d.ends_with(".yaml")),
+        "a resolved declaration must be a real on-disk YAML path: {declared:?}"
+    );
 }

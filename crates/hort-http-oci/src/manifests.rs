@@ -1081,10 +1081,39 @@ pub(super) enum UpstreamManifestPullOutcome {
     /// the generic [`Self::UpstreamUnavailable`] envelope — operators see
     /// the exact numbers they need to size the knob.
     ManifestTooLarge { bytes_read: u64, cap: u64 },
+    /// The upstream manifest declares a composition the composite scan could
+    /// never assess — more constituents than the whole-image budget allows, or
+    /// more bytes. Surfaces as 400 `UNSUPPORTED`.
+    ///
+    /// **An upstream image above the bound cannot be mirrored, and that is the
+    /// accepted cost rather than an oversight**: accepting it would mint a row
+    /// whose composite verdict is permanently absent, so the release authority
+    /// never arrives and the hold carries no deadline — a state only a curator
+    /// override leaves. The consequence is documented where an operator
+    /// configures an upstream
+    /// (`docs/architecture/how-to/declare-gitops-config.md`).
+    ///
+    /// Carries nothing: the actual and the bound came out of an upstream
+    /// response body, so they are logged where the refusal is decided and the
+    /// wire gets a fixed message — the sanitisation discipline
+    /// `DomainError::UpstreamMetadataInvalid` established.
+    UnassessableComposition,
     /// Infrastructure failure (storage, event store, repo lookup
     /// after ingest). Surfaces as 500.
     Internal,
 }
+
+/// Leader-side sentinel for [`UpstreamManifestPullOutcome::UnassessableComposition`],
+/// carried out of the coalesce closure the same way the
+/// missing-`Docker-Content-Digest` case is.
+///
+/// A sentinel rather than a typed `DomainError` variant because this refusal is
+/// made and classified inside one crate: nothing outside the OCI pull-through
+/// legs can produce it, and nothing outside them has an answer for it. Both
+/// mappers match it **before** their string-classifying tail, which would
+/// otherwise fold an `upstream:`-prefixed message into a generic 502 and blame
+/// an upstream that answered correctly.
+const UNASSESSABLE_COMPOSITION_SENTINEL: &str = "upstream:unassessable_composition:oci-manifest";
 
 /// On local manifest miss, attempt to fetch the manifest from a
 /// configured upstream and ingest it locally. Mirror of
@@ -1292,6 +1321,27 @@ async fn try_upstream_manifest_pull_by_digest(
             // for the path again, so dropping it now also stops an ingest
             // failure from leaving it behind.
             hort_app::project::remove_cached_body(cache_handle).await;
+            // The admission gate, before the mint: hort must not accept an
+            // artifact it can never answer about, and a manifest the
+            // composition can never assemble is refused deterministically
+            // before its config is even read — so its composite verdict is
+            // permanently absent, the release authority never arrives, and the
+            // hold has no deadline. Decided from the manifest's own
+            // declarations, so no blob is fetched to reach it.
+            if let Err(reason) =
+                crate::manifests_write::refuse_past_assessment_budget(&manifest_bytes)
+            {
+                tracing::warn!(
+                    repo_id = %blob_repo_id,
+                    manifest_digest = %blob_upstream_digest,
+                    refusal = %reason,
+                    "OCI pull-through: upstream manifest declares a composition the composite \
+                     scan cannot assess; refusing to mirror it"
+                );
+                return Err(AppError::External(
+                    UNASSESSABLE_COMPOSITION_SENTINEL.to_string(),
+                ));
+            }
             let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
                 Box::new(std::io::Cursor::new(manifest_bytes.clone()));
             // Derived before the mint so the claims ride the manifest's own
@@ -1590,6 +1640,22 @@ async fn try_upstream_manifest_pull_by_tag(
             // for the path again, so dropping it now also stops an ingest
             // failure from leaving it behind.
             hort_app::project::remove_cached_body(cache_handle).await;
+            // The admission gate — see the digest-ref leg for why a manifest
+            // the composite scan cannot assess must not be minted at all.
+            if let Err(reason) =
+                crate::manifests_write::refuse_past_assessment_budget(&manifest_bytes)
+            {
+                tracing::warn!(
+                    repo_id = %meta_repo_id,
+                    manifest_digest = %upstream_digest,
+                    refusal = %reason,
+                    "OCI pull-through: upstream manifest declares a composition the composite \
+                     scan cannot assess; refusing to mirror it"
+                );
+                return Err(AppError::External(
+                    UNASSESSABLE_COMPOSITION_SENTINEL.to_string(),
+                ));
+            }
             let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
                 Box::new(std::io::Cursor::new(manifest_bytes.clone()));
             let claims = crate::manifests_write::pull_membership_claims(
@@ -1737,6 +1803,13 @@ fn map_manifest_pull_error(
         }
         Err(AppError::Domain(DomainError::CurationBlocked { .. })) => {
             Err(UpstreamManifestPullOutcome::CurationBlocked)
+        }
+        // Matched ahead of the string-classifying tail, which would read the
+        // `upstream:` prefix as "the upstream failed" and answer 502 for a
+        // refusal that is hort's own. The leader has already logged the actual
+        // and the bound.
+        Err(AppError::External(ref msg)) if msg.contains(UNASSESSABLE_COMPOSITION_SENTINEL) => {
+            Err(UpstreamManifestPullOutcome::UnassessableComposition)
         }
         Err(AppError::Domain(DomainError::UpstreamBodyTooLarge {
             bytes_read, cap, ..
@@ -2163,6 +2236,25 @@ fn upstream_pull_failure_response(
                 "bytes_read": bytes_read,
                 "cap": cap,
             })),
+        }
+        .into_response(),
+        // `UNSUPPORTED` and deliberately neither `MANIFEST_INVALID` nor
+        // `502`: the client did not send this manifest and the upstream
+        // answered correctly — hort is the one refusing. "The server does not
+        // support the requested operation" is the honest statement, and it is
+        // the code `parse_index_children_for_admission` already answers for a
+        // valid index this registry cannot store. The specifics stay in the
+        // leader's `warn!` (upstream-derived text).
+        //
+        // One message for all three admission refusals, and worded over what
+        // they share rather than over the byte and count bounds alone: the
+        // third is a descriptor declaring no readable `size`, and telling that
+        // operator the composition was "larger than this registry can assess"
+        // would send them to size a bound that is not what refused them.
+        UpstreamManifestPullOutcome::UnassessableComposition => OciError::Unsupported {
+            message: "upstream manifest declares a composition this registry cannot \
+                      assess, so it is not mirrored"
+                .to_string(),
         }
         .into_response(),
         UpstreamManifestPullOutcome::Internal => OciError::Internal.into_response(),
@@ -5333,6 +5425,300 @@ mod tests {
         assert_eq!(body, content);
     }
 
+    /// **The pull-through half of the admission gate.** An upstream image
+    /// whose declared composition the composite scan could never assess is
+    /// not mirrored — refused before the mint, so no row, no scan job and no
+    /// deadline-less hold.
+    ///
+    /// `400 UNSUPPORTED` and deliberately not a `502`: the upstream answered
+    /// correctly and the manifest is valid; hort is the one refusing. The
+    /// actual and the bound stay in the server log, because they came out of
+    /// an upstream response body.
+    ///
+    /// **An upstream image above the bound therefore cannot be mirrored**, and
+    /// that is the accepted cost of not accepting what cannot be assessed —
+    /// documented where an operator configures an upstream, not only here.
+    ///
+    /// Asserted on **both** legs, because they are two functions that read the
+    /// same body: the digest-ref leg and the tag leg.
+    #[test]
+    fn pull_through_refuses_a_manifest_past_the_assessment_bound() {
+        use hort_domain::oci::ImageBudget;
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        // One reference past the bound: the registry used to accept this and
+        // the composition then refused it before reading its config.
+        let references = ImageBudget::default_for_composite_scan().max_manifest_blob_references();
+        let layers: Vec<serde_json::Value> = (0..references)
+            .map(|i| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": format!("sha256:{i:016x}{}", "0".repeat(48)),
+                    "size": 64,
+                })
+            })
+            .collect();
+        let content = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 7,
+            },
+            "layers": layers,
+        }))
+        .expect("fixture serialises");
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let media = "application/vnd.oci.image.manifest.v1+json";
+        let digest_ref = format!("sha256:{hex}");
+
+        for (leg, reference) in [("digest-ref", digest_ref.as_str()), ("tag", "v1")] {
+            let (status, minted, scan_enqueues) = run(async {
+                let handle = PrometheusBuilder::new().build_recorder().handle();
+                let (ctx, mocks) = build_mock_ctx(handle);
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                mocks.repositories.insert(repo);
+
+                seed_upstream_mapping(&mocks, repo_id);
+                mocks.upstream_proxy.insert_manifest(
+                    UP_PREFIX,
+                    UP_NAME,
+                    reference,
+                    ManifestFetch {
+                        bytes: content.clone(),
+                        media_type: media.into(),
+                        declared_digest: Some(digest_ref.clone()),
+                        last_modified: None,
+                    },
+                );
+
+                let router = manifest_router(ctx);
+                let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{reference}");
+                let resp = router
+                    .oneshot(
+                        Request::get(&uri)
+                            .header(ACCEPT, media)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let minted = mocks
+                    .artifacts
+                    .find_by_checksum(&hex.parse().expect("the fixture digest parses"))
+                    .await
+                    .expect("the artifact lookup answers");
+                let scan_enqueues = mocks.lifecycle.scan_enqueues().len();
+                (status, minted.is_some(), scan_enqueues)
+            });
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{leg}: an image this registry cannot assess is not mirrored"
+            );
+            assert!(
+                !minted,
+                "{leg}: the refusal is before the mint, so there is no row to hold"
+            );
+            assert_eq!(
+                scan_enqueues, 0,
+                "{leg}: and no scan job whose verdict could never arrive"
+            );
+        }
+    }
+
+    /// **The pull-through half of the conformance refusal.** An upstream
+    /// manifest whose `config` or `layers[]` declares no readable `size` is
+    /// not mirrored either: `size` is REQUIRED by the OCI image spec, and
+    /// charging an absent one as zero let such a manifest clear the byte
+    /// bound, be minted, and then be refused by the assessment — accepted,
+    /// then permanently unassessable.
+    ///
+    /// Same code as the bound refusals (`400 UNSUPPORTED`) and deliberately
+    /// not a third: hort is the one refusing, the upstream answered correctly,
+    /// and the client did not send this manifest. Which descriptor was at
+    /// fault is in the leader's `warn!` and **not** in the response — the
+    /// whole document came out of an upstream response body, so there is
+    /// nothing in it a client of hort is owed.
+    #[test]
+    fn pull_through_refuses_a_manifest_whose_descriptor_declares_no_readable_size() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        // A one-layer image, far inside both bounds, whose single layer
+        // declares nothing. Under the old "contributes zero" reading this was
+        // the smallest manifest in the world and was mirrored whatever the
+        // layer really weighed.
+        let content = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 7,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{}", "1".repeat(64)),
+            }],
+        }))
+        .expect("fixture serialises");
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let media = "application/vnd.oci.image.manifest.v1+json";
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, body, minted, scan_enqueues) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: media.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, media)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let minted = mocks
+                .artifacts
+                .find_by_checksum(&hex.parse().expect("the fixture digest parses"))
+                .await
+                .expect("the artifact lookup answers");
+            let scan_enqueues = mocks.lifecycle.scan_enqueues().len();
+            (status, body, minted.is_some(), scan_enqueues)
+        });
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-conformant upstream manifest is not mirrored"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&body).expect("an OCI error envelope is JSON");
+        assert_eq!(envelope["errors"][0]["code"], "UNSUPPORTED", "{envelope}");
+        let serialized = envelope.to_string();
+        for leak in ["layers[", "config", "size"] {
+            assert!(
+                !serialized.contains(leak),
+                "the response must not say which descriptor an upstream document got \
+                 wrong, found {leak:?} in {serialized}"
+            );
+        }
+        assert!(
+            !minted,
+            "the refusal is before the mint, so there is no row to hold"
+        );
+        assert_eq!(
+            scan_enqueues, 0,
+            "and no scan job whose verdict could never arrive"
+        );
+    }
+
+    /// The boundary, on the same path: an upstream image **exactly at** the
+    /// bound is mirrored. Refusing a composable image is the failure the
+    /// admission gate must not introduce, and a proxy is where it would be
+    /// least visible.
+    #[test]
+    fn pull_through_mirrors_a_manifest_exactly_at_the_assessment_bound() {
+        use hort_domain::oci::ImageBudget;
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let references = ImageBudget::default_for_composite_scan().max_manifest_blob_references();
+        let layers: Vec<serde_json::Value> = (0..references - 1)
+            .map(|i| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": format!("sha256:{i:016x}{}", "0".repeat(48)),
+                    "size": 64,
+                })
+            })
+            .collect();
+        let content = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 7,
+            },
+            "layers": layers,
+        }))
+        .expect("fixture serialises");
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let media = "application/vnd.oci.image.manifest.v1+json";
+        let digest_ref = format!("sha256:{hex}");
+
+        let status = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: media.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, media)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            resp.status()
+        });
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the largest composable image must still be mirrorable"
+        );
+    }
+
     // ================================================================
     // #46 Item 4 — the pull-through re-fix. Items 1/2 made proxy
     // multi-arch tree-release work only on the hosted-PUSH path: the
@@ -7694,6 +8080,7 @@ mod tests {
             UpstreamManifestPullOutcome::UpstreamUnavailable => "UpstreamUnavailable",
             UpstreamManifestPullOutcome::UpstreamDigestMissing => "UpstreamDigestMissing",
             UpstreamManifestPullOutcome::ManifestTooLarge { .. } => "ManifestTooLarge",
+            UpstreamManifestPullOutcome::UnassessableComposition => "UnassessableComposition",
             UpstreamManifestPullOutcome::Internal => "Internal",
         }
     }

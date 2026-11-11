@@ -955,6 +955,8 @@ mod tests {
             format: "oci",
             coords,
             kind: hort_domain::types::ArtifactKind::OciManifest,
+            // A manifest is the composition, not a layer of one.
+            layer_role: hort_domain::ports::scanner::LayerRole::Unknown,
         }
     }
 
@@ -967,6 +969,7 @@ mod tests {
             format: "maven",
             coords,
             kind: hort_domain::types::ArtifactKind::MavenJar,
+            layer_role: hort_domain::ports::scanner::LayerRole::Unknown,
         }
     }
 
@@ -979,6 +982,7 @@ mod tests {
             format: "maven",
             coords,
             kind: hort_domain::types::ArtifactKind::MavenPom,
+            layer_role: hort_domain::ports::scanner::LayerRole::Unknown,
         }
     }
 
@@ -1005,6 +1009,10 @@ mod tests {
             format: "oci",
             coords,
             kind: hort_domain::types::ArtifactKind::OciBlob,
+            // The layer fixtures stand in for a manifest declaring these
+            // bytes among an image's layers — which is the only thing
+            // that earns the rootfs materialisation (ADR 0064 D6).
+            layer_role: hort_domain::ports::scanner::LayerRole::ImageLayer,
         }
     }
 
@@ -1471,12 +1479,11 @@ mod tests {
     /// The two values are still different answers, and this adapter's job
     /// is to return the right one — but *what* the gating one costs the
     /// layer is `NotAnalysable::gates_release`'s call, not this
-    /// assertion's. On a constituent under a promoted composite verdict
-    /// it no longer holds the layer, because the composition is where
-    /// that symlink is materialised and the package database read
-    /// (ADR 0064 D2). Everywhere else — every unpromoted repository,
-    /// every non-constituent kind — it is the fail-closed hold this test
-    /// was written for.
+    /// assertion's, and that call reads the artifact's kind alone. On a
+    /// composition constituent it no longer holds the layer, because the
+    /// composition is where that symlink is materialised and the package
+    /// database read (ADR 0064 D2). On every other kind it is the
+    /// fail-closed hold this test was written for.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_rootfs_report_with_no_results_over_a_tree_missing_link_entries_is_a_hold() {
@@ -1685,6 +1692,7 @@ mod tests {
             format: "oci",
             coords: &coords,
             kind: hort_domain::types::ArtifactKind::OciManifest,
+            layer_role: hort_domain::ports::scanner::LayerRole::Unknown,
         };
         let r = a.scan(&target, None).await.expect("no CLI, no error");
         assert_eq!(

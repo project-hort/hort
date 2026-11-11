@@ -88,9 +88,19 @@ pub enum PolicyField {
     /// are the lowercase `ScanEnforcement` wire strings
     /// (`reject` / `record`).
     Enforcement,
-    /// `composite_verdict_mode` changed (ADR 0064 D6). The
-    /// `previous_value` / `new_value` payloads are the lowercase
-    /// `CompositeVerdictMode` wire strings (`observed` / `promoted`).
+    /// **Retired, and kept only to replay history.** This field used to
+    /// select whether a composed OCI image's scan verdict reached its
+    /// manifest; the composed verdict now decides unconditionally
+    /// (ADR 0064 D2), so nothing produces this variant any more and no
+    /// decision consults it.
+    ///
+    /// It cannot be deleted: the event store is append-only (ADR 0002),
+    /// so `PolicyUpdated` events naming it — payloads carrying the
+    /// lowercase wire strings `observed` / `promoted` — sit in every
+    /// installation's policy streams for the life of the installation,
+    /// and the scan-policy fold must keep folding those streams. See
+    /// `scan_policy_fold`, which tolerates and discards the value rather
+    /// than decoding it.
     CompositeVerdictMode,
 }
 
@@ -147,19 +157,12 @@ impl PolicyField {
     ///   ADR 0041 cross-opt-in matrix);
     /// - `RescanIntervalHours` — schedules the cron rescan cadence, not
     ///   the verdict;
-    /// - `CompositeVerdictMode` — `ScanBackends`' argument, on the
-    ///   composition axis (ADR 0064 D6). It decides whether the *next*
-    ///   scan's composed-image verdict reaches the manifest; it
-    ///   re-interprets no stored finding, because a composite verdict's
-    ///   findings are produced by a scan of an assembled image and a
-    ///   manifest that has never had one has nothing for this pass to
-    ///   re-derive. Making it gate-affecting would be worse than
-    ///   useless: the pass re-derives from stored findings, so
-    ///   `promoted → observed` would un-reject the population a promoted
-    ///   composite had correctly rejected with no fresh assessment —
-    ///   which is exactly why ADR 0064 D6 rules `ScanEnforcement::Record`
-    ///   out by name and leaves recovering the estate to the operator's
-    ///   own curation re-evaluation.
+    /// - `CompositeVerdictMode` — **retired**, and so gate-affecting in
+    ///   no direction: nothing produces the variant and no decision
+    ///   reads the field (see the variant's own documentation). The arm
+    ///   exists because historical events carry it, and `false` is the
+    ///   only answer a replay can act on — a stored value nothing
+    ///   consults cannot flip a stored-findings verdict.
     ///
     /// Closed match (no `_` arm) so a future `PolicyField` variant fails
     /// to compile here, forcing a deliberate gate-affecting decision

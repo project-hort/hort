@@ -29,8 +29,7 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus, ReleaseOrigin};
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-    SignerIdentityPattern,
+    NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SignerIdentityPattern,
 };
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{DomainEvent, PolicyScope, ScanAssessment};
@@ -456,7 +455,6 @@ fn projection(
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: Utc::now(),
         updated_at: Utc::now(),

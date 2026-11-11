@@ -182,18 +182,6 @@ pub mod labels {
     /// `SkippedOff` orchestrator arm has a valid label. Small, bounded
     /// cardinality (3 values).
     pub const MODE: &str = "mode";
-    /// Resolved `composite_verdict_mode` label on
-    /// `hort_scan_composite_assessment_total`. Closed taxonomy of 2, the
-    /// lowercase wire-form of
-    /// [`hort_domain::entities::scan_policy::CompositeVerdictMode`]'s
-    /// `Display`: `{observed, promoted}`. What it separates is the one
-    /// thing the assessment arms cannot say on their own — whether this
-    /// assessment *gated* the manifest or only measured it — so a
-    /// `deterministic_refusal` an operator is watching as a coverage gap
-    /// and a `deterministic_refusal` holding a manifest fail-closed are
-    /// two series rather than one. Doubles the counter's cardinality to
-    /// 8, which is nothing.
-    pub const AUTHORITY: &str = "authority";
 }
 
 /// Pinned `decision_point` label values for
@@ -2740,7 +2728,7 @@ pub fn emit_scan_terminal(result: ScanTerminalResult) {
 }
 
 // ---------------------------------------------------------------------------
-// Shadow composite scan (ADR 0064 D6)
+// Composite scan (ADR 0064 D2)
 // ---------------------------------------------------------------------------
 
 use hort_domain::ports::composite_scan_observation::GateDecision;
@@ -2763,13 +2751,14 @@ use hort_domain::ports::jobs_repository::TriggerSource;
 /// and the parity test makes a *string* drift a test failure. Neither
 /// alone would hold both halves.
 ///
-/// **This counter decides nothing.** The shadow composite assessment
-/// carries no release authority until an operator promotes it (ADR 0064
-/// D6), and the row the counter is derived from is a projection no
-/// release path may read. What the counter adds over that row is the
-/// *shape over time*: D6's promotion criteria are baseline completion,
-/// coverage and error rates, and a one-row-per-manifest table answers
-/// only today's snapshot.
+/// **This counter decides nothing.** The composite assessment does — it
+/// is the manifest's filesystem verdict (ADR 0064 D2) — but it reaches
+/// the release gate through the artifact's own event stream, which is
+/// what keeps the row this counter is derived from a measurement surface
+/// and a projection no release path may read. What the counter adds over
+/// that row is the *shape over time*: coverage, error rate and the
+/// composition's contribution are rates, and a one-row-per-manifest
+/// table answers only today's snapshot.
 ///
 /// String values are normative — they appear verbatim in
 /// `docs/metrics-catalog.md`.
@@ -2786,9 +2775,10 @@ pub enum CompositeAssessmentResult {
     /// the expected shape, not an alert.
     NothingToCompose,
     /// A composition was expected and could not be assembled, for a
-    /// reason re-running reproduces. This is the **coverage gap** an
-    /// operator weighing promotion is watching: every tick here is a
-    /// manifest the composite verdict would have nothing to say about.
+    /// reason re-running reproduces. This is the **coverage gap**, and
+    /// every tick is a manifest held `scan_indeterminate` fail-closed:
+    /// the absent verdict is what ADR 0007 holds on. Operators watch the
+    /// ratio against `assessed`.
     DeterministicRefusal,
     /// The same absence for a condition that may clear — a store that
     /// did not answer, an unreachable upstream. Kept apart from the arm
@@ -2834,85 +2824,35 @@ impl From<hort_domain::ports::composite_scan_observation::CompositeAssessment>
     }
 }
 
-/// `authority` label value of `hort_scan_composite_assessment_total` —
-/// whether the policy governing this run had promoted the composed-image
-/// verdict to release authority (ADR 0064 D6).
-///
-/// Mirrors
-/// [`CompositeVerdictMode`](hort_domain::entities::scan_policy::CompositeVerdictMode)'s
-/// two wire strings, and for the same reason
-/// [`CompositeAssessmentResult`] mirrors `CompositeAssessment`: the
-/// metric vocabulary stays in this module, the `From` makes a third
-/// domain arm a compile error here, and the parity test makes a string
-/// drift a test failure.
-///
-/// What it is for: the four `result` arms say what the assessment
-/// *found*, and nothing about whether it *decided* anything. Under
-/// `observed` a `deterministic_refusal` is a coverage gap an operator is
-/// weighing before promoting; under `promoted` the same arm is a
-/// manifest held fail-closed. Separating them is what lets an operator
-/// see, from metrics alone, whether their promotion is gating and what
-/// it is gating on.
-///
-/// String values are normative — they appear verbatim in
-/// `docs/metrics-catalog.md`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CompositeAuthority {
-    /// The composed verdict was recorded and decided nothing.
-    Observed,
-    /// The composed verdict was the manifest row's own.
-    Promoted,
-}
-
-impl CompositeAuthority {
-    /// Wire string. Catalog rule: must match `docs/metrics-catalog.md`
-    /// AND `CompositeVerdictMode::Display` (hence the
-    /// `policy_projections.composite_verdict_mode` CHECK) exactly.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Observed => "observed",
-            Self::Promoted => "promoted",
-        }
-    }
-}
-
-/// The policy's posture lifted into the emitting layer's vocabulary —
-/// same precedent as [`CompositeAssessmentResult`]'s `From`.
-impl From<hort_domain::entities::scan_policy::CompositeVerdictMode> for CompositeAuthority {
-    fn from(mode: hort_domain::entities::scan_policy::CompositeVerdictMode) -> Self {
-        use hort_domain::entities::scan_policy::CompositeVerdictMode as M;
-        match mode {
-            M::Observed => Self::Observed,
-            M::Promoted => Self::Promoted,
-        }
-    }
-}
-
-/// Emit `hort_scan_composite_assessment_total{result,authority}` once per
-/// composite assessment.
+/// Emit `hort_scan_composite_assessment_total{result}` once per composite
+/// assessment.
 ///
 /// Exactly one increment per assessment, including the three arms that
 /// composed nothing: "how often is there nothing to assess?" is half of
 /// the coverage question, and a counter that only ticked on success
 /// could not answer it.
-pub fn emit_composite_assessment(result: CompositeAssessmentResult, authority: CompositeAuthority) {
+///
+/// **One label.** The counter carried an `authority` label separating an
+/// assessment that gated its manifest from one that only measured it,
+/// because an operator-granted per-policy posture decided which it was.
+/// The composed image's verdict is now the manifest's unconditionally
+/// (ADR 0064 D2), so every assessment gates and the label could only ever
+/// take one value — a constant series that asserts a posture no longer in
+/// the system.
+pub fn emit_composite_assessment(result: CompositeAssessmentResult) {
     metrics::counter!(
         "hort_scan_composite_assessment_total",
         labels::RESULT => result.as_str(),
-        labels::AUTHORITY => authority.as_str(),
     )
     .increment(1);
 }
 
 /// `result` label value of `hort_scan_composite_comparison_total`.
 ///
-/// Closed taxonomy of 3: **whether promoting the composite verdict would
-/// change this artifact's outcome, and in which direction.** That is ADR
-/// 0064 D6's promotion criterion stated as a rate — "if the composite
-/// verdict carried authority, how many artifacts would change outcome,
-/// and which way?" — which the one-row-per-manifest projection answers
-/// only for the present instant.
+/// Closed taxonomy of 3: **what assessing the composition contributed to
+/// this artifact's outcome, and in which direction.** The
+/// one-row-per-manifest projection answers that for the present instant;
+/// the counter answers it as a rate.
 ///
 /// Derived from the observation row's two gate decisions by
 /// [`Self::of`], so the counter and the row cannot disagree.
@@ -2920,29 +2860,27 @@ pub fn emit_composite_assessment(result: CompositeAssessmentResult, authority: C
 /// **No decision is a label here.** Neither side's `GateDecision` value
 /// reaches the series: `composite_stricter` says the composite blocks
 /// where the primary does not, without naming which blocking variant it
-/// is. The composite verdict carries no release authority (D6), and a
-/// dashboard series keyed on its value would be that verdict escaping
-/// into something acted on by exactly the back door this unit's
-/// structural guard closes on the code path.
+/// is. A dashboard series keyed on a `GateDecision` value would be the
+/// recorded verdict escaping the projection into something acted on, by
+/// exactly the back door this unit's structural guard closes on the code
+/// path.
 ///
 /// String values are normative — they appear verbatim in
 /// `docs/metrics-catalog.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeComparisonResult {
-    /// The two sides hold the artifact the same way. Promoting the
-    /// composite verdict would change nothing for this artifact — which
-    /// is the value a promotion decision needs to be overwhelmingly the
-    /// common one.
+    /// The two sides hold the artifact the same way, so the composition
+    /// contributed nothing this artifact's own bytes did not already
+    /// say.
     Agree,
     /// The composite findings block where the primary axis's do not.
-    /// Promoting would **add** a hold. This is the measured gap ADR 0064
-    /// exists for — packages a per-constituent scan never assessed — and
-    /// also where a false positive from the new analysis path would
-    /// show up first, which is why the verdict is readable before it is
-    /// enforcing.
+    /// The composition **adds** a hold. This is the measured gap
+    /// ADR 0064 exists for — packages a per-constituent scan never
+    /// assessed — and also where a false positive from the composed
+    /// analysis path shows up first.
     CompositeStricter,
     /// The primary axis's findings block where the composite's do not.
-    /// Promoting would **remove** a hold: the composed filesystem does
+    /// The composition **removes** a hold: the composed filesystem does
     /// not carry what a constituent's isolated scan condemned it for —
     /// a package a later layer deletes being the canonical shape.
     CompositePermissive,
@@ -2952,10 +2890,11 @@ impl CompositeComparisonResult {
     /// Compare the observation row's two gate decisions.
     ///
     /// The comparison is on **whether the gate holds the artifact**, not
-    /// on decision equality, because that is the question an operator
-    /// weighing promotion is asking: would this artifact's outcome
-    /// change? `FindingsRecorded` and `Reject` both mean "blocking
-    /// violations under the active policy" and differ only in the
+    /// on decision equality, because the question is whether assessing
+    /// the composition changed this artifact's outcome, not whether the
+    /// two decisions are spelled the same. `FindingsRecorded` and
+    /// `Reject` both mean "blocking violations under the active policy"
+    /// and differ only in the
     /// policy's `enforcement` mode — and both sides of a row are judged
     /// under **one** resolved policy, so a row holding one of each is
     /// not reachable. Were it ever reachable, it would be an
@@ -3071,6 +3010,31 @@ pub enum ScanFailureResult {
     /// backend list reached a format it does not cover, or a policy that
     /// predates the row is still in the database.
     InertPairing,
+    /// Emitted by `ScanOrchestrationUseCase::record_outcome` once per
+    /// scan job that spent its whole attempt budget without the
+    /// manifest's composition ever becoming producible — a store or an
+    /// upstream that did not answer, or a phase that ran out of clock
+    /// (ADR 0064 D1's *transient* refusal). `scanner` is `composite`,
+    /// because the unit that went unassessed is the composition rather
+    /// than any one backend.
+    ///
+    /// Distinct from [`Self::NothingAnalysable`], and the distinction is
+    /// the whole point of the label: there a backend *ran* over the
+    /// artifact and answered that it found nothing to analyse, so the
+    /// scan reached a deterministic result and the artifact is held
+    /// terminally. Here the scan never got as far as having something to
+    /// analyse, so the artifact is held *recoverably* and the rescan
+    /// sweep re-asks. Reading the two as one population would report a
+    /// pull-through estate behind a flaky upstream as a policy mismatch.
+    ///
+    /// A sustained non-zero rate means images are being held for want of
+    /// constituents hort cannot acquire — an upstream outage, a credential
+    /// that stopped working, or a composite budget too small for the
+    /// estate's images. The run it reports reached **no** artifact-terminal
+    /// decision, so it deliberately has no `hort_scan_terminal_total`
+    /// tick beside it — the artifact is held, and the hold is one it was
+    /// already in or one this path took.
+    CompositionNotProduced,
 }
 
 impl ScanFailureResult {
@@ -3082,6 +3046,7 @@ impl ScanFailureResult {
             Self::ReportTooLarge => "report_too_large",
             Self::NothingAnalysable => "nothing_analysable",
             Self::InertPairing => "inert_pairing",
+            Self::CompositionNotProduced => "composition_not_produced",
         }
     }
 }
@@ -3982,19 +3947,41 @@ pub fn set_cron_rescan_eligible_artifacts(count: u64) {
 /// Set `hort_cron_rescan_stranded_eligible_artifacts` to the count of
 /// **stranded** artifacts (issue #6) the most recent `CronRescanTickHandler`
 /// invocation found via `RescanCandidatesRepository::select_stranded` —
-/// `quarantine_status='quarantined'` artifacts whose last scan attempt
-/// errored (every scanner backend failed to run) and exhausted retries. No
+/// artifacts in one of the two holds whose last scan attempt errored or
+/// was never made, plus absent-verdict holds whose last scan request is
+/// older than their resolved rescan interval. No
 /// labels — single global gauge, mirrors
 /// [`set_cron_rescan_eligible_artifacts`]'s shape exactly.
 ///
 /// Distinct from the interval-based `hort_cron_rescan_eligible_artifacts`
 /// gauge: a sustained non-zero value here is a different operational
-/// signal — artifacts stuck because a scanner backend is down, not the
+/// signal — artifacts stuck because a scanner backend is down or because
+/// nothing could analyse them, not the
 /// routine rescan sweep falling behind. Operators alarm on sustained
 /// `> 0` for an extended period (a healthy scanner drains this to zero
 /// every tick once it recovers).
 pub fn set_cron_rescan_stranded_eligible_artifacts(count: u64) {
     metrics::gauge!("hort_cron_rescan_stranded_eligible_artifacts").set(count as f64);
+}
+
+/// Set `hort_cron_rescan_composite_unassessed_artifacts` to the count of
+/// live OCI image manifests the most recent `CronRescanTickHandler`
+/// invocation found via
+/// `RescanCandidatesRepository::select_composite_unassessed` — `released`
+/// or permissive-default `NULL` manifests with no composite assessment
+/// ever recorded. No labels — single global gauge, mirrors
+/// [`set_cron_rescan_eligible_artifacts`]'s shape exactly.
+///
+/// Distinct from both gauges above, and the third distinct operational
+/// signal this one handler produces: a non-zero value is neither a
+/// backlog nor an outage but an estate still serving images on evidence
+/// the composed-verdict rule did not produce (ADR 0064 D2). It is the
+/// number an operator watches drain to zero when driving the cutover
+/// after an upgrade, and it stays at zero afterwards — every composite
+/// scan records an assessment, so a manifest ingested after the upgrade
+/// never enters this set.
+pub fn set_cron_rescan_composite_unassessed_artifacts(count: u64) {
+    metrics::gauge!("hort_cron_rescan_composite_unassessed_artifacts").set(count as f64);
 }
 
 // ---------------------------------------------------------------------------
@@ -6917,6 +6904,22 @@ mod tests {
             super::ScanFailureResult::InertPairing.as_str(),
             "inert_pairing"
         );
+        assert_eq!(
+            super::ScanFailureResult::CompositionNotProduced.as_str(),
+            "composition_not_produced"
+        );
+    }
+
+    /// The two no-verdict labels are different strings, which is what
+    /// keeps a flaky upstream from reading as a policy mismatch: one
+    /// says a backend ran and answered "nothing to analyse", the other
+    /// says the scan never had the composition to analyse.
+    #[test]
+    fn a_missing_composition_is_not_a_backend_abstention() {
+        assert_ne!(
+            super::ScanFailureResult::CompositionNotProduced.as_str(),
+            super::ScanFailureResult::NothingAnalysable.as_str(),
+        );
     }
 
     #[test]
@@ -6926,6 +6929,7 @@ mod tests {
             super::ScanFailureResult::ReportTooLarge,
             super::ScanFailureResult::NothingAnalysable,
             super::ScanFailureResult::InertPairing,
+            super::ScanFailureResult::CompositionNotProduced,
         ];
         let set: HashSet<&'static str> = variants
             .iter()
@@ -7225,14 +7229,14 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Shadow composite scan (ADR 0064 D6)
+    // Composite scan (ADR 0064 D2)
     // -------------------------------------------------------------------
 
     /// The label values are the **column** values. A drift here would
     /// make `GROUP BY assessment` over `composite_scan_observations`
     /// and `sum by (result)` over this counter two different questions,
-    /// which is exactly what an operator watching D6's promotion
-    /// criteria would be combining.
+    /// which is exactly what an operator watching coverage and error
+    /// rate combines.
     #[test]
     fn composite_assessment_result_mirrors_the_stored_column_value() {
         use hort_domain::ports::composite_scan_observation::CompositeAssessment as A;
@@ -7282,9 +7286,15 @@ mod tests {
         }
     }
 
-    /// Each of the four outcomes ticks the counter exactly once under
-    /// each posture — the eight series the pair of label taxonomies
-    /// spans, and nothing else.
+    /// Each of the four outcomes ticks the counter exactly once — the
+    /// four series the one label taxonomy spans, and nothing else.
+    ///
+    /// The label-count assertion is the half that matters now: the
+    /// counter used to carry a second label naming whether the
+    /// assessment gated its manifest, and with the composed verdict
+    /// unconditional that distinction has one value. A reintroduced
+    /// second label would be an unannounced series split, which is what
+    /// `docs/metrics-catalog.md` exists to arbitrate.
     #[test]
     fn emit_composite_assessment_ticks_once_per_outcome() {
         for result in [
@@ -7293,73 +7303,22 @@ mod tests {
             super::CompositeAssessmentResult::DeterministicRefusal,
             super::CompositeAssessmentResult::TransientRefusal,
         ] {
-            for authority in [
-                super::CompositeAuthority::Observed,
-                super::CompositeAuthority::Promoted,
-            ] {
-                let snap = capture_metrics(|| super::emit_composite_assessment(result, authority));
-                let entries = snap.into_vec();
-                let ticks: Vec<_> = entries
-                    .iter()
-                    .filter(|(k, _, _, _)| k.key().name() == "hort_scan_composite_assessment_total")
-                    .collect();
-                assert_eq!(ticks.len(), 1, "exactly one series per assessment");
-                let (key, _, _, value) = ticks[0];
-                let labels: std::collections::HashMap<&str, &str> =
-                    key.key().labels().map(|l| (l.key(), l.value())).collect();
-                assert_eq!(labels.get("result"), Some(&result.as_str()));
-                assert_eq!(labels.get("authority"), Some(&authority.as_str()));
-                assert_eq!(labels.len(), 2, "no label but `result` and `authority`");
-                match value {
-                    metrics_util::debugging::DebugValue::Counter(v) => assert_eq!(*v, 1),
-                    other => panic!("expected Counter, got {other:?}"),
-                }
+            let snap = capture_metrics(|| super::emit_composite_assessment(result));
+            let entries = snap.into_vec();
+            let ticks: Vec<_> = entries
+                .iter()
+                .filter(|(k, _, _, _)| k.key().name() == "hort_scan_composite_assessment_total")
+                .collect();
+            assert_eq!(ticks.len(), 1, "exactly one series per assessment");
+            let (key, _, _, value) = ticks[0];
+            let labels: std::collections::HashMap<&str, &str> =
+                key.key().labels().map(|l| (l.key(), l.value())).collect();
+            assert_eq!(labels.get("result"), Some(&result.as_str()));
+            assert_eq!(labels.len(), 1, "no label but `result`");
+            match value {
+                metrics_util::debugging::DebugValue::Counter(v) => assert_eq!(*v, 1),
+                other => panic!("expected Counter, got {other:?}"),
             }
-        }
-    }
-
-    /// The `authority` label values are the **column** values of
-    /// `policy_projections.composite_verdict_mode`, for
-    /// [`CompositeAssessmentResult`]'s reason one label over: an
-    /// operator correlating "which policies are promoted?" (a SQL
-    /// question) with "what is promotion gating?" (a PromQL one) is
-    /// combining the two, and a drift would make them different
-    /// questions.
-    #[test]
-    fn composite_authority_mirrors_the_policy_column_value() {
-        use hort_domain::entities::scan_policy::CompositeVerdictMode as M;
-        for (domain, label) in [
-            (M::Observed, super::CompositeAuthority::Observed),
-            (M::Promoted, super::CompositeAuthority::Promoted),
-        ] {
-            assert_eq!(
-                super::CompositeAuthority::from(domain),
-                label,
-                "the From impl must not cross the arms"
-            );
-            assert_eq!(
-                label.as_str(),
-                domain.to_string(),
-                "the metric label and the policy column must spell the posture identically"
-            );
-        }
-    }
-
-    /// Both values are distinct, lowercase snake_case — the catalog's
-    /// own rule, asserted rather than reviewed.
-    #[test]
-    fn composite_authority_values_are_unique_and_snake_case() {
-        let values = [
-            super::CompositeAuthority::Observed.as_str(),
-            super::CompositeAuthority::Promoted.as_str(),
-        ];
-        let distinct: HashSet<&'static str> = values.iter().copied().collect();
-        assert_eq!(distinct.len(), values.len(), "label values collide");
-        for value in values {
-            assert!(
-                !value.is_empty() && value.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                "{value} must be lowercase snake_case"
-            );
         }
     }
 
@@ -7382,11 +7341,11 @@ mod tests {
         for decision in [G::Clean, G::FindingsRecorded, G::Reject] {
             assert_eq!(C::of(decision, decision), C::Agree);
         }
-        // The composite blocks and the primary does not: promoting adds
-        // a hold. Both blocking variants read the same way.
+        // The composite blocks and the primary does not: the composition
+        // adds a hold. Both blocking variants read the same way.
         assert_eq!(C::of(G::Reject, G::Clean), C::CompositeStricter);
         assert_eq!(C::of(G::FindingsRecorded, G::Clean), C::CompositeStricter);
-        // And the other direction: promoting removes a hold.
+        // And the other direction: the composition removes a hold.
         assert_eq!(C::of(G::Clean, G::Reject), C::CompositePermissive);
         assert_eq!(C::of(G::Clean, G::FindingsRecorded), C::CompositePermissive);
         // Both block, differing only in the enforcement mode the policy
@@ -7819,6 +7778,33 @@ mod tests {
         match value {
             metrics_util::debugging::DebugValue::Gauge(v) => {
                 assert_eq!(*v, 7.0);
+            }
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_cron_rescan_composite_unassessed_artifacts_records_gauge_value() {
+        let snap = capture_metrics(|| {
+            super::set_cron_rescan_composite_unassessed_artifacts(3);
+        });
+        let entries = snap.into_vec();
+        let (key, _, _, value) = entries
+            .iter()
+            .find(|(k, _, _, _)| {
+                k.key().name() == "hort_cron_rescan_composite_unassessed_artifacts"
+            })
+            .expect("hort_cron_rescan_composite_unassessed_artifacts must fire");
+        // No labels — single global gauge, mirrors its two siblings.
+        assert_eq!(
+            key.key().labels().count(),
+            0,
+            "hort_cron_rescan_composite_unassessed_artifacts must have NO labels \
+             (single global gauge)",
+        );
+        match value {
+            metrics_util::debugging::DebugValue::Gauge(v) => {
+                assert_eq!(*v, 3.0);
             }
             other => panic!("expected Gauge, got {other:?}"),
         }

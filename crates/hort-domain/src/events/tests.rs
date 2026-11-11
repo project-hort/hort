@@ -2247,15 +2247,12 @@ fn policy_field_is_gate_affecting_is_exactly_the_scan_gate_fields() {
     assert!(!PolicyField::MaxArtifactAge.is_gate_affecting());
     assert!(!PolicyField::ScanBackends.is_gate_affecting());
     assert!(!PolicyField::RescanIntervalHours.is_gate_affecting());
-    // `composite_verdict_mode` is `ScanBackends`' argument on the
-    // composition axis (ADR 0064 D6): it decides whether the NEXT scan's
-    // composed-image verdict reaches the manifest, and re-interprets no
-    // stored finding. Making it gate-affecting would be actively wrong,
-    // not merely unnecessary — the pass re-derives from stored findings,
-    // so `promoted` -> `observed` would un-reject the population a
-    // promoted composite had correctly rejected without assessing
-    // anything afresh, which is exactly the hazard that disqualified
-    // shipping the composite verdict under `ScanEnforcement::Record`.
+    // `composite_verdict_mode` is retired — nothing produces the variant
+    // and no decision reads the field (ADR 0064 D2). `false` is the only
+    // answer a replay of a historical event can act on: a stored value
+    // nothing consults cannot flip a stored-findings verdict, and making
+    // it gate-affecting would drive a re-evaluation pass off an event
+    // whose field has no consumer.
     assert!(!PolicyField::CompositeVerdictMode.is_gate_affecting());
 }
 

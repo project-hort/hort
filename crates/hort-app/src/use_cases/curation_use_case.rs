@@ -44,7 +44,7 @@ use hort_domain::events::{
     Actor, ApiActor, ArtifactReEvaluated, DomainEvent, ReEvaluationTrigger, ReleaseReason,
     StreamId, NO_POLICY,
 };
-use hort_domain::policy::{composite_verdict_mode_of, ReEvaluationOutcome};
+use hort_domain::policy::ReEvaluationOutcome;
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::curation_decisions_repository::{
@@ -1210,15 +1210,6 @@ impl CurationUseCase {
             policy.as_ref(),
             &exclusions,
             kind,
-            // **Resolved, not pinned** (ADR 0064 D6). A curator asked for
-            // this one artifact to be judged again, which is the
-            // operator-driven recovery D6 reserves the already-rejected
-            // estate to: "recovering the existing estate is
-            // operator-driven, through the curation re-evaluation". The
-            // automatic policy-mutation pass pins
-            // `CompositeVerdictMode::Observed` instead, so nothing
-            // releases that population without someone asking.
-            composite_verdict_mode_of(policy.as_ref()),
             now,
         )
         .await
@@ -5488,8 +5479,8 @@ mod tests {
         use hort_domain::entities::curation_rule::{CurationRule, CurationRuleAction};
         use hort_domain::entities::managed_by::ManagedBy;
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-            ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
 
@@ -5517,7 +5508,6 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: NegligibleAction::Ignore,
                 enforcement: ScanEnforcement::Reject,
-                composite_verdict_mode: CompositeVerdictMode::Observed,
                 stream_version: 0,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),

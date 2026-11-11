@@ -463,7 +463,7 @@ async fn a_transient_scan_failure_with_the_budget_spent_leaves_a_terminal_row() 
     // And the sweep still re-picks the artifact, so the scan gets another
     // chance once the scanner is back.
     let candidates = PgRescanCandidatesRepository::new(pool.clone())
-        .select_stranded(50)
+        .select_stranded(50, chrono::Utc::now())
         .await
         .expect("select_stranded");
     assert!(
@@ -495,11 +495,19 @@ async fn a_transient_scan_failure_with_the_budget_spent_leaves_a_terminal_row() 
 ///
 /// **This is also the item's rollout condition made visible.** A
 /// `scan_indeterminate` artifact is outside the interval sweep's
-/// `released`/NULL predicate, so once this row completes the artifact has
-/// no automatic selection signal at all. That is correct for a question
-/// whose answer cannot change until its cause is removed, and it is why
-/// this change ships with the targeted reassessment of the
+/// `released`/NULL predicate, so once this row completes, the two
+/// job-status arms of the stranded sweep no longer see it either — which
+/// is why this change ships with the reassessment of the
 /// completed/no-verdict population rather than alone.
+///
+/// What re-asks the question from then on is the sweep's absent-verdict
+/// arm, which re-admits exactly this row once its resolved rescan
+/// interval has elapsed. The assertion below is therefore about *this*
+/// tick, and that is the point: the answer cannot change until its cause
+/// is removed (a policy gaining a `scan_backends` entry, a backend
+/// learning the format), nothing emits an event when it does, so the
+/// question is worth re-asking on an interval and not worth re-asking
+/// every five minutes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(hort_pg_db)]
 async fn a_scan_with_nothing_to_analyse_completes_the_row_and_leaves_the_sweep() {
@@ -551,13 +559,15 @@ async fn a_scan_with_nothing_to_analyse_completes_the_row_and_leaves_the_sweep()
 
     // The sweep half.
     let candidates = PgRescanCandidatesRepository::new(pool.clone())
-        .select_stranded(50)
+        .select_stranded(50, chrono::Utc::now())
         .await
         .expect("select_stranded");
     assert!(
         !candidates.iter().any(|c| c.artifact_id == artifact),
-        "a completed scan job is not a stranded one: the sweep re-drives a scan that could \
-         not run, and this one ran and answered. Got {} candidates",
+        "a completed scan job is not a stranded one on this tick: the sweep re-drives a \
+         scan that could not run, and this one ran and answered. The absent-verdict arm \
+         re-asks it once the rescan interval has elapsed, which has not happened for a \
+         job seeded now. Got {} candidates",
         candidates.len()
     );
 }
@@ -649,7 +659,7 @@ async fn a_persistence_failure_at_the_cap_leaves_a_quarantined_artifact_stranded
 
     // And the sweep still sees it.
     let candidates = PgRescanCandidatesRepository::new(pool.clone())
-        .select_stranded(50)
+        .select_stranded(50, chrono::Utc::now())
         .await
         .expect("select_stranded");
     assert!(

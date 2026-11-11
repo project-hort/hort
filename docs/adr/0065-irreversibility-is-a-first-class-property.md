@@ -46,9 +46,9 @@ ADRs argue the same point from scratch, each in its own domain:
 - **0061** disables a subscription rather than skipping an event, in its own
   words because "a gap is recoverable by nobody, a disabled subscription is
   recoverable by an operator".
-- **0064** runs a new analysis path as a shadow assessment carrying no release
-  authority, because a pipeline whose first act can be irreversible is the
-  thing to avoid.
+- **0064** lets a new analysis path claim only the assessments taken after it,
+  leaving the already-terminal estate to the operator's re-evaluation, because
+  a pipeline whose first act can be irreversible is the thing to avoid.
 - **0038** keeps destructive operations behind a fresh, claim-bearing admin
   session, so there is zero *standing* destructive privilege.
 

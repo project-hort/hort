@@ -47,8 +47,8 @@ use hort_config::DesiredState;
 use hort_domain::entities::managed_by::ManagedBy;
 use hort_domain::entities::rbac::{ClaimMapping, GrantSubject, Permission, PermissionGrant};
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, NegligibleAction, ProvenanceConfigError, ProvenanceConfigWarning,
-    ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+    NegligibleAction, ProvenanceConfigError, ProvenanceConfigWarning, ProvenanceMode,
+    ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::events::PolicyScope;
 use uuid::Uuid;
@@ -196,22 +196,29 @@ pub(crate) const RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED: &str =
 
 /// `rule` label value for
 /// `hort_apply_config_linter_total` emitted when a `ScanPolicy`
-/// envelope promotes the composed-image verdict to release authority
-/// (`compositeVerdictMode: promoted`) while declaring no scanner
-/// backends. The waiver wins: `run_scan` returns `SkippedNoBackends`
-/// before a composition is resolved, so the promotion grants authority
-/// to a verdict no manifest in scope ever carries (ADR 0064 D6 ×
-/// ADR 0016's cross-opt-in matrix, closed as the ADR 0015 inert-field
-/// block). The composition-axis sibling of
-/// [`RULE_TRUST_UPSTREAM_PUBLISH_TIME_REQUIRES_SCAN_BACKENDS`], whose
-/// other half is the same empty backend list. One increment per
-/// offending `ScanPolicy`. **Not** retired by a future implementation:
-/// a waived scan has nothing to promote under any of them.
+/// envelope declares the **retired** `compositeVerdictMode`. A composed
+/// OCI image's scan verdict decides its manifest's release
+/// unconditionally (ADR 0064 D2), so neither value selects anything and
+/// nothing reads the field — the same ADR 0015 accepted-but-inert
+/// surface [`RULE_PREFETCH_MAX_AGE_DAYS_NOT_IMPLEMENTED`] closes for
+/// `maxAgeDays`, on the composition axis.
+///
+/// **Retired, not deferred**, which is why this label does not end in
+/// `_not_implemented`: there is no future implementation that gives the
+/// field a consumer, so the operator's move is to delete the line and
+/// not to wait for a release. In its sharpest form, too — the field used
+/// to decide whether the composed verdict reached the artifact at all,
+/// so an operator who typed either value was making a threat-model
+/// decision that accepting the field now would silently void. The
+/// reasoning and the retirement trigger live on
+/// [`hort_config::desired::validate_scan_policy_composite_verdict_mode_retired`].
+/// One increment per offending `ScanPolicy`. Catalog entry update ships
+/// in the same PR (`docs/metrics-catalog.md`).
 ///
 /// Single source of truth shared between [`LinterRule::metric_rule`] and
 /// the apply caller's emission site.
-pub(crate) const RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS: &str =
-    "composite_verdict_promoted_requires_scan_backends";
+pub(crate) const RULE_SCAN_POLICY_COMPOSITE_VERDICT_MODE_RETIRED: &str =
+    "scan_policy_composite_verdict_mode_retired";
 
 /// `rule` label value for
 /// `hort_apply_config_linter_total` emitted when an `ArtifactRepository`
@@ -262,6 +269,76 @@ pub(crate) const RULE_REPOSITORY_STORAGE_PATH_DEPRECATED: &str =
 /// Single source of truth shared between [`LinterRule::metric_rule`] and
 /// the apply caller's emission site.
 pub(crate) const RULE_REPOSITORY_QUOTA_BYTES_RETIRED: &str = "repository_quota_bytes_retired";
+
+/// `rule` label value for
+/// `hort_apply_config_linter_total` emitted when a `ScanPolicy` waives
+/// scanning outright (`scanBackends: []`) for a repository whose format
+/// is `oci`.
+///
+/// A composed OCI image's scan verdict decides its manifest's release,
+/// and it is now the **only** verdict that does (ADR 0064 D2): an OCI
+/// blob is a composition constituent
+/// ([`ArtifactKind::is_composition_constituent`](hort_domain::types::ArtifactKind::is_composition_constituent)),
+/// so nothing a layer reports in isolation condemns or clears anything.
+/// `ScanOrchestrationUseCase::run_scan` returns `SkippedNoBackends` on an
+/// empty backend list **before** a composition is resolved, so under this
+/// pairing no manifest the policy governs is ever composed and no image is
+/// ever assessed — while the waiver still supplies `ScanWaived` as the
+/// release authority, so the images serve. The operator has waived the one
+/// analysis that can say anything about an OCI artifact at all.
+///
+/// The surviving half of the retired
+/// `composite_verdict_promoted_requires_scan_backends`, which paired the
+/// waiver with `compositeVerdictMode: promoted`. That half stopped being
+/// an operator opt-in when the composite verdict became unconditionally
+/// authoritative, so what used to need two declarations now needs one —
+/// which makes the rejection **wider**, not narrower, and is why it could
+/// not stay a per-envelope rule: the second half is now the governed
+/// repository's `format`, which no single `ScanPolicy` envelope carries.
+///
+/// **Scoped to `oci` deliberately, and this is the load-bearing half.**
+/// `scanBackends: []` is a supported, documented operator waiver for
+/// every other format — a hosted npm or Maven repository the operator has
+/// decided not to scan releases on `ScanWaived` exactly as before, and a
+/// blanket ban would delete that surface
+/// ([`hort_config::desired::validate_trust_upstream_publish_time_against_scan_backends`]
+/// is the only other row that reads an empty list, and it too rejects a
+/// *pairing* rather than the waiver itself). What makes `oci` different
+/// is not that scanning matters more there but that the composition is
+/// the unit of assessment, so a waiver removes the assessment of the
+/// artifact rather than of its parts.
+///
+/// **Not retired by a future implementation**, like
+/// [`RULE_TRUST_UPSTREAM_PUBLISH_TIME_REQUIRES_SCAN_BACKENDS`] and unlike
+/// the inert-field rows: a waived scan composes nothing under any
+/// scanner that ships later. One increment per offending (policy,
+/// repository) pairing. Catalog entry update ships in the same PR
+/// (`docs/metrics-catalog.md`).
+///
+/// Single source of truth shared between [`LinterRule::metric_rule`] and
+/// the apply caller's emission site.
+pub(crate) const RULE_OCI_REPOSITORY_REQUIRES_SCAN_BACKENDS: &str =
+    "oci_repository_requires_scan_backends";
+
+/// The repository `format:` string whose artifacts are **composed** before
+/// they are assessed.
+///
+/// Read directly rather than injected, exactly as
+/// [`collect_scan_backend_capability`] reads the scanner capability map:
+/// the offline `validate-config` CLI, `gitops_boot` and the apply-test
+/// harness all reach row 18 through one call, so a caller cannot silently
+/// skip the row by forgetting to supply a set, and the fact is a permanent
+/// property of the build rather than of a deployment.
+///
+/// It is one string because exactly one format handler produces the
+/// composition: `OciFormatHandler::format_key` is `"oci"` and
+/// `OciFormatHandler::scan_kind` is the only `scan_kind` in the workspace
+/// returning [`ArtifactKind::OciManifest`](hort_domain::types::ArtifactKind::OciManifest)
+/// — the row that carries a composite verdict (ADR 0064 D4) — or
+/// `OciBlob`, the only constituent kind. A repository's declared `format:`
+/// IS that registry key (both composition roots register handlers under
+/// the literal string), which is the same identity row 7c relies on.
+const COMPOSED_FORMAT: &str = "oci";
 
 /// The snapshot-free apply-config lint rules.
 ///
@@ -348,14 +425,13 @@ pub enum LinterRule {
     /// appending is the only placement that leaves every existing
     /// config's reject message exactly as it was.
     SaRotationTargetConflict,
-    /// Row 15 — a `ScanPolicy` promoting the composed-image verdict to
-    /// release authority (`compositeVerdictMode: promoted`) while
-    /// declaring no scanner backends, so the promotion has nothing to
-    /// act on (ADR 0064 D6 × ADR 0016). Reject + metric. Appended after
-    /// row 14, same reason: apply aborts on the first row with error
-    /// findings, so appending is the only placement that leaves every
-    /// existing config's reject message exactly as it was.
-    CompositeVerdictPromotedRequiresScanBackends,
+    /// Row 15 — a `ScanPolicy` declaring the **retired**
+    /// `compositeVerdictMode`, which no longer selects anything
+    /// (ADR 0064 D2). Reject + metric. Appended after row 14, same
+    /// reason: apply aborts on the first row with error findings, so
+    /// appending is the only placement that leaves every existing
+    /// config's reject message exactly as it was.
+    ScanPolicyCompositeVerdictModeRetired,
     /// Row 16 — an `ArtifactRepository` declaring the deprecated,
     /// placement-inert `storage.path`. **Warn + metric** — the only
     /// inert-field row that does not reject (see
@@ -373,6 +449,29 @@ pub enum LinterRule {
     /// that leaves every existing config's reject message exactly as it
     /// was.
     RepositoryQuotaBytesRetired,
+    /// Row 18 — an **effective** `ScanPolicy` waiving scanning
+    /// (`scanBackends: []`) for a repository whose format is
+    /// [`COMPOSED_FORMAT`]. Reject + metric. The reasoning, and why the
+    /// row is `oci`-scoped rather than a blanket ban on the waiver, is on
+    /// [`RULE_OCI_REPOSITORY_REQUIRES_SCAN_BACKENDS`].
+    ///
+    /// Evaluated over the **effective** pairing, not the declared scope —
+    /// it shares row 7c's resolver
+    /// ([`effective_repositories_for`]) for the reason row 7c does: a
+    /// global waiver never reaches a repository that declares a policy of
+    /// its own, so linting the declared scope would reject a pairing the
+    /// runtime never forms.
+    ///
+    /// Appended after row 17 for row 9's own reason: apply aborts on the
+    /// first row with error findings, so appending is the only placement
+    /// that leaves every existing config's reject message exactly as it
+    /// was. That ordering is why the row is collected at the end of
+    /// [`StaticConfigValidator::validate`] in its own walk rather than
+    /// inside the rows 7/7c pass — `static_validator_and_apply_agree_on_reject_rule`
+    /// compares the report's **first** error against the apply table's
+    /// first row with findings, so a finding pushed at row 7c's position
+    /// while the table entry sits last would make the two disagree.
+    OciRepositoryRequiresScanBackends,
 }
 
 impl LinterRule {
@@ -412,13 +511,16 @@ impl LinterRule {
             Self::ScanPolicyMaxArtifactAgeNotImplemented => {
                 Some(RULE_SCAN_POLICY_MAX_ARTIFACT_AGE_NOT_IMPLEMENTED)
             }
-            Self::CompositeVerdictPromotedRequiresScanBackends => {
-                Some(RULE_COMPOSITE_VERDICT_PROMOTED_REQUIRES_SCAN_BACKENDS)
+            Self::ScanPolicyCompositeVerdictModeRetired => {
+                Some(RULE_SCAN_POLICY_COMPOSITE_VERDICT_MODE_RETIRED)
             }
             Self::RepositoryStoragePathDeprecated => {
                 Some(RULE_REPOSITORY_STORAGE_PATH_DEPRECATED)
             }
             Self::RepositoryQuotaBytesRetired => Some(RULE_REPOSITORY_QUOTA_BYTES_RETIRED),
+            Self::OciRepositoryRequiresScanBackends => {
+                Some(RULE_OCI_REPOSITORY_REQUIRES_SCAN_BACKENDS)
+            }
             Self::SaIssuerFk
             | Self::UnderConstrainedFederatedIdentities
             | Self::ProvenanceConfig
@@ -778,22 +880,22 @@ impl StaticConfigValidator {
             ));
         }
 
-        // Row 15 — a `ScanPolicy` promoting the composed-image verdict
-        // to release authority while waiving scanning outright. The two
-        // opt-ins cancel: the waiver returns before a composition is
-        // resolved, so the promotion grants authority to a verdict no
-        // manifest in scope ever carries (ADR 0064 D6 × ADR 0016, closed
-        // as the ADR 0015 inert-field block). Appended after row 14 for
-        // row 9's own reason — apply aborts on the first row with error
-        // findings, so appending is the only placement that leaves every
-        // existing config's reject message exactly as it was.
+        // Row 15 — a `ScanPolicy` declaring the retired
+        // `compositeVerdictMode`. The composed image's verdict decides
+        // its manifest's release unconditionally (ADR 0064 D2), so
+        // neither value selects anything and nothing reads the field —
+        // accepting it while nothing reads it is the ADR 0015
+        // inert-field block, and in its sharpest form, because the field
+        // used to decide whether the composed verdict reached the
+        // artifact at all. Appended after row 14 for row 9's own
+        // reason — apply aborts on the first row with error findings, so
+        // appending is the only placement that leaves every existing
+        // config's reject message exactly as it was.
         for err in
-            hort_config::desired::validate_scan_policy_promoted_composite_requires_scan_backends(
-                desired,
-            )
+            hort_config::desired::validate_scan_policy_composite_verdict_mode_retired(desired)
         {
             report.errors.push(LintFinding::error(
-                LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+                LinterRule::ScanPolicyCompositeVerdictModeRetired,
                 err.to_string(),
             ));
         }
@@ -838,6 +940,30 @@ impl StaticConfigValidator {
                 LinterRule::RepositoryQuotaBytesRetired,
                 err.to_string(),
             ));
+        }
+
+        // Row 18 — an effective `ScanPolicy` waiving scanning outright
+        // for an OCI repository. The composition is the unit of
+        // assessment for an OCI artifact and now the only thing that
+        // carries a verdict on one (ADR 0064 D2), and the waiver returns
+        // before a composition is resolved — so the images serve on the
+        // waiver's own release authority with nothing having assessed
+        // them. The waiver stays supported for every other format,
+        // which is why this is a separate row rather than a wider
+        // reading of row 7c (`collect_oci_scan_waiver` carries the
+        // reasoning).
+        //
+        // Walked here rather than in the rows 7/7c pass even though it
+        // shares their tables: the report's first error and the apply
+        // table's first row with findings have to name the same row
+        // (`static_validator_and_apply_agree_on_reject_rule`), and this
+        // row's table entry is last. Appended for row 9's own reason —
+        // apply aborts on the first row with error findings, so
+        // appending is the only placement that leaves every existing
+        // config's reject message exactly as it was.
+        let (declared_repos, repos_with_scoped_policy) = effective_scope_tables(desired);
+        for env in &desired.scan_policies {
+            collect_oci_scan_waiver(env, &repos_with_scoped_policy, &declared_repos, &mut report);
         }
 
         report
@@ -1032,32 +1158,18 @@ impl StaticConfigValidator {
     /// then row 7c for each envelope); that is invisible to the apply
     /// caller, which selects findings by [`LinterRule`] rather than by
     /// report position.
+    ///
+    /// Row 18 reads the same two [`effective_scope_tables`] as row 7c but
+    /// is **not** collected here: its report position has to match its
+    /// position in the apply table, which is last (see
+    /// [`LinterRule::OciRepositoryRequiresScanBackends`]).
     fn collect_scan_policy_rows(&self, desired: &DesiredState, report: &mut StaticLintReport) {
         let repo_format_by_name: HashMap<&str, &str> = desired
             .repositories
             .iter()
             .map(|r| (r.metadata.name.as_str(), r.spec.format.as_str()))
             .collect();
-        // Row 7c reads (name, format) pairs in declaration order, so its
-        // findings are deterministic and every repository it walks has a
-        // format by construction — no lookup that could miss.
-        let declared_repos: Vec<(&str, &str)> = desired
-            .repositories
-            .iter()
-            .map(|r| (r.metadata.name.as_str(), r.spec.format.as_str()))
-            .collect();
-        // Row 7c — the repositories that carry a policy of their own.
-        // Runtime resolution is repo-scoped-wins-over-global
-        // (`use_cases::policy_resolution`), so a global policy never
-        // reaches one of these and must not be linted against it.
-        let repos_with_scoped_policy: HashSet<&str> = desired
-            .scan_policies
-            .iter()
-            .filter_map(|env| match &env.spec.scope {
-                ScopeSpec::Repository(r) => Some(r.repository.as_str()),
-                ScopeSpec::Global => None,
-            })
-            .collect();
+        let (declared_repos, repos_with_scoped_policy) = effective_scope_tables(desired);
 
         for env in &desired.scan_policies {
             self.collect_provenance_config(env, &repo_format_by_name, report);
@@ -1357,9 +1469,123 @@ fn collect_scan_backend_capability(
     }
 }
 
-/// Row 7c helper — the declared repositories a policy's `scanBackends`
-/// actually govern at runtime, as `(name, format)` pairs in declaration
-/// order.
+/// Row 18 — reject an **effective** `ScanPolicy` that waives scanning
+/// outright (`scanBackends: []`) for a repository whose format is
+/// [`COMPOSED_FORMAT`].
+///
+/// The rejection's reasoning, and why the row is `oci`-scoped rather than
+/// a blanket ban on the waiver, is on
+/// [`RULE_OCI_REPOSITORY_REQUIRES_SCAN_BACKENDS`]. In short: the
+/// composition is the unit of assessment for an OCI artifact and now the
+/// only thing that carries a verdict on one (ADR 0064 D2), and
+/// `ScanOrchestrationUseCase::run_scan` returns `SkippedNoBackends` on an
+/// empty backend list before a composition is resolved — so the images
+/// serve on the waiver's own `ScanWaived` authority with nothing ever
+/// having assessed them.
+///
+/// # The exact complement of row 7c, by construction
+///
+/// [`collect_scan_backend_capability`] returns early on an empty
+/// `scanBackends` — the waiver is a decision, not an inert pairing — and
+/// this row returns early on a **non**-empty one. So the two rows
+/// partition the `scanBackends` space and neither can restate the
+/// other's verdict: row 7c never sees the list this row judges. That is
+/// what "a separate rule beside the capability row" means here, and it is
+/// why folding the two together would change what row 7c asserts.
+///
+/// # The unit of evaluation is the effective pairing, not the scope
+///
+/// Shares row 7c's resolver ([`effective_repositories_for`]) and its
+/// reason: runtime policy resolution is repo-scoped-wins-over-global
+/// ([`crate::use_cases::policy_resolution`]), so a **global** waiver
+/// never reaches an OCI repository that declares a policy of its own and
+/// must not be rejected against it. The declared scope carries no format
+/// of its own — a `ScanPolicy` is `global` or `{repository: X}`, never
+/// `{format: oci}` — so "governs an OCI repository" is a question only
+/// the resolved pairing can answer.
+///
+/// An unresolved scope repository name yields no finding, exactly as in
+/// rows 7 and 7c: the scope-existence validator owns that error and
+/// double-reporting one root cause is what those rows already avoid.
+///
+/// One finding per (policy, OCI repository) pairing, in deterministic
+/// order (policy declaration order × repository declaration order). A
+/// global waiver over three OCI repositories is three findings and names
+/// each, because the operator's fix is per repository: a scoped policy
+/// for one of them does not answer for the other two.
+fn collect_oci_scan_waiver(
+    env: &Envelope<ScanPolicySpec>,
+    repos_with_scoped_policy: &HashSet<&str>,
+    declared_repos: &[(&str, &str)],
+    report: &mut StaticLintReport,
+) {
+    if !env.spec.scan_backends.is_empty() {
+        return;
+    }
+    let policy_name = env.metadata.name.as_str();
+    for (repo, _) in
+        effective_repositories_for(&env.spec.scope, repos_with_scoped_policy, declared_repos)
+            .into_iter()
+            .filter(|(_, format)| *format == COMPOSED_FORMAT)
+    {
+        report.errors.push(LintFinding::error(
+            LinterRule::OciRepositoryRequiresScanBackends,
+            format!(
+                "ScanPolicy `{policy_name}`: an empty `scanBackends` waives scanning for OCI \
+                 repository `{repo}`, whose artifacts are assessed as a composed image and \
+                 only as one. The scan returns before a composition is resolved, so no \
+                 manifest this policy governs is ever composed and no image is ever \
+                 assessed — while the waiver itself is the release authority, so those \
+                 images serve with nothing having looked at them. A layer's own findings \
+                 cannot stand in: an OCI blob is a composition constituent, so a statement \
+                 about its isolated filesystem is a statement about a tree nothing runs \
+                 (ADR 0064 D2). Declare the backends that should assess the composition \
+                 (`scanBackends: [trivy]`), or scope a policy with backends to `{repo}` so \
+                 this waiver no longer governs it. The waiver stays supported for every \
+                 non-`{COMPOSED_FORMAT}` format, where the artifact hort stores is the \
+                 artifact it assesses."
+            ),
+        ));
+    }
+}
+
+/// The two tables an **effective-scope** `ScanPolicy` row reads, in one
+/// declaration both rows share: the declared repositories as
+/// `(name, format)` pairs in declaration order, and the names that carry
+/// a repository-scoped `ScanPolicy` of their own.
+///
+/// Rows 7c and 18 are the two, and they must agree about which pairings
+/// the runtime forms or the same config would be accepted by one and
+/// rejected by the other over the same resolution. Declaration order is
+/// what makes both rows' findings deterministic, and every repository
+/// either walks has a format by construction — no lookup that could
+/// miss.
+///
+/// The scoped-policy set is why a global policy is linted against *some*
+/// repositories and not others: runtime resolution is
+/// repo-scoped-wins-over-global
+/// ([`crate::use_cases::policy_resolution`]), so a global policy never
+/// reaches a repository in this set.
+fn effective_scope_tables(desired: &DesiredState) -> (Vec<(&str, &str)>, HashSet<&str>) {
+    let declared_repos: Vec<(&str, &str)> = desired
+        .repositories
+        .iter()
+        .map(|r| (r.metadata.name.as_str(), r.spec.format.as_str()))
+        .collect();
+    let repos_with_scoped_policy: HashSet<&str> = desired
+        .scan_policies
+        .iter()
+        .filter_map(|env| match &env.spec.scope {
+            ScopeSpec::Repository(r) => Some(r.repository.as_str()),
+            ScopeSpec::Global => None,
+        })
+        .collect();
+    (declared_repos, repos_with_scoped_policy)
+}
+
+/// Rows 7c and 18 helper — the declared repositories a policy's
+/// `scanBackends` actually govern at runtime, as `(name, format)` pairs in
+/// declaration order.
 ///
 /// - `Repository(name)` → that repository alone, and only when it is
 ///   declared (an unresolved name belongs to the scope-existence
@@ -1526,7 +1752,6 @@ fn provenance_projection_for_lint(
         rescan_interval_hours: 0,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -1722,7 +1947,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -2148,7 +2373,7 @@ mod tests {
                     rescan_interval_hours: 24,
                     negligible_action: "ignore".into(),
                     enforcement: "reject".into(),
-                    composite_verdict_mode: "observed".into(),
+                    composite_verdict_mode: None,
                 },
             }],
             ..Default::default()
@@ -2613,6 +2838,12 @@ mod tests {
 
     /// The explicit waiver is a decision, not an inert pairing — it never
     /// trips the row, whatever the repository's format.
+    ///
+    /// Row-7c-scoped, and deliberately **not** a claim that the waiver
+    /// applies: the OCI half of this fixture is row 18's rejection
+    /// (`row18_an_oci_repository_under_a_scan_waiver_rejects`). The two
+    /// rows partition the `scanBackends` space, so what this asserts is
+    /// that row 7c does not also speak to the list row 18 judges.
     #[test]
     fn an_empty_scan_backends_list_never_triggers_the_row() {
         let desired = DesiredState {
@@ -3205,51 +3436,54 @@ mod tests {
         assert_eq!(LinterRule::SaRotationTargetConflict.metric_rule(), None);
     }
 
-    // ---- row 15: compositeVerdictMode x scanBackends -------------------
+    // ---- row 15: the retired compositeVerdictMode ----------------------
 
     /// Every row-15 finding in a report, by message, so a test asserts
     /// what the operator reads rather than a count.
-    fn promoted_composite_findings(report: &StaticLintReport) -> Vec<&str> {
+    fn retired_composite_mode_findings(report: &StaticLintReport) -> Vec<&str> {
         report
             .errors
             .iter()
-            .filter(|f| f.rule == LinterRule::CompositeVerdictPromotedRequiresScanBackends)
+            .filter(|f| f.rule == LinterRule::ScanPolicyCompositeVerdictModeRetired)
             .map(|f| f.message.as_str())
             .collect()
     }
 
     #[test]
-    fn row15_promoted_composite_with_no_backends_rejects() {
-        let mut env = scan_policy_global("p-waived-but-promoted", vec![]);
-        env.spec.composite_verdict_mode = "promoted".into();
-        let desired = DesiredState {
-            scan_policies: vec![env],
-            ..Default::default()
-        };
-        let report = oci_validator().validate(&desired);
-        let findings = promoted_composite_findings(&report);
-        assert_eq!(findings.len(), 1, "{findings:?}");
-        assert!(
-            findings[0].contains("p-waived-but-promoted"),
-            "{findings:?}"
-        );
+    fn row15_a_declared_composite_verdict_mode_rejects() {
+        for declared in ["promoted", "observed"] {
+            let mut env = scan_policy_global("p-declares-the-mode", vec!["trivy"]);
+            env.spec.composite_verdict_mode = Some(declared.into());
+            let desired = DesiredState {
+                scan_policies: vec![env],
+                ..Default::default()
+            };
+            let report = oci_validator().validate(&desired);
+            let findings = retired_composite_mode_findings(&report);
+            assert_eq!(findings.len(), 1, "`{declared}`: {findings:?}");
+            assert!(findings[0].contains("p-declares-the-mode"), "{findings:?}");
+            assert!(
+                findings[0].contains("retired"),
+                "the operator must read that the field is gone: {findings:?}"
+            );
+        }
     }
 
-    /// Each half alone is a supported posture — which is what makes this
-    /// a cross-opt-in collapse rather than an inert field.
+    /// A policy that never named the field applies — including one that
+    /// waives scanning, which the row this replaced did reach.
     #[test]
-    fn row15_either_half_alone_is_accepted() {
-        let mut promoted = scan_policy_global("p-promoted-scanning", vec!["trivy"]);
-        promoted.spec.composite_verdict_mode = "promoted".into();
-        let waived = scan_policy_global("p-waived", vec![]);
-        for env in [promoted, waived] {
+    fn row15_an_omitted_composite_verdict_mode_is_accepted() {
+        for env in [
+            scan_policy_global("p-scanning", vec!["trivy"]),
+            scan_policy_global("p-waived", vec![]),
+        ] {
             let desired = DesiredState {
                 scan_policies: vec![env],
                 ..Default::default()
             };
             let report = oci_validator().validate(&desired);
             assert!(
-                promoted_composite_findings(&report).is_empty(),
+                retired_composite_mode_findings(&report).is_empty(),
                 "{:?}",
                 report.errors
             );
@@ -3263,11 +3497,11 @@ mod tests {
     fn row15_is_appended_after_the_existing_rows() {
         let mut inert = repo_env("npm-inert", "npm");
         inert.spec.prefetch_policy.max_age_days = Some(90);
-        let mut promoted = scan_policy_global("p-waived-but-promoted", vec![]);
-        promoted.spec.composite_verdict_mode = "promoted".into();
+        let mut declares = scan_policy_global("p-declares-the-mode", vec!["trivy"]);
+        declares.spec.composite_verdict_mode = Some("promoted".into());
         let desired = DesiredState {
             repositories: vec![inert],
-            scan_policies: vec![promoted],
+            scan_policies: vec![declares],
             ..Default::default()
         };
         let report = oci_validator().validate(&desired);
@@ -3276,7 +3510,7 @@ mod tests {
             Some(LinterRule::PrefetchMaxAgeDaysNotImplemented),
             "row 6 must still be the first error — row 15 is appended last"
         );
-        assert_eq!(promoted_composite_findings(&report).len(), 1);
+        assert_eq!(retired_composite_mode_findings(&report).len(), 1);
     }
 
     /// Row 15's metric key is the one the catalog and the apply's
@@ -3284,8 +3518,227 @@ mod tests {
     #[test]
     fn row15_emits_its_catalogued_linter_metric() {
         assert_eq!(
-            LinterRule::CompositeVerdictPromotedRequiresScanBackends.metric_rule(),
-            Some("composite_verdict_promoted_requires_scan_backends"),
+            LinterRule::ScanPolicyCompositeVerdictModeRetired.metric_rule(),
+            Some("scan_policy_composite_verdict_mode_retired"),
+        );
+    }
+
+    // ---- row 18: an OCI repository governed by a scan waiver -----------
+
+    /// Every row-18 finding in a report, by message, so a test asserts
+    /// what the operator reads rather than a count.
+    fn oci_waiver_findings(report: &StaticLintReport) -> Vec<&str> {
+        report
+            .errors
+            .iter()
+            .filter(|f| f.rule == LinterRule::OciRepositoryRequiresScanBackends)
+            .map(|f| f.message.as_str())
+            .collect()
+    }
+
+    /// The rejection, on a repository-scoped waiver. The message must
+    /// carry the pairing, why an OCI waiver is different from any other
+    /// one, and both remedies.
+    #[test]
+    fn row18_an_oci_repository_under_a_scan_waiver_rejects() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-proxy", "oci")],
+            scan_policies: vec![scan_policy_scoped("p-oci-waived", "oci-proxy", vec![])],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let findings = oci_waiver_findings(&report);
+        assert_eq!(findings.len(), 1, "{:?}", report.errors);
+        assert_eq!(
+            findings[0],
+            "ScanPolicy `p-oci-waived`: an empty `scanBackends` waives scanning for OCI \
+             repository `oci-proxy`, whose artifacts are assessed as a composed image and \
+             only as one. The scan returns before a composition is resolved, so no \
+             manifest this policy governs is ever composed and no image is ever \
+             assessed — while the waiver itself is the release authority, so those \
+             images serve with nothing having looked at them. A layer's own findings \
+             cannot stand in: an OCI blob is a composition constituent, so a statement \
+             about its isolated filesystem is a statement about a tree nothing runs \
+             (ADR 0064 D2). Declare the backends that should assess the composition \
+             (`scanBackends: [trivy]`), or scope a policy with backends to `oci-proxy` so \
+             this waiver no longer governs it. The waiver stays supported for every \
+             non-`oci` format, where the artifact hort stores is the artifact it assesses."
+        );
+    }
+
+    /// **The counter-assertion this row exists around.** `scanBackends:
+    /// []` is a supported, documented operator waiver for every non-OCI
+    /// format, and a blanket ban would delete that surface. Four formats
+    /// whose artifacts hort assesses as the artifact it stores — one of
+    /// them (`gradle`) with no scanner coverage at all, so it waives for
+    /// the strongest available reason — all apply clean.
+    #[test]
+    fn row18_a_non_oci_scan_waiver_is_still_accepted() {
+        for format in ["npm", "pypi", "maven", "gradle"] {
+            let desired = DesiredState {
+                repositories: vec![repo_env("not-oci", format)],
+                scan_policies: vec![scan_policy_scoped("p-waived", "not-oci", vec![])],
+                ..Default::default()
+            };
+            let report = oci_validator().validate(&desired);
+            assert!(
+                oci_waiver_findings(&report).is_empty(),
+                "the explicit scan waiver must stay supported for `{format}`: {:?}",
+                report.errors
+            );
+            assert!(
+                report.errors.is_empty(),
+                "and no other row may reject it either: {:?}",
+                report.errors
+            );
+        }
+    }
+
+    /// The resolver case that decides the row: a **global** waiver is a
+    /// finding for an OCI repository that declares no policy of its own,
+    /// because repo-scoped-wins-over-global means the global one is what
+    /// the runtime resolves for it. The npm repository beside it is not a
+    /// finding, so the walk is per governed repository and not per
+    /// policy.
+    #[test]
+    fn row18_a_global_waiver_reaches_an_oci_repository_with_no_policy_of_its_own() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("npm-proxy", "npm"), repo_env("oci-proxy", "oci")],
+            scan_policies: vec![scan_policy_global("p-global-waiver", vec![])],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let findings = oci_waiver_findings(&report);
+        assert_eq!(
+            findings.len(),
+            1,
+            "one finding for the OCI repository, none for npm: {:?}",
+            report.errors
+        );
+        assert!(findings[0].contains("`oci-proxy`"), "{findings:?}");
+        assert!(findings[0].contains("`p-global-waiver`"), "{findings:?}");
+    }
+
+    /// The other half of the same resolution, and the reason the row
+    /// cannot lint the declared scope: the **same** global waiver is
+    /// **not** a finding when every OCI repository carries a scanning
+    /// policy of its own, because the scoped policy wins and the global
+    /// waiver never reaches one. Rejecting it here would reject a pairing
+    /// the runtime never forms.
+    #[test]
+    fn row18_a_global_waiver_is_silent_when_every_oci_repository_is_scoped_elsewhere() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("npm-proxy", "npm"), repo_env("oci-proxy", "oci")],
+            scan_policies: vec![
+                scan_policy_global("p-global-waiver", vec![]),
+                scan_policy_scoped("p-oci-scanning", "oci-proxy", vec!["trivy"]),
+            ],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            oci_waiver_findings(&report).is_empty(),
+            "the scoped policy wins, so the global waiver governs no OCI \
+             repository: {:?}",
+            report.errors
+        );
+        assert!(
+            report.errors.is_empty(),
+            "and nothing else rejects this shipped shape: {:?}",
+            report.errors
+        );
+    }
+
+    /// A policy that declares backends is row 7c's subject, never this
+    /// row's — the early return on a non-empty list is what keeps the two
+    /// rows a partition of the `scanBackends` space.
+    #[test]
+    fn row18_a_policy_with_backends_is_not_this_rows_subject() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-proxy", "oci")],
+            scan_policies: vec![scan_policy_scoped(
+                "p-oci-scanning",
+                "oci-proxy",
+                vec!["trivy"],
+            )],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            oci_waiver_findings(&report).is_empty(),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    /// An unresolved scope repository name belongs to the
+    /// scope-existence validator; row 18 stays quiet so one root cause
+    /// produces one message, exactly as rows 7 and 7c do.
+    #[test]
+    fn row18_an_unresolved_scope_name_is_not_this_rows_finding() {
+        let desired = DesiredState {
+            repositories: vec![repo_env("oci-proxy", "oci")],
+            scan_policies: vec![scan_policy_scoped("p-typo", "oci-prxoy", vec![])],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert!(
+            oci_waiver_findings(&report).is_empty(),
+            "{:?}",
+            report.errors
+        );
+    }
+
+    /// One finding per (policy, OCI repository) pairing, in repository
+    /// declaration order: a global waiver over two OCI repositories names
+    /// both, because a scoped policy for one of them does not answer for
+    /// the other.
+    #[test]
+    fn row18_findings_are_one_per_governed_oci_repository_in_declared_order() {
+        let desired = DesiredState {
+            repositories: vec![
+                repo_env("oci-proxy", "oci"),
+                repo_env("npm-proxy", "npm"),
+                repo_env("oci-hosted", "oci"),
+            ],
+            scan_policies: vec![scan_policy_global("p-global-waiver", vec![])],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        let findings = oci_waiver_findings(&report);
+        assert_eq!(findings.len(), 2, "{:?}", report.errors);
+        assert!(findings[0].contains("`oci-proxy`"), "{findings:?}");
+        assert!(findings[1].contains("`oci-hosted`"), "{findings:?}");
+    }
+
+    /// Row 18 is appended: a bundle tripping an earlier row AND row 18
+    /// still rejects with the earlier row's message, because apply aborts
+    /// on the first row with error findings.
+    #[test]
+    fn row18_is_appended_after_the_existing_rows() {
+        let mut inert = repo_env("npm-inert", "npm");
+        inert.spec.prefetch_policy.max_age_days = Some(90);
+        let desired = DesiredState {
+            repositories: vec![inert, repo_env("oci-proxy", "oci")],
+            scan_policies: vec![scan_policy_scoped("p-oci-waived", "oci-proxy", vec![])],
+            ..Default::default()
+        };
+        let report = oci_validator().validate(&desired);
+        assert_eq!(
+            report.errors.first().map(|f| f.rule),
+            Some(LinterRule::PrefetchMaxAgeDaysNotImplemented),
+            "row 6 must still be the first error — row 18 is appended last"
+        );
+        assert_eq!(oci_waiver_findings(&report).len(), 1);
+    }
+
+    /// Row 18's metric key is the one the catalog and the apply's
+    /// emission site share.
+    #[test]
+    fn row18_emits_its_catalogued_linter_metric() {
+        assert_eq!(
+            LinterRule::OciRepositoryRequiresScanBackends.metric_rule(),
+            Some("oci_repository_requires_scan_backends"),
         );
     }
 

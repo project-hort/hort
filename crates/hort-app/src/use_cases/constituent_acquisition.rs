@@ -67,9 +67,10 @@
 //! deduplicates on content and the row is created as it always was.
 //! Minting the row here instead would mean committing an artifact, an
 //! `ArtifactIngested` event, a quarantine window and a scan job as a side
-//! effect of an assessment that carries no authority, which is a much
-//! larger claim than warming the cache. The layout writer reads CAS, not
-//! rows, so the row buys this path nothing.
+//! effect of assessing a *different* artifact — the manifest whose
+//! composition this layer belongs to — which is a much larger claim than
+//! warming the cache. The layout writer reads CAS, not rows, so the row
+//! buys this path nothing.
 
 use std::collections::HashSet;
 use std::fmt;

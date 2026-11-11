@@ -615,6 +615,7 @@ mod tests {
             format: "npm",
             coords,
             kind: hort_domain::types::ArtifactKind::NpmTarball,
+            layer_role: hort_domain::ports::scanner::LayerRole::Unknown,
         }
     }
 

@@ -13,12 +13,23 @@ spec:
   # pinned public key is the trust anchor, not an OIDC {issuer, san} identity;
   # a non-empty list is apply-rejected (ADR 0039 §4, the inert-field guard).
   #
-  # `scanBackends: []` keeps the release gate purely provenance + time: with no
-  # scanner the release authority is ScanWaived, so the ONLY gates are
-  # ProvenanceClearance=Cleared AND the quarantine timer — a deterministic
-  # single-axis round-trip. A 30s window is long enough that a keyed
-  # `cosign sign` lands inside it, short enough that the release/expiry sweep
-  # completes well within a smoke run.
+  # `scanBackends` is omitted, which inherits the built-in default `[trivy]`. An
+  # empty list is NOT available here: it waives scanning for a format whose
+  # artifacts are assessed as a composed image, and apply refuses that pairing.
+  #
+  # So the release gate is provenance AND time AND a scan authority, and what
+  # supplies the third for this scenario's subject is that the subject has no
+  # filesystem of its own to assess: the push is an image INDEX, which binds
+  # references rather than a root filesystem, so there is no composition for a
+  # verdict to be about. That records a completed not-applicable assessment,
+  # which opens the release gate exactly as a clean verdict does. The index's
+  # arch-specific children ARE composed images and are assessed as such — a
+  # finding at or above `severityThreshold` on one of them rejects that child.
+  #
+  # A 30s window is long enough that a keyed `cosign sign` lands inside it, short
+  # enough that the release/expiry sweep completes well within a smoke run. It
+  # must also now cover the subject's scan, which runs on the worker this
+  # scenario already requires.
   scope:
     repository: oci-provenance-e2e
   severityThreshold: critical
@@ -27,5 +38,17 @@ spec:
   provenanceMode: required
   provenanceBackends: [cosign-key]
   provenanceIdentities: []
-  scanBackends: []
+  # `enforcement: record` — a Trivy verdict is recorded, never gating. What
+  # this fixture asserts must not depend on which CVEs an upstream tag
+  # happens to carry on the day the suite runs, only on whether each row got
+  # a completed assessment at all. Omitting the field is the opposite
+  # posture, not a quieter one: it inherits the enforcing default, and this
+  # policy scans, so a `critical` finding would reject an arch-specific child
+  # and so refuse the signed index's closure, which is what this scenario's
+  # release assertion pulls.
+  #
+  # `record` un-gates the scan axis only: `ScanRecorded` carries the same
+  # provenance AND-precondition as every other timer authority, so the never-
+  # signed half of this scenario still holds indefinitely.
+  enforcement: record
   licensePolicy: {}

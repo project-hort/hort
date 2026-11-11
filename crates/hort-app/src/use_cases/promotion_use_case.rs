@@ -642,8 +642,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode,
-        ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
+        ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::{
         system_actor, Actor, ApprovalDecision, DomainEvent, PolicyResult, PolicyScope,
@@ -712,7 +712,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
