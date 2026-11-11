@@ -2910,7 +2910,7 @@ intentionally NOT operator-tunable.
 | `hort_advisory_query_total` | counter | `result` | — | `cache_hit`, `cache_miss`, `upstream_4xx`, `upstream_5xx`, `network_error`, `timeout`, `length_mismatch`, `body_too_large` |
 | `hort_advisory_hydration_total` | counter | `result` | — | `cache_hit`, `fetched`, `failed` |
 | `hort_sbom_extraction_total` | counter | `format`, `result` | — | `result ∈ {success, unsupported_format, parse_error, payload_unavailable}` |
-| `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, unusable_lockfile, payload_unavailable, not_applicable}` |
+| `hort_sbom_resolution_total` | counter | `format`, `result` | — | `result ∈ {resolved, no_lockfile, declared, unusable_lockfile, payload_unavailable, not_applicable}` |
 | `hort_finding_component_relation_total` | counter | `format`, `result` | — | `result ∈ {subject, contained, not_contained, not_established}` |
 | `hort_sbom_components_skipped_total` | counter | `format` | — | — (the skip count rides the counter's value) |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
@@ -2927,7 +2927,7 @@ Source of truth for the result enums:
 - `hort_app::metrics::SbomExtractionResult` for
   `hort_sbom_extraction_total.result`.
 - `hort_app::metrics::SbomResolutionResult` for
-  `hort_sbom_resolution_total.result`. Its three payload-derived arms are
+  `hort_sbom_resolution_total.result`. Its four payload-derived arms are
   lifted from `hort_domain::ports::format_handler::SbomResolution` (the
   handler-side vocabulary) via `From`; the remaining two are outcomes only
   the orchestrator can observe.
@@ -3169,7 +3169,7 @@ scan-time SBOM extraction attempt) — *did a BOM come out*:
   content one.
 
 **`hort_sbom_resolution_total.result` semantics** (closed taxonomy of
-5; same emitter, same one-tick-per-attempt cadence) — *what the
+6; same emitter, same one-tick-per-attempt cadence) — *what the
 component versions mean*. The two counters are orthogonal and both fire
 on every attempt: `hort_sbom_extraction_total` says whether a BOM was
 produced, this one says on what basis:
@@ -3178,33 +3178,72 @@ produced, this one says on what basis:
   (cargo's embedded `Cargo.lock`) and the closure walk succeeded: every
   component carries the exact version the artifact was built against, so
   a finding against one is real.
-- `no_lockfile` — the payload carried no resolved-dependency document.
-  Expected and truthful (nothing forces a publisher to embed one), but
-  the BOM is **subject-only**: the artifact itself is scanned and its
-  dependencies are not. The declared-range fallback is deliberately not
+- `no_lockfile` — the payload carried no dependency document, or carried
+  a declaration that was read and found empty. Expected and truthful
+  (nothing forces a publisher to declare a dependency), and the BOM is
+  **subject-only** because there was nothing to put in it: the artifact
+  itself is scanned and no dependency is. For a format with a resolved
+  document to look for, the declared-range fallback is deliberately not
   used — a range floor is not a version anything was built with.
-- `unusable_lockfile` — a resolved-dependency document was present but
-  could not be used (unparseable, over a parser cap, not a
-  self-consistent resolve), or the extraction failed before reaching
-  one. Also the arm for a handler `Err`. BOM is subject-only.
-- `payload_unavailable` — pairs with the extraction counter's arm of the
-  same name.
-- `not_applicable` — the format does not derive its SBOM from the
-  payload (npm, PyPI, and every opaque format), or no handler is
-  registered. Not a degradation: there is no resolved-dependency
-  document to look for.
+- `declared` — the payload carried a dependency **declaration** and it
+  was read: the BOM names the artifact's **direct** dependencies at
+  whatever versions their constraints pin (a concrete version where the
+  constraint is a single exact one, none where it admits a range). PyPI's
+  `Requires-Dist` is the shape. A real reading of the artifact and **not
+  a subject-only fallback** — but not a resolve either, on two counts
+  that each disqualify `resolved` alone: the versions are constraints
+  rather than what anything was built with, and the list is one hop deep
+  rather than a closure. A finding against such a component is a
+  statement about what a consumer *may* resolve, which is also why those
+  findings arrive with `component_relation=not_contained` (see
+  `hort_finding_component_relation_total`) and do not condemn the
+  artifact. **PyPI never reports `resolved`**, pinned requirements
+  included.
+- `unusable_lockfile` — a dependency document was present but could not
+  be used (unparseable, over a parser cap, not a self-consistent
+  resolve), or the extraction failed before reaching one. Also the arm
+  for a document that was read and proves nothing: a PyPI declaration
+  the artifact marks `Dynamic: Requires-Dist` (PEP 643), or an sdist
+  whose metadata predates 2.2, where silence about the field carries no
+  guarantee. Also the arm for a handler `Err`.
 
-Operator reading: `resolved / (resolved + no_lockfile +
-unusable_lockfile)` per format is the share of scans that examined
-dependencies at all. A registry whose cargo scans are mostly
-`no_lockfile` is not being scanned in the way its operator thinks it is,
-and no finding count would reveal that. `no_lockfile` moving is a
-publisher-population fact; `unusable_lockfile` moving is ours. The
-payload path now runs for every repository class, so a proxy's
-`resolved` findings are real evidence about the upstream author's
-dev-time resolve, not the consumer's build — `enforcement: record` is
-the recommended mode on proxied lockfile-resolving formats for exactly
-that reason (see ADR 0056's amendment).
+  **This arm is a gating absence, not a thinner BOM.** The declaration
+  went unread, so the orchestrator hands the scan **no** SBOM: a backend
+  whose entire input is the component list abstains instead of returning
+  a clean verdict over an empty one, and the artifact holds fail-closed
+  (ADR 0007). A payload-reading backend on the same policy is unaffected
+  and its verdict still completes the run.
+- `payload_unavailable` — pairs with the extraction counter's arm of the
+  same name. Also a gating absence, on the retryable side: the CAS read
+  may succeed later, so it spends the scan job's attempt budget and
+  reaches a hold or `ScanIndeterminate` only at exhaustion.
+- `not_applicable` — the format does not derive its SBOM from the
+  payload (npm and every opaque format), or no handler is registered.
+  Not a degradation: there is no dependency document in the payload to
+  look for.
+
+**`not_applicable` no longer covers PyPI.** PyPI reads its own
+`<dist-info>/METADATA` / `PKG-INFO`, so every PyPI scan — including
+rescans of artifacts ingested before the change — reports one of the
+payload-derived arms instead. A dashboard or alert that keyed PyPI on
+`not_applicable` sees that series fall to zero; re-key it on `declared`
+(the healthy steady state), with `unusable_lockfile` as the actionable
+one.
+
+Operator reading: `(resolved + declared) / (resolved + declared +
+no_lockfile + unusable_lockfile)` per format is the share of scans that
+examined dependencies at all. Keep `resolved` and `declared` apart when
+reading a *finding*: only the first says the version was the one built.
+A registry whose cargo scans are mostly `no_lockfile` is not being
+scanned in the way its operator thinks it is, and no finding count would
+reveal that. `no_lockfile` moving is a publisher-population fact;
+`unusable_lockfile` moving is ours — and on PyPI it is also the one arm
+that withholds artifacts, so it is the series to alert on. The payload
+path now runs for every repository class, so a proxy's `resolved`
+findings are real evidence about the upstream author's dev-time resolve,
+not the consumer's build — `enforcement: record` is the recommended mode
+on proxied lockfile-resolving formats for exactly that reason (see
+ADR 0056's amendment).
 
 **`hort_sbom_components_skipped_total`** counts dependencies a resolved
 closure walked *through* but could not emit, for having no registry
@@ -3376,7 +3415,7 @@ Cardinality:
 - `hort_advisory_query_total`: 8 result values → 8 series.
 - `hort_advisory_hydration_total`: 3 result values → 3 series.
 - `hort_sbom_extraction_total`: ~15 formats × 4 results → 60 series.
-- `hort_sbom_resolution_total`: ~15 formats × 5 results → 75 series.
+- `hort_sbom_resolution_total`: ~15 formats × 6 results → 90 series.
 - `hort_sbom_components_skipped_total`: ~15 formats → 15 series.
 - `hort_artifact_became_vulnerable_total`: ≤10k repositories × 4
   severities × 2 ingest_source → 80k series ceiling. Honours the
