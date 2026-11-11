@@ -35,6 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A scan in which every backend ran and none could analyse the artifact now
+  leaves its job row `completed` with the reason in `result_summary`, and ticks
+  the new `hort_scan_jobs_total{result="nothing_analysable"}` instead of
+  `failed`. The artifact is still held `scan_indeterminate`; it no longer
+  appears under `?kind=scan&status=failed` and is no longer re-enqueued by the
+  stranded-rescan sweep — list it with
+  `GET /api/v1/admin/curation/queue?status=scan_indeterminate` and recover it
+  by fixing the policy's `scanBackends` and rescanning (#427).
 - `hort-cli curation waive <artifact_id>` is now `curation waive artifact
   <artifact_id>`; `waive versions`, `waive digests` and `block digests`
   address a decision in bulk (#176).

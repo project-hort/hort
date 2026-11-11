@@ -31,16 +31,31 @@
 //! answer" and "gave up" were one word at the one place an operator
 //! looks.
 //!
-//! The dispositions map one-to-one, and the reason strings cross
-//! unchanged — they are the operator-visible `last_error` text:
+//! The dispositions map one-to-one onto outcomes, and the reason
+//! strings on the two failing dispositions cross unchanged — they are
+//! the operator-visible `last_error` text:
 //!
 //! | [`ScanRunOutcome`] | [`ScanRowDisposition`] | [`TaskOutcome`] |
 //! |---|---|---|
 //! | `Completed` | `Completed` | `Completed { result_summary }` |
 //! | `SkippedNoBackends` | `Completed` | `Completed { result_summary }` |
-//! | `NothingAnalysable` | `Failed(reason)` | `Failed { retry: false }` |
+//! | `NothingAnalysable` | `Completed` | `Completed { result_summary }` |
 //! | `Failed`, budget spent | `Failed(err)` | `Failed { retry: false }` |
 //! | `Failed`, budget left | `Retry(err)` | `Failed { retry: true }` |
+//!
+//! `NothingAnalysable` is the one row where the artifact and the job
+//! part company: the artifact is held `scan_indeterminate` because
+//! nothing examined it, and the job completed because every backend ran
+//! and reported. It carries its reason on `result_summary` rather than
+//! `last_error` — a non-error reason in the error field is the same
+//! category mistake one field down, and a `failed` row would put the
+//! artifact back into every surface keyed on `jobs.status='failed'`
+//! (the operator's `?kind=scan&status=failed` triage listing, and the
+//! stranded-rescan sweep that re-enqueued the identical abstention
+//! every tick). What tells the three answers apart for an operator is
+//! `hort_scan_jobs_total{result}`, where this arm has its own
+//! `nothing_analysable` value — the row's `status` alone cannot, having
+//! only three words for four answers.
 //!
 //! A `record_outcome` error is the one case with no disposition: no
 //! verdict was recorded, so the obligation is undischarged and the
@@ -77,11 +92,14 @@ use crate::use_cases::scan_orchestration::{
 /// standing up a whole [`ScanOrchestrationUseCase`]: it is the entire
 /// handoff this module exists to get right, and the thing a future
 /// change is most likely to get wrong is returning `Completed` for an
-/// arm that did not complete.
+/// arm that **did not answer** — a scan still owed an attempt, or one
+/// that gave up. "Answered that there was nothing to analyse" is an
+/// answer; "the scanner never ran" is not.
 ///
-/// `result_summary` rides only the `Completed` disposition. The failing
+/// `result_summary` rides only the `Completed` disposition, which is
+/// why the no-verdict arm's reason reaches the row at all. The failing
 /// dispositions carry their text on `jobs.last_error` instead, which is
-/// where an operator reads it.
+/// where an operator reads an error.
 fn outcome_for(disposition: ScanRowDisposition, result_summary: serde_json::Value) -> TaskOutcome {
     match disposition {
         ScanRowDisposition::Completed => TaskOutcome::Completed { result_summary },
@@ -216,20 +234,25 @@ impl TaskHandler for ScanTaskHandler {
                 ScanRunOutcome::SkippedNoBackends { kind: _ } => {
                     serde_json::json!({ "skipped": "no_backends" })
                 }
-                // These two arms never reach a `Completed` disposition,
-                // so `outcome_for` drops the summary and the row keeps
-                // its `last_error` instead. Built anyway: a future arm
-                // that starts completing must not inherit a `Null`
-                // summary by omission.
                 ScanRunOutcome::NothingAnalysable { scanner, reason } => {
-                    // Not an `error`: every backend ran. The job still
-                    // ends terminal-failed (there is no verdict to
-                    // record), so the summary names what abstained.
+                    // Not an `error`: every backend ran. This arm
+                    // reaches a `Completed` disposition, so the summary
+                    // is the row's only record of what abstained — the
+                    // reason does not go on `last_error`, which is
+                    // where an operator reads a failure. The shape
+                    // predates that mapping: it was built for the arm
+                    // that was dropping it, against exactly the change
+                    // that now keeps it.
                     serde_json::json!({
                         "scanner": scanner,
                         "nothing_analysable": reason,
                     })
                 }
+                // The one arm that never reaches a `Completed`
+                // disposition, so `outcome_for` drops this summary and
+                // the row keeps its `last_error` instead. Built anyway,
+                // for the reason above: an arm that starts completing
+                // must not inherit a `Null` summary by omission.
                 ScanRunOutcome::Failed(reason) => {
                     serde_json::json!({ "error": reason })
                 }
@@ -293,6 +316,32 @@ mod tests {
             TaskOutcome::Completed {
                 result_summary: summary
             },
+        );
+    }
+
+    /// A scan that answered "nothing to analyse" completes the row and
+    /// carries its reason on the summary.
+    ///
+    /// This is the handoff the no-verdict arm depends on: the reason is
+    /// deliberately not on `last_error` (nothing errored), so the
+    /// summary is the row's only record of what abstained. A disposition
+    /// that dropped it would leave a `completed` row with no trace of
+    /// why no verdict exists.
+    #[test]
+    fn the_no_verdict_summary_rides_the_completed_disposition() {
+        let summary = serde_json::json!({
+            "scanner": "trivy",
+            "nothing_analysable": "no scan backend could analyse artifact \
+                                   (kind npm_tarball): trivy=no_analyzer_matched",
+        });
+        let outcome = outcome_for(ScanRowDisposition::Completed, summary.clone());
+        assert_eq!(
+            outcome,
+            TaskOutcome::Completed {
+                result_summary: summary
+            },
+            "a scan with nothing to analyse answered, so the row completes — and the reason \
+             must survive the handoff, because `last_error` is not where it goes"
         );
     }
 

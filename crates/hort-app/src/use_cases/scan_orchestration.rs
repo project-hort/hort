@@ -272,7 +272,13 @@ pub enum ScanRunOutcome {
     /// nothing to analyse will have nothing to analyse again — the
     /// artifact's kind and the backend's analyzers are both fixed — so
     /// retrying only delays the hold by `max_attempts` backoffs. This
-    /// arm goes terminal immediately.
+    /// arm spends no budget at all.
+    ///
+    /// And it is the one arm where the artifact and the job end in
+    /// opposite states: the artifact is terminal
+    /// (`ScanIndeterminate`), because nothing examined it; the job
+    /// reports [`ScanRowDisposition::Completed`], because every backend
+    /// ran and reported. `record_outcome` is where that is spelled out.
     NothingAnalysable {
         /// Comma-joined backend names that were asked, for the
         /// `ScanIndeterminate` event's audit label.
@@ -328,8 +334,21 @@ pub enum ScanRunOutcome {
 /// can retire a row the other still considers owed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanRowDisposition {
-    /// The scan recorded a result. Terminal success; the row carries
-    /// the handler's `result_summary`.
+    /// **The scan answered.** Terminal success; the row carries the
+    /// handler's `result_summary`.
+    ///
+    /// Three arms reach it, and only two of them recorded a verdict:
+    /// `Completed { … }` (a backend examined the artifact),
+    /// `SkippedNoBackends` (the operator waived scanning) and
+    /// `NothingAnalysable` (every backend ran and none examined it).
+    /// The third holds the artifact `scan_indeterminate` and still
+    /// completes its row, because this type is the **row's**
+    /// vocabulary: it says what the dispatcher should write and nothing
+    /// else, and a job that did everything asked of it did not fail.
+    /// What the scan *found* is `ScanRunOutcome`'s question, and what an
+    /// operator watches it on is
+    /// `hort_scan_jobs_total{result}` — which keeps the three apart,
+    /// `nothing_analysable` included.
     Completed,
     /// Terminal failure. `String` is the operator-visible `last_error`
     /// text, verbatim — the same string the removed `mark_failed` calls
@@ -1277,10 +1296,11 @@ impl ScanOrchestrationUseCase {
     /// were previously held by comments:
     ///
     /// - **Fail-closed ordering holds by construction.** The artifact's
-    ///   transition to `ScanIndeterminate` precedes the row's terminal
-    ///   write because the row write happens after this function has
-    ///   returned. A failure here propagates as `Err` and no terminal
-    ///   row is written on the strength of it.
+    ///   transition to `ScanIndeterminate` precedes the row's result
+    ///   write — on both arms that make it, the retry-exhausted one and
+    ///   the no-verdict one — because the row write happens after this
+    ///   function has returned. A failure here propagates as `Err` and
+    ///   no row result is written on the strength of it.
     /// - **A persistence failure is an undischarged obligation.** When
     ///   this returns `Err`, no verdict was recorded, so the handler
     ///   reports a retryable failure. Below the cap the row goes back
@@ -1398,6 +1418,30 @@ impl ScanOrchestrationUseCase {
                 // fixed, so the next attempt has the same outcome.
                 // `record_scan_indeterminate` is idempotent on an
                 // already-terminal artifact.
+                //
+                // **And the row completes.** The artifact's state above
+                // and the `jobs` row below answer two different
+                // questions, and this arm answers them differently: the
+                // artifact is held because nothing knows what is in it,
+                // while the *job* did everything that was asked of it —
+                // every backend ran and reported. A `failed` row here
+                // says the scan errored, which is the word that put this
+                // population into every surface keyed on
+                // `jobs.status='failed'`: an operator's
+                // `?kind=scan&status=failed` triage listing, and
+                // `RescanCandidatesRepository::select_stranded`, which
+                // re-enqueued the same deterministic abstention on every
+                // tick forever. Neither is a statement anyone can act on
+                // — the fix for an abstention is the `ScanPolicy`'s
+                // backends, not another attempt at the same scan.
+                //
+                // The reason therefore travels on `result_summary`
+                // (built by `ScanTaskHandler::run`) rather than on
+                // `last_error`, which only terminal and rescheduled rows
+                // carry. The scan counter keeps the three words apart:
+                // `nothing_analysable`, not `completed` — a held,
+                // unassessed artifact must not read as clean — and not
+                // `failed`, because nothing failed.
                 tracing::warn!(
                     artifact_id = %job.artifact_id,
                     format = %job.format,
@@ -1408,16 +1452,11 @@ impl ScanOrchestrationUseCase {
                      mismatch, not a clean scan",
                 );
                 self.quarantine
-                    .record_scan_indeterminate(
-                        job.artifact_id,
-                        scanner,
-                        reason.clone(),
-                        job.attempts,
-                    )
+                    .record_scan_indeterminate(job.artifact_id, scanner, reason, job.attempts)
                     .await?;
-                emit_scan_jobs(ScanJobsResult::Failed);
+                emit_scan_jobs(ScanJobsResult::NothingAnalysable);
                 emit_scan_terminal(ScanTerminalResult::Indeterminate);
-                Ok(ScanRowDisposition::Failed(reason))
+                Ok(ScanRowDisposition::Completed)
             }
             ScanRunOutcome::Failed(err) => {
                 if job.attempts >= self.config.max_attempts {

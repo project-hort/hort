@@ -2597,7 +2597,7 @@ pub fn emit_gitops_event(kind: &'static str, event_type: &'static str) {
 // ---------------------------------------------------------------------------
 
 /// Outcome label of `hort_scan_jobs_total`. Closed
-/// taxonomy of 4 — every state transition the orchestrator drives
+/// taxonomy of 5 — every state transition the orchestrator drives
 /// maps to exactly one variant.
 ///
 /// String values are normative — they appear verbatim in
@@ -2607,19 +2607,37 @@ pub enum ScanJobsResult {
     /// Emitted by `ScanOrchestrationUseCase::claim_pending` per claimed
     /// job — one tick per row returned from `JobsRepository::claim_scan_jobs`.
     PendingClaimed,
-    /// Emitted by `record_outcome` when the scan recorded a result
-    /// (`ScanRowDisposition::Completed` — both `Completed { … }` and
-    /// `SkippedNoBackends` route through this label).
+    /// Emitted by `record_outcome` when the scan recorded a verdict —
+    /// the `Completed { … }` and `SkippedNoBackends` arms.
     ///
-    /// These three labels report what `record_outcome` decided the row
+    /// These four labels report what `record_outcome` decided the row
     /// should become, not a write it performed: the row is written by
     /// the `TaskDispatcher` from the returned disposition, so the
     /// scan-specific counter and `hort_admin_tasks_completed_total`
     /// describe one transition from two layers.
     Completed,
+    /// Emitted by `record_outcome` on the `NothingAnalysable` arm: every
+    /// backend ran and none examined the artifact, so the scan
+    /// **answered** without producing a verdict.
+    ///
+    /// Deliberately its own value rather than folded into either
+    /// neighbour, and both directions matter. Folded into `failed` it
+    /// claims an error where none occurred — the collapse this label
+    /// exists to undo. Folded into `completed` it claims a recorded
+    /// verdict, so an artifact held `scan_indeterminate` with nothing
+    /// known about its bytes would read as clean in the scan counter;
+    /// that is the worse direction of the two, because the generic
+    /// `hort_admin_tasks_completed_total{kind="scan"}` already reports
+    /// this population as `completed` (the row *is* completed) and this
+    /// counter is the only one that can say what the scan found.
+    ///
+    /// Shares `ScanRowDisposition::Completed` with the label above: the
+    /// row's fate and the scan's answer are two questions, and this is
+    /// the one place the second is counted.
+    NothingAnalysable,
     /// Emitted by `record_outcome` on a terminal disposition
     /// (`ScanRowDisposition::Failed` — the job exhausted
-    /// `max_attempts`, or had nothing analysable).
+    /// `max_attempts`).
     Failed,
     /// Emitted by `record_outcome` when it asks for another attempt
     /// (`ScanRowDisposition::Retry`). Mutually exclusive with `Failed`
@@ -2634,6 +2652,7 @@ impl ScanJobsResult {
         match self {
             Self::PendingClaimed => "pending_claimed",
             Self::Completed => "completed",
+            Self::NothingAnalysable => "nothing_analysable",
             Self::Failed => "failed",
             Self::Retried => "retried",
         }
@@ -2674,9 +2693,20 @@ pub enum ScanTerminalResult {
     /// (which would claim an examination that never happened) nor into
     /// `indeterminate` (which would claim a hold that does not exist).
     NotApplicable,
-    /// The scanner could not decide: terminal scan failure after retry
-    /// exhaustion. Emitted on the retry-exhausted `Failed` arm — the
-    /// artifact transitioned to `scan_indeterminate`.
+    /// No verdict exists for the artifact, and one is not coming from
+    /// this job. Emitted on the two arms that drive the artifact to
+    /// `scan_indeterminate`: the retry-exhausted `Failed` arm (for a
+    /// prior status other than `Quarantined` — see the
+    /// `hort_scan_terminal_total` section of
+    /// `docs/metrics-catalog.md`) and the `NothingAnalysable` arm,
+    /// where every backend ran and none examined the artifact.
+    ///
+    /// Both sites are listed because the job-level labels differ while
+    /// this one does not: the first ticks
+    /// `hort_scan_jobs_total{result=failed}` and the second
+    /// `{result=nothing_analysable}`. A reader who took this for the
+    /// retry-exhausted arm alone would conclude the no-verdict arm
+    /// emits no artifact-terminal tick at all.
     Indeterminate,
     /// The scanner decided: bad content. Emitted on the
     /// `Completed{findings}` arm — the artifact transitioned to
@@ -3485,7 +3515,7 @@ pub fn register_scan_metrics() {
         "hort_scan_jobs_total",
         Unit::Count,
         "scan-job state transitions, by terminal `result` \
-         (pending_claimed / completed / failed / retried)"
+         (pending_claimed / completed / nothing_analysable / failed / retried)"
     );
     let _ = counter!("hort_scan_jobs_total");
 
@@ -6740,6 +6770,27 @@ mod tests {
     }
 
     #[test]
+    fn scan_jobs_result_nothing_analysable_as_str() {
+        assert_eq!(
+            super::ScanJobsResult::NothingAnalysable.as_str(),
+            "nothing_analysable"
+        );
+    }
+
+    /// The no-verdict label is neither of its neighbours. Pinned as an
+    /// inequality rather than left to the `as_str` assertions above,
+    /// because the defect this value exists to undo was exactly a
+    /// no-verdict scan wearing one of these two words: `failed` claims
+    /// an error that did not happen, `completed` claims a verdict that
+    /// does not exist.
+    #[test]
+    fn scan_jobs_result_nothing_analysable_is_neither_completed_nor_failed() {
+        let no_verdict = super::ScanJobsResult::NothingAnalysable.as_str();
+        assert_ne!(no_verdict, super::ScanJobsResult::Completed.as_str());
+        assert_ne!(no_verdict, super::ScanJobsResult::Failed.as_str());
+    }
+
+    #[test]
     fn scan_jobs_result_failed_as_str() {
         assert_eq!(super::ScanJobsResult::Failed.as_str(), "failed");
     }
@@ -6754,6 +6805,7 @@ mod tests {
         let variants = [
             super::ScanJobsResult::PendingClaimed,
             super::ScanJobsResult::Completed,
+            super::ScanJobsResult::NothingAnalysable,
             super::ScanJobsResult::Failed,
             super::ScanJobsResult::Retried,
         ];

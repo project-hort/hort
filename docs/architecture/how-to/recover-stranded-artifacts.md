@@ -18,18 +18,28 @@ An artifact's **initial** scan can fail for two structurally different
 reasons:
 
 - **The scan couldn't run at all** — every configured scanner backend
-  errored (unreachable, crashed, timed out). This is a
-  **scanner-execution / infrastructure failure**: transient, and
-  recoverable once the scanner comes back.
-- **The scan ran but no verdict came out of it** — the scanner executed
-  and produced output hort could not parse or classify, or every backend
-  abstained about the artifact. The artifact transitions to
+  errored (unreachable, crashed, timed out, or returned output hort
+  could not parse). This is a **scanner-execution / infrastructure
+  failure**: transient, and recoverable once the scanner comes back.
+- **The scan ran and answered that there was nothing to analyse** —
+  every configured backend executed and none of them examined the
+  artifact: no analyzer matched its kind, or the payload was an archive
+  the adapter refused to materialise. The artifact transitions to
   `scan_indeterminate`. Under ADR 0007 that is a **hold, not a dead
-  end**: the same sweep re-picks it, and a verdict that is reached
-  supersedes the absent one — a non-blocking verdict returns the
-  artifact to `quarantined` and the ordinary release sweep decides from
-  there, a blocking one condemns it. The curator's manual release and
-  post-exclusion policy re-evaluation reach it as well.
+  end** — a verdict that is reached supersedes the absent one, so a
+  non-blocking verdict returns the artifact to `quarantined` and the
+  ordinary release sweep decides from there, while a blocking one
+  condemns it. The curator's manual release and post-exclusion policy
+  re-evaluation reach it as well.
+
+**The two differ in what is owed, and that is what this guide is
+about.** The first is owed another scan attempt: the scan never ran, so
+running it again is the fix, and hort records that with a **`failed`**
+`kind='scan'` row and re-drives it automatically. The second is owed
+nothing by the scanner — it ran and reported — so its row **completes**,
+and re-running the identical scan would only repeat the identical
+answer. What moves the second is removing the cause (§4), not another
+attempt. Everything below about automatic recovery is about the first.
 
 Before issue #6, both failure modes collapsed onto the same outcome: on
 retry exhaustion (`HORT_SCANNER_MAX_ATTEMPTS`, default 6), the artifact
@@ -43,11 +53,21 @@ exhausts retries now leaves the artifact **exactly where it was**:
 still `quarantine_status='quarantined'`, downloads still blocked (the
 status is the gate — ADR 0007), but with a persisted "last scan
 errored" fact (`jobs.status='failed'` on its most recent `kind='scan'`
-row). **This is the "stranded" state this guide is about.** A scan that
-produced no verdict still goes to the `scan_indeterminate` path, and as
-of ADR 0007's "A reached verdict supersedes an absent one" the same
-sweep recovers that state too — the two differ in which status the
-artifact waits in, not in whether anything re-scans it.
+row). **This is the "stranded" state this guide is about**, and that
+`failed` row is both its definition and its discovery key.
+
+A scan that **answered** "nothing to analyse" goes to the
+`scan_indeterminate` path and leaves a **`completed`** row instead. ADR
+0007's "A reached verdict supersedes an absent one" still holds for it —
+a reached verdict is accepted and decides the artifact — but the
+stranded sweep is not what delivers one: `select_stranded` requires the
+most recent `kind='scan'` job to be `failed` or absent, so a completed
+row takes the artifact out of it. That is deliberate. A deterministic
+abstention re-answers the same way on every attempt, so re-enqueueing it
+every tick spent batch capacity to re-record one fact forever, and
+`jobs.status='failed'` claimed an error that never happened. This
+population is listed and recovered by the mechanisms in §4, not by the
+sweep in §2.
 
 **No new release authority was added.** A recovered scan releases the
 artifact via the existing `ScanSucceeded` authority (or rejects it on
@@ -107,6 +127,17 @@ undriven deployment is discoverable without reading this guide first.
   requires `Permission::Curate` or `Permission::Admin` — it is the read
   that grounds the manual release, which the curator owns (ADR 0007).
 
+  **This listing is the stranded population and only it.** A scan that
+  answered "nothing to analyse" completed its row, so it is absent
+  here — by design, since nothing is owed it another attempt. Use
+  `GET /api/v1/admin/curation/queue?status=scan_indeterminate`
+  (`Permission::Curate` or `Permission::Admin`) to list artifacts held
+  without a verdict whatever the reason, and the
+  `hort_scan_jobs_total{result="nothing_analysable"}` counter to see the
+  abstentions happening. A metric sustained above zero there is a
+  repository paired with backends that cannot adjudicate its format —
+  a `scanBackends` fix, not a scanner outage.
+
 ## 3. Manual recovery — the non-admin operator path
 
 If you don't want to wait for the next tick (or the CronJob is
@@ -139,9 +170,12 @@ next scan-completion notification to see the outcome.
 
 This endpoint already refuses to double-enqueue: if the artifact has
 an in-flight `kind='scan'` job, it returns `409 Conflict` with the
-existing job id instead of creating a duplicate. A stranded artifact
-(no in-flight job — its last attempt already failed terminally) is
-always a valid rescan target.
+existing job id instead of creating a duplicate. **Only an in-flight
+job refuses it** — the previous job's result is not consulted, so both
+populations from §1 are valid targets: a stranded artifact whose last
+attempt failed terminally, and an artifact whose last scan completed
+having found nothing to analyse. For the second this is the instrument
+to reach for once the cause is removed (§4), since no sweep selects it.
 
 ### 3b. Admin — the raw `enqueue_scan` insert (legacy fallback)
 
@@ -157,13 +191,18 @@ a last resort if the HTTP surface itself is unreachable.
 
 ## 4. What does NOT recover a stranded artifact
 
-- **Nothing, if the abstention is deterministic.** Everything above
+- **The sweep, if the abstention is deterministic.** Everything in §2
   gives the scan another chance to run; none of it changes what the scan
   says. A `scan_indeterminate` artifact whose backends abstain about its
-  kind re-answers the same way on every tick, so the sweep alone will
-  not move it — what moves it is removing the cause (a `ScanPolicy`
-  change, a backend that can analyse the format), after which the next
-  tick's verdict lands and the release sweep decides. The curator's
+  kind would re-answer the same way every time, so its scan job
+  completed and `select_stranded` does not select it at all — the sweep
+  is not a slow exit for this population, it is not an exit. What moves
+  it is **removing the cause** (a `ScanPolicy` change: a backend that
+  can analyse the format, or
+  `compositeVerdictMode: promoted` where that is the right call) and
+  then a rescan — §3a's `POST /api/v1/artifacts/:id/rescan` reaches it,
+  since a completed last job is not an in-flight one — after which the
+  verdict lands and the release sweep decides. The curator's
   manual release is the immediate exit
   (`hort-cli curation waive artifact <artifact_id> --justification '…'`,
   or `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`), which

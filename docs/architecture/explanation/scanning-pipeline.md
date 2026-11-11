@@ -944,12 +944,36 @@ If no backend produced a verdict:
   transitions straight to the `scan_indeterminate` status, with
   no retry budget spent. The artifact's kind and the backend's analyzers
   are both fixed, so the next attempt reaches the same answer; retrying
-  would only delay the hold by the backoff schedule. The sweep still
-  re-picks the artifact on later ticks, which is what heals it when the
-  cause of the abstention goes away — a `ScanPolicy` moving to
-  `compositeVerdictMode: promoted`, say, after which `no_analyzer_matched`
-  no longer gates an `OciBlob`. A deterministic abstention simply
-  re-answers the same way, once per tick, appending nothing.
+  would only delay the hold by the backoff schedule.
+
+  **The job itself completes.** Every backend ran and reported, so the
+  scan *answered* — it answered that there was nothing to look at — and
+  a `jobs.status='failed'` row would say the scan errored. That word is
+  load-bearing in two places: an operator's
+  `?kind=scan&status=failed` triage listing, and
+  `RescanCandidatesRepository::select_stranded`, whose predicate is
+  "last `kind='scan'` job `failed` or absent". With the row completed
+  the artifact is in neither, which is the intended end of a loop that
+  used to re-enqueue the identical abstention on every tick and record
+  the identical answer. The reason rides the row's `result_summary`
+  (`{"scanner": …, "nothing_analysable": …}`) rather than `last_error`,
+  and the per-job counter keeps the three answers apart —
+  `hort_scan_jobs_total{result="nothing_analysable"}`, which is neither
+  `failed` (nothing failed) nor `completed` (no verdict exists). The
+  artifact-terminal
+  `hort_scan_terminal_total{result="indeterminate"}` still ticks: the
+  hold is unchanged, and no verdict still carries no release authority.
+
+  So what heals it is **removing the cause** — a `ScanPolicy` moving to
+  `compositeVerdictMode: promoted`, say, after which
+  `no_analyzer_matched` no longer gates an `OciBlob`, or adding a
+  backend that can analyse the format — and then a rescan
+  (`POST /api/v1/artifacts/:id/rescan`, which only an in-flight job
+  refuses). The curator's manual release and post-exclusion policy
+  re-evaluation reach the hold as well. See
+  [recovering stranded artifacts](../how-to/recover-stranded-artifacts.md)
+  for the operator-side split between this population and a real
+  scanner outage.
 - **Every abstention was `not_applicable`** → a **completed assessment
   with nothing to assess.** The orchestrator records a `ScanCompleted`
   with no findings and `assessment = not_applicable`, so scan authority
