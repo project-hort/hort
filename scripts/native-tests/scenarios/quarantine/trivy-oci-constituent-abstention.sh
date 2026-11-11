@@ -269,7 +269,7 @@ if skopeo copy \
     pass "(1) push of the fixture to the enforcing repo succeeded"
 else
     fail "(1) push of the fixture to the enforcing repo" \
-        "skopeo copy dir:${BASE_LAYOUT} -> ${DEST_IMAGE} exited non-zero. A 400 MANIFEST_BLOB_UNKNOWN naming sha256:${NEW_LAYER_HEX} is the defect this scenario is about, reached one step earlier than the blob fetch below: the manifest PUT refuses a constituent already in a terminal state, and a layer whose scan abstained with no_analyzer_matched lands scan_indeterminate within seconds of its upload. Check the worker log for 'no scan backend produced a verdict'."
+        "skopeo copy dir:${BASE_LAYOUT} -> ${DEST_IMAGE} exited non-zero. A 503 UNAVAILABLE on the manifest PUT is the defect this scenario is about, reached one step earlier than the blob fetch below: the manifest PUT refuses a constituent already in a terminal state, and a layer whose scan abstained with no_analyzer_matched lands scan_indeterminate within seconds of its upload. That envelope names no digest — sha256:${NEW_LAYER_HEX} is the layer to look for — so check hort-server for the refusal line naming it, and the worker log for 'no scan backend produced a verdict'."
     summary
 fi
 

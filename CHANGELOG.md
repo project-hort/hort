@@ -102,6 +102,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `hort_sbom_resolution_total{format="pypi"}` reports a new `declared` value
   instead of `not_applicable` — re-key any dashboard on that series, and alert
   on `unusable_lockfile`, the arm that withholds an artifact (#424).
+- An OCI manifest push naming a constituent hort has already decided about no
+  longer answers `400 MANIFEST_BLOB_UNKNOWN`: a rejected constituent answers
+  `403 DENIED` naming that digest, and one held for want of a scan verdict
+  answers `503 UNAVAILABLE`. A constituent not yet pushed is unchanged (#429).
 
 ### Fixed
 

@@ -147,10 +147,15 @@ pub enum OciError {
     /// caller, write-granted included. Code is `UNAVAILABLE` — the same
     /// spec-extension as `Quarantined`; no new OCI error code.
     ScanIndeterminate,
-    /// 403 — the artifact exists, the caller passed the repository read
-    /// gate, and it is **`Rejected`**: a terminal verdict was reached
-    /// against it and it will never be served. `subject` is the digest
-    /// (blob) or client reference (manifest) the caller asked for, and
+    /// 403 — the artifact exists, the caller passed the repository gate,
+    /// and it is **`Rejected`**: a terminal verdict was reached against
+    /// it and it will never be served. `subject` is the digest (blob) or
+    /// client reference (manifest) the caller asked for — or, where the
+    /// refusal is about something the named document **binds** rather
+    /// than about the document itself (a manifest `GET` withheld for a
+    /// terminal constituent, a manifest `PUT` refused for one), the
+    /// constituent's own digest. The emitting site states which, because
+    /// it is the one thing a reader cannot infer from the envelope.
     /// `axis` is which kind of verdict condemned it —
     /// `RejectionReason::wire_kind()`'s operator-facing token, the one
     /// vocabulary the curation queue and the `?reason=` filter already
