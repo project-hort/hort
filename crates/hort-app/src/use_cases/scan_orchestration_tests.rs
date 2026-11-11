@@ -3177,8 +3177,10 @@ async fn claim_pending_returns_jobs_repository_response() {
 /// derives its components from the artifact's stored bytes, not from
 /// `format_metadata`.
 ///
-/// The payload grammar is deliberately trivial — `RESOLVED:<name>@<ver>,…`
-/// with an optional `;skipped=<n>` suffix, `NOLOCK`, `BROKEN`, `BOOM` —
+/// The payload grammar is deliberately trivial —
+/// `RESOLVED:<name>@<ver>,…` with an optional `;skipped=<n>` suffix,
+/// `DECLARED:<name>@<ver>,…`, `NOLOCK`, `NOSBOM`, `BOOM`, `PANIC`, and
+/// anything else for the unusable-declaration arm —
 /// because what is under test here is the *orchestration*: does the
 /// artifact's stored payload reach the handler as a stream, and does each
 /// outcome land on the right metric and the right degradation. The real
@@ -3289,6 +3291,25 @@ impl PayloadSbom for PayloadShapedSbomHandler {
         }
         if text == "NOLOCK" {
             return Ok(subject_only(SbomResolution::NoLockfile));
+        }
+        // The fourth resolution: a dependency **declaration** was read
+        // out of the payload — components named, versions whatever the
+        // declaration's constraints pin. PyPI's `Requires-Dist` is the
+        // production shape; no closure was walked, so it is not
+        // `Resolved`.
+        if let Some(list) = text.strip_prefix("DECLARED:") {
+            return Ok(PayloadSbomExtraction {
+                sbom: Some(Sbom {
+                    subject: Some(subject),
+                    components: list
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .map(|spec| component(&format!("pkg:cargo/{spec}")))
+                        .collect(),
+                }),
+                resolution: SbomResolution::Declared,
+                skipped_non_registry: 0,
+            });
         }
         let Some(rest) = text.strip_prefix("RESOLVED:") else {
             return Ok(subject_only(SbomResolution::UnusableLockfile));
@@ -3612,8 +3633,11 @@ async fn payload_scan_survives_an_unreadable_stored_payload() {
 ///
 /// `payload` drives which [`SbomAbsence`] the extraction reaches:
 /// `b"BOOM"` is a handler error, `b"NOSBOM"` a declared absence,
-/// `b"RESOLVED:…"` a real BOM. Passing `unreadable_payload` fails the
-/// CAS read instead, which is the transient arm.
+/// `b"BADLOCK"` (anything unrecognised) a **subject-only BOM carrying
+/// `UnusableLockfile`** — the shape a handler that kept its subject
+/// returns — and `b"RESOLVED:…"` / `b"DECLARED:…"` a real BOM. Passing
+/// `unreadable_payload` fails the CAS read instead, which is the
+/// transient arm.
 async fn run_sbom_driven_scan(
     backends: &[&str],
     payload: &[u8],
@@ -3752,6 +3776,164 @@ async fn an_unreadable_sbom_does_not_discard_a_payload_reading_backends_verdict(
             }
         ),
         "trivy assessed the artifact, so the run has a verdict: {outcome:?}"
+    );
+}
+
+// ----- the subject-only fail-open, closed -----------------------------------
+
+/// **The primary hazard of moving a format onto the payload branch, as a
+/// scan-disposition test.**
+///
+/// A handler that cannot read the artifact's dependency document degrades
+/// to a subject-only BOM rather than erroring — right for the BOM, and
+/// catastrophic if the caller reads `Some(_)` as "a BOM came out". The
+/// component list is then length zero, an SBOM-driven backend
+/// *executes* over it (it abstains only on `None`), and an empty finding
+/// set is `ScanStanding::Clears { findings_present: false }`, which
+/// releases under `ScanSucceeded`: a clean scan over an artifact whose
+/// declaration was never read.
+///
+/// This asserts the **disposition**, not the handler's return value,
+/// because the handler returning a subject-only BOM is correct and is
+/// not what was wrong.
+#[tokio::test]
+async fn a_subject_only_bom_from_an_unread_declaration_does_not_authorize_release() {
+    let outcome = run_sbom_driven_scan(&["osv"], b"BADLOCK", false).await;
+    match &outcome {
+        ScanRunOutcome::NothingAnalysable { scanner, reason } => {
+            assert_eq!(scanner, "osv");
+            assert!(
+                reason.contains("unusable_archive"),
+                "the abstention must name the unread declaration: {reason}"
+            );
+        }
+        other => panic!("expected a fail-closed no-verdict, got {other:?}"),
+    }
+    assert!(
+        !matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "a declaration that could not be read is not an absence of package surface"
+    );
+    assert!(
+        !matches!(outcome, ScanRunOutcome::Completed { .. }),
+        "nothing here may record a ScanCompleted: {outcome:?}"
+    );
+}
+
+/// The same input under a policy that also names a payload-reading
+/// backend still completes. The fail-closed hold above is about the
+/// *absence of any verdict*, never about discarding one that exists —
+/// an unread BOM was enrichment on this run, and enrichment is not
+/// authority.
+#[tokio::test]
+async fn a_subject_only_bom_does_not_discard_a_payload_reading_backends_verdict() {
+    let outcome = run_sbom_driven_scan(&["trivy", "osv"], b"BADLOCK", false).await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::Analysed,
+                ..
+            }
+        ),
+        "trivy assessed the artifact, so the run has a verdict: {outcome:?}"
+    );
+}
+
+/// A declaration the handler **read** is the healthy path: the run
+/// completes, and the component list is in the outcome — so it reached
+/// the backend and the persisted `sbom_components` projection. The
+/// contrast with the unread case above is the whole point of keeping
+/// `SbomResolution` apart from the `Option`: the same `Some(Sbom)` shape
+/// gates in one case and not in the other, and only the resolution says
+/// which.
+///
+/// (This harness's `osv` double abstains unconditionally, so the
+/// assessment label here is the abstention's, not a verdict's. What the
+/// test pins is that the run is not **held**, and that the declaration
+/// was carried forward.)
+#[tokio::test]
+async fn a_read_declaration_reaches_the_backend_and_does_not_gate() {
+    let outcome = run_sbom_driven_scan(&["osv"], b"DECLARED:urllib3@1.26.0", false).await;
+    let ScanRunOutcome::Completed { sbom, .. } = &outcome else {
+        panic!("a read declaration must not hold the artifact: {outcome:?}");
+    };
+    let sbom = sbom.as_ref().expect("the declaration is carried forward");
+    assert_eq!(
+        sbom.components
+            .iter()
+            .map(|c| c.purl.as_str())
+            .collect::<Vec<_>>(),
+        vec!["pkg:cargo/urllib3@1.26.0"],
+        "the component list reached the scan subject"
+    );
+}
+
+/// An absence the handler **declared** — the payload carries no
+/// dependency information at all — still records a completed
+/// not-applicable assessment. Without this the close above would hold
+/// every such artifact forever, on a hold with nothing to wait on.
+#[tokio::test]
+async fn a_declared_empty_declaration_still_completes() {
+    let outcome = run_sbom_driven_scan(&["osv"], b"NOLOCK", false).await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::NotApplicable,
+                ..
+            }
+        ),
+        "an empty declaration is a completed fact about the artifact: {outcome:?}"
+    );
+}
+
+// ----- CAS unavailability is a release-authority state, both ways -----------
+
+/// **Configuration one: the BOM is the only input.** A payload that
+/// could not be *reached* is a statement about the machine, so it earns
+/// the scan job's existing attempt budget rather than a terminal
+/// no-verdict — routed through `Failed`, which reschedules on the shared
+/// backoff and holds or records `ScanIndeterminate` only at exhaustion.
+/// The metadata branch PyPI used to take had no CAS-unavailable outcome
+/// at all, so this is new ground for every PyPI scan.
+#[tokio::test]
+async fn cas_unavailability_under_an_sbom_only_policy_is_retryable_not_clean() {
+    let outcome = run_sbom_driven_scan(&["osv"], b"DECLARED:urllib3@1.26.0", true).await;
+    match &outcome {
+        ScanRunOutcome::Failed(msg) => assert!(
+            msg.contains("scan backends failed"),
+            "the retryable path's own wording: {msg}"
+        ),
+        other => panic!("expected the retryable path, got {other:?}"),
+    }
+    assert!(
+        !matches!(outcome, ScanRunOutcome::Completed { .. }),
+        "an unreachable payload must not record a scan: {outcome:?}"
+    );
+}
+
+/// **Configuration two: a payload-reading sibling is configured.** It
+/// assesses the artifact itself and does not consult the component list,
+/// so its verdict completes the run — a CAS hiccup on the SBOM read must
+/// not cost a scan that actually happened.
+#[tokio::test]
+async fn cas_unavailability_still_completes_when_a_payload_reading_backend_answers() {
+    let outcome = run_sbom_driven_scan(&["trivy", "osv"], b"DECLARED:urllib3@1.26.0", true).await;
+    assert!(
+        matches!(
+            outcome,
+            ScanRunOutcome::Completed {
+                assessment: ScanAssessment::Analysed,
+                ..
+            }
+        ),
+        "the sibling's verdict stands: {outcome:?}"
     );
 }
 
@@ -5152,6 +5334,7 @@ mod metrics_emission_tests {
         for candidate in [
             "resolved",
             "no_lockfile",
+            "declared",
             "unusable_lockfile",
             "payload_unavailable",
             "not_applicable",
@@ -5182,6 +5365,113 @@ mod metrics_emission_tests {
             "unusable_lockfile",
             "a handler error is the same fact to an operator: the payload was \
              reachable and no usable component list came out of it"
+        );
+    }
+
+    /// The new resolution arm has its own label value, so an operator
+    /// can tell a BOM built from a **declaration** from one built from a
+    /// resolve — the difference between "these are the versions a
+    /// consumer may resolve" and "these are the versions this artifact
+    /// was built against".
+    #[test]
+    fn hort_sbom_resolution_total_reports_a_declaration_as_declared() {
+        assert_eq!(resolution_label(b"DECLARED:urllib3@1.26.0"), "declared");
+    }
+
+    /// **PyPI leaves the `not_applicable` population.** Its declaration
+    /// is in the artifact, so a PyPI scan now reports a payload-derived
+    /// arm and an operator whose dashboards keyed PyPI on
+    /// `not_applicable` sees that series fall to zero.
+    ///
+    /// This is the orchestrator half — a payload-reading handler
+    /// registered for `pypi` reports `declared` and never
+    /// `not_applicable`. The other half, that `PyPiFormatHandler` is
+    /// such a handler, is pinned in `hort-formats` (`hort-app` cannot
+    /// depend on it — that is the layering boundary).
+    #[test]
+    fn hort_sbom_resolution_total_no_longer_reports_not_applicable_for_pypi() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let handler = Arc::new(PayloadShapedSbomHandler::default());
+                let mut handlers: HashMap<String, Arc<dyn FormatHandler>> = HashMap::new();
+                handlers.insert("pypi".into(), handler);
+                let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
+                scanners.insert(
+                    "trivy".into(),
+                    Arc::new(MockScanner::new("trivy", Ok(vec![]))),
+                );
+
+                let (uc, _jobs, _events, storage, artifacts, repositories, _policy, metadata_repo) =
+                    make_uc_full(
+                        vec!["trivy".into()],
+                        scanners,
+                        Arc::new(MockAdvisory::ok(vec![])),
+                        handlers,
+                    );
+                let artifact_id = seed_cargo_artifact_with_payload(
+                    &artifacts,
+                    &repositories,
+                    &metadata_repo,
+                    &storage,
+                    b"DECLARED:urllib3@1.26.0",
+                    serde_json::Value::Null,
+                )
+                .await;
+                let mut job = sample_scan_job(artifact_id, 1);
+                job.format = "pypi".into();
+                let _ = uc.run_scan(&job).await.expect("run_scan");
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"pypi") && labels.get("result") == Some(&"declared")
+            }),
+            Some(1),
+            "a pypi scan reports the basis its component list was derived on"
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"pypi")
+                    && labels.get("result") == Some(&"not_applicable")
+            }),
+            None,
+            "`not_applicable` means `payload_sbom() == None`, which pypi is no longer"
+        );
+    }
+
+    /// An unread declaration reports `unusable_lockfile` on the
+    /// resolution counter **and** `parse_error` on the extraction
+    /// counter — the pair an operator needs, because the scan it belongs
+    /// to records no verdict at all. The extraction counter must not say
+    /// `success`: a subject-only BOM the orchestrator declines to hand
+    /// onward is not an extraction that succeeded.
+    #[test]
+    fn hort_sbom_metrics_report_an_unread_declaration_as_a_content_failure() {
+        let snap = capture_async_metrics(|| {
+            Box::pin(async move {
+                let _ = run_cargo_payload_scan(b"BADLOCK").await;
+            })
+        });
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_resolution_total", |labels| {
+                labels.get("format") == Some(&"cargo")
+                    && labels.get("result") == Some(&"unusable_lockfile")
+            }),
+            Some(1),
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_extraction_total", |labels| {
+                labels.get("format") == Some(&"cargo")
+                    && labels.get("result") == Some(&"parse_error")
+            }),
+            Some(1),
+        );
+        assert_eq!(
+            find_counter(&snap, "hort_sbom_extraction_total", |labels| {
+                labels.get("format") == Some(&"cargo") && labels.get("result") == Some(&"success")
+            }),
+            None,
+            "the BOM did not reach the scan, so nothing succeeded",
         );
     }
 
@@ -6640,6 +6930,69 @@ fn a_listed_component_is_not_contained_when_the_format_ships_none_of_it() {
             "{evidence:?}"
         );
     }
+}
+
+/// **`ComponentRelation` moves release authority, and the PyPI shape is
+/// where that becomes visible for newly discovered proxied
+/// dependencies.** Reading a proxied distribution's own `Requires-Dist`
+/// puts components in the BOM that were never there before, and what
+/// each new finding can do to the artifact is decided here rather than
+/// by the finding's severity.
+///
+/// Both halves asserted, because the Boolean override alone does not
+/// explain the change:
+///
+/// - A finding naming a component **the declaration lists** is
+///   `NotContained` — the wheel asks for `urllib3`, it does not carry
+///   it — and `may_condemn_artifact` **denies** it authority. So the new
+///   component list cannot start terminally rejecting distributions over
+///   their dependencies' advisories.
+/// - A finding naming something **the declaration does not list**, from
+///   a backend whose only input was that list, is `NotEstablished`: the
+///   join failed, and the fail-closed reading of absent evidence is that
+///   the finding still counts (ADR 0007). `may_condemn_artifact`
+///   **grants** it authority.
+#[test]
+fn a_pypi_declarations_components_cannot_condemn_the_artifact_but_an_unjoined_finding_can() {
+    let sbom = sbom_with(Some("pkg:pypi/myapp@1.0.0"), &["pkg:pypi/urllib3@1.26.0"]);
+    let relations = ComponentRelations {
+        sbom: Some(&sbom),
+        // `PyPiFormatHandler::payload_contains_components()` — a wheel
+        // ships its own modules and none of what it asks for.
+        payload_contains_components: false,
+        format: "pypi",
+    };
+
+    // The matching PURL: in the BOM, not in the artifact.
+    let matched = relations.relation_for("pkg:pypi/urllib3@1.26.0", EvidenceBasis::SuppliedSbom);
+    assert_eq!(matched, ComponentRelation::NotContained);
+    let mut f = finding("pkg:pypi/x@1", "CVE-0", SeverityThreshold::Critical);
+    f.component_relation = matched;
+    assert!(
+        !f.may_condemn_artifact(TEST_SCAN_KIND),
+        "a dependency the wheel merely declares must not condemn the wheel"
+    );
+
+    // The non-matching PURL, from a backend whose whole input was the
+    // BOM: the join failed, so the relation is unestablished and the
+    // finding keeps authority.
+    let unmatched =
+        relations.relation_for("pkg:pypi/never-declared@9.9.9", EvidenceBasis::SuppliedSbom);
+    assert_eq!(unmatched, ComponentRelation::NotEstablished);
+    let mut f = finding("pkg:pypi/x@1", "CVE-0", SeverityThreshold::Critical);
+    f.component_relation = unmatched;
+    assert!(
+        f.may_condemn_artifact(TEST_SCAN_KIND),
+        "an absence of evidence about the relation reads fail-closed"
+    );
+
+    // And the subject itself is in the artifact by definition, so an
+    // advisory against the distribution still condemns it.
+    let subject = relations.relation_for("pkg:pypi/myapp@1.0.0", EvidenceBasis::SuppliedSbom);
+    assert_eq!(subject, ComponentRelation::Subject);
+    let mut f = finding("pkg:pypi/x@1", "CVE-0", SeverityThreshold::Critical);
+    f.component_relation = subject;
+    assert!(f.may_condemn_artifact(TEST_SCAN_KIND));
 }
 
 /// The opposite format shape: an image carries its layers, so the same

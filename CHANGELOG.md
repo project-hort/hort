@@ -95,9 +95,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `hort-cli curation waive <artifact_id>` is now `curation waive artifact
   <artifact_id>`; `waive versions`, `waive digests` and `block digests`
   address a decision in bulk (#176).
+- A PyPI scan now reads the distribution's own dependency declaration, so a
+  proxied distribution's dependencies reach the scan. Expect dependency
+  findings on proxied PyPI repositories; they do not by themselves reject the
+  distribution (#424).
+- `hort_sbom_resolution_total{format="pypi"}` reports a new `declared` value
+  instead of `not_applicable` — re-key any dashboard on that series, and alert
+  on `unusable_lockfile`, the arm that withholds an artifact (#424).
 
 ### Fixed
 
+- An artifact whose embedded dependency declaration cannot be read is no
+  longer recorded as a clean scan under a policy whose only backend adjudicates
+  the component list — it is held instead. Affects PyPI, Cargo and Maven
+  (#424).
+- A PyPI requirement whose specifier does not pin exactly one version
+  (`==1.*`, `==1.0,!=1.0`, `===1.0`) no longer reaches the SBOM as a versioned
+  component, so advisory matching is not keyed on a version nothing resolves
+  to (#424).
 - A write-granted publisher can now resolve its own artifact held
   `scan_indeterminate` — OCI manifest and cargo index entry — so an upload held
   for want of a scan verdict can still be signed.

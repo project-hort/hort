@@ -27,7 +27,7 @@ use hort_domain::types::{
 
 use crate::publish_identity::IdentityCheck;
 use crate::range_resolvers::resolve_semver_range_max;
-use crate::sbom_helpers::{build_subject_component, strip_version_constraint};
+use crate::sbom_helpers::{build_subject_component, strip_version_constraint, subject_only};
 
 /// Cargo format handler (RFC 2789 sparse registry).
 ///
@@ -778,19 +778,6 @@ impl PayloadSbom for CargoFormatHandler {
             resolution: SbomResolution::Resolved,
             skipped_non_registry: closure.skipped_non_registry,
         })
-    }
-}
-
-/// A BOM that names the artifact under scan and claims nothing about its
-/// dependencies — the honest degradation whenever the resolve is unknown.
-fn subject_only(subject: SbomComponent, resolution: SbomResolution) -> PayloadSbomExtraction {
-    PayloadSbomExtraction {
-        sbom: Some(Sbom {
-            subject: Some(subject),
-            components: Vec::new(),
-        }),
-        resolution,
-        skipped_non_registry: 0,
     }
 }
 
@@ -3349,10 +3336,11 @@ dependencies = [
     }
 
     #[test]
-    fn payload_sbom_capability_is_declared_by_cargo_alone() {
+    fn payload_sbom_capability_matches_each_handlers_own_source() {
         // The declaration is what lets the scan orchestrator skip a CAS
-        // read for every other format; `None` must stay the honest answer
-        // for handlers that do not read the payload.
+        // read for a format that has no payload dependency document;
+        // `None` must stay the honest answer for those handlers, and
+        // `Some` for every handler whose declaration is in the artifact.
         assert!(
             handler().payload_sbom().is_some(),
             "cargo derives its scan SBOM from the payload"
@@ -3362,8 +3350,12 @@ dependencies = [
             "npm's SBOM comes from stored metadata; it must not cost a CAS read"
         );
         assert!(
-            crate::pypi::PyPiFormatHandler.payload_sbom().is_none(),
-            "PyPI's SBOM comes from stored metadata; it must not cost a CAS read"
+            crate::pypi::PyPiFormatHandler.payload_sbom().is_some(),
+            "PyPI reads its own METADATA / PKG-INFO; the declaration is in the artifact"
+        );
+        assert!(
+            crate::maven::MavenFormatHandler.payload_sbom().is_some(),
+            "maven reads the embedded POM"
         );
     }
 

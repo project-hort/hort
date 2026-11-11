@@ -3280,17 +3280,25 @@ pub fn emit_sbom_extraction(format: &str, result: SbomExtractionResult) {
     .increment(1);
 }
 
-/// Outcome label of `hort_sbom_resolution_total`. Closed taxonomy of 5 —
+/// Outcome label of `hort_sbom_resolution_total`. Closed taxonomy of 6 —
 /// exactly one per scan-time SBOM extraction attempt.
 ///
 /// Where [`SbomExtractionResult`] says whether an SBOM came out,
 /// this says **what its component versions mean**. The distinction is
-/// operationally load-bearing: a `resolved` BOM names the versions the
-/// artifact was actually built against, so a finding against it is real;
-/// every other value means the scan fell back to a subject-only BOM and
-/// the artifact's dependencies were not examined at all. A registry
-/// whose cargo scans are mostly `no_lockfile` is not being scanned in the
-/// way its operator thinks it is, and no other signal says so.
+/// operationally load-bearing, and it is a three-way one rather than
+/// "resolved vs. degraded":
+///
+/// - `resolved` names the versions the artifact was actually built
+///   against, so a finding against one is real;
+/// - `declared` names the artifact's own direct dependency declaration,
+///   whose versions are the publisher's *constraints* — a real reading
+///   of the artifact, and not a claim about what any consumer resolves;
+/// - every remaining value means no component list was derived, and the
+///   BOM is subject-only or absent.
+///
+/// A registry whose cargo scans are mostly `no_lockfile` is not being
+/// scanned in the way its operator thinks it is, and no other signal
+/// says so.
 ///
 /// String values are normative — they appear verbatim in
 /// `docs/metrics-catalog.md`.
@@ -3299,23 +3307,42 @@ pub enum SbomResolutionResult {
     /// The payload yielded a resolved-dependency document and the
     /// closure walk succeeded: every component carries an exact version.
     Resolved,
-    /// The payload carried no resolved-dependency document. Expected and
-    /// truthful — nothing forces a publisher to embed one — but the BOM
-    /// is subject-only.
+    /// The payload carried no resolved-dependency document, or carried a
+    /// declaration that was read and found empty. Expected and truthful
+    /// — nothing forces a publisher to declare a dependency — and the
+    /// BOM is subject-only because there was nothing to put in it.
     NoLockfile,
-    /// The payload carried a resolved-dependency document that could not
-    /// be used (unparseable, over a parser cap, not a self-consistent
-    /// resolve), or the extraction failed before reaching one. Also the
-    /// arm for a handler that returned `Err`. The BOM is subject-only.
+    /// The payload carried a dependency **declaration** and it was read:
+    /// the BOM names the artifact's direct dependencies at whatever
+    /// versions their constraints pin. Not a degradation and not a
+    /// resolve — see
+    /// [`SbomResolution::Declared`](hort_domain::ports::format_handler::SbomResolution::Declared).
+    Declared,
+    /// The payload carried a dependency document that could not be used
+    /// (unparseable, over a parser cap, not a self-consistent resolve),
+    /// one whose own metadata says its value is not canonical, or the
+    /// extraction failed before reaching one. Also the arm for a handler
+    /// that returned `Err`.
+    ///
+    /// The declaration went **unread**, which is why the orchestrator
+    /// spends this as a gating absence rather than as a thinner BOM: a
+    /// backend whose whole input is the component list assessed nothing
+    /// (ADR 0007).
     UnusableLockfile,
     /// The read from CAS failed, so the payload never reached the
     /// handler. Pairs with
     /// [`SbomExtractionResult::PayloadUnavailable`].
     PayloadUnavailable,
     /// The format does not derive its SBOM from the payload
-    /// (`FormatHandler::payload_sbom() == None`) — npm, PyPI, and every
-    /// opaque format. Not a degradation: there is no resolved-dependency
-    /// document to look for.
+    /// (`FormatHandler::payload_sbom() == None`) — npm and every opaque
+    /// format — or no handler is registered. Not a degradation: there is
+    /// no dependency document in the payload to look for.
+    ///
+    /// **PyPI left this population**: it reads its own
+    /// `<dist-info>/METADATA` / `PKG-INFO`, so a PyPI scan now reports
+    /// one of the payload-derived arms above. An operator whose
+    /// dashboards keyed PyPI on `not_applicable` sees that series go to
+    /// zero.
     NotApplicable,
 }
 
@@ -3326,6 +3353,7 @@ impl SbomResolutionResult {
         match self {
             Self::Resolved => "resolved",
             Self::NoLockfile => "no_lockfile",
+            Self::Declared => "declared",
             Self::UnusableLockfile => "unusable_lockfile",
             Self::PayloadUnavailable => "payload_unavailable",
             Self::NotApplicable => "not_applicable",
@@ -3333,17 +3361,24 @@ impl SbomResolutionResult {
     }
 }
 
-/// The handler-side vocabulary (3 arms — what a format handler can
-/// observe) lifted into the emitting layer's vocabulary (5 arms — the
-/// handler's three plus the two only the orchestrator can see). The
+/// The handler-side vocabulary (4 arms — what a format handler can
+/// observe) lifted into the emitting layer's vocabulary (6 arms — the
+/// handler's four plus the two only the orchestrator can see). The
 /// domain stays free of metric concerns; the mapping lives here, with
 /// the counter.
+///
+/// Exhaustive with no wildcard arm, deliberately: a new
+/// [`SbomResolution`](hort_domain::ports::format_handler::SbomResolution)
+/// variant must be given a label value here (and a catalog row) rather
+/// than inheriting one, because inheriting would report a new basis for
+/// a component list as an old one.
 impl From<hort_domain::ports::format_handler::SbomResolution> for SbomResolutionResult {
     fn from(resolution: hort_domain::ports::format_handler::SbomResolution) -> Self {
         use hort_domain::ports::format_handler::SbomResolution;
         match resolution {
             SbomResolution::Resolved => Self::Resolved,
             SbomResolution::NoLockfile => Self::NoLockfile,
+            SbomResolution::Declared => Self::Declared,
             SbomResolution::UnusableLockfile => Self::UnusableLockfile,
         }
     }
@@ -3525,8 +3560,8 @@ pub fn register_scan_metrics() {
         "hort_sbom_resolution_total",
         Unit::Count,
         "scan-time SBOM extraction attempts, by `format` and how the components \
-         were derived (`result`: resolved / no_lockfile / unusable_lockfile / \
-         payload_unavailable / not_applicable)"
+         were derived (`result`: resolved / no_lockfile / declared / \
+         unusable_lockfile / payload_unavailable / not_applicable)"
     );
     let _ = counter!("hort_sbom_resolution_total");
 
@@ -8122,6 +8157,51 @@ mod tests {
     /// This is the *layer-appropriate* test: hort-app doesn't choose an
     /// exporter, so the test only asserts that calling
     /// `register_scan_metrics` populates the `metrics::Recorder`
+    /// The resolution label's six wire strings, pinned by value: the
+    /// catalog calls them normative, and a dashboard or alert rule keys
+    /// on the string rather than on the variant.
+    #[test]
+    fn sbom_resolution_result_wire_strings_match_the_catalog() {
+        use super::SbomResolutionResult;
+        assert_eq!(SbomResolutionResult::Resolved.as_str(), "resolved");
+        assert_eq!(SbomResolutionResult::NoLockfile.as_str(), "no_lockfile");
+        assert_eq!(SbomResolutionResult::Declared.as_str(), "declared");
+        assert_eq!(
+            SbomResolutionResult::UnusableLockfile.as_str(),
+            "unusable_lockfile"
+        );
+        assert_eq!(
+            SbomResolutionResult::PayloadUnavailable.as_str(),
+            "payload_unavailable"
+        );
+        assert_eq!(
+            SbomResolutionResult::NotApplicable.as_str(),
+            "not_applicable"
+        );
+    }
+
+    /// Every handler-side resolution lifts to its own label value. The
+    /// `From` is exhaustive with no wildcard precisely so a new domain
+    /// variant cannot inherit an older variant's label — which would
+    /// report a new basis for a component list as an old one.
+    #[test]
+    fn every_handler_resolution_lifts_to_its_own_label() {
+        use super::SbomResolutionResult;
+        use hort_domain::ports::format_handler::SbomResolution;
+        let pairs = [
+            (SbomResolution::Resolved, "resolved"),
+            (SbomResolution::NoLockfile, "no_lockfile"),
+            (SbomResolution::Declared, "declared"),
+            (SbomResolution::UnusableLockfile, "unusable_lockfile"),
+        ];
+        let mut seen = HashSet::new();
+        for (resolution, expected) in pairs {
+            let label = SbomResolutionResult::from(resolution).as_str();
+            assert_eq!(label, expected, "{resolution:?}");
+            assert!(seen.insert(label), "two resolutions share `{label}`");
+        }
+    }
+
     /// registry. The rendered-Prometheus-text regression
     /// (the smoke test's phase-7 surface) lives in
     /// `crates/hort-server/tests/scan_metrics_registration.rs` —

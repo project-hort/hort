@@ -48,7 +48,7 @@ use hort_domain::types::{
 };
 
 use crate::publish_identity::IdentityCheck;
-use crate::sbom_helpers::build_subject_component;
+use crate::sbom_helpers::{build_subject_component, subject_only};
 
 pub use coords::{
     build_logical_path, parse_download_path, parse_sidecar_hex, split_ga,
@@ -982,22 +982,6 @@ fn maven_sbom_components(specs: &[DependencySpec]) -> Vec<SbomComponent> {
             })
         })
         .collect()
-}
-
-/// A subject-only [`PayloadSbomExtraction`] — no components, just the
-/// artifact's own coordinate. Used for every degrade-soft arm: a
-/// `.jar`/`.war` with no embedded POM still lets OSV query the artifact's
-/// own coordinate, and a POM that failed to parse degrades to the same
-/// shape rather than dropping the SBOM entirely.
-fn subject_only(subject: SbomComponent, resolution: SbomResolution) -> PayloadSbomExtraction {
-    PayloadSbomExtraction {
-        sbom: Some(Sbom {
-            subject: Some(subject),
-            components: Vec::new(),
-        }),
-        resolution,
-        skipped_non_registry: 0,
-    }
 }
 
 /// Whether any `/`-separated segment of a zip entry name is a literal

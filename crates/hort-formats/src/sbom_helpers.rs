@@ -6,8 +6,9 @@
 //!
 //! See explanation/scanning-pipeline.md for the SBOM extraction design.
 
+use hort_domain::ports::format_handler::{PayloadSbomExtraction, SbomResolution};
 use hort_domain::types::sbom::{Ecosystem, SbomComponent};
-use hort_domain::types::ArtifactCoords;
+use hort_domain::types::{ArtifactCoords, Sbom};
 
 /// Strip the leading version-range operator a manifest commonly carries
 /// (`^1.2.3`, `~1.2.3`, `=1.2.3`, plain `1.2.3`) and return the trimmed
@@ -64,6 +65,34 @@ pub(crate) fn build_subject_component(
         ecosystem,
         licenses,
         direct_dependency: true,
+    }
+}
+
+/// A BOM that names the artifact under scan and claims nothing about its
+/// dependencies, carrying `resolution` as the reason.
+///
+/// Every [`PayloadSbom`](hort_domain::ports::format_handler::PayloadSbom)
+/// degrade-soft arm returns this shape rather than `Err` or `None`: the
+/// artifact's own coordinate is still worth querying an advisory
+/// database for, and SBOM enrichment is not the place to abort a scan.
+///
+/// **What the caller does with it is decided by `resolution`, not by the
+/// `Some`.** A subject-only BOM paired with
+/// [`SbomResolution::UnusableLockfile`] is an unread declaration, and
+/// the scan orchestrator spends it as a gating absence — so a handler
+/// reaching for this helper is choosing a reason, not choosing to be
+/// non-gating.
+pub(crate) fn subject_only(
+    subject: SbomComponent,
+    resolution: SbomResolution,
+) -> PayloadSbomExtraction {
+    PayloadSbomExtraction {
+        sbom: Some(Sbom {
+            subject: Some(subject),
+            components: Vec::new(),
+        }),
+        resolution,
+        skipped_non_registry: 0,
     }
 }
 

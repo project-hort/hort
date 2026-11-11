@@ -45,7 +45,7 @@ use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceIndex;
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::format_handler::{FormatHandler, SbomResolution};
 use hort_domain::ports::jobs_repository::{JobsRepository, ScanJob};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
@@ -509,9 +509,10 @@ pub struct ScanOrchestrationUseCase {
     policy_projections: Arc<dyn PolicyProjectionRepository>,
     advisory: Arc<dyn AdvisoryPort>,
     /// CAS handle for the scan-time payload read. Only formats that
-    /// declare `FormatHandler::payload_sbom`, in a `Hosted` repository,
-    /// reach it — every other scan costs no storage round-trip. Wired to
-    /// the same CAS the Trivy
+    /// declare `FormatHandler::payload_sbom` reach it — every other scan
+    /// costs no storage round-trip. The repository class plays no part:
+    /// `try_extract_sbom`'s own docs say why a proxied artifact is read
+    /// exactly as a hosted one is. Wired to the same CAS the Trivy
     /// adapter reads from (which has streamed artifact bytes at scan
     /// time since it shipped; this field puts the SBOM path on the same
     /// footing).
@@ -1904,15 +1905,46 @@ impl ScanOrchestrationUseCase {
         if extraction.skipped_non_registry > 0 {
             emit_sbom_components_skipped(format_key, extraction.skipped_non_registry as u64);
         }
-        match extraction.sbom {
-            Some(sbom) => {
+        // **The resolution decides, not the `Option`.** A handler that
+        // could not read the artifact's dependency document degrades to a
+        // subject-only BOM rather than erroring, which is right for the
+        // BOM and wrong for the verdict: reading `Some(_)` as "a BOM came
+        // out" hands an SBOM-only backend a component list of length zero,
+        // and that backend returns `Analysed([])` — a *clean scan* over an
+        // artifact whose declaration was never read. Fail-soft about the
+        // BOM is not fail-soft about release authority (ADR 0007).
+        //
+        // So `UnusableLockfile` takes the same gating absence a handler
+        // `Err` takes above, and for the same reason: the two are one fact
+        // to an operator, and the only thing separating them is whether
+        // the handler chose to keep the subject on its way out. The
+        // subject is dropped with it — a BOM that reaches a backend is a
+        // BOM that backend will answer over, so the one shape this arm
+        // must not produce is a `Some` that gates nothing.
+        //
+        // Nothing is lost on a policy whose backend reads the payload: it
+        // never consulted the component list, so it still assesses the
+        // artifact and the run still completes with its verdict.
+        match (extraction.sbom, extraction.resolution) {
+            (_, SbomResolution::UnusableLockfile) => {
+                tracing::warn!(
+                    artifact_id = %artifact.id,
+                    format_key,
+                    "the payload's dependency declaration could not be read; proceeding with \
+                     no SBOM so a backend whose whole input is the component list cannot \
+                     report an unexamined artifact clean",
+                );
+                emit_sbom_extraction(format_key, SbomExtractionResult::ParseError);
+                SbomExtraction::Absent(SbomAbsence::Unreadable)
+            }
+            (Some(sbom), _) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::Success);
                 SbomExtraction::Extracted(sbom)
             }
             // The handler reached the payload and declares it carries no
             // dependency information — the same answer an opaque format
             // gives, and a completed fact rather than a failure.
-            None => {
+            (None, _) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::UnsupportedFormat);
                 SbomExtraction::Absent(SbomAbsence::NotDeclared)
             }

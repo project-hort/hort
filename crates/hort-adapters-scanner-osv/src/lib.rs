@@ -231,7 +231,7 @@ impl Default for OsvScannerConfig {
 /// | format  | SBOM source | evidence test |
 /// |---------|-------------|---------------|
 /// | `npm`   | packument metadata → `FormatHandler::extract_sbom` | `a_known_vulnerable_npm_sbom_yields_a_finding` |
-/// | `pypi`  | per-release JSON `requires_dist` → `FormatHandler::extract_sbom` | `a_known_vulnerable_pypi_sbom_yields_a_finding` |
+/// | `pypi`  | the wheel's `<dist-info>/METADATA` or the sdist's `PKG-INFO` → `PayloadSbom` | `a_known_vulnerable_pypi_sbom_yields_a_finding` |
 /// | `cargo` | the `.crate`'s `Cargo.lock` → `PayloadSbom` | `a_known_vulnerable_cargo_sbom_yields_a_finding` |
 /// | `maven` | the POM's `<dependencies>` → `PayloadSbom` | `a_known_vulnerable_maven_sbom_yields_a_finding` |
 ///

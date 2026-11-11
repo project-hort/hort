@@ -561,27 +561,76 @@ pub trait VersionDiscovery: Send + Sync {
 
 /// How a [`PayloadSbom`] extraction derived the SBOM it returned.
 ///
-/// The three arms are not interchangeable and must not be collapsed:
-/// "the artifact carries no resolved-dependency document" and "it
-/// carries one that cannot be trusted to describe what was built" are
-/// different facts about the artifact, and only the caller can decide
-/// what posture each deserves. The scan orchestrator maps them onto
-/// distinct metric label values so an operator can tell a registry full
-/// of lockfile-less artifacts from one whose lockfiles are failing to
-/// parse.
+/// The four arms are not interchangeable and must not be collapsed:
+/// "the artifact carries no resolved-dependency document", "it carries a
+/// dependency *declaration* whose versions are constraints" and "it
+/// carries a resolve that cannot be trusted to describe what was built"
+/// are different facts about the artifact, and only the caller can
+/// decide what posture each deserves. The scan orchestrator maps them
+/// onto distinct metric label values so an operator can tell a registry
+/// full of lockfile-less artifacts from one whose lockfiles are failing
+/// to parse.
+///
+/// **Overstating is the dangerous direction** (ADR 0007): a value that
+/// claims more than was derived turns a partial reading of the artifact
+/// into release authority over it. That is why [`Self::Declared`] exists
+/// rather than being folded into [`Self::Resolved`] whenever a
+/// declaration's constraints happen to be exact pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SbomResolution {
     /// The payload yielded a resolved-dependency document and the
     /// closure walk succeeded — every component in
     /// [`PayloadSbomExtraction::sbom`] carries an exact version.
+    ///
+    /// Both halves are required. A handler that reads only an
+    /// artifact's **direct** declarations has not walked a closure and
+    /// must report [`Self::Declared`] instead, however exact the
+    /// versions it recovered are.
     Resolved,
     /// The payload carried no resolved-dependency document. An expected,
     /// truthful state (nothing forces a publisher to embed one), not a
     /// failure.
+    ///
+    /// Paired with a subject-only BOM: the component list is empty
+    /// because there was no document to build one from. A handler that
+    /// *did* read a declaration and found it empty is also this arm —
+    /// the component list it produces is empty for the same reason, and
+    /// an empty declaration is as truthful as an absent one.
     NoLockfile,
-    /// The payload carried a resolved-dependency document that could not
-    /// be used — unparseable, over a parser cap, or not a self-consistent
+    /// The payload carried a dependency **declaration** rather than a
+    /// resolve: its components are named, and each version is whatever
+    /// the declaration's constraint pins it to — a concrete version
+    /// where the constraint is a single exact one, absent where it
+    /// admits a range.
+    ///
+    /// Distinct from [`Self::Resolved`] on two counts, and either alone
+    /// is enough to disqualify `Resolved`: the versions are constraints
+    /// rather than the versions something was built against, and the
+    /// list is the artifact's direct edges rather than a closure. A
+    /// finding against such a component is a statement about what a
+    /// consumer *may* resolve, not about what this artifact was built
+    /// with — and `payload_contains_components() == false` is how the
+    /// caller learns the artifact does not carry the component either.
+    ///
+    /// PyPI's `Requires-Dist` is the shape: PEP 508 specifiers, direct
+    /// edges only, environment markers stripped.
+    Declared,
+    /// The payload carried a dependency document that could not be used
+    /// — unparseable, over a parser cap, or not a self-consistent
     /// resolve — or the extraction itself failed before reaching one.
+    ///
+    /// Also the arm for a document that was read successfully and
+    /// proves nothing: a declaration the artifact itself marks as not
+    /// canonical (PEP 643's `Dynamic: Requires-Dist`), or one in a
+    /// metadata version whose silence about a field carries no
+    /// guarantee. "Absent" and "absent, and that tells you nothing" are
+    /// the same bytes and opposite facts, so they must not share
+    /// [`Self::NoLockfile`].
+    ///
+    /// **The caller is expected to treat this as a gating absence**, not
+    /// as a thinner BOM: whatever subject-only BOM accompanies it, the
+    /// artifact's declaration went unread, so a backend whose whole
+    /// input is that BOM assessed nothing (ADR 0007).
     UnusableLockfile,
 }
 
@@ -1124,8 +1173,10 @@ pub trait FormatHandler: Send + Sync {
     /// storage I/O, so a format that does not consume the payload never
     /// costs a CAS read per scan.
     ///
-    /// Cargo returns `Some(self)`; every other format inherits this
-    /// default.
+    /// cargo, maven and pypi return `Some(self)` — a `.crate`'s embedded
+    /// `Cargo.lock`, a POM's `<dependencies>`, a wheel's
+    /// `<dist-info>/METADATA` / an sdist's `PKG-INFO`. Every other format
+    /// inherits this default.
     fn payload_sbom(&self) -> Option<&dyn PayloadSbom> {
         None
     }
@@ -1879,13 +1930,19 @@ mod tests {
 
     #[test]
     fn sbom_resolution_arms_are_distinct() {
-        // The three arms exist precisely so a caller can tell them apart;
+        // The four arms exist precisely so a caller can tell them apart;
         // an accidental collapse (e.g. deriving `PartialEq` on a
         // future single-field wrapper) would silently merge "no lockfile"
         // into "unusable lockfile" at the metric.
         assert_ne!(SbomResolution::Resolved, SbomResolution::NoLockfile);
         assert_ne!(SbomResolution::NoLockfile, SbomResolution::UnusableLockfile);
         assert_ne!(SbomResolution::UnusableLockfile, SbomResolution::Resolved);
+        // `Declared` is the arm an exact-pinned declaration must NOT be
+        // reported as `Resolved` under: a direct-edge read is not a
+        // closure walk, whatever the versions look like.
+        assert_ne!(SbomResolution::Declared, SbomResolution::Resolved);
+        assert_ne!(SbomResolution::Declared, SbomResolution::NoLockfile);
+        assert_ne!(SbomResolution::Declared, SbomResolution::UnusableLockfile);
     }
 
     #[test]
