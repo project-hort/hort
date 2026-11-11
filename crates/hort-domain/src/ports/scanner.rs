@@ -1,4 +1,3 @@
-use crate::entities::scan_policy::CompositeVerdictMode;
 use crate::error::DomainResult;
 use crate::oci::{ImageLayout, ImageLayoutLayer};
 use crate::types::{ArtifactCoords, ArtifactKind, ContentHash, Finding, Sbom};
@@ -149,6 +148,111 @@ impl ScanUnit<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// LayerRole
+// ---------------------------------------------------------------------------
+
+/// What the manifests **hort itself holds** say about whether a stored
+/// blob is a layer of a composed image.
+///
+/// The fact that decides whether presenting those bytes as a root
+/// filesystem is a statement about anything (ADR 0064 D6). A package
+/// finding is a statement about an installed package tree that runs: an
+/// image layer is one step in building such a tree, so an isolated scan
+/// of it is evidence about a real composition's constituent (D2). A blob
+/// that is *not* part of an image has no such tree, so a finding read out
+/// of it is, in D6's words, "a statement about nothing" — and hort
+/// produced one only because every tar-shaped blob was materialised as a
+/// root filesystem, "correct for an image layer, a coincidence for
+/// anything else".
+///
+/// **The role is not a property of the bytes and no handler can answer
+/// it.** `FormatHandler::scan_kind` classifies every OCI blob as
+/// [`ArtifactKind::OciBlob`] on purpose: a layer and a config are stored
+/// at the same path prefix with the same `content_type`, and the role
+/// lives in the *manifest's* descriptor. So this travels beside the kind
+/// rather than inside it — the kind says what the bytes are, this says
+/// what hort's own manifests declare them to be.
+///
+/// **Three values and two answers**, and which pair shares an answer is
+/// the whole decision: see [`Self::permits_rootfs_materialisation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerRole {
+    /// A manifest hort holds composes as an image — its config describes
+    /// a layered root filesystem — and names these bytes among its
+    /// layers.
+    ///
+    /// Positive evidence from the only place the role exists. A root
+    /// filesystem is what these bytes are, so the isolated scan of them
+    /// keeps running and keeps recording what it sees (ADR 0064 D2); what
+    /// D2 changed is that its filesystem findings no longer carry release
+    /// authority for the layer, not that the scan stops.
+    ImageLayer,
+    /// Every manifest that names these bytes was resolved, and none of
+    /// them is an image that names them as a layer — an OCI *artifact*
+    /// manifest's payload layer (a Helm chart, an SBOM attachment, a
+    /// signature), or a blob named only as an image **config**.
+    ///
+    /// Also positive evidence, and it is the one value that changes what
+    /// happens: these bytes are not a root filesystem, so materialising
+    /// them as one would read a package inventory out of a tree nothing
+    /// runs and spend an extraction doing it.
+    NotAnImageLayer,
+    /// Hort holds no statement either way: no manifest names these bytes
+    /// at all, or one does and could not be resolved.
+    ///
+    /// **An absent parent is not evidence**, and this value exists so
+    /// that nothing can mistake it for some. A blob is ingested and
+    /// scanned *before* its manifest exists on a hosted push — blobs
+    /// first, manifest last, which is the push order the distribution
+    /// spec requires — so "no manifest names this blob yet" is the
+    /// ordinary state of every layer of every pushed image at the moment
+    /// its own scan runs. Reading it as "not a layer" would withdraw the
+    /// layer evidence scan from the whole push population,
+    /// non-deterministically by job ordering, which is the shape
+    /// ADR 0064 D6 rejects a per-constituent parent walk for.
+    Unknown,
+}
+
+impl LayerRole {
+    /// Whether these bytes may be presented to a scanner **as a root
+    /// filesystem**.
+    ///
+    /// The single definition of the decision, so a materialiser cannot
+    /// spell it a second way. [`Self::NotAnImageLayer`] is the only
+    /// refusal, and that asymmetry is the rule rather than a default:
+    /// removing the materialisation needs positive evidence that these
+    /// bytes are not a layer, while
+    /// [`Self::Unknown`] — no statement, or a statement hort could not
+    /// read — leaves the behaviour exactly as it was.
+    ///
+    /// Exhaustive with no wildcard arm, so a future value has to state
+    /// which side it is on.
+    #[must_use]
+    pub const fn permits_rootfs_materialisation(&self) -> bool {
+        match self {
+            Self::ImageLayer | Self::Unknown => true,
+            Self::NotAnImageLayer => false,
+        }
+    }
+
+    /// Stable lowercase identifier for logs and metric labels.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ImageLayer => "image_layer",
+            Self::NotAnImageLayer => "not_an_image_layer",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for LayerRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ScanTarget
 // ---------------------------------------------------------------------------
 
@@ -190,6 +294,22 @@ pub struct ScanTarget<'a> {
     /// materialisation of a composition comes from
     /// [`ScanUnit::Image`], never from this field.
     pub kind: ArtifactKind,
+    /// What hort's own manifests declare about this row's place in a
+    /// composed image (ADR 0064 D6) — see [`LayerRole`].
+    ///
+    /// Meaningful for a row whose [`ArtifactKind::is_composition_constituent`]
+    /// is true, which today is the OCI blob and nothing else. Every other
+    /// row carries [`LayerRole::Unknown`], which is not a placeholder but
+    /// the literal answer: hort's manifests say nothing about the layer
+    /// role of a Java archive, and no materialisation asks.
+    ///
+    /// It sits beside [`Self::kind`] rather than inside it because the
+    /// two are different facts about the same row — the kind is what the
+    /// bytes are and never changes, while the role is what the registry's
+    /// other artifacts say about them and becomes known when a manifest
+    /// naming them arrives. A format handler can answer the first and
+    /// provably not the second.
+    pub layer_role: LayerRole,
 }
 
 impl ScanTarget<'_> {
@@ -412,19 +532,17 @@ impl NotAnalysable {
     ///
     /// [`Self::UnsupportedContainer`] and [`Self::NoAnalyzerMatched`] are
     /// the arms whose answer depends on the artifact rather than only on
-    /// the refusal, and `kind` and `composite_verdict` are what that
-    /// depends on (ADR 0064 D2). What puts them together is the criterion
-    /// D2 states: whether what the scan says is about *the bytes* or
-    /// about *the resulting filesystem*, which governs the **absence** of
-    /// an assessment exactly as it governs a finding. "I have no decoder
-    /// for this container" is a statement about hort's decoder inventory;
-    /// "no analyzer claimed anything here" is an absence of analysis.
-    /// Neither says the bytes are dangerous — so on a row that is a
-    /// *constituent* of a composition hort assesses as one unit, and only
-    /// where an operator has promoted that composite verdict, the
-    /// statement belongs to the composition and must not hold the
-    /// constituent. On every other row, and under every other posture,
-    /// both hold exactly as they did before.
+    /// the refusal, and `kind` is what that depends on (ADR 0064 D2).
+    /// What puts them together is the criterion D2 states: whether what
+    /// the scan says is about *the bytes* or about *the resulting
+    /// filesystem*, which governs the **absence** of an assessment
+    /// exactly as it governs a finding. "I have no decoder for this
+    /// container" is a statement about hort's decoder inventory; "no
+    /// analyzer claimed anything here" is an absence of analysis. Neither
+    /// says the bytes are dangerous — so on a row that is a *constituent*
+    /// of a composition hort assesses as one unit, the statement belongs
+    /// to the composition and must not hold the constituent. On every
+    /// other row both hold exactly as they did before.
     ///
     /// The two that stay unconditional are on the other side of the same
     /// line. `UnusableArchive` is about the bytes — an extraction bound
@@ -432,11 +550,15 @@ impl NotAnalysable {
     /// `IncompleteComposition` is the composition's *own* absent
     /// assessment, so it has nothing above it to hand the obligation to.
     ///
-    /// Both inputs are required, and together: promotion alone would move
-    /// the obligation for every format ADR 0064 explicitly leaves undecided,
-    /// and the kind alone would move it before an operator had granted the
-    /// composite verdict any authority — which is the "obligation dropped
-    /// rather than moved" hazard D6's ordering exists to prevent.
+    /// **The composite verdict is the only verdict** (ADR 0064 D2), so
+    /// `kind` is the whole input: the obligation moves to the composition
+    /// for every constituent, not only where an operator had granted the
+    /// composed verdict authority. This arm used to take a second input —
+    /// the resolved per-policy posture — and an absence of that grant left
+    /// an unanalysable layer holding its manifest with no deadline and
+    /// nothing that could ever supply one, which is the hold ADR 0062
+    /// exists to prevent reached through the one case it does not
+    /// propagate.
     ///
     /// "Which rows are constituents?" is
     /// [`ArtifactKind::is_composition_constituent`]'s answer rather than a
@@ -447,16 +569,11 @@ impl NotAnalysable {
     /// Exhaustive over the variants with no wildcard arm, so a future one
     /// has to state its answer rather than inheriting one.
     #[must_use]
-    pub fn gates_release(
-        &self,
-        kind: ArtifactKind,
-        composite_verdict: CompositeVerdictMode,
-    ) -> bool {
+    pub fn gates_release(&self, kind: ArtifactKind) -> bool {
         match self {
             Self::NotApplicable => false,
             Self::UnsupportedContainer | Self::NoAnalyzerMatched => {
-                !(kind.is_composition_constituent()
-                    && composite_verdict.carries_release_authority())
+                !kind.is_composition_constituent()
             }
             Self::UnusableArchive | Self::IncompleteComposition => true,
         }
@@ -750,6 +867,7 @@ mod tests {
             format: "maven",
             coords: &c,
             kind: ArtifactKind::MavenJar,
+            layer_role: LayerRole::Unknown,
         };
         let copied = target;
         assert_eq!(copied.format, "maven");
@@ -835,52 +953,49 @@ mod tests {
         }
     }
 
-    /// Every kind × posture pair in which nothing has moved — which is
-    /// every one but a promoted constituent. Over all five variants, so
-    /// "an unpromoted repository is byte-for-byte unchanged" is asserted
-    /// rather than reasoned about.
-    const UNMOVED: [(ArtifactKind, CompositeVerdictMode); 3] = [
-        // A constituent, but no operator has promoted anything.
-        (ArtifactKind::OciBlob, CompositeVerdictMode::Observed),
-        // The composition itself, which carries its own verdict.
-        (ArtifactKind::OciManifest, CompositeVerdictMode::Promoted),
-        // A format ADR 0064 leaves undecided, under a policy whose
-        // promotion is about OCI images.
-        (ArtifactKind::NpmTarball, CompositeVerdictMode::Promoted),
+    /// Every kind for which nothing has moved — which is every kind but
+    /// a constituent. Over all five abstentions, so "a non-constituent
+    /// row is byte-for-byte unchanged" is asserted rather than reasoned
+    /// about.
+    const UNMOVED: [ArtifactKind; 2] = [
+        // The composition itself, which carries its own verdict and so
+        // has nothing above it for the obligation to move to.
+        ArtifactKind::OciManifest,
+        // A format ADR 0064 leaves undecided.
+        ArtifactKind::NpmTarball,
     ];
 
     /// The split the release gate rests on: only the absence of a
     /// surface is releasable; an unassessed surface still holds.
     ///
-    /// Asserted on every kind × posture pair in which nothing has moved,
-    /// because the answers below are what an unpromoted repository — and
-    /// every non-OCI repository under any posture — must keep getting.
+    /// Asserted on every kind for which nothing has moved, because the
+    /// answers below are what every non-constituent row must keep
+    /// getting.
     #[test]
     fn only_not_applicable_does_not_gate_release() {
-        for (kind, mode) in UNMOVED {
-            assert!(!NotAnalysable::NotApplicable.gates_release(kind, mode));
-            assert!(NotAnalysable::UnusableArchive.gates_release(kind, mode));
-            assert!(NotAnalysable::NoAnalyzerMatched.gates_release(kind, mode));
+        for kind in UNMOVED {
+            assert!(!NotAnalysable::NotApplicable.gates_release(kind));
+            assert!(NotAnalysable::UnusableArchive.gates_release(kind));
+            assert!(NotAnalysable::NoAnalyzerMatched.gates_release(kind));
             // An image that was never assembled is an image whose
             // filesystem went unassessed — the one answer that must not
             // be the non-gating one.
-            assert!(NotAnalysable::IncompleteComposition.gates_release(kind, mode));
+            assert!(NotAnalysable::IncompleteComposition.gates_release(kind));
             // Asserted again below as a pair with `UnusableArchive`,
             // which is the form that makes the day one of them stops a
             // deliberate edit rather than a line disappearing unnoticed.
             assert!(
-                NotAnalysable::UnsupportedContainer.gates_release(kind, mode),
-                "{kind} under {mode}: nothing has moved for this row"
+                NotAnalysable::UnsupportedContainer.gates_release(kind),
+                "{kind}: nothing has moved for this row"
             );
         }
     }
 
     /// **The pair ADR 0064 D2 splits, asserted together.** On a
-    /// constituent under a promoted composite verdict, "I have no decoder
-    /// for this container" stops holding the layer — the composition
-    /// decodes it, and the measured case is `tar+zstd` — while "this
-    /// archive tripped an extraction bound" keeps holding it, because
-    /// that is a statement about the bytes.
+    /// constituent, "I have no decoder for this container" does not hold
+    /// the layer — the composition decodes it, and the measured case is
+    /// `tar+zstd` — while "this archive tripped an extraction bound"
+    /// keeps holding it, because that is a statement about the bytes.
     ///
     /// One test over the pair, because either assertion alone is
     /// satisfied by a wrong rule: dropping both would disarm the zip-bomb
@@ -888,15 +1003,15 @@ mod tests {
     /// terminal with ADR 0062 withholding every image that binds it — the
     /// defect this moves.
     #[test]
-    fn a_promoted_constituent_stops_gating_on_a_missing_decoder_but_not_on_a_hostile_archive() {
-        let (kind, mode) = (ArtifactKind::OciBlob, CompositeVerdictMode::Promoted);
+    fn a_constituent_does_not_gate_on_a_missing_decoder_but_does_on_a_hostile_archive() {
+        let kind = ArtifactKind::OciBlob;
         assert!(
-            !NotAnalysable::UnsupportedContainer.gates_release(kind, mode),
+            !NotAnalysable::UnsupportedContainer.gates_release(kind),
             "a missing decoder is a statement about hort, not about the layer; \
              the composition that reads these bytes carries the verdict"
         );
         assert!(
-            NotAnalysable::UnusableArchive.gates_release(kind, mode),
+            NotAnalysable::UnusableArchive.gates_release(kind),
             "an extraction bound tripped, or an entry that tried to escape the \
              workspace, is about these bytes and holds them wherever their \
              filesystem verdict lives"
@@ -918,31 +1033,30 @@ mod tests {
     /// obligation to the very assessment that did not happen, and
     /// `UnusableArchive` is about the bytes.
     #[test]
-    fn a_promoted_constituent_stops_gating_on_an_unmatched_analyzer_but_not_on_the_composition() {
-        let (kind, mode) = (ArtifactKind::OciBlob, CompositeVerdictMode::Promoted);
+    fn a_constituent_does_not_gate_on_an_unmatched_analyzer_but_does_on_the_composition() {
+        let kind = ArtifactKind::OciBlob;
         assert!(
-            !NotAnalysable::NoAnalyzerMatched.gates_release(kind, mode),
+            !NotAnalysable::NoAnalyzerMatched.gates_release(kind),
             "no analyzer claiming this layer is an absence of analysis, not a claim \
              about the bytes; the composition that is assessed carries it"
         );
         assert!(
-            NotAnalysable::IncompleteComposition.gates_release(kind, mode),
+            NotAnalysable::IncompleteComposition.gates_release(kind),
             "an image that was never assembled is the composition's own absent \
              assessment — there is nothing above it for the obligation to move to"
         );
         assert!(
-            NotAnalysable::UnusableArchive.gates_release(kind, mode),
+            NotAnalysable::UnusableArchive.gates_release(kind),
             "an extraction bound tripped is about these bytes and keeps holding them"
         );
     }
 
-    /// And the cells that moved are the only ones: every variant, over
-    /// every kind, under both postures.
+    /// And the cells that moved are the only ones: every variant over
+    /// every kind.
     ///
     /// Two cells, one per abstention that states an absence of analysis
     /// rather than a fact about the bytes — a container with no decoder
-    /// and a tree no analyzer claimed. Both only on an OCI blob, and
-    /// both only under a promoted composite verdict.
+    /// and a tree no analyzer claimed — and both only on an OCI blob.
     ///
     /// The exhaustive form is what scopes the loosening. ADR 0064 decides
     /// the OCI image and says of every other format "not decided here";
@@ -952,7 +1066,7 @@ mod tests {
     /// abstention joining `MOVED_REFUSALS` would release a layer on a
     /// statement that is about its bytes.
     #[test]
-    fn exactly_two_cells_of_the_kind_posture_matrix_moved() {
+    fn exactly_two_cells_of_the_refusal_kind_matrix_moved() {
         const EVERY_KIND: [ArtifactKind; 9] = [
             ArtifactKind::MavenJar,
             ArtifactKind::MavenPom,
@@ -974,26 +1088,20 @@ mod tests {
         let mut moved = 0usize;
         for refusal in EVERY_ABSTENTION {
             for kind in EVERY_KIND {
-                for mode in [
-                    CompositeVerdictMode::Observed,
-                    CompositeVerdictMode::Promoted,
-                ] {
-                    let gates = refusal.gates_release(kind, mode);
-                    let is_moved_cell = MOVED_REFUSALS.contains(&refusal)
-                        && kind == ArtifactKind::OciBlob
-                        && mode == CompositeVerdictMode::Promoted;
-                    if is_moved_cell {
-                        moved += 1;
-                        assert!(!gates, "{refusal}: a moved cell must not gate");
-                    } else if refusal == NotAnalysable::NotApplicable {
-                        assert!(!gates, "{refusal} is the absence of a surface everywhere");
-                    } else {
-                        assert!(
-                            gates,
-                            "{refusal} on {kind} under {mode} must gate exactly as it did \
-                             before ADR 0064 D2's loosening"
-                        );
-                    }
+                let gates = refusal.gates_release(kind);
+                let is_moved_cell =
+                    MOVED_REFUSALS.contains(&refusal) && kind == ArtifactKind::OciBlob;
+                if is_moved_cell {
+                    moved += 1;
+                    assert!(!gates, "{refusal}: a moved cell must not gate");
+                } else if refusal == NotAnalysable::NotApplicable {
+                    assert!(!gates, "{refusal} is the absence of a surface everywhere");
+                } else {
+                    assert!(
+                        gates,
+                        "{refusal} on {kind} must gate exactly as it did before \
+                         ADR 0064 D2's loosening"
+                    );
                 }
             }
         }
@@ -1033,13 +1141,77 @@ mod tests {
             "the log line and the metric label are the same string"
         );
         assert_eq!(
-            NotAnalysable::UnusableArchive
-                .gates_release(ArtifactKind::OciBlob, CompositeVerdictMode::Observed),
-            NotAnalysable::UnsupportedContainer
-                .gates_release(ArtifactKind::OciBlob, CompositeVerdictMode::Observed),
+            NotAnalysable::UnusableArchive.gates_release(ArtifactKind::OciManifest),
+            NotAnalysable::UnsupportedContainer.gates_release(ArtifactKind::OciManifest),
             "splitting the reason changed no outcome on its own; what separates \
-             the two is the promoted constituent asserted above"
+             the two is the constituent asserted above"
         );
+    }
+
+    /// Every [`LayerRole`], for the exhaustive assertions below.
+    const EVERY_LAYER_ROLE: [LayerRole; 3] = [
+        LayerRole::ImageLayer,
+        LayerRole::NotAnImageLayer,
+        LayerRole::Unknown,
+    ];
+
+    /// **Exactly one** role withholds the root-filesystem
+    /// materialisation, and it is the one carrying positive evidence that
+    /// these bytes are not a layer.
+    ///
+    /// Asserted over every value rather than over the interesting one,
+    /// because the asymmetry *is* the decision. A role drifting onto the
+    /// refusing side takes the layer evidence scan ADR 0064 D2 keeps away
+    /// from whatever reaches it — and `LayerRole::Unknown` is the state
+    /// every layer of every hosted push is in at the moment its own scan
+    /// runs, so that drift would silently withdraw the evidence from the
+    /// whole push population.
+    #[test]
+    fn only_a_positively_declared_non_layer_withholds_the_rootfs_materialisation() {
+        let refusing: Vec<LayerRole> = EVERY_LAYER_ROLE
+            .into_iter()
+            .filter(|role| !role.permits_rootfs_materialisation())
+            .collect();
+        assert_eq!(
+            refusing,
+            vec![LayerRole::NotAnImageLayer],
+            "an absent or unreadable declaration is not evidence that these bytes \
+             are not a layer; only a resolved manifest set that says so is"
+        );
+    }
+
+    /// Each role labels itself distinctly — a collision would make two
+    /// different materialisation decisions indistinguishable in the log
+    /// line that explains why a blob got no verdict.
+    #[test]
+    fn every_layer_role_has_a_distinct_label() {
+        let mut labels: Vec<&str> = EVERY_LAYER_ROLE.iter().map(LayerRole::as_str).collect();
+        let total = labels.len();
+        for label in &labels {
+            assert!(
+                label.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{label} must be lowercase snake_case"
+            );
+        }
+        labels.sort_unstable();
+        labels.dedup();
+        assert_eq!(labels.len(), total, "labels must be unique: {labels:?}");
+        assert_eq!(
+            LayerRole::ImageLayer.to_string(),
+            LayerRole::ImageLayer.as_str(),
+            "the log line and the label are the same string"
+        );
+        // `Debug` is what a failing `assert_eq!` over a role prints and
+        // what a `ScanTarget`'s own `Debug` carries into a span, so each
+        // variant has to render as itself. Asserted rather than assumed
+        // because a passing assertion never formats its operands.
+        for (role, rendered) in [
+            (LayerRole::ImageLayer, "ImageLayer"),
+            (LayerRole::NotAnImageLayer, "NotAnImageLayer"),
+            (LayerRole::Unknown, "Unknown"),
+        ] {
+            assert_eq!(format!("{role:?}"), rendered);
+        }
     }
 
     /// Every arm answers `gates_release` and labels itself, with no arm
@@ -1054,14 +1226,12 @@ mod tests {
             // `gates_release` is an exhaustive match, so this call is
             // what proves the arm was given an answer rather than
             // falling through a wildcard.
-            let _ = refusal.gates_release(ArtifactKind::NpmTarball, CompositeVerdictMode::Observed);
+            let _ = refusal.gates_release(ArtifactKind::NpmTarball);
         }
         assert_eq!(
             EVERY_ABSTENTION
                 .iter()
-                .filter(
-                    |r| !r.gates_release(ArtifactKind::NpmTarball, CompositeVerdictMode::Observed)
-                )
+                .filter(|r| !r.gates_release(ArtifactKind::NpmTarball))
                 .count(),
             1,
             "exactly one arm is the absence of a surface rather than an unassessed one"

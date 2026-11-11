@@ -18,9 +18,16 @@ spec:
   # `provenanceIdentities` MUST be empty for a cosign-key-only scope (ADR 0039
   # §4, the inert-field guard — a non-empty list is apply-rejected).
   #
-  # `scanBackends: []` keeps the release gate purely provenance + time, same
-  # rationale as oci-provenance-e2e-required.yaml. The window doubles as the
-  # signing deadline AND must cover the client's constituent pulls, which
+  # `scanBackends` is omitted, which inherits the built-in default `[trivy]`;
+  # an empty list is apply-refused for an OCI repository, same as on
+  # oci-provenance-e2e-required.yaml, and the same not-applicable assessment
+  # supplies the signed index's scan authority there. The difference here is the
+  # subject: this repository proxies a real multi-layer image, so the index's
+  # arch-specific children are composed images that trivy actually assesses, and
+  # a finding at or above `severityThreshold` on one of them rejects that child.
+  #
+  # The window doubles as the signing deadline AND must cover the client's
+  # constituent pulls and now their scans, which
   # must complete before the sign so the one-shot verify cascade (it walks
   # the signed subject's constituents once, at verify time, and clears only
   # rows that exist at that moment) finds every row — a constituent ingested
@@ -36,5 +43,17 @@ spec:
   provenanceMode: required
   provenanceBackends: [cosign-key]
   provenanceIdentities: []
-  scanBackends: []
+  # `enforcement: record` — a Trivy verdict is recorded, never gating. What
+  # this fixture asserts must not depend on which CVEs an upstream tag
+  # happens to carry on the day the suite runs, only on whether each row got
+  # a completed assessment at all. Omitting the field is the opposite
+  # posture, not a quieter one: it inherits the enforcing default, and this
+  # policy scans, so a `critical` finding would reject an arch-specific child
+  # and so refuse the signed index's closure, which both the authenticated
+  # warm pass and the anonymous `--all` pull walk.
+  #
+  # `record` un-gates the scan axis only: `ScanRecorded` carries the same
+  # provenance AND-precondition as every other timer authority, so the hold-
+  # until-signed gate is unchanged.
+  enforcement: record
   licensePolicy: {}

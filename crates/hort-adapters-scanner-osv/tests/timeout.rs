@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use hort_adapters_scanner_osv::{OsvScannerAdapter, OsvScannerConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::DomainError;
-use hort_domain::ports::scanner::{ScanTarget, ScanUnit, ScannerPort};
+use hort_domain::ports::scanner::{LayerRole, ScanTarget, ScanUnit, ScannerPort};
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ContentHash, Sbom};
 
 /// Serializes every write-then-exec fixture in this test binary. An
@@ -117,6 +117,8 @@ async fn osv_scan_timeout_kills_hung_child_within_configured_window() {
         format: "npm",
         coords: &coords,
         kind: ArtifactKind::NpmTarball,
+        // An npm tarball is nobody's image layer; the role asks nothing.
+        layer_role: LayerRole::Unknown,
     };
     let result = adapter.scan(&target, Some(&sbom)).await;
     let elapsed = started.elapsed();

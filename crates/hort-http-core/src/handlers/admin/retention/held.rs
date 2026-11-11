@@ -352,8 +352,8 @@ mod tests {
 
     fn required_policy(repo_id: Uuid) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-            ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
         };
         ScanPolicyProjection {
             policy_id: Uuid::new_v4(),
@@ -372,7 +372,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

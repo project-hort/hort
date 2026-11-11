@@ -328,12 +328,13 @@ const CENSUS: [(&str, usize, usize, usize, usize); 18] = [
         1,
         0,
     ),
-    // `select_eligible` and `select_stranded`, one literal each.
+    // `select_eligible`, `select_stranded` and
+    // `select_composite_unassessed`, one literal each.
     (
         "crates/hort-adapters-postgres/src/rescan_candidates.rs",
-        2,
-        2,
-        2,
+        3,
+        3,
+        3,
         0,
     ),
     // -- the five readers assessed one at a time alongside them -----------
@@ -634,10 +635,10 @@ fn the_corrected_defects_carry_the_predicate_in_their_sql() {
         checked += 1;
     }
     assert_eq!(
-        checked, 4,
-        "expected to check the 4 corrected statements (the curation queue's \
-         listing with its CTE, both rescan sweeps, the patch-candidate \
-         listing); checked {checked}"
+        checked, 5,
+        "expected to check the 5 statements in the corrected files (the curation \
+         queue's listing with its CTE, all three rescan-candidate sweeps, the \
+         patch-candidate listing); checked {checked}"
     );
 }
 
@@ -676,7 +677,7 @@ fn stripping_the_predicate_from_a_corrected_statement_trips_the_guard() {
         );
         flipped += 1;
     }
-    assert_eq!(flipped, 4, "expected 4 corrected statements, saw {flipped}");
+    assert_eq!(flipped, 5, "expected 5 corrected statements, saw {flipped}");
 }
 
 /// At least one statement passes through the marker, not the predicate.

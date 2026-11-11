@@ -11,19 +11,26 @@
 //!    has elapsed, that are `quarantine_status='released'`, and that
 //!    have no in-flight `kind='scan'` job.
 //! 3. Call [`RescanCandidatesRepository::select_stranded`] (issue #6) to
-//!    fetch up to [`BATCH_SIZE`] **stranded** artifacts:
-//!    `quarantine_status='quarantined'` with a last scan attempt that
-//!    errored (every backend failed to run — see
-//!    `ScanOrchestrationUseCase::record_outcome`) and no in-flight
-//!    `kind='scan'` job. A scanner outage strands every artifact pulled
-//!    during it; this half of the sweep re-enqueues them once the
-//!    scanner recovers, self-healing without operator intervention.
-//! 4. For each candidate from either source, call
+//!    fetch up to [`BATCH_SIZE`] **stranded** artifacts: one of the two
+//!    holds with a last scan attempt that errored or was never made (see
+//!    `ScanOrchestrationUseCase::record_outcome`), or an absent-verdict
+//!    hold whose last scan request is older than its resolved rescan
+//!    interval, and no in-flight `kind='scan'` job. A scanner outage
+//!    strands every artifact pulled during it; this part of the sweep
+//!    re-enqueues them once the scanner recovers, self-healing without
+//!    operator intervention.
+//! 4. Call [`RescanCandidatesRepository::select_composite_unassessed`] to
+//!    fetch up to [`BATCH_SIZE`] live OCI image manifests with no
+//!    recorded composite assessment — released on evidence that predates
+//!    the composed verdict carrying release authority (ADR 0064 D2), and
+//!    reached by neither query above.
+//! 5. For each candidate from any source, call
 //!    [`JobsRepository::enqueue_scan`] with `priority=10` and
 //!    `trigger_source="cron"`.
-//! 5. Return [`TaskOutcome::Completed`] with a result summary
-//!    `{ eligible, stranded_eligible, enqueued }` so the framework's
-//!    `result_summary` column captures per-tick load from both sources.
+//! 6. Return [`TaskOutcome::Completed`] with a result summary
+//!    `{ eligible, stranded_eligible, composite_unassessed, enqueued }`
+//!    so the framework's `result_summary` column captures per-tick load
+//!    from every source.
 //!
 //! Conflict detection is layered: the candidate SQL already filters
 //! `NOT EXISTS (in-flight scan job)`, but a race against another
@@ -31,7 +38,29 @@
 //! `DomainError::Conflict` from the partial unique index
 //! `(artifact_id) WHERE kind='scan'`. The handler swallows that
 //! variant per row and continues — ON-CONFLICT-DO-NOTHING
-//! semantics. Applies identically to both candidate sources.
+//! semantics. Applies identically to every candidate source, including
+//! to the same artifact arriving from two of them in one tick: the
+//! second enqueue conflicts and is swallowed, so a row the stranded and
+//! the composite-unassessed predicates both match costs one job, not
+//! two.
+//!
+//! # This tick is the existing-estate cutover
+//!
+//! Retiring the composite-verdict posture changes what a *new* scan
+//! concludes. It does not revisit a row already stored, and two of the
+//! three populations that need revisiting have no other selection signal
+//! at all: an artifact held `scan_indeterminate` is outside
+//! `select_eligible`'s statuses, and a live manifest never
+//! composite-assessed is inside them but not interval-stale. This
+//! handler's three sources are what reach them, which makes the sweep
+//! the cutover rather than a cadence — the chart ships it disabled
+//! (`scheduledTasks.cronRescanTick.enabled: false`), so on an upgrade an
+//! operator drives it through the existing admin-task route
+//! (`hort-cli admin task invoke cron-rescan-tick`) and repeats while the
+//! summary reports a non-zero count. No new instrument: the bound is
+//! [`BATCH_SIZE`] per invocation and the resumption is the next
+//! invocation's re-select, each population leaving its predicate as it
+//! is reassessed.
 //!
 //! Worker registration in the dispatch table lives in the
 //! `hort-worker` composition root, not here.
@@ -49,8 +78,9 @@ use hort_domain::ports::BoxFuture;
 use hort_domain::types::task_tier::scan_queue_priority;
 
 use crate::metrics::{
-    emit_scan_jobs_enqueued, set_cron_rescan_eligible_artifacts,
-    set_cron_rescan_stranded_eligible_artifacts, TriggerSourceLabel,
+    emit_scan_jobs_enqueued, set_cron_rescan_composite_unassessed_artifacts,
+    set_cron_rescan_eligible_artifacts, set_cron_rescan_stranded_eligible_artifacts,
+    TriggerSourceLabel,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,24 +124,25 @@ impl CronRescanTickHandler {
     }
 
     /// Enqueue a `kind='scan'` job for every candidate in `batch`.
-    /// Shared by both candidate sources (interval-eligible and
-    /// stranded) — enqueue mechanics are identical; `stranded` only
-    /// selects the audit-log framing so a re-enqueued stranded artifact
-    /// gets its own distinguishable `info!` line (security-relevant
-    /// state-adjacent: an artifact that was stuck because the scanner
-    /// couldn't run is getting a fresh chance).
+    /// Shared by every candidate source — enqueue mechanics are
+    /// identical; `source` only selects the audit-log framing so a
+    /// re-enqueued artifact that was *stuck* gets its own
+    /// distinguishable `info!` line (security-relevant state-adjacent:
+    /// an artifact nothing could assess, or one serving on evidence the
+    /// current rule did not produce, is getting a fresh chance).
     ///
     /// Returns the count of rows that actually landed (Conflict-swallowed
     /// rows do NOT count — ON-CONFLICT-DO-NOTHING semantics, a race
-    /// against another trigger source between SELECT and INSERT), or
+    /// against another trigger source between SELECT and INSERT, or the
+    /// same artifact arriving from two sources in one tick), or
     /// `Err(reason)` on the first non-Conflict enqueue failure. The
     /// caller maps that to a retryable `TaskOutcome::Failed` and aborts
-    /// the tick — the un-enqueued candidates (from either source) are
+    /// the tick — the un-enqueued candidates (from any source) are
     /// simply re-selected on the next tick, 5 minutes later.
     async fn enqueue_batch(
         &self,
         batch: &[RescanCandidate],
-        stranded: bool,
+        source: CandidateSource,
     ) -> Result<u32, String> {
         let mut enqueued: u32 = 0;
         for c in batch {
@@ -129,11 +160,12 @@ impl CronRescanTickHandler {
             {
                 Ok(_) => {
                     enqueued += 1;
-                    if stranded {
+                    if let Some(why) = source.recovery_note() {
                         tracing::info!(
                             artifact_id = %c.artifact_id,
-                            "cron rescan tick: re-enqueued a stranded artifact \
-                             (last scan errored — scanner appears to have recovered)",
+                            source = source.as_str(),
+                            "cron rescan tick: re-enqueued an artifact no sweep would \
+                             otherwise reach ({why})",
                         );
                     }
                 }
@@ -141,17 +173,19 @@ impl CronRescanTickHandler {
                     // ON CONFLICT (against the partial unique index
                     // `(artifact_id) WHERE kind='scan'`) DO NOTHING
                     // — a race against ingest, manual rescan, or
-                    // advisory-watch resolves harmlessly.
+                    // advisory-watch resolves harmlessly, and so does
+                    // one artifact matching two of this tick's own
+                    // predicates.
                     tracing::debug!(
                         artifact_id = %c.artifact_id,
-                        stranded,
+                        source = source.as_str(),
                         "cron rescan tick: enqueue conflict swallowed (race against another trigger source)",
                     );
                 }
                 Err(err) => {
                     tracing::warn!(
                         artifact_id = %c.artifact_id,
-                        stranded,
+                        source = source.as_str(),
                         error = %err,
                         "cron rescan tick: enqueue_scan failed; will retry on next tick",
                     );
@@ -160,6 +194,51 @@ impl CronRescanTickHandler {
             }
         }
         Ok(enqueued)
+    }
+}
+
+/// Which predicate produced a candidate — the enqueue log's framing, and
+/// nothing else. The enqueue itself is identical across all three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateSource {
+    /// `select_eligible`: a live artifact whose policy interval elapsed.
+    /// The routine case, logged per tick in aggregate rather than per
+    /// artifact.
+    Interval,
+    /// `select_stranded`: a held artifact whose scan errored, was never
+    /// requested, or reached no verdict at all.
+    Stranded,
+    /// `select_composite_unassessed`: a live OCI image manifest with no
+    /// recorded composite assessment.
+    CompositeUnassessed,
+}
+
+impl CandidateSource {
+    /// Stable label for the tracing field.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Interval => "interval",
+            Self::Stranded => "stranded",
+            Self::CompositeUnassessed => "composite_unassessed",
+        }
+    }
+
+    /// Why this artifact needed a sweep to find it, for the per-artifact
+    /// `info!` line — `None` for the routine interval source, which
+    /// would otherwise log a line per artifact per tick for the whole
+    /// estate.
+    fn recovery_note(self) -> Option<&'static str> {
+        match self {
+            Self::Interval => None,
+            Self::Stranded => Some(
+                "held with no usable scan verdict — the scanner appears to have \
+                 recovered, or the question is being re-asked",
+            ),
+            Self::CompositeUnassessed => Some(
+                "live with no composite assessment ever recorded, so it is serving on \
+                 evidence the composed-verdict rule did not produce",
+            ),
+        }
     }
 }
 
@@ -189,7 +268,7 @@ impl TaskHandler for CronRescanTickHandler {
                     ));
                 }
             };
-            let stranded_candidates = match self.candidates.select_stranded(BATCH_SIZE).await {
+            let stranded_candidates = match self.candidates.select_stranded(BATCH_SIZE, now).await {
                 Ok(rows) => rows,
                 Err(err) => {
                     tracing::warn!(
@@ -203,8 +282,28 @@ impl TaskHandler for CronRescanTickHandler {
                 }
             };
 
+            let composite_unassessed_candidates = match self
+                .candidates
+                .select_composite_unassessed(BATCH_SIZE)
+                .await
+            {
+                Ok(rows) => rows,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "cron rescan tick: select_composite_unassessed failed; will retry \
+                         on next tick",
+                    );
+                    return Ok(TaskOutcome::fail(
+                        format!("select_composite_unassessed failed: {err}"),
+                        true,
+                    ));
+                }
+            };
+
             let eligible = candidates.len();
             let stranded_eligible = stranded_candidates.len();
+            let composite_unassessed = composite_unassessed_candidates.len();
             // `hort_cron_rescan_eligible_artifacts` gauge.
             // Set once per tick; operator alarms on sustained > batch_size.
             set_cron_rescan_eligible_artifacts(eligible as u64);
@@ -212,23 +311,44 @@ impl TaskHandler for CronRescanTickHandler {
             // Set once per tick; operator alarms on sustained > 0 (a
             // healthy scanner drains this to zero every tick).
             set_cron_rescan_stranded_eligible_artifacts(stranded_eligible as u64);
+            // `hort_cron_rescan_composite_unassessed_artifacts` gauge.
+            // Set once per tick; non-zero means live OCI image manifests
+            // are still serving with no composite assessment on record,
+            // and is how an operator driving the cutover sees it drain.
+            set_cron_rescan_composite_unassessed_artifacts(composite_unassessed as u64);
 
-            let enqueued_eligible = match self.enqueue_batch(&candidates, false).await {
+            let enqueued_eligible = match self
+                .enqueue_batch(&candidates, CandidateSource::Interval)
+                .await
+            {
                 Ok(n) => n,
                 Err(reason) => return Ok(TaskOutcome::fail(reason, true)),
             };
-            let enqueued_stranded = match self.enqueue_batch(&stranded_candidates, true).await {
+            let enqueued_stranded = match self
+                .enqueue_batch(&stranded_candidates, CandidateSource::Stranded)
+                .await
+            {
                 Ok(n) => n,
                 Err(reason) => return Ok(TaskOutcome::fail(reason, true)),
             };
-            let enqueued = enqueued_eligible + enqueued_stranded;
+            let enqueued_composite_unassessed = match self
+                .enqueue_batch(
+                    &composite_unassessed_candidates,
+                    CandidateSource::CompositeUnassessed,
+                )
+                .await
+            {
+                Ok(n) => n,
+                Err(reason) => return Ok(TaskOutcome::fail(reason, true)),
+            };
+            let enqueued = enqueued_eligible + enqueued_stranded + enqueued_composite_unassessed;
 
             // `hort_scan_jobs_enqueued_total{trigger_source="cron"}`.
             // Conflict-on-enqueue rows do NOT count (the helper takes the
             // landed-rows count, not the attempted-rows count). Both
             // candidate sources share this counter — trigger_source is
-            // "cron" either way; the stranded/interval split is
-            // observable via the two eligible-artifacts gauges and the
+            // "cron" either way; the split between them is observable
+            // via the three eligible-artifacts gauges and the
             // per-artifact `info!` line above.
             if enqueued > 0 {
                 emit_scan_jobs_enqueued(TriggerSourceLabel::Cron, u64::from(enqueued));
@@ -237,6 +357,7 @@ impl TaskHandler for CronRescanTickHandler {
             tracing::info!(
                 eligible,
                 stranded_eligible,
+                composite_unassessed,
                 enqueued,
                 "cron rescan tick complete",
             );
@@ -245,6 +366,7 @@ impl TaskHandler for CronRescanTickHandler {
                 result_summary: json!({
                     "eligible": eligible,
                     "stranded_eligible": stranded_eligible,
+                    "composite_unassessed": composite_unassessed,
                     "enqueued": enqueued,
                 }),
             })
@@ -337,6 +459,13 @@ mod tests {
         // before this type gained the method.
         stranded_rows: Mutex<Vec<RescanCandidate>>,
         stranded_err: Mutex<Option<DomainError>>,
+        // `select_composite_unassessed`'s independent controls, same
+        // default-empty posture as the stranded pair above so every
+        // test predating the third source keeps its behaviour.
+        composite_unassessed_rows: Mutex<Vec<RescanCandidate>>,
+        composite_unassessed_err: Mutex<Option<DomainError>>,
+        last_stranded_now: Mutex<Option<DateTime<Utc>>>,
+        last_eligible_now: Mutex<Option<DateTime<Utc>>>,
     }
 
     impl MockCandidates {
@@ -347,6 +476,10 @@ mod tests {
                 last_batch_size: Mutex::new(None),
                 stranded_rows: Mutex::new(Vec::new()),
                 stranded_err: Mutex::new(None),
+                composite_unassessed_rows: Mutex::new(Vec::new()),
+                composite_unassessed_err: Mutex::new(None),
+                last_stranded_now: Mutex::new(None),
+                last_eligible_now: Mutex::new(None),
             }
         }
 
@@ -357,6 +490,10 @@ mod tests {
                 last_batch_size: Mutex::new(None),
                 stranded_rows: Mutex::new(Vec::new()),
                 stranded_err: Mutex::new(None),
+                composite_unassessed_rows: Mutex::new(Vec::new()),
+                composite_unassessed_err: Mutex::new(None),
+                last_stranded_now: Mutex::new(None),
+                last_eligible_now: Mutex::new(None),
             }
         }
 
@@ -370,6 +507,10 @@ mod tests {
                 last_batch_size: Mutex::new(None),
                 stranded_rows: Mutex::new(Vec::new()),
                 stranded_err: Mutex::new(Some(err)),
+                composite_unassessed_rows: Mutex::new(Vec::new()),
+                composite_unassessed_err: Mutex::new(None),
+                last_stranded_now: Mutex::new(None),
+                last_eligible_now: Mutex::new(None),
             }
         }
 
@@ -381,8 +522,36 @@ mod tests {
             self
         }
 
+        /// Builder: seed the rows `select_composite_unassessed` returns.
+        /// Same consuming shape as [`Self::with_stranded`].
+        fn with_composite_unassessed(self, rows: Vec<RescanCandidate>) -> Self {
+            *self.composite_unassessed_rows.lock().unwrap() = rows;
+            self
+        }
+
+        /// Construct a mock whose `select_composite_unassessed` call
+        /// fails — the other two succeed with an empty set.
+        fn new_failing_composite_unassessed(err: DomainError) -> Self {
+            let mock = Self::new(Vec::new());
+            *mock.composite_unassessed_err.lock().unwrap() = Some(err);
+            mock
+        }
+
         fn last_batch_size(&self) -> Option<u32> {
             *self.last_batch_size.lock().unwrap()
+        }
+
+        /// The `now` the handler passed to `select_stranded` — the handle
+        /// for asserting both queries are driven off one captured
+        /// timestamp rather than two reads of the clock.
+        fn last_stranded_now(&self) -> Option<DateTime<Utc>> {
+            *self.last_stranded_now.lock().unwrap()
+        }
+
+        /// The `now` the handler passed to `select_eligible`, so a test
+        /// can compare the two rather than only bounding each.
+        fn last_eligible_now(&self) -> Option<DateTime<Utc>> {
+            *self.last_eligible_now.lock().unwrap()
         }
     }
 
@@ -390,9 +559,10 @@ mod tests {
         fn select_eligible<'a>(
             &'a self,
             batch_size: u32,
-            _now: DateTime<Utc>,
+            now: DateTime<Utc>,
         ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
             *self.last_batch_size.lock().unwrap() = Some(batch_size);
+            *self.last_eligible_now.lock().unwrap() = Some(now);
             let maybe_err = self.err.lock().unwrap().take();
             if let Some(err) = maybe_err {
                 return Box::pin(async move { Err(err) });
@@ -404,12 +574,26 @@ mod tests {
         fn select_stranded<'a>(
             &'a self,
             _batch_size: u32,
+            now: DateTime<Utc>,
         ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
+            *self.last_stranded_now.lock().unwrap() = Some(now);
             let maybe_err = self.stranded_err.lock().unwrap().take();
             if let Some(err) = maybe_err {
                 return Box::pin(async move { Err(err) });
             }
             let rows = self.stranded_rows.lock().unwrap().clone();
+            Box::pin(async move { Ok(rows) })
+        }
+
+        fn select_composite_unassessed<'a>(
+            &'a self,
+            _batch_size: u32,
+        ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
+            let maybe_err = self.composite_unassessed_err.lock().unwrap().take();
+            if let Some(err) = maybe_err {
+                return Box::pin(async move { Err(err) });
+            }
+            let rows = self.composite_unassessed_rows.lock().unwrap().clone();
             Box::pin(async move { Ok(rows) })
         }
     }
@@ -1066,5 +1250,304 @@ mod tests {
             DebugValue::Gauge(v) => assert_eq!(*v, 3.0, "gauge must reflect stranded count"),
             other => panic!("expected Gauge, got {other:?}"),
         }
+    }
+
+    // =====================================================================
+    // The third source: live manifests with no composite assessment
+    // =====================================================================
+
+    /// The composite-unassessed source is selected, enqueued and counted
+    /// beside the other two — three sources, three counts, one
+    /// `enqueued` total.
+    #[tokio::test]
+    async fn run_enqueues_composite_unassessed_candidates_beside_the_other_two() {
+        let interval = make_candidate();
+        let stranded = make_candidate();
+        let unassessed_a = make_candidate();
+        let unassessed_b = make_candidate();
+        let candidates = Arc::new(
+            MockCandidates::new(vec![interval.clone()])
+                .with_stranded(vec![stranded.clone()])
+                .with_composite_unassessed(vec![unassessed_a.clone(), unassessed_b.clone()]),
+        );
+        let jobs = Arc::new(MockJobs::new(FailureMode::None));
+
+        let jobs_for_assert = jobs.clone();
+        let handler = make_handler(candidates, jobs);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["eligible"], 1);
+                assert_eq!(result_summary["stranded_eligible"], 1);
+                assert_eq!(
+                    result_summary["composite_unassessed"], 2,
+                    "the third source needs its own key, or an operator driving the \
+                     cutover cannot tell it apart from the interval backlog",
+                );
+                assert_eq!(result_summary["enqueued"], 4);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+
+        let enqueued: Vec<Uuid> = jobs_for_assert
+            .calls()
+            .iter()
+            .map(|c| c.artifact_id)
+            .collect();
+        assert_eq!(enqueued.len(), 4);
+        for expected in [
+            interval.artifact_id,
+            stranded.artifact_id,
+            unassessed_a.artifact_id,
+            unassessed_b.artifact_id,
+        ] {
+            assert!(
+                enqueued.contains(&expected),
+                "every source's candidates must be enqueued; {expected} missing from \
+                 {enqueued:?}",
+            );
+        }
+    }
+
+    /// A `select_composite_unassessed` error is a retryable failure that
+    /// short-circuits before any enqueue, exactly as its two siblings
+    /// are — so the cutover's own source cannot half-run a tick.
+    #[tokio::test]
+    async fn run_returns_failed_retry_when_select_composite_unassessed_errors() {
+        let candidates = Arc::new(MockCandidates::new_failing_composite_unassessed(
+            DomainError::Invariant("simulated composite-unassessed select failure".into()),
+        ));
+        let jobs = Arc::new(MockJobs::new(FailureMode::None));
+
+        let jobs_for_assert = jobs.clone();
+        let handler = make_handler(candidates, jobs);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok — select errors are surfaced via TaskOutcome::Failed");
+
+        match outcome {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(retry, "select_composite_unassessed failure must retry");
+                assert!(
+                    reason.contains("select_composite_unassessed"),
+                    "reason should name the failing query: {reason}",
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        assert_eq!(
+            jobs_for_assert.calls().len(),
+            0,
+            "a select failure must short-circuit before any enqueue"
+        );
+    }
+
+    /// One artifact matching two of this tick's predicates costs one
+    /// job, not two: the second `enqueue_scan` hits the partial unique
+    /// index and is swallowed. The populations deliberately overlap — a
+    /// held manifest can be both stranded and never composite-assessed —
+    /// so this is the normal case rather than a race.
+    #[tokio::test]
+    async fn run_costs_one_job_for_an_artifact_two_sources_both_return() {
+        let shared = make_candidate();
+        let candidates = Arc::new(
+            MockCandidates::new(Vec::new())
+                .with_stranded(vec![shared.clone()])
+                .with_composite_unassessed(vec![shared.clone()]),
+        );
+        // The second enqueue of the same artifact is what production's
+        // `jobs_scan_unique` partial unique index answers with Conflict.
+        let jobs = Arc::new(MockJobs::new(FailureMode::ConflictAt(1)));
+
+        let jobs_for_assert = jobs.clone();
+        let handler = make_handler(candidates, jobs);
+
+        let outcome = handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok — a Conflict between two sources is swallowed");
+
+        match outcome {
+            TaskOutcome::Completed { result_summary } => {
+                // Both sources counted the row — the counts are what each
+                // predicate found, not a deduplicated total.
+                assert_eq!(result_summary["stranded_eligible"], 1);
+                assert_eq!(result_summary["composite_unassessed"], 1);
+                assert_eq!(
+                    result_summary["enqueued"], 1,
+                    "the duplicate enqueue must not count",
+                );
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(
+            jobs_for_assert.calls().len(),
+            2,
+            "both attempts are made; the index resolves the duplicate"
+        );
+    }
+
+    /// Every source's enqueue-failure arm aborts the tick the same way.
+    ///
+    /// Three sources, three identical `Err(reason) => TaskOutcome::fail`
+    /// arms, and only the first one had a test — so "a fatal enqueue
+    /// error aborts the tick" was proven for the interval source and
+    /// assumed for the two that recover populations nothing else
+    /// reaches. The un-enqueued candidates are re-selected on the next
+    /// tick, which is only true if the tick actually reports a retryable
+    /// failure rather than a partial success.
+    #[tokio::test]
+    async fn a_fatal_enqueue_error_aborts_the_tick_from_whichever_source_it_came() {
+        for (position, source) in [
+            (0usize, "interval"),
+            (1usize, "stranded"),
+            (2usize, "composite_unassessed"),
+        ] {
+            let candidates = Arc::new(
+                MockCandidates::new(vec![make_candidate()])
+                    .with_stranded(vec![make_candidate()])
+                    .with_composite_unassessed(vec![make_candidate()]),
+            );
+            let jobs = Arc::new(MockJobs::new(FailureMode::InternalAt(position)));
+
+            let jobs_for_assert = jobs.clone();
+            let handler = make_handler(candidates, jobs);
+
+            let outcome = handler
+                .run(&serde_json::Value::Null, make_context())
+                .await
+                .expect("Ok — a non-Conflict enqueue error is surfaced via TaskOutcome::Failed");
+
+            match outcome {
+                TaskOutcome::Failed { retry, reason } => {
+                    assert!(retry, "{source}: a fatal enqueue error must retry");
+                    assert!(
+                        reason.contains("enqueue_scan"),
+                        "{source}: reason should mention enqueue_scan: {reason}",
+                    );
+                }
+                other => panic!("{source}: expected Failed, got {other:?}"),
+            }
+            assert_eq!(
+                jobs_for_assert.calls().len(),
+                position + 1,
+                "{source}: the tick must abort at the failing row, leaving the rest for \
+                 the next tick to re-select"
+            );
+        }
+    }
+
+    /// Both time-reading queries are driven off the **one** timestamp the
+    /// tick captured. `select_stranded`'s absent-verdict arm compares a
+    /// job's `created_at` against it, so a second clock read here would
+    /// let the two halves of one tick disagree about when the tick was.
+    #[tokio::test]
+    async fn run_passes_one_captured_now_to_both_time_reading_queries() {
+        let candidates = Arc::new(MockCandidates::new(Vec::new()));
+        let jobs = Arc::new(MockJobs::new(FailureMode::None));
+
+        let candidates_for_assert = candidates.clone();
+        let before = Utc::now();
+        let handler = make_handler(candidates, jobs);
+        handler
+            .run(&serde_json::Value::Null, make_context())
+            .await
+            .expect("Ok");
+        let after = Utc::now();
+
+        let stranded_now = candidates_for_assert
+            .last_stranded_now()
+            .expect("select_stranded must receive the tick's timestamp");
+        assert!(
+            stranded_now >= before && stranded_now <= after,
+            "select_stranded's `now` must be the tick's own capture, got {stranded_now}",
+        );
+        assert_eq!(
+            candidates_for_assert.last_eligible_now(),
+            Some(stranded_now),
+            "both queries must read the same captured instant",
+        );
+    }
+
+    /// `hort_cron_rescan_composite_unassessed_artifacts` is set once per
+    /// tick to the third source's count, independent of its two
+    /// siblings — the number an operator watches drain while driving the
+    /// cutover.
+    #[test]
+    fn run_emits_composite_unassessed_gauge_metric() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use metrics_util::MetricKind;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let candidates = Arc::new(
+            MockCandidates::new(Vec::new())
+                .with_composite_unassessed(vec![make_candidate(), make_candidate()]),
+        );
+        let jobs = Arc::new(MockJobs::new(FailureMode::None));
+        let handler = make_handler(candidates, jobs);
+
+        metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(handler.run(&serde_json::Value::Null, make_context()))
+                .expect("Ok");
+        });
+
+        let snap = snapshotter.snapshot().into_vec();
+        let gauge = snap.iter().find(|(ck, _, _, _)| {
+            ck.kind() == MetricKind::Gauge
+                && ck.key().name() == "hort_cron_rescan_composite_unassessed_artifacts"
+        });
+        let (gkey, _, _, gvalue) =
+            gauge.expect("hort_cron_rescan_composite_unassessed_artifacts gauge");
+        assert_eq!(
+            gkey.key().labels().count(),
+            0,
+            "hort_cron_rescan_composite_unassessed_artifacts must have no labels",
+        );
+        match gvalue {
+            DebugValue::Gauge(v) => {
+                assert_eq!(*v, 2.0, "gauge must reflect the composite-unassessed count")
+            }
+            other => panic!("expected Gauge, got {other:?}"),
+        }
+    }
+
+    /// The source enum's two halves agree: exactly the sources whose
+    /// candidates no other sweep reaches carry a per-artifact recovery
+    /// note, and the routine interval source does not (it would log a
+    /// line per artifact per tick for the whole estate).
+    #[test]
+    fn only_the_recovery_sources_carry_a_per_artifact_note() {
+        assert_eq!(CandidateSource::Interval.as_str(), "interval");
+        assert!(CandidateSource::Interval.recovery_note().is_none());
+
+        for source in [
+            CandidateSource::Stranded,
+            CandidateSource::CompositeUnassessed,
+        ] {
+            assert!(
+                source.recovery_note().is_some(),
+                "{} is a population no other sweep reaches, so its re-enqueue is an \
+                 audit fact",
+                source.as_str(),
+            );
+        }
+        assert_eq!(CandidateSource::Stranded.as_str(), "stranded");
+        assert_eq!(
+            CandidateSource::CompositeUnassessed.as_str(),
+            "composite_unassessed"
+        );
     }
 }

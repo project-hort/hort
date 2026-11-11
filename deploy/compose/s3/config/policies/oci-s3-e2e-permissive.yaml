@@ -14,5 +14,17 @@ spec:
   quarantineDuration: 0s
   requireApproval: false
   provenanceMode: off
-  scanBackends: []
+  # `enforcement: record` — a Trivy verdict is recorded, never gating, the
+  # posture every other OCI e2e fixture carries. What a fixture asserts must
+  # not depend on a scanner verdict over its content, only on whether each
+  # row got a completed assessment at all. Omitting the field is the opposite
+  # posture, not a quieter one: it inherits the enforcing default, and this
+  # policy scans.
+  #
+  # The exposure here is the smallest of the family — the blob is generated
+  # random bytes rather than an upstream tag, and a layer blob is a
+  # composition constituent, so a filesystem claim cannot condemn it either
+  # way. The posture is still the right one: a fixture should not carry a
+  # verdict dependency it has no use for.
+  enforcement: record
   licensePolicy: {}

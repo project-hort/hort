@@ -619,6 +619,11 @@ pub async fn build_app_context(
         // The composite path's constituent acquisition (ADR 0064 D1).
         upstream_proxy_for_composite_scan,
         caching_resolver.clone(),
+        // The membership projection the layer-role resolver reads a
+        // blob's nominating manifests out of (ADR 0064 D6), so a blob no
+        // manifest composes an image from is not presented to a scanner
+        // as a root filesystem. Read-only on this path.
+        content_references.clone(),
         scanners_map,
         // Clone so the SeedImportUseCase below can consume the same
         // handler set. The `Arc<dyn FormatHandler>` values are cheap

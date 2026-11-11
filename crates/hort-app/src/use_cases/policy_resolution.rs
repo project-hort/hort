@@ -64,8 +64,7 @@ mod tests {
     use uuid::Uuid;
 
     use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-        ScanPolicyProjection, SeverityThreshold,
+        NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::PolicyScope;
 
@@ -89,7 +88,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

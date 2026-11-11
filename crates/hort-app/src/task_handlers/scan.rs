@@ -40,6 +40,7 @@
 //! | `Completed` | `Completed` | `Completed { result_summary }` |
 //! | `SkippedNoBackends` | `Completed` | `Completed { result_summary }` |
 //! | `NothingAnalysable` | `Completed` | `Completed { result_summary }` |
+//! | `CompositionNotProduced` | `Failed(reason)` | `Failed { retry: false }` |
 //! | `Failed`, budget spent | `Failed(err)` | `Failed { retry: false }` |
 //! | `Failed`, budget left | `Retry(err)` | `Failed { retry: true }` |
 //!
@@ -56,6 +57,14 @@
 //! `hort_scan_jobs_total{result}`, where this arm has its own
 //! `nothing_analysable` value — the row's `status` alone cannot, having
 //! only three words for four answers.
+//!
+//! `CompositionNotProduced` shares `Failed`'s row and not its artifact
+//! handling: the row is `failed` because the run answered nothing and
+//! because that word is what the stranded sweep's "quarantined, last
+//! scan job failed or absent" predicate needs in order to re-ask, while
+//! the artifact is left in the recoverable hold rather than escalated to
+//! `scan_indeterminate`. Which hold an outcome leaves behind is
+//! `record_outcome`'s question and not this table's.
 //!
 //! A `record_outcome` error is the one case with no disposition: no
 //! verdict was recorded, so the obligation is undischarged and the
@@ -254,6 +263,18 @@ impl TaskHandler for ScanTaskHandler {
                 // for the reason above: an arm that starts completing
                 // must not inherit a `Null` summary by omission.
                 ScanRunOutcome::Failed(reason) => {
+                    serde_json::json!({ "error": reason })
+                }
+                // An `error` key, like `Failed` and unlike
+                // `NothingAnalysable`: nothing about this run reached a
+                // verdict, and the row it produces is `failed` precisely
+                // so `select_stranded` re-asks once the store or the
+                // upstream recovers. The composite reason is already the
+                // row's `last_error`; this summary is built for the same
+                // reason the two arms above build theirs — so a future
+                // arm that starts completing cannot inherit a `Null`
+                // summary by omission.
+                ScanRunOutcome::CompositionNotProduced { reason } => {
                     serde_json::json!({ "error": reason })
                 }
             };

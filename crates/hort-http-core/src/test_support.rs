@@ -1109,8 +1109,7 @@ pub struct MockPorts {
 pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectionRepository) {
     use chrono::Utc;
     use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-        ScanPolicyProjection, SeverityThreshold,
+        NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::PolicyScope;
     let now = Utc::now();
@@ -1131,7 +1130,6 @@ pub fn seed_permissive_global_policy_for_tests(projections: &MockPolicyProjectio
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,
@@ -1274,8 +1272,7 @@ fn repo_scoped_hold_policy(
 ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
     use chrono::Utc;
     use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, NegligibleAction, ScanEnforcement, ScanPolicyProjection,
-        SeverityThreshold,
+        NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::PolicyScope;
     let now = Utc::now();
@@ -1296,7 +1293,6 @@ fn repo_scoped_hold_policy(
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,

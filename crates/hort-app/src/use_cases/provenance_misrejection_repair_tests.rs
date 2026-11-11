@@ -17,8 +17,7 @@ use crate::use_cases::STREAM_EVENT_CAP;
 use chrono::{DateTime, Duration};
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, NegligibleAction, ScanEnforcement, ScanPolicyProjection,
-    SeverityThreshold,
+    NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::error::DomainError;
 use hort_domain::events::PolicyScope;
@@ -261,7 +260,6 @@ fn required_provenance_projections_with_window(
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: Utc::now(),
         updated_at: Utc::now(),

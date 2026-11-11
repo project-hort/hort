@@ -11,8 +11,8 @@ pub mod authenticate_use_case;
 pub(crate) mod cas_bounded_read;
 pub mod cas_scrub_use_case;
 // The composed scan unit of an OCI image manifest (ADR 0064 D1):
-// resolving it from the manifest's own bytes, and the shadow assessment
-// that runs it with no release authority (D6).
+// resolving it from the manifest's own bytes, and running it as the
+// manifest's own filesystem verdict (D2).
 pub(crate) mod composite_scan;
 pub(crate) mod constituent_acquisition;
 pub mod content_reference;
@@ -79,6 +79,12 @@ pub mod index_serve;
 // `VersionOrdering` implementations.
 pub mod index_serve_filter;
 pub mod ingest_use_case;
+// "Do any of hort's own manifests make this blob a layer of a composed
+// image?" — the role ADR 0064 D6 scopes the root-filesystem
+// materialisation by, read off the manifests' `oci_layer` membership
+// edges and their own strict parse. See the module docs for why an
+// absent nomination is not a negative.
+pub(crate) mod layer_role_resolution;
 // ADR 0062's **omission** shape for the OCI surfaces hort builds out of
 // manifest digests (the referrers index, `tags/list`): which of the
 // entries a document is about to name would the pull refuse? The closure
@@ -250,9 +256,10 @@ pub mod virtual_resolution;
 // from CAS. See `docs/architecture/how-to/pypi-pull-through.md`.
 pub mod wheel_metadata_use_case;
 
-// The shadow composite assessment's evidence sink (ADR 0064 D6). The
-// module stays crate-private — `ShadowCompositeScan` and the resolution
-// are internal — but the composition root has to hand the orchestrator
+// Where the composite assessment's durable evidence goes (ADR 0064 D2) —
+// a projection beside the verdict, never the path the verdict travels.
+// The module stays crate-private — `CompositeScan` and the resolution are
+// internal — but the composition root has to hand the orchestrator
 // somewhere to write, so the sink itself is part of the public surface.
 pub use composite_scan::ShadowObservationSink;
 pub use group_reconcile_use_case::{GroupReconcileUseCase, ReconcileReport};

@@ -25,8 +25,8 @@
 //!    survivors to the findings that may decide *this* artifact's
 //!    verdict: one naming a component whose code the artifact does not
 //!    carry — or making a filesystem claim about a tree that belongs to
-//!    a composition rather than to this row (`kind` plus the resolved
-//!    posture, ADR 0064 D2) — is dropped from the **condemning** set, and
+//!    a composition rather than to this row (`kind`, ADR 0064 D2) — is
+//!    dropped from the **condemning** set, and
 //!    the summary the tier walk and the negligible lane read is
 //!    recomputed over what is left. Nothing is removed from the record —
 //!    see that predicate and ADR 0056's 2026-10-15 amendment.
@@ -86,8 +86,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ScanEnforcement,
-    ScanPolicyProjection, SeverityThreshold,
+    ExclusionProjection, NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use crate::events::{PolicyViolation, SeveritySummary};
 use crate::types::{severity_summary_from_findings, ArtifactCoords, ArtifactKind, Finding};
@@ -239,44 +238,6 @@ impl DefaultPolicy {
     pub const fn enforcement() -> ScanEnforcement {
         ScanEnforcement::Reject
     }
-
-    /// Default `composite_verdict_mode` when no operator `ScanPolicy` is
-    /// configured for a repo (ADR 0064 D6).
-    ///
-    /// Returns [`CompositeVerdictMode::Observed`] — the composed image of
-    /// an OCI manifest is still assessed and recorded, and its verdict
-    /// decides nothing. This is the one default whose fail-safe direction
-    /// runs the *other* way from [`Self::enforcement`]'s: promotion is an
-    /// operator act against named criteria, because a composite verdict
-    /// adds rejections across an existing estate and `Rejected` is
-    /// terminal. A default that promoted would be a release deciding for
-    /// an operator what D6 reserves to them.
-    pub const fn composite_verdict_mode() -> CompositeVerdictMode {
-        CompositeVerdictMode::Observed
-    }
-}
-
-/// The **resolved** composite-verdict posture for the repository a
-/// `policy` governs (ADR 0064 D6).
-///
-/// `None` — no operator policy resolved — is
-/// [`CompositeVerdictMode::Observed`] via
-/// [`DefaultPolicy::composite_verdict_mode`], because promotion is an
-/// operator act against named criteria and the built-in default policy
-/// has no operator behind it.
-///
-/// The single definition of the question, for the reason the two
-/// verdict functions share [`Finding::may_condemn_artifact`]: the
-/// posture decides whether a constituent's filesystem findings gate, and
-/// whether the absence of a composite assessment holds a manifest, and
-/// two sites resolving it separately could answer differently about one
-/// repository. Mirrors `provenance_mode_of` in the application layer,
-/// one axis over.
-#[must_use]
-pub fn composite_verdict_mode_of(policy: Option<&ScanPolicyProjection>) -> CompositeVerdictMode {
-    policy
-        .map(|p| p.composite_verdict_mode)
-        .unwrap_or_else(DefaultPolicy::composite_verdict_mode)
 }
 
 /// Compute the quarantine observation-window **deadline** from the stored
@@ -377,23 +338,20 @@ pub fn evaluate_scan_result(
     // agree about which findings may decide one finding list.
     //
     // The predicate asks a second question of the same input, and `kind`
-    // plus the resolved composite-verdict posture are what it needs to
-    // answer it: a finding about the filesystem one *constituent* of a
-    // composition makes in isolation is evidence rather than the verdict
-    // once an operator has promoted the composition's own verdict
-    // (ADR 0064 D2). The posture is resolved here, from the policy this
-    // evaluation is already under, so the narrowing and the posture cannot
-    // come from different repositories; `kind` arrives from the caller,
-    // which resolved it from the artifact's own format handler.
+    // is what it needs to answer it: a finding about the filesystem one
+    // *constituent* of a composition makes in isolation is evidence rather
+    // than the verdict, because the composition is the unit of filesystem
+    // assessment and its verdict is the only verdict (ADR 0064 D2).
+    // `kind` arrives from the caller, which resolved it from the
+    // artifact's own format handler.
     //
     // This is the path a **fresh scan** takes, and also the **tighten**
-    // re-evaluation over an artifact's stored findings. Both resolve the
-    // posture rather than pinning it, which is what keeps them answering
-    // one question: a constituent a promoted policy let through on a fresh
-    // scan is not then re-rejected by the next threshold change.
-    let composite_verdict = composite_verdict_mode_of(policy);
+    // re-evaluation over an artifact's stored findings. Both narrow here,
+    // which is what keeps them answering one question: a constituent let
+    // through on a fresh scan is not then re-rejected by the next
+    // threshold change.
     let mut condemning = filtered.remaining_findings;
-    condemning.retain(|f| f.may_condemn_artifact(kind, composite_verdict));
+    condemning.retain(|f| f.may_condemn_artifact(kind));
     let condemning_summary = severity_summary_from_findings(&condemning);
 
     // Step 2 — resolve threshold.
@@ -617,7 +575,6 @@ pub fn has_license_policy(value: &serde_json::Value) -> bool {
 mod tests {
     use super::*;
     use crate::entities::repository::RepositoryFormat;
-    use crate::entities::scan_policy::CompositeVerdictMode;
     use crate::entities::scan_policy::{
         ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
     };
@@ -726,7 +683,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),
@@ -1669,7 +1625,7 @@ mod tests {
             ComponentRelation::NotEstablished,
         ] {
             let one = about(relation, finding("CVE-SWEEP", SeverityThreshold::Critical));
-            let condemns = one.may_condemn_artifact(TEST_KIND, CompositeVerdictMode::Observed);
+            let condemns = one.may_condemn_artifact(TEST_KIND);
             let r = evaluate_scan_result(&coords("any"), TEST_KIND, &[one], None, &[], ts(0));
             assert_eq!(
                 matches!(r, ScanOutcome::Reject(_)),
@@ -1743,18 +1699,25 @@ mod tests {
         f
     }
 
-    /// A promoted policy at `threshold`.
-    fn promoted(threshold: SeverityThreshold) -> ScanPolicyProjection {
-        ScanPolicyProjection {
-            composite_verdict_mode: CompositeVerdictMode::Promoted,
-            ..projection(threshold, serde_json::Value::Null)
-        }
+    /// A finding about the payload's **own bytes** — a leaked key, a
+    /// malware signature. It condemns its artifact however those bytes
+    /// are composed, including on a constituent, which is what makes it
+    /// the counter-case to the filesystem fixture above.
+    fn byte_statement_finding(vuln: &str, sev: SeverityThreshold) -> Finding {
+        let mut f = finding(vuln, sev);
+        f.statement = crate::types::FindingStatement::Bytes;
+        f
+    }
+
+    /// A policy at `threshold` with no licence policy.
+    fn at_threshold(threshold: SeverityThreshold) -> ScanPolicyProjection {
+        projection(threshold, serde_json::Value::Null)
     }
 
     /// **The trapdoor, closed.** A constituent cleared by a fresh scan
-    /// under a promoted policy is still clear when an operator *lowers* a
-    /// threshold and the tighten pass re-derives the verdict over the
-    /// same **stored** findings.
+    /// is still clear when an operator *lowers* a threshold and the
+    /// tighten pass re-derives the verdict over the same **stored**
+    /// findings.
     ///
     /// Both halves run through this one function, because the tighten
     /// pass is this function over the stored findings blob — so the only
@@ -1765,7 +1728,7 @@ mod tests {
     /// finding is serialised and read back here rather than reused by
     /// value, because "it survives the blob" is the half that was broken.
     #[test]
-    fn a_threshold_tighten_does_not_re_reject_a_promoted_constituent() {
+    fn a_threshold_tighten_does_not_re_reject_a_constituent() {
         let fresh = vec![filesystem_finding(
             "CVE-2022-LAYER",
             SeverityThreshold::High,
@@ -1775,13 +1738,13 @@ mod tests {
                 &coords("layer"),
                 ArtifactKind::OciBlob,
                 &fresh,
-                Some(&promoted(SeverityThreshold::Critical)),
+                Some(&at_threshold(SeverityThreshold::Critical)),
                 &[],
                 ts(0),
             ),
             ScanOutcome::Clean,
-            "the fresh scan under a promoted policy lets the layer through: \
-             the composition that binds it carries the filesystem verdict",
+            "the fresh scan lets the layer through: the composition that \
+             binds it carries the filesystem verdict",
         );
 
         // What the tighten pass actually reads: the stored findings blob.
@@ -1793,7 +1756,7 @@ mod tests {
                 &coords("layer"),
                 ArtifactKind::OciBlob,
                 &stored,
-                Some(&promoted(SeverityThreshold::High)),
+                Some(&at_threshold(SeverityThreshold::High)),
                 &[],
                 ts(0),
             ),
@@ -1805,12 +1768,13 @@ mod tests {
     }
 
     /// And the counter-case that says the test above is not vacuous: the
-    /// identical stored findings, at the identical lowered threshold,
-    /// reject under the default posture. The tighten pass is doing real
-    /// work; what changed is only that it now reads the statement.
+    /// identical lowered threshold, over a finding about the payload's
+    /// **own bytes**, still rejects the same constituent. The tighten
+    /// pass is doing real work — what moved is one statement class on one
+    /// row role, not the walk.
     #[test]
-    fn the_same_tighten_still_rejects_an_unpromoted_constituent() {
-        let fresh = vec![filesystem_finding(
+    fn the_same_tighten_still_rejects_a_constituent_on_a_claim_about_its_bytes() {
+        let fresh = vec![byte_statement_finding(
             "CVE-2022-LAYER",
             SeverityThreshold::High,
         )];
@@ -1820,28 +1784,24 @@ mod tests {
             &coords("layer"),
             ArtifactKind::OciBlob,
             &stored,
-            Some(&projection(
-                SeverityThreshold::High,
-                serde_json::Value::Null,
-            )),
+            Some(&at_threshold(SeverityThreshold::High)),
             &[],
             ts(0),
         );
         assert!(
             matches!(r, ScanOutcome::Reject(_)),
-            "an unpromoted constituent gates on its own filesystem findings \
-             exactly as it did before ADR 0064 D2: {r:?}",
+            "a leaked key is in those bytes however they are composed, so it \
+             keeps gating its own artifact: {r:?}",
         );
     }
 
-    /// A promoted policy is **not** a global disarm: the same stored
+    /// The loosening is **not** a global disarm: the same stored
     /// filesystem finding at the same lowered threshold still rejects
-    /// every row whose materialised tree is its own. `compositeVerdictMode`
-    /// is a `ScanPolicy` field and a global policy reaches every
-    /// repository, so this is the assertion that keeps an operator
-    /// promoting their OCI estate from disarming their npm one.
+    /// every row whose materialised tree is its own. The rule reaches a
+    /// row by its *role*, so this is the assertion that keeps the OCI
+    /// estate's composition rule from disarming an npm one.
     #[test]
-    fn promotion_does_not_disarm_a_row_whose_filesystem_is_its_own() {
+    fn the_loosening_does_not_disarm_a_row_whose_filesystem_is_its_own() {
         let stored = vec![filesystem_finding("CVE-2022-TREE", SeverityThreshold::High)];
         for kind in [
             ArtifactKind::OciManifest,
@@ -1857,14 +1817,14 @@ mod tests {
                 &coords("pkg"),
                 kind,
                 &stored,
-                Some(&promoted(SeverityThreshold::High)),
+                Some(&at_threshold(SeverityThreshold::High)),
                 &[],
                 ts(0),
             );
             assert!(
                 matches!(r, ScanOutcome::Reject(_)),
-                "{kind}: the materialised tree is this artifact's own, so a \
-                 promoted composite verdict has nothing to move the claim to: {r:?}",
+                "{kind}: the materialised tree is this artifact's own, so \
+                 there is no composition above it to move the claim to: {r:?}",
             );
         }
     }

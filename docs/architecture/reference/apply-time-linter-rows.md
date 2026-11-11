@@ -54,7 +54,8 @@ treats as a hard block.
 | 12 | `VirtualMemberFormatNotEnforced` / `virtual_member_format_not_enforced` | `ArtifactRepository.virtualMembers[]` | a member whose `format` differs from the virtual's |
 | 13 | `ScanPolicyMaxArtifactAgeNotImplemented` / `scan_policy_max_artifact_age_not_implemented` | `ScanPolicy.maxArtifactAge` | any value — the inert state is the absent field |
 | 14 | `SaRotationTargetConflict` / — | `ServiceAccount.fallbackRotation.targetSecret` | two `ServiceAccount` envelopes declaring the same `(namespace, name)` target — the reconciler's ownership barrier refuses one of them on every tick, so its declared rotation never happens |
-| 15 | `CompositeVerdictPromotedRequiresScanBackends` / `composite_verdict_promoted_requires_scan_backends` | `ScanPolicy.compositeVerdictMode` + `scanBackends` | `compositeVerdictMode: promoted` paired with `scanBackends: []` — the waiver returns before a composed image is resolved, so the promotion grants release authority to a verdict no manifest in scope ever carries ([ADR 0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md) D6 × [ADR 0016](../../adr/0016-cross-opt-in-interaction-matrix.md)) |
+| 15 | `ScanPolicyCompositeVerdictModeRetired` / `scan_policy_composite_verdict_mode_retired` | `ScanPolicy.compositeVerdictMode` | any value — the inert state is the absent field. The composed image's verdict decides its manifest's release unconditionally ([ADR 0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md) D2), so neither value selects anything and nothing reads the field. **Retired, not deferred**, like row 17: no future implementation gives it a consumer. The field stays in the `deny_unknown_fields` spec solely so this rejection replaces an `unknown field` parse error |
+| 18 | `OciRepositoryRequiresScanBackends` / `oci_repository_requires_scan_backends` | `ScanPolicy.scanBackends` × governed repository | an **empty** `scanBackends` on an effective policy governing a `format: oci` repository. The composition is the unit of assessment for an OCI artifact and now the only thing carrying a verdict on one ([ADR 0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md) D2), and the waiver returns `SkippedNoBackends` before a composition is resolved — so no image is ever assessed while the waiver is itself the release authority. The **exact complement of row 7c**, which returns early on the empty list this row judges, so the two partition `scanBackends` and neither restates the other. Evaluated over the effective pairing (same resolver as row 7c), because a `ScanPolicy` has no format scope — `global` or `{repository: X}` — so "governs an OCI repository" is a question only the resolved pairing answers. The waiver stays supported for **every other format** |
 
 Rows 0, 1 and 4 are not in this table because they are not lint rows:
 row 0 is `DesiredState::validate` (per-envelope + cross-document), row 1
@@ -68,9 +69,18 @@ for which of them the offline gate runs.
 Apply aborts on the **first** row with an error finding, so a row
 inserted ahead of an existing one changes which message an
 already-failing config is rejected with. New rows are therefore appended
-at the end — rows 9 through 15 all carry that note in their
-`LinterRule` doc comment, and rows 10–15 were appended in that order for
+at the end — rows 9 through 18 all carry that note in their
+`LinterRule` doc comment, and rows 10–18 were appended in that order for
 exactly this reason.
+
+Appending means **two** places, not one, and row 18 is where that became
+load-bearing. `static_validator_and_apply_agree_on_reject_rule` compares
+the report's *first error* against the apply table's *first row with
+findings*, so a row's position in `StaticConfigValidator::validate` has to
+match its position in `PRE_WRITE_REJECT_ROWS`. Row 18 reads the same two
+scope tables as row 7c and would naturally have been collected in that
+row's walk; it is collected at the end of `validate` instead, in its own
+walk, because its table entry is last.
 
 ### Retirement triggers
 
@@ -90,13 +100,23 @@ trigger in the `validate_*` doc comment:
 The other rows are not on this list: they reject a configuration that is
 wrong, and no future work makes them obsolete. Row 14 is one of them —
 two ServiceAccounts cannot share a rotation target under any
-implementation, because the owner of a Secret is a single value. So is
-row 15: a waived scan has nothing to promote under any implementation of
-the composite path, so the combination stays wrong however that path
-develops. It is the second row whose subject is a **cross-opt-in
-collapse** rather than a missing control — row 5 is the first, and the
-two share the empty backend list as the half that cancels the other
-opt-in.
+implementation, because the owner of a Secret is a single value. Rows 15
+and 17 are on it for a different reason again: both name a **retired**
+field rather than a missing control, so there is no implementation to
+wait for and the only thing that retires the row is the field leaving
+the spec. Row 18 is not on it either, and for row 5's reason: a waived
+scan composes nothing under any scanner that ships later.
+
+Row 5 is still the only row whose subject is **two** operator opt-ins
+collapsing. Row 18 is the surviving half of the row that used to be the
+second: row 15 previously rejected `compositeVerdictMode: promoted` ×
+`scanBackends: []`, and when the composed verdict's authority stopped
+being an opt-in at all, the half that remained an operator declaration
+was the waiver. One declaration now does what two used to, which makes
+the rejection **wider** than the one it replaces — and is why it could
+not stay a per-envelope rule in `hort-config`: the other half is the
+governed repository's `format`, which no single `ScanPolicy` envelope
+carries.
 
 ## Table 2 — surfaces with no named row, and where they are checked
 
@@ -111,7 +131,6 @@ opt-in.
 | `proxy.credentials` | `ParseError::CredentialsFieldForbidden` — parse time | the field is forbidden outright, so it never reaches a `DesiredState` |
 | A declared name that already exists as a `managed_by=local` row; `HORT_AUTH_PROVIDER=disabled` with `ClaimMapping` envelopes declared | row 1 — `validate_against` | needs the current-state snapshot / the deployment env, which the pure validator cannot hold by construction |
 | `ScanPolicy.requireApproval`, `severityThreshold`, `negligibleAction`, `enforcement`, `quarantineDuration` | enforced at runtime (`policy::promotion`, `policy::scan`, `effective_quarantine_deadline`) | nothing to withdraw — these decide what they say they decide |
-| `ScanPolicy.compositeVerdictMode` on its own (any value, with a non-empty `scanBackends`) | enforced at runtime (`ScanOrchestrationUseCase`'s composite path — a promoted composition's findings join the manifest row's, and a promoted composition's absence routes through the fail-closed no-verdict partition) | nothing to withdraw — the consumer exists. The *combination* with `scanBackends: []` is **row 15** above, which is a cross-opt-in collapse rather than an inert field: each opt-in is load-bearing alone and they cancel together |
 | `UpstreamMapping.allowedRealmHosts` | `validate_allowed_realm_hosts` (per-envelope, `hort-config::upstream_mapping`) + the value-object constructor + two schema CHECKs | both rules are decidable from this one envelope — the auth type and the list are in the same spec — so per-spec validation is the earliest place the verdict exists and the only one provably before the bundle's first write, exactly as [`validate_tls_material`](../../../crates/hort-config/src/upstream_mapping.rs) argues beside it. The non-`bearer_challenge` rejection is an [ADR 0015](../../adr/0015-apply-time-linter-inert-fields-and-naming.md) inert-field rejection **without** a rule key, like `validate_virtual_type_shape` above. A mapping with no `secretRef` is deliberately **not** rejected: the consumer (the credentialed realm exchange) comes into being the moment a secret is added to the same mapping, so the field is conditional, not inert |
 | `UpstreamMapping.notFoundCacheSeconds` | `validate_not_found_cache_seconds` (per-envelope, `hort-config::upstream_mapping`) + `push_upstream_mapping_format_compatibility_errors` (row 0, cross-document) + the value-object constructor + a schema CHECK | the value rule — a positive number of seconds the `integer` column can hold — is decidable from this one envelope, so per-spec validation is the earliest place the verdict exists and the only one provably before the bundle's first write, the same argument [`validate_tls_material`](../../../crates/hort-config/src/upstream_mapping.rs) makes for its siblings on this kind. It is a *value-range* check rather than an [ADR 0015](../../adr/0015-apply-time-linter-inert-fields-and-naming.md) inert-field withdrawal or an [ADR 0016](../../adr/0016-cross-opt-in-interaction-matrix.md) cross-opt-in collapse, which is what every row in Table 1 is; the rule itself is the domain's `not_found_cache_seconds_reason`, shared rather than mirrored, exactly as `allowedRealmHosts` shares `allowed_realm_host_reason`. `0` is refused because it would be *enforced* — a zero TTL re-fetches on every retry inside the negative-cache window, the coalescing loss the window exists to prevent, which is also why `HORT_PULL_DEDUP_TTL_NOT_FOUND_SECS` refuses it. The **format**-effective half is a row-0 cross-document rule because it needs the parent repository's `format` in scope: only the Maven pull-through legs pass the value to `PullDedup`, so the field on any other format would be stored and never read, and that rejection is deleted per format as each format's legs are wired |
 | `PermissionGrant.subject.userId` that is not UUID syntax | row 0 — `validate_permission_grant`'s `Uuid::parse_str` | UUID syntax is a per-envelope fact, so per-spec validation is the earliest place the verdict exists. It is also the only place provably before the bundle's first write: the consolidated grant reconcile runs **last**, so the parse that used to own this verdict refused a typo only after the repository, policy and mapping writes of the same bundle had committed. That parse is now a `DomainError::Invariant` this rule makes unreachable — the same shape `Permission::from_str` beside it already had. Whether the UUID names an **existing user** is deliberately unchecked: it is not a static property of the bundle |
@@ -155,6 +174,10 @@ four of them agree:
 2. `LinterRule` in `hort-app::lint::static_validate` — a new variant,
    appended; its `metric_rule` arm; a metric `rule`-label `const` if it
    emits one; and the call in `validate`, appended after the last row.
+   **Appended there even when the row could share an earlier row's walk** —
+   the report position has to match the table position in (3), or step
+   (4)'s test fails for a config that trips both rows (see *Row order is
+   append-only* above).
 3. `PRE_WRITE_REJECT_ROWS` — the `error!` line and the `RowAbort`.
    `pre_write_validation_consumes_every_reject_row` matches `LinterRule`
    **without a wildcard**, so a new variant does not compile until it is

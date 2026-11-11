@@ -22,7 +22,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::entities::scan_policy::{CompositeVerdictMode, SeverityThreshold};
+use crate::entities::scan_policy::SeverityThreshold;
 use crate::error::{DomainError, DomainResult};
 use crate::events::SeveritySummary;
 use crate::types::ArtifactKind;
@@ -185,8 +185,8 @@ pub struct Finding {
     /// question from the one the fresh scan answered — which is what the
     /// tighten pass did while this field was transient: it read every
     /// stored finding as `Unstated`, condemned, and terminally rejected
-    /// the same constituent a fresh scan under the same promoted policy
-    /// had just let through. Whose filesystem the claim is about is
+    /// the same constituent a fresh scan over the same findings had just
+    /// let through. Whose filesystem the claim is about is
     /// **not** stored, because it is derivable from the row's
     /// [`ArtifactKind`] at any time; see [`FindingStatement`] on why the
     /// composition of the two is not a variant.
@@ -788,37 +788,39 @@ impl Finding {
     /// prevent.
     ///
     /// The second fact is **what the finding's statement is about**
-    /// ([`FindingStatement`], ADR 0064 D2) — and it takes two inputs to
-    /// spend, because the producer states only half of it. A claim about
-    /// the filesystem one *constituent* of a composition makes in
-    /// isolation is not a claim about the composition anything runs: a
-    /// later layer adds packages an earlier one cannot be read for, and
-    /// removes packages it carries, so no composition of per-constituent
-    /// verdicts reconstructs the composed package set. Where an operator
-    /// has promoted the composite verdict (`composite_verdict`), the
+    /// ([`FindingStatement`], ADR 0064 D2) — and the producer states only
+    /// half of it. A claim about the filesystem one *constituent* of a
+    /// composition makes in isolation is not a claim about the composition
+    /// anything runs: a later layer adds packages an earlier one cannot be
+    /// read for, and removes packages it carries, so no composition of
+    /// per-constituent verdicts reconstructs the composed package set. The
     /// composition is assessed as one unit and carries the filesystem
-    /// verdict, so the constituent's own filesystem findings are evidence
-    /// and nothing more. Under every other posture they gate exactly as
-    /// they do today — which is what makes an unpromoted repository
-    /// byte-for-byte unchanged a property of this one match.
+    /// verdict, so a constituent's own filesystem findings are evidence
+    /// and nothing more. On a row that is not a constituent they gate
+    /// exactly as they always have.
     ///
-    /// So the [`FindingStatement::Filesystem`] arm is where `kind` and
-    /// `composite_verdict` are composed, and it is composed **here**
-    /// rather than stored on the finding: the producer's half is a fact
-    /// nothing downstream can recover, the row's half is derivable from
-    /// the artifact whenever it is wanted, and a field holding the two
-    /// already joined would be a stored conclusion (ADR 0040). The same
-    /// two inputs, in the same conjunction, are what
+    /// So the [`FindingStatement::Filesystem`] arm is where the row's half
+    /// — `kind` — is spent, and it is spent **here** rather than stored on
+    /// the finding: the producer's half is a fact nothing downstream can
+    /// recover, the row's half is derivable from the artifact whenever it
+    /// is wanted, and a field holding the two already joined would be a
+    /// stored conclusion (ADR 0040). The same input, answering the same
+    /// question, is what
     /// [`NotAnalysable::gates_release`](crate::ports::scanner::NotAnalysable::gates_release)
-    /// composes for an *absent* assessment of that same surface — and
+    /// spends for an *absent* assessment of that same surface — and
     /// "which rows are constituents?" is
     /// [`ArtifactKind::is_composition_constituent`]'s single answer in
     /// both, so a finding and an absence cannot disagree about one row.
     ///
-    /// Both inputs are required, and together: promotion alone would move
-    /// the obligation for every format ADR 0064 leaves undecided, and the
-    /// kind alone would move it before an operator had granted the
-    /// composite verdict any authority.
+    /// **The composite verdict is the only verdict**, which is why `kind`
+    /// is the whole input. This arm used to take a second one — the
+    /// resolved per-policy composite-verdict posture — so that the
+    /// loosening only applied where an operator had granted the composed
+    /// verdict release authority. That grant was migration scaffolding:
+    /// its shipped default withheld authority, so the composition was
+    /// assessed and recorded while deciding nothing, and a constituent
+    /// hort could not analyse in isolation held its manifest with no
+    /// deadline and no authority that could ever arrive to clear it.
     ///
     /// The other two statements condemn, and each for its own reason:
     /// [`FindingStatement::Bytes`] is true of the bytes however they are
@@ -833,19 +835,11 @@ impl Finding {
     /// until it is given release authority or denied it here.
     ///
     /// `kind` is what the artifact's own format handler says its bytes
-    /// are, and `composite_verdict` is a **resolved** posture — normally
-    /// [`crate::policy::composite_verdict_mode_of`] over the policy that
-    /// governs the artifact's repository, never a per-finding field,
-    /// because promotion is a property of that policy and a finding
-    /// carrying its own copy could disagree with it. One caller pins the
-    /// posture to [`CompositeVerdictMode::Observed`] instead of resolving
-    /// it, deliberately and for ADR 0064 D6's reason — see
-    /// [`crate::policy::decide_rejected_transition`].
-    pub fn may_condemn_artifact(
-        &self,
-        kind: ArtifactKind,
-        composite_verdict: CompositeVerdictMode,
-    ) -> bool {
+    /// are, resolved by the application caller through the handler
+    /// registry — never from a path prefix, and never a per-finding field:
+    /// a finding carrying its own copy of the row's role could disagree
+    /// with the row.
+    pub fn may_condemn_artifact(&self, kind: ArtifactKind) -> bool {
         let carries_the_component = match self.component_relation {
             ComponentRelation::Subject => true,
             ComponentRelation::Contained => true,
@@ -855,10 +849,7 @@ impl Finding {
         let decides_this_artifact = match self.statement {
             FindingStatement::Bytes => true,
             FindingStatement::Unstated => true,
-            FindingStatement::Filesystem => {
-                !(kind.is_composition_constituent()
-                    && composite_verdict.carries_release_authority())
-            }
+            FindingStatement::Filesystem => !kind.is_composition_constituent(),
         };
         carries_the_component && decides_this_artifact
     }
@@ -1133,7 +1124,7 @@ mod tests {
     /// findings reads the same fact the fresh scan read. Before this, the
     /// field was transient and every stored finding came back `Unstated`
     /// — which condemns, so the tighten pass terminally rejected the same
-    /// constituent a promoted fresh scan had just let through.
+    /// constituent a fresh scan had just let through.
     #[test]
     fn a_stated_statement_survives_the_round_trip() {
         for stated in [FindingStatement::Bytes, FindingStatement::Filesystem] {
@@ -1969,7 +1960,7 @@ mod tests {
             "and the statement key is absent from the same payload",
         );
         assert!(
-            parsed.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
+            parsed.may_condemn_artifact(NON_CONSTITUENT),
             "a record written before the fields existed keeps today's authority",
         );
     }
@@ -2084,7 +2075,7 @@ mod tests {
     fn a_subject_finding_may_condemn() {
         let mut f = valid_finding();
         f.component_relation = ComponentRelation::Subject;
-        assert!(f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed));
+        assert!(f.may_condemn_artifact(NON_CONSTITUENT));
     }
 
     /// A format whose payload carries its closure (an OCI image and its
@@ -2094,7 +2085,7 @@ mod tests {
     fn a_contained_component_finding_may_condemn() {
         let mut f = valid_finding();
         f.component_relation = ComponentRelation::Contained;
-        assert!(f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed));
+        assert!(f.may_condemn_artifact(NON_CONSTITUENT));
     }
 
     /// The one relation that withholds authority: the artifact resolved the
@@ -2104,7 +2095,7 @@ mod tests {
     fn a_not_contained_component_finding_may_not_condemn() {
         let mut f = valid_finding();
         f.component_relation = ComponentRelation::NotContained;
-        assert!(!f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed));
+        assert!(!f.may_condemn_artifact(NON_CONSTITUENT));
     }
 
     /// Absence of evidence is not evidence of non-containment: an
@@ -2113,15 +2104,14 @@ mod tests {
     fn a_not_established_relation_may_condemn() {
         let mut f = valid_finding();
         f.component_relation = ComponentRelation::NotEstablished;
-        assert!(f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed));
+        assert!(f.may_condemn_artifact(NON_CONSTITUENT));
     }
 
     // -- the statement axis (ADR 0064 D2) ----------------------------------
 
     /// **The pair the loosening is.** Over the same artifact — an OCI
-    /// layer — under the same promoted policy: a claim about the
-    /// filesystem this constituent composes in isolation stops condemning
-    /// it, and a claim about its bytes does not.
+    /// layer: a claim about the filesystem this constituent composes in
+    /// isolation does not condemn it, and a claim about its bytes does.
     ///
     /// Asserted together because either half alone is satisfied by a rule
     /// that is wrong. "Nothing moves" passes the second assertion; "every
@@ -2131,81 +2121,76 @@ mod tests {
     /// or malware finding must not be disarmed by a decision taken when
     /// no such backend existed.
     #[test]
-    fn under_promotion_a_constituents_filesystem_claim_stops_condemning_and_its_bytes_do_not() {
+    fn a_constituents_filesystem_claim_does_not_condemn_it_and_its_bytes_do() {
         let mut filesystem = valid_finding();
         filesystem.statement = FindingStatement::Filesystem;
         let mut bytes = valid_finding();
         bytes.statement = FindingStatement::Bytes;
 
         assert!(
-            !filesystem.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+            !filesystem.may_condemn_artifact(ArtifactKind::OciBlob),
             "a constituent's isolated package set is evidence; the composition \
              that binds it carries the verdict"
         );
         assert!(
-            bytes.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+            bytes.may_condemn_artifact(ArtifactKind::OciBlob),
             "a leaked key or a malware signature is in those bytes however \
              they are composed, so it keeps gating its own artifact"
         );
     }
 
-    /// And the whole matrix — every statement × every kind × both
-    /// postures — so "an unpromoted repository is byte-for-byte
-    /// unchanged" and "a non-constituent format is untouched" are both
-    /// properties of this one predicate rather than of each caller:
-    /// exactly one cell of the fifty-four differs from what it was before
-    /// ADR 0064 D2.
+    /// And the whole matrix — every statement × every kind — so "a
+    /// non-constituent format is untouched" is a property of this one
+    /// predicate rather than of each caller: exactly one cell of the
+    /// twenty-seven withholds authority.
     ///
     /// The expectation is spelled out from the two facts rather than read
     /// back off the predicate, so a change to the rule shows up here as a
     /// failure instead of moving both sides at once.
     #[test]
-    fn exactly_one_statement_kind_and_posture_triple_withholds_authority() {
+    fn exactly_one_statement_and_kind_pair_withholds_authority() {
+        let mut cells = 0;
+        let mut withheld = 0;
         for statement in every_statement() {
             for kind in every_kind() {
-                for mode in [
-                    CompositeVerdictMode::Observed,
-                    CompositeVerdictMode::Promoted,
-                ] {
-                    let mut f = valid_finding();
-                    f.statement = statement;
-                    let moved = statement == FindingStatement::Filesystem
-                        && kind == ArtifactKind::OciBlob
-                        && mode == CompositeVerdictMode::Promoted;
-                    assert_eq!(
-                        f.may_condemn_artifact(kind, mode),
-                        !moved,
-                        "{statement} on a {kind} under {mode} must {} condemn",
-                        if moved { "not" } else { "still" }
-                    );
-                }
+                let mut f = valid_finding();
+                f.statement = statement;
+                let moved =
+                    statement == FindingStatement::Filesystem && kind == ArtifactKind::OciBlob;
+                assert_eq!(
+                    f.may_condemn_artifact(kind),
+                    !moved,
+                    "{statement} on a {kind} must {} condemn",
+                    if moved { "not" } else { "still" }
+                );
+                cells += 1;
+                withheld += usize::from(moved);
             }
         }
+        // Counter-assertion: the matrix is real and the rule is not
+        // "nothing moves" — which every `!moved` assertion above would
+        // also pass if `every_kind()` ever stopped yielding `OciBlob`.
+        assert!(cells >= 9, "the matrix shrank to {cells} cells");
+        assert_eq!(withheld, 1, "exactly one cell withholds authority");
     }
 
-    /// **Both inputs are required, and together.** The kind alone would
-    /// move the obligation before an operator granted the composite
-    /// verdict any authority; the posture alone would move it for every
-    /// format ADR 0064 leaves undecided. Stated as the two one-input
-    /// slices of the cell above, because that is what a rule reading only
-    /// one of them would pass.
+    /// **The kind is what spends the rule, and it is spent narrowly.**
+    /// Taking the row's role out of the predicate would move the
+    /// obligation for every format ADR 0064 leaves undecided, and for the
+    /// composition itself — which is the row that *carries* the composite
+    /// verdict and so has nothing above it to hand its findings to.
     #[test]
-    fn neither_the_kind_nor_the_posture_alone_moves_the_obligation() {
+    fn the_loosening_reaches_constituents_and_nothing_else() {
         let mut f = valid_finding();
         f.statement = FindingStatement::Filesystem;
 
         assert!(
-            f.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Observed),
-            "a constituent that stopped gating before promotion would be a \
-             constituent nothing gates — the obligation dropped, not moved"
-        );
-        assert!(
-            f.may_condemn_artifact(ArtifactKind::NpmTarball, CompositeVerdictMode::Promoted),
-            "a global `compositeVerdictMode: promoted` must not disarm an npm \
+            f.may_condemn_artifact(ArtifactKind::NpmTarball),
+            "the composite verdict carrying authority must not disarm an npm \
              estate: the tarball's materialised tree is the artifact's own"
         );
         assert!(
-            f.may_condemn_artifact(ArtifactKind::OciManifest, CompositeVerdictMode::Promoted),
+            f.may_condemn_artifact(ArtifactKind::OciManifest),
             "the composition is not a constituent of itself, so the row that \
              carries the composite verdict keeps its own filesystem findings"
         );
@@ -2220,7 +2205,7 @@ mod tests {
         f.component_relation = ComponentRelation::NotContained;
         f.statement = FindingStatement::Bytes;
         assert!(
-            !f.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+            !f.may_condemn_artifact(ArtifactKind::OciBlob),
             "a component the artifact does not carry never condemns, whatever \
              the statement is about"
         );
@@ -2228,7 +2213,7 @@ mod tests {
         f.component_relation = ComponentRelation::Subject;
         f.statement = FindingStatement::Filesystem;
         assert!(
-            !f.may_condemn_artifact(ArtifactKind::OciBlob, CompositeVerdictMode::Promoted),
+            !f.may_condemn_artifact(ArtifactKind::OciBlob),
             "a subject relation does not win back the authority the moved \
              obligation took away"
         );
@@ -2242,13 +2227,9 @@ mod tests {
     ///
     /// While the statement was transient this assertion ran the other
     /// way: the rehydrated finding read `Unstated`, which condemns, and
-    /// the tighten pass therefore rejected the constituent a promoted
-    /// fresh scan had just let through — terminally, since
-    /// `ScanPolicyRetroactive → Rejected` is revisited by no rescan. What
-    /// keeps promotion from un-rejecting the *already*-rejected estate
-    /// (ADR 0064 D6) is now the posture the automatic loosening pass pins,
-    /// not an absent value — see
-    /// [`crate::policy::decide_rejected_transition`].
+    /// the tighten pass therefore rejected the constituent a fresh scan
+    /// had just let through — terminally, since
+    /// `ScanPolicyRetroactive → Rejected` is revisited by no rescan.
     #[test]
     fn a_finding_read_back_out_of_the_blob_answers_exactly_as_the_original() {
         for statement in every_statement() {
@@ -2261,17 +2242,12 @@ mod tests {
             assert_eq!(rehydrated.statement, statement);
 
             for kind in every_kind() {
-                for mode in [
-                    CompositeVerdictMode::Observed,
-                    CompositeVerdictMode::Promoted,
-                ] {
-                    assert_eq!(
-                        rehydrated.may_condemn_artifact(kind, mode),
-                        stored.may_condemn_artifact(kind, mode),
-                        "{statement} on a {kind} under {mode}: a stored finding \
-                         must not answer differently from the one that was stored"
-                    );
-                }
+                assert_eq!(
+                    rehydrated.may_condemn_artifact(kind),
+                    stored.may_condemn_artifact(kind),
+                    "{statement} on a {kind}: a stored finding must not answer \
+                     differently from the one that was stored"
+                );
             }
         }
     }
@@ -2305,13 +2281,13 @@ mod tests {
 
                 f.component_relation = ComponentRelation::NotContained;
                 assert!(
-                    !f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
+                    !f.may_condemn_artifact(NON_CONSTITUENT),
                     "a non-contained component never condemns: {f:?}"
                 );
 
                 f.component_relation = ComponentRelation::Subject;
                 assert!(
-                    f.may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
+                    f.may_condemn_artifact(NON_CONSTITUENT),
                     "a subject finding always condemns: {f:?}"
                 );
             }
@@ -2414,14 +2390,11 @@ mod tests {
         for a in ALL_RELATIONS {
             for b in ALL_RELATIONS {
                 let winner = a.more_condemning(b);
-                if with_relation(a)
-                    .may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed)
-                    || with_relation(b)
-                        .may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed)
+                if with_relation(a).may_condemn_artifact(NON_CONSTITUENT)
+                    || with_relation(b).may_condemn_artifact(NON_CONSTITUENT)
                 {
                     assert!(
-                        with_relation(winner)
-                            .may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
+                        with_relation(winner).may_condemn_artifact(NON_CONSTITUENT),
                         "{a:?} + {b:?} resolved to {winner:?}, which cannot condemn \
                          although an input could",
                     );
@@ -2522,8 +2495,7 @@ mod tests {
                 .all(|other| relation.more_condemning(*other) == *other || *other == relation);
             assert_eq!(
                 is_bottom,
-                !with_relation(relation)
-                    .may_condemn_artifact(NON_CONSTITUENT, CompositeVerdictMode::Observed),
+                !with_relation(relation).may_condemn_artifact(NON_CONSTITUENT),
                 "{relation:?}: sitting at the bottom of the containment order and \
                  being refused release authority must be the same thing",
             );

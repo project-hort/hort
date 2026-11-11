@@ -323,12 +323,13 @@ pub(crate) fn warm_manifest_blobs(
 /// not blobs, and are handled by the standard manifest-pull flow if a
 /// client pulls them).
 ///
-/// Deliberately a simple walker — does NOT enforce the
-/// `MAX_BLOB_REFERENCES` cap or 400-shape errors that
-/// [`crate::manifests_write::parse_manifest_blobs`] enforces. Those
-/// are validation rules for *pushes*; for prefetch we only care about
-/// "what blobs to optimistically warm" and treat unparseable entries
-/// as nothing-to-prefetch.
+/// Deliberately a simple walker — does NOT enforce the admission bounds
+/// or the 400-shape errors that
+/// [`crate::manifests_write::parse_manifest_blobs`] enforces. It does not
+/// need to: a manifest reaching prefetch has already been admitted, so
+/// those bounds hold of it by construction. For prefetch we only care
+/// about "what blobs to optimistically warm" and treat unparseable
+/// entries as nothing-to-prefetch.
 fn parse_manifest_blob_digests(body: &Bytes) -> Option<Vec<ContentHash>> {
     // Stream-project via `OciManifestProjector` (ADR 0026). Memory bound
     // is `sizeof(OciManifestProjection)` (a handful of descriptors),

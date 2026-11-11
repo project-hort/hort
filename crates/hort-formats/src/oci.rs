@@ -55,9 +55,15 @@ impl FormatHandler for OciFormatHandler {
     /// classification of the row can tell a `tar+gzip` layer from a JSON
     /// config, and inventing the distinction here would mean guessing.
     /// [`ArtifactKind::OciBlob`] states the honest fact and leaves the
-    /// container decision to the materialiser, which has the bytes: a tar
-    /// is a layer and becomes a root filesystem, anything else carries no
-    /// package surface.
+    /// rest to two parties that can answer it: the materialiser has the
+    /// bytes and reads the container out of them, and the application
+    /// layer has the registry's other manifests and reads the **declared
+    /// role** out of them
+    /// (`hort_app::use_cases::layer_role_resolution`). Both are needed —
+    /// a tar can be a root filesystem, and an OCI artifact's payload
+    /// layer is a tar that is not one, so the container alone would make
+    /// the materialisation a coincidence rather than a decision
+    /// (ADR 0064 D6).
     fn scan_kind(&self, artifact: &Artifact) -> ArtifactKind {
         if artifact.path.starts_with(OCI_BLOB_PATH_PREFIX) {
             ArtifactKind::OciBlob

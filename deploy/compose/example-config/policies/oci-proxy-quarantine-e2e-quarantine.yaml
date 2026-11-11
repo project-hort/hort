@@ -9,11 +9,17 @@ spec:
   # quarantineDuration: 0s (as on oci-mirror-e2e), `created_at` and
   # `created_at - duration` are the same instant, so the scenario's
   # index-vs-child window-differential assertion would pass regardless of
-  # whether the #46 Item 2 zero-window carve-out actually fires. `scanBackends:
-  # []` keeps the hold purely time-based (same rationale as
-  # oci-quarantine-e2e-quarantine.yaml): the compose stack runs no
-  # hort-worker, so no scan would ever complete anyway. (Repo-scoped, so no
-  # other scenario is affected.)
+  # whether the referenced-tree-descendant zero-window carve-out actually fires
+  # (`ingest_use_case.rs`, which gives a descendant of a referenced tree a zero
+  # window while its index keeps the full one). The 24h window,
+  # not a scan result, is what holds the rows (same rationale as
+  # oci-quarantine-e2e-quarantine.yaml): it outlasts any smoke run, and before
+  # the deadline there is no release authority for a scan to supply.
+  # (Repo-scoped, so no other scenario is affected.)
+  #
+  # `scanBackends` is omitted rather than `[]`: an empty list waives scanning for
+  # a format assessed as a composed image, which apply refuses. Omitted inherits
+  # the built-in default `[trivy]`.
   scope:
     repository: oci-proxy-quarantine-e2e
   severityThreshold: critical
@@ -21,5 +27,18 @@ spec:
   requireApproval: false
   # Provenance off for e2e (no per-ingest verify job).
   provenanceMode: off
-  scanBackends: []
+  # `enforcement: record` — a Trivy verdict is recorded, never gating. What
+  # this fixture asserts must not depend on which CVEs an upstream tag
+  # happens to carry on the day the suite runs, only on whether each row got
+  # a completed assessment at all. Omitting the field is the opposite
+  # posture, not a quieter one: it inherits the enforcing default, and this
+  # policy scans, so a `critical` finding would reject a row and answer `403`
+  # where this scenario asserts the anonymous `503` + `Retry-After` hold and
+  # the write-authorized `200` hold-read — and would leave the child row
+  # neither releasable nor released, which is the differential the scenario
+  # measures.
+  #
+  # `record` leaves the 24h hold untouched: `ScanRecorded` is a timer
+  # authority, so nothing releases inside a smoke run.
+  enforcement: record
   licensePolicy: {}

@@ -3250,8 +3250,7 @@ mod visibility_extension_tests {
 
     fn repo_scoped_policy(repo_id: Uuid, duration_secs: i64) -> ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-            SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
 
@@ -3272,7 +3271,6 @@ mod visibility_extension_tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

@@ -21,14 +21,10 @@
 #
 # WHY THE SIBLING SCENARIO CANNOT SEE THIS, which is the reason this file
 # exists rather than a fifth leg over there. `trivy-oci-not-applicable.sh`
-# runs against `oci-trivy-e2e`, whose policy is `enforcement: record` and
-# (by omission) `compositeVerdictMode: observed`:
-#   - under `record` no verdict gates anything, so a run there cannot
-#     distinguish "this absence of assessment moved to the composition"
-#     from "nothing was gating in the first place";
-#   - under `observed` the composite verdict carries no release authority,
-#     so there is nothing for a constituent's obligation to move TO and
-#     the loosening is correctly inert.
+# runs against `oci-trivy-e2e`, whose policy is `enforcement: record`:
+# under `record` no verdict gates anything, so a run there cannot
+# distinguish "this absence of assessment moved to the composition" from
+# "nothing was gating in the first place".
 # Its synthetic layer also lands on `not_applicable` — the arm that has
 # never gated — never on `no_analyzer_matched`. So it proves every OCI row
 # receives a completed assessment; it cannot prove that a GATING
@@ -36,7 +32,8 @@
 #
 # THE FIXTURE, AND WHY IT IS ONE SYMLINK AWAY FROM THE SIBLING'S. Source
 # is a single-arch Alpine base (a real apk database — so the composition
-# this policy promotes has a genuine package surface to assess) plus one
+# whose verdict gates this image has a genuine package surface to assess)
+# plus one
 # synthetic layer appended locally. That layer is byte-for-byte the shape
 # of the sibling scenario's package-less layer — one certificate file, no
 # package database — PLUS a symlink beside it, and that one entry is the
@@ -61,13 +58,13 @@
 # final leg goes over HTTP.
 #
 # WHAT IS DELIBERATELY NOT ASSERTED. The MANIFEST row's own verdict. Under
-# `enforcement: reject` x `compositeVerdictMode: promoted` the composite
-# assessment of the assembled image carries release authority, so whether
-# the manifest releases or is rejected depends on which CVEs the Alpine
-# base carries on the day the suite runs — exactly the dependency the
-# sibling fixture chose `record` to avoid. That is the promotion working
-# as ADR 0064 D6 intends and it is not this scenario's claim; the claim is
-# about the layer, which is the row the defect stranded.
+# `enforcement: reject` the composite assessment of the assembled image
+# is the manifest's verdict, so whether the manifest releases or is
+# rejected depends on which CVEs the Alpine base carries on the day the
+# suite runs — exactly the dependency the sibling fixture chose `record`
+# to avoid. That is ADR 0064 D2 working as intended and it is not this
+# scenario's claim; the claim is about the layer, which is the row the
+# defect stranded.
 
 # shellcheck source=../../lib/common.sh
 # shellcheck disable=SC1091
@@ -107,7 +104,7 @@ EXPECTED_ROWS="${TRIVY_COMPOSITE_EXPECTED_ROWS:-4}"
 
 log "==> Trivy OCI constituent-abstention e2e (ADR 0064 D2)"
 log "registry : ${HORT_URL}"
-log "repo     : ${REPO_KEY} (trivy, ${WINDOW_SECS}s window, enforcement=reject, compositeVerdictMode=promoted)"
+log "repo     : ${REPO_KEY} (trivy, ${WINDOW_SECS}s window, enforcement=reject)"
 log "source   : ${SOURCE_IMAGE} + one synthetic link-carrying layer"
 log "dest     : ${DEST_IMAGE}"
 
@@ -118,23 +115,30 @@ REPO_ID="$(psql_one "SELECT id FROM repositories WHERE key = '${REPO_KEY}' LIMIT
 log "repository id=${REPO_ID}"
 
 # Belt and braces on the posture the whole scenario rests on. A policy
-# that silently lost its promotion would make every assertion below fail
+# that silently stopped enforcing would make every assertion below fail
 # for a reason that has nothing to do with the code under test, and the
 # failure would read as a regression in the release path.
+#
+# Only `enforcement` is read. The composed image's verdict is the
+# manifest's unconditionally (ADR 0064 D2) — there is no second posture to
+# confirm, and `policy_projections.composite_verdict_mode` is a retired
+# column nothing reads, so asserting on it would be asserting on a stored
+# byte no decision consults.
+#
 # `policy_projections.scope` is the externally-tagged `PolicyScope`, so a
 # repository-scoped row carries `{"Repository": "<uuid>"}` — matched on the
 # repository id rather than on the policy's name, because what governs this
 # push is whichever active policy resolves for THIS repository.
-POSTURE="$(psql_one "SELECT enforcement || '/' || composite_verdict_mode
+POSTURE="$(psql_one "SELECT enforcement
                      FROM policy_projections
                      WHERE archived = false
                        AND scope->>'Repository' = '${REPO_ID}'
                      LIMIT 1;")"
-if [ "$POSTURE" = "reject/promoted" ]; then
-    pass "(0) the resolved policy is enforcement=reject, compositeVerdictMode=promoted"
+if [ "$POSTURE" = "reject" ]; then
+    pass "(0) the resolved policy is enforcement=reject"
 else
-    fail "(0) the resolved policy must be enforcement=reject, compositeVerdictMode=promoted" \
-        "got '${POSTURE:-<no repository-scoped scan policy>}' for repository_id='${REPO_ID}'. Without the promotion a constituent's absent assessment has nothing to move to and this scenario is asserting the wrong thing; without reject nothing gates and it is asserting nothing."
+    fail "(0) the resolved policy must be enforcement=reject" \
+        "got '${POSTURE:-<no repository-scoped scan policy>}' for repository_id='${REPO_ID}'. Without reject nothing gates and this scenario is asserting nothing."
     summary
 fi
 
@@ -262,9 +266,9 @@ if skopeo copy \
         --dest-creds "$DEST_CREDS" \
         "dir:${BASE_LAYOUT}" \
         "docker://${DEST_IMAGE}" 2>&1; then
-    pass "(1) push of the fixture to the enforcing, promoted repo succeeded"
+    pass "(1) push of the fixture to the enforcing repo succeeded"
 else
-    fail "(1) push of the fixture to the enforcing, promoted repo" \
+    fail "(1) push of the fixture to the enforcing repo" \
         "skopeo copy dir:${BASE_LAYOUT} -> ${DEST_IMAGE} exited non-zero. A 400 MANIFEST_BLOB_UNKNOWN naming sha256:${NEW_LAYER_HEX} is the defect this scenario is about, reached one step earlier than the blob fetch below: the manifest PUT refuses a constituent already in a terminal state, and a layer whose scan abstained with no_analyzer_matched lands scan_indeterminate within seconds of its upload. Check the worker log for 'no scan backend produced a verdict'."
     summary
 fi
@@ -311,7 +315,7 @@ if bounded_poll "link layer scanned" 240 \
 else
     STATE="$(psql_one "SELECT COALESCE(quarantine_status::text,'null') || ' last_scan_at=' || COALESCE(last_scan_at::text,'NULL') FROM artifacts WHERE id = '${LINK_LAYER_ID}';")"
     fail "(3) the link-carrying layer must record a completed scan within 240s" \
-        "row state: ${STATE:-<row gone>}. 'scan_indeterminate' with last_scan_at=NULL is THE defect: the scan abstained with no_analyzer_matched and that abstention held the layer, even though the composition above it is the unit of filesystem assessment and this policy has promoted its verdict. Check the worker log for 'no scan backend produced a verdict' naming kind oci_blob."
+        "row state: ${STATE:-<row gone>}. 'scan_indeterminate' with last_scan_at=NULL is THE defect: the scan abstained with no_analyzer_matched and that abstention held the layer, even though the composition above it is the unit of filesystem assessment and carries its verdict. Check the worker log for 'no scan backend produced a verdict' naming kind oci_blob."
     summary
 fi
 

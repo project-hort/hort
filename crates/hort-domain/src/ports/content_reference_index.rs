@@ -47,8 +47,9 @@
 //!   the manifest artifact, `target =` the blob's own content hash,
 //!   `kind = "oci_config"` for the config blob, `"oci_layer"` for each
 //!   layer blob. An image index PUT writes none of these (it has no
-//!   config/layers). Bounded by the same `MAX_BLOB_REFERENCES` cap
-//!   applied to blob-existence validation. GC-active keepalive exactly
+//!   config/layers). Bounded by the same admission gate applied to
+//!   blob-existence validation — the composite scan's whole-image
+//!   constituent budget, which a manifest past is not minted at all. GC-active keepalive exactly
 //!   like `oci_index_member` — orthogonal to, and not double-counted
 //!   against, the config/layer blob's `ArtifactGroupUseCase` group
 //!   membership (#46).

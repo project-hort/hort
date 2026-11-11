@@ -223,8 +223,7 @@ mod tests {
     use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
     use hort_domain::entities::repository::{Repository, RepositoryFormat};
     use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-        ScanPolicyProjection, SeverityThreshold,
+        NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
     };
     use hort_domain::events::{system_actor, PolicyScope};
     use hort_domain::ports::content_reference_index::{ContentReference, ContentReferenceIndex};
@@ -339,7 +338,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -512,7 +510,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

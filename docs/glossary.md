@@ -53,37 +53,28 @@ for and removes packages an earlier one carries. See
 [ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
 and [Layer chain ID](#layer-chain-id-chainid).
 
-### Composite verdict mode (`compositeVerdictMode`)
+### Composite verdict mode (`compositeVerdictMode`) — retired
 
-A `ScanPolicy` field (`compositeVerdictMode: observed | promoted`) deciding
-whether a composed OCI image's scan verdict decides its **manifest's**
-release. The composition is assessed on every manifest scan either way and
-every assessment is recorded as a `composite_scan_observations` row; the
-field is what grants the verdict release authority. Under `observed` — the
-default, and the posture of any policy that omits the field — the manifest's
-own assessment is byte-for-byte what it would be with no composite path at
-all. Under `promoted` the composition's findings **are** the manifest row's
-and reach the release gate under the ordinary predicate, and a composition
-that could not be produced is an absent verdict that holds the manifest
-`scan_indeterminate`; an image index and an artifact manifest stay
-non-gating, having no composition to gate on. `promoted` is also what
-moves the obligation **off** the layers: an OCI blob's own filesystem
-findings stop deciding its release and a layer hort has no decoder for
-stops being withheld for that, since the composition that binds it is
-what assesses the filesystem (ADR 0064 D2). The findings stay in the
-record, a claim about the layer's *bytes* still blocks it, non-OCI
-formats are untouched whatever the field says, and an already-rejected
-layer is recovered only by an explicit curation re-evaluation. Distinct
-from
-[enforcement mode](#enforcement-mode) on both axes: that decides what a
-blocking verdict *does*, this decides *whose analysis* produced it, and
-unlike `enforcement` a change re-judges no existing population in either
-direction (promotion takes effect on each manifest's next scan). `promoted`
-with an empty `scanBackends` is an apply-time rejection. See
+A former `ScanPolicy` field (`compositeVerdictMode: observed | promoted`)
+deciding whether a composed OCI image's scan verdict decided its
+**manifest's** release. It is **retired**: the composed verdict now decides
+unconditionally, and a policy envelope declaring either value is refused at
+gitops apply. `observed`, the shipped default, withheld that authority —
+which left the composition assessed and recorded while deciding nothing, and
+a constituent hort could not analyse in isolation holding its manifest with
+no deadline and no authority that could ever clear it. What `promoted`
+granted is what the pipeline now does for every policy: the composition's
+findings **are** the manifest row's and reach the release gate under the
+ordinary predicate, a composition that could not be produced is an absent
+verdict that holds the manifest `scan_indeterminate`, an image index and an
+artifact manifest stay non-gating for want of a composition to gate on, and
+an OCI blob's own filesystem findings no longer decide its release. See
 [ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
-D6 and
-[declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
-`kind: ScanPolicy`.
+D2, the migration notice in
+[`CHANGELOG.md`](../CHANGELOG.md), and
+[*The composed image is the scan unit*](architecture/explanation/scanning-pipeline.md#the-composed-image-is-the-scan-unit).
+Distinct from [enforcement mode](#enforcement-mode), which decides what a
+blocking verdict *does* and is **not** retired.
 
 ### Curator (`Permission::Curate`)
 

@@ -17,9 +17,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use hort_domain::entities::artifact::{is_scan_clearable, ProvenanceClearance};
-use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, ScanPolicyProjection,
-};
+use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
 use hort_domain::events::RejectionReason;
 use hort_domain::policy::{
     decide_rejected_transition, effective_quarantine_deadline, ReEvaluationOutcome,
@@ -89,16 +87,6 @@ pub(crate) enum RejectedDerivation {
 /// [`scan_kind_of`](crate::use_cases::scan_kind_resolution::scan_kind_of)
 /// — the role half of ADR 0064 D2's line.
 ///
-/// `composite_verdict` is **chosen by the caller, not resolved here**,
-/// and it is the one input on which this module's two callers
-/// deliberately differ (ADR 0064 D6): the automatic loosening pass of
-/// the policy-mutation walk pins [`CompositeVerdictMode::Observed`] so a
-/// promotion never un-rejects a terminal constituent by itself, while the
-/// curator's explicit single-artifact re-evaluation passes the resolved
-/// posture, because that is the operator-driven recovery D6 points at.
-/// Each caller states its choice and its reason where it makes it; see
-/// [`decide_rejected_transition`]'s module docs for the full argument.
-///
 /// `Err` only when the paired stream breached the event cap, so the
 /// evidence cannot be read to its tail and no verdict may be derived
 /// from the prefix.
@@ -108,7 +96,6 @@ pub(crate) async fn derive_rejected_outcome(
     policy: Option<&ScanPolicyProjection>,
     exclusions: &[ExclusionProjection],
     kind: ArtifactKind,
-    composite_verdict: CompositeVerdictMode,
     now: DateTime<Utc>,
 ) -> AppResult<RejectedDerivation> {
     let artifact = paired.artifact();
@@ -159,7 +146,6 @@ pub(crate) async fn derive_rejected_outcome(
         last_findings,
         policy,
         exclusions,
-        composite_verdict,
         quarantine_deadline,
         now,
     );

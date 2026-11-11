@@ -31,8 +31,8 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
-    ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::PolicyScope;
@@ -148,26 +148,13 @@ fn row_to_projection(row: &sqlx::postgres::PgRow) -> DomainResult<ScanPolicyProj
             "policy_projections.enforcement does not decode to ScanEnforcement: {e}"
         ))
     })?;
-    // `composite_verdict_mode` is a CHECK-constrained text column decoded
-    // via the domain `FromStr`. The column is
-    // `text NOT NULL DEFAULT 'observed'`, so any row written before this
-    // column existed surfaces as Observed — the composed-image verdict
-    // carries no release authority until an operator promotes it
-    // (ADR 0064 D6), which is what every such row was written under. A
-    // value outside the two variants is a corrupt-row invariant
-    // violation: defaulting one to `Observed` would silently un-promote a
-    // policy an operator promoted, and defaulting it to `Promoted` would
-    // grant release authority nobody granted.
-    let composite_verdict_mode_str: String = row
-        .try_get("composite_verdict_mode")
-        .map_err(|e| map_row_err(&e))?;
-    let composite_verdict_mode = CompositeVerdictMode::from_str(&composite_verdict_mode_str)
-        .map_err(|e| {
-            DomainError::Invariant(format!(
-                "policy_projections.composite_verdict_mode does not decode to \
-                 CompositeVerdictMode: {e}"
-            ))
-        })?;
+    // `policy_projections.composite_verdict_mode` is deliberately NOT
+    // read. The composed image's scan verdict decides its manifest's
+    // release unconditionally (ADR 0064 D2), so the column selects
+    // nothing and the projection carries no field for it. The column
+    // itself is left exactly as it is — ADR 0030's expand/contract has
+    // the DDL that drops it ship in the release *after* the one that
+    // removed the last code reference, and this is that removal.
     let stream_version_i64: i64 = row.try_get("stream_version").map_err(|e| map_row_err(&e))?;
     let stream_version = u64::try_from(stream_version_i64).map_err(|_| {
         DomainError::Invariant(format!(
@@ -193,7 +180,6 @@ fn row_to_projection(row: &sqlx::postgres::PgRow) -> DomainResult<ScanPolicyProj
         rescan_interval_hours,
         negligible_action,
         enforcement,
-        composite_verdict_mode,
         stream_version,
         created_at,
         updated_at,
@@ -263,7 +249,6 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
                           rescan_interval_hours, negligible_action, enforcement,
-                          composite_verdict_mode,
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE policy_id = $1"#,
@@ -290,7 +275,6 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
                           rescan_interval_hours, negligible_action, enforcement,
-                          composite_verdict_mode,
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE name = $1 AND archived = false"#,
@@ -321,7 +305,6 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
                           rescan_interval_hours, negligible_action, enforcement,
-                          composite_verdict_mode,
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE name = $1"#,
@@ -344,7 +327,6 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                           provenance_identities, max_artifact_age_secs,
                           license_policy, archived, scan_backends,
                           rescan_interval_hours, negligible_action, enforcement,
-                          composite_verdict_mode,
                           stream_version, created_at, updated_at
                    FROM policy_projections
                    WHERE archived = false
@@ -411,7 +393,6 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
         let rescan_interval_hours = projection.rescan_interval_hours;
         let negligible_action = projection.negligible_action.to_string();
         let enforcement = projection.enforcement.to_string();
-        let composite_verdict_mode = projection.composite_verdict_mode.to_string();
         let raw_version = projection.stream_version;
         let Ok(stream_version) = i64::try_from(raw_version) else {
             return Box::pin(async move {
@@ -437,11 +418,10 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                        provenance_identities, max_artifact_age_secs,
                        license_policy, archived, scan_backends,
                        rescan_interval_hours, stream_version,
-                       created_at, updated_at, negligible_action, enforcement,
-                       composite_verdict_mode
+                       created_at, updated_at, negligible_action, enforcement
                    ) VALUES (
                        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                       $16, $17, $18, $19, $20
+                       $16, $17, $18, $19
                    )
                    ON CONFLICT (policy_id) DO UPDATE SET
                        name                     = EXCLUDED.name,
@@ -459,7 +439,6 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
                        rescan_interval_hours    = EXCLUDED.rescan_interval_hours,
                        negligible_action        = EXCLUDED.negligible_action,
                        enforcement              = EXCLUDED.enforcement,
-                       composite_verdict_mode   = EXCLUDED.composite_verdict_mode,
                        stream_version           = EXCLUDED.stream_version,
                        updated_at               = EXCLUDED.updated_at"#,
             )
@@ -482,7 +461,6 @@ impl PolicyProjectionRepository for PgPolicyProjectionRepository {
             .bind(updated_at)
             .bind(&negligible_action)
             .bind(&enforcement)
-            .bind(&composite_verdict_mode)
             .execute(&self.pool)
             .await
             .map_err(|e| map_query_err(&e, "upsert"))?;
@@ -641,7 +619,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: version,
             created_at: now,
             updated_at: now,
@@ -1101,83 +1078,78 @@ mod tests {
         assert_eq!(fetched.enforcement, ScanEnforcement::Reject);
     }
 
-    // Round-trip `composite_verdict_mode` (text column,
-    // CHECK-constrained) through the DB. The `DEFAULT 'observed'` makes a
-    // row written before the column existed read back as `Observed` —
-    // the composed-image verdict carries no release authority until an
-    // operator promotes it (ADR 0064 D6), which is what every such row
-    // was written under.
+    /// **The retired `composite_verdict_mode` column is not read**, on
+    /// both sides: the adapter's `INSERT` does not name it, and the
+    /// projection a row decodes to does not depend on its value.
+    ///
+    /// ADR 0030's expand/contract is why there is a test here at all
+    /// rather than a `DROP COLUMN`: the DDL that removes the column may
+    /// ship only in a release strictly *after* the one that removed the
+    /// last code reference, and this is that removal. So the column
+    /// survives, unread — and "unread" is the thing worth pinning,
+    /// because a `SELECT` that quietly started naming it again would
+    /// restore a decode of a value no decision consults.
+    ///
+    /// The read side is asserted by an out-of-band `UPDATE` to **each**
+    /// CHECK-legal value: if any read path still decoded the column, two
+    /// states differing only in it would decode to two different
+    /// projections. Exercising both values is what keeps the assertion
+    /// off the accident of the row carrying the column default.
+    ///
+    /// **One row throughout.** `policy_projections` carries a unique
+    /// index on the active scope, so a second active global policy in the
+    /// same database is a constraint violation rather than a second
+    /// fixture — which is what the write-side half would otherwise have
+    /// needed. Reading the default back off the row the adapter just
+    /// wrote proves the same thing.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    async fn upsert_and_find_by_id_round_trip_composite_verdict_mode() {
-        let Some(pool) = maybe_pool().await else {
-            return;
-        };
-        let repo = PgPolicyProjectionRepository::new(pool);
-
-        let id = Uuid::new_v4();
-        let mut p = sample_projection(id, &format!("cvm-{}", id.simple()), 1);
-        assert_eq!(p.composite_verdict_mode, CompositeVerdictMode::Observed);
-        repo.upsert(&p).await.expect("upsert observed");
-        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
-        assert_eq!(
-            fetched.composite_verdict_mode,
-            CompositeVerdictMode::Observed
-        );
-
-        // Promote and confirm the non-default round-trips — both through
-        // the INSERT bind and the ON CONFLICT DO UPDATE arm.
-        p.composite_verdict_mode = CompositeVerdictMode::Promoted;
-        p.stream_version = 2;
-        repo.upsert(&p).await.expect("upsert promoted");
-        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
-        assert_eq!(
-            fetched.composite_verdict_mode,
-            CompositeVerdictMode::Promoted
-        );
-
-        // And demote — the update arm must not be one-way, because an
-        // operator who promoted on one repository and did not like what
-        // they saw has to be able to stop.
-        p.composite_verdict_mode = CompositeVerdictMode::Observed;
-        p.stream_version = 3;
-        repo.upsert(&p).await.expect("upsert observed again");
-        let fetched = repo.find_by_id(id).await.expect("find").expect("row");
-        assert_eq!(
-            fetched.composite_verdict_mode,
-            CompositeVerdictMode::Observed
-        );
-    }
-
-    /// The same storage-layer backstop on the composition axis. Reaching
-    /// it matters more here than for most columns: a value outside the
-    /// taxonomy has no safe decode — `Observed` would silently
-    /// un-promote a policy an operator promoted, and `Promoted` would
-    /// grant release authority nobody granted — so the row must not be
-    /// writable in the first place.
-    #[tokio::test]
-    #[serial(hort_pg_db)]
-    async fn composite_verdict_mode_check_constraint_rejects_an_unknown_value() {
+    async fn the_retired_composite_verdict_mode_column_is_not_read() {
         let Some(pool) = maybe_pool().await else {
             return;
         };
         let repo = PgPolicyProjectionRepository::new(pool.clone());
+
         let id = Uuid::new_v4();
-        let p = sample_projection(id, &format!("cvm-chk-{}", id.simple()), 1);
+        let p = sample_projection(id, &format!("cvm-{}", id.simple()), 1);
         repo.upsert(&p).await.expect("upsert");
 
-        let err = sqlx::query(
-            "UPDATE policy_projections SET composite_verdict_mode = $1 WHERE policy_id = $2",
+        // The write side: the `INSERT` omits the column, so the row takes
+        // the schema `DEFAULT 'observed'` rather than anything the
+        // adapter bound.
+        let written = sqlx::query_scalar::<_, String>(
+            "SELECT composite_verdict_mode FROM policy_projections WHERE policy_id = $1",
         )
-        .bind("enforce")
         .bind(id)
-        .execute(&pool)
+        .fetch_one(&pool)
         .await
-        .expect_err("an out-of-taxonomy composite verdict mode must violate the CHECK");
-        assert!(
-            err.to_string().contains("composite_verdict_mode"),
-            "the constraint violation should name the column: {err}"
+        .expect("the column still exists");
+        assert_eq!(
+            written, "observed",
+            "the adapter binds nothing for this column, so the row takes the \
+             schema default"
         );
+
+        // The read side.
+        let baseline = repo.find_by_id(id).await.expect("find").expect("row");
+        for stored in ["promoted", "observed"] {
+            sqlx::query(
+                "UPDATE policy_projections SET composite_verdict_mode = $1 \
+                 WHERE policy_id = $2",
+            )
+            .bind(stored)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("the column still accepts `{stored}`: {e}"));
+
+            let fetched = repo.find_by_id(id).await.expect("find").expect("row");
+            assert_eq!(
+                fetched, baseline,
+                "with `composite_verdict_mode = {stored}` the projection must be \
+                 byte-for-byte the one the column-ignorant read produced"
+            );
+        }
     }
 
     /// The column's CHECK constraint is the storage-layer backstop for

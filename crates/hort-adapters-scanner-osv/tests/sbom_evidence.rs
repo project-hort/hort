@@ -59,7 +59,7 @@ use std::path::PathBuf;
 use hort_adapters_scanner_osv::{OsvScannerAdapter, OsvScannerConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{ScanAnalysis, ScanTarget, ScanUnit, ScannerPort};
+use hort_domain::ports::scanner::{LayerRole, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort};
 use hort_domain::types::sbom::SbomComponent;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ContentHash, Ecosystem, Finding, Sbom};
 
@@ -122,9 +122,11 @@ async fn scan_sbom(coords: &ArtifactCoords, sbom: &Sbom) -> Option<DomainResult<
             _ => "oci",
         },
         coords,
-        // This backend reads only the SBOM, so the kind is carried for
-        // trait conformance and never consulted.
+        // This backend reads only the SBOM, so neither the kind nor the
+        // layer role is consulted; both are carried for trait
+        // conformance.
         kind: ArtifactKind::Other,
+        layer_role: LayerRole::Unknown,
     };
     Some(adapter.scan(&target, Some(sbom)).await)
 }

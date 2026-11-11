@@ -144,8 +144,8 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 // the shared `hort_app::provenance` module (single source for apply + the
 // offline validator), not duplicated here.
 use crate::provenance::{
-    composite_verdict_mode_from_spec, negligible_action_from_spec, provenance_identities_from_spec,
-    provenance_mode_from_spec, scan_enforcement_from_spec,
+    negligible_action_from_spec, provenance_identities_from_spec, provenance_mode_from_spec,
+    scan_enforcement_from_spec,
 };
 use hort_domain::entities::service_account::{
     backing_username, FallbackRotation, FederatedIdentity, SecretFormat, ServiceAccount,
@@ -776,13 +776,18 @@ const PRE_WRITE_REJECT_ROWS: &[(LinterRule, &str, RowAbort)] = &[
         RowAbort::EveryFinding,
     ),
     (
-        LinterRule::CompositeVerdictPromotedRequiresScanBackends,
-        "gitops apply: compositeVerdictMode × scanBackends:[] linter rejected ScanPolicy envelope(s) (a waived scan resolves no composed image, so the promoted verdict is never produced)",
+        LinterRule::ScanPolicyCompositeVerdictModeRetired,
+        "gitops apply: compositeVerdictMode linter rejected ScanPolicy envelope(s) (the field is retired — the composed image's verdict decides its manifest's release unconditionally, so neither value selects anything)",
         RowAbort::EveryFinding,
     ),
     (
         LinterRule::RepositoryQuotaBytesRetired,
         "gitops apply: quotaBytes linter rejected ArtifactRepository envelope(s) (the field is retired and was never enforced — nothing compared it to a usage figure)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::OciRepositoryRequiresScanBackends,
+        "gitops apply: scanBackends linter rejected ScanPolicy envelope(s) (an empty scanBackends waives the composed-image assessment that is an OCI artifact's only verdict, and the waiver is itself the release authority)",
         RowAbort::EveryFinding,
     ),
 ];
@@ -1922,12 +1927,6 @@ fn create_command_from_spec(
         // hort-config validated the wire value (parses to reject/record)
         // before this site.
         enforcement: scan_enforcement_from_spec(&env.spec.enforcement),
-        // `composite_verdict_mode` flows from YAML to the create
-        // command. hort-config validated the wire value (parses to
-        // observed/promoted) before this site, and the `promoted` ×
-        // empty-`scanBackends` combination is rejected by the linter row
-        // ahead of the first write.
-        composite_verdict_mode: composite_verdict_mode_from_spec(&env.spec.composite_verdict_mode),
     }
 }
 
@@ -1978,11 +1977,6 @@ fn update_command_from_diff(
         // Flow enforcement through. Same argument: per-field same-value
         // skip in `update_policy`.
         enforcement: FieldChange::Set(scan_enforcement_from_spec(&env.spec.enforcement)),
-        // Flow composite_verdict_mode through. Same argument: per-field
-        // same-value skip in `update_policy`.
-        composite_verdict_mode: FieldChange::Set(composite_verdict_mode_from_spec(
-            &env.spec.composite_verdict_mode,
-        )),
     }
 }
 
@@ -2131,9 +2125,7 @@ mod tests {
     // Test-only — the provenance mappers live in `crate::provenance`;
     // these types are referenced only by the fixtures.
     use hort_config::scan_policy::SignerIdentitySpec;
-    use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-    };
+    use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, ScanEnforcement};
 
     use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{MockCall, MockRepositoryRepository};
@@ -3165,7 +3157,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -6640,7 +6632,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -6675,7 +6667,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 3,
             created_at: now,
             updated_at: now,
@@ -8117,21 +8108,19 @@ mod tests {
                 expect_rule: LinterRule::SaRotationTargetConflict,
                 effective_backend: None,
             },
-            // Row 15 — a ScanPolicy promoting the composed-image verdict
-            // while waiving scanning outright. Global scope and no
-            // repositories, so row 7c has nothing to pair the (empty)
-            // backend list against and row 15 is the first error.
+            // Row 15 — a ScanPolicy declaring the retired
+            // `compositeVerdictMode`. The shared builder sets nothing
+            // else that rejects, so row 15 is the first error.
             Case {
                 desired: DesiredState {
                     scan_policies: vec![{
-                        let mut env = scan_policy_env("p-waived-but-promoted");
-                        env.spec.composite_verdict_mode = "promoted".into();
-                        env.spec.scan_backends = vec![];
+                        let mut env = scan_policy_env("p-declares-the-mode");
+                        env.spec.composite_verdict_mode = Some("promoted".into());
                         env
                     }],
                     ..Default::default()
                 },
-                expect_rule: LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+                expect_rule: LinterRule::ScanPolicyCompositeVerdictModeRetired,
                 effective_backend: None,
             },
             // Row 17 — a repository declaring the retired `quotaBytes`.
@@ -8147,6 +8136,24 @@ mod tests {
                     ..Default::default()
                 },
                 expect_rule: LinterRule::RepositoryQuotaBytesRetired,
+                effective_backend: None,
+            },
+            // Row 18 — an OCI repository governed by a scan waiver. The
+            // shared policy builder leaves `verify_if_present` with no
+            // identities, which is row 7's *warning* and not an error, and
+            // row 7c returns early on the empty list it would otherwise
+            // judge — so row 18 is the first (and only) error.
+            Case {
+                desired: DesiredState {
+                    repositories: vec![repo_env_with_format("oci-waived", "proxy", "oci")],
+                    scan_policies: vec![scan_policy_with_repo_scope_and_backends(
+                        "p-oci-waived",
+                        "oci-waived",
+                        vec![],
+                    )],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::OciRepositoryRequiresScanBackends,
                 effective_backend: None,
             },
         ];
@@ -8432,8 +8439,9 @@ mod tests {
                 | LinterRule::VirtualMemberFormatNotEnforced
                 | LinterRule::ScanPolicyMaxArtifactAgeNotImplemented
                 | LinterRule::SaRotationTargetConflict
-                | LinterRule::CompositeVerdictPromotedRequiresScanBackends
-                | LinterRule::RepositoryQuotaBytesRetired => Consumption::Table,
+                | LinterRule::ScanPolicyCompositeVerdictModeRetired
+                | LinterRule::RepositoryQuotaBytesRetired
+                | LinterRule::OciRepositoryRequiresScanBackends => Consumption::Table,
                 // Row 2 — its own abort immediately before row 4, so the
                 // cross-kind FK keeps its distinct log line and its
                 // `"; "`-joined envelope.
@@ -8467,9 +8475,10 @@ mod tests {
             LinterRule::VirtualMemberFormatNotEnforced,
             LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
             LinterRule::SaRotationTargetConflict,
-            LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+            LinterRule::ScanPolicyCompositeVerdictModeRetired,
             LinterRule::RepositoryStoragePathDeprecated,
             LinterRule::RepositoryQuotaBytesRetired,
+            LinterRule::OciRepositoryRequiresScanBackends,
         ];
 
         let in_table: HashSet<LinterRule> =
@@ -8513,7 +8522,7 @@ mod tests {
             .count();
         assert_eq!(
             (table, dedicated, advisory),
-            (15, 1, 2),
+            (16, 1, 2),
             "the LinterRule bucket counts changed — a silent reclassification \
              (or a variant missing from ALL_RULES) is exactly what this guard \
              exists to catch"
@@ -9072,7 +9081,14 @@ mod tests {
                             ..Default::default()
                         },
                         rebuild: rebuild_scan_policy,
-                        leaves: 9,
+                        // Eight, not nine: `compositeVerdictMode` is a
+                        // retired `Option<String>` whose `None` the seed
+                        // carries, so there is no string leaf for the
+                        // mutation walk to reach. Row 15 refuses every
+                        // `Some` in the pre-write pass, which is the
+                        // answer to the question this test asks about
+                        // every field it does see.
+                        leaves: 8,
                     }
                 }
                 Kind::RetentionPolicy => {
@@ -9335,9 +9351,9 @@ mod tests {
         // through by both gates proves nothing about either.
         assert_eq!(
             (checked, unrepresentable),
-            (76, 8),
+            (74, 8),
             "the mutation corpus changed size (checked {checked}, \
-             unrepresentable {unrepresentable}; 42 string leaves x 2 \
+             unrepresentable {unrepresentable}; 41 string leaves x 2 \
              replacements, less the typed leaves that stop deserialising). \
              Expected when a spec field is added or removed — re-read the \
              per-kind leaf counts above with it"
@@ -9848,7 +9864,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -9882,7 +9898,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -10335,7 +10351,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }

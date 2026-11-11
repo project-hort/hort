@@ -15,8 +15,7 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
-    SignerIdentityPattern,
+    NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold, SignerIdentityPattern,
 };
 use serde::{Deserialize, Serialize};
 
@@ -174,27 +173,28 @@ pub struct ScanPolicySpec {
     /// are persisted, and the artifact is not rejected.
     #[serde(default = "default_enforcement")]
     pub enforcement: String,
-    /// Whether a composed OCI image's scan verdict decides its
-    /// manifest's release (`observed | promoted`). Validated via
-    /// [`CompositeVerdictMode::FromStr`] in [`validate_scan_policy`].
-    /// Defaults to `observed` when omitted — the behaviour of every
-    /// policy that predates the field, so an existing tree needs no
-    /// migration.
+    /// **Retired.** A composed OCI image's scan verdict decides its
+    /// manifest's release unconditionally (ADR 0064 D2), so there is no
+    /// posture left for this field to select.
     ///
-    /// Under `observed` the composition is still resolved, acquired,
-    /// scanned and recorded as an observation; what the field grants is
-    /// release authority over the manifest. Promotion is an operator act
-    /// against named criteria (ADR 0064 D6) because a composite verdict
-    /// adds rejections across an existing estate and a rejection is
-    /// terminal.
+    /// **`None` is the only value apply accepts.** Any declared value is
+    /// rejected by
+    /// [`validate_scan_policy_composite_verdict_mode_retired`](crate::desired::validate_scan_policy_composite_verdict_mode_retired),
+    /// which names the retirement; a different value does not change
+    /// that. The field stays in the `deny_unknown_fields` spec solely so
+    /// that rejection can replace an ``unknown field
+    /// `compositeVerdictMode` `` parse error, which would tell an
+    /// operator they may have mistyped something or be running the wrong
+    /// version and nothing about why.
     ///
-    /// `promoted` with an empty `scanBackends` is an apply-time reject:
-    /// a waived scan returns before a composition is resolved, so no
-    /// manifest ever carries a composite assessment for the promotion to
-    /// act on (ADR 0015 / ADR 0016 — see
-    /// [`validate_scan_policy_promoted_composite_requires_scan_backends`](crate::desired::validate_scan_policy_promoted_composite_requires_scan_backends)).
-    #[serde(default = "default_composite_verdict_mode")]
-    pub composite_verdict_mode: String,
+    /// **`Option<String>` with no serde default, and that is
+    /// load-bearing.** While the field had a `#[serde(default)]` a
+    /// document that omitted it and one that set it to the default
+    /// deserialised identically, so a refusal written against the field
+    /// could only refuse every tree or none of them. The `Option` is
+    /// what makes absence distinguishable from a declared value, and so
+    /// what lets an operator who never typed the field apply unchanged.
+    pub composite_verdict_mode: Option<String>,
 }
 
 /// Out-of-the-box `scanBackends` default when the YAML omits the
@@ -257,14 +257,6 @@ fn default_negligible_action() -> String {
 /// Mirrors [`ScanEnforcement::default`].
 fn default_enforcement() -> String {
     ScanEnforcement::default().to_string()
-}
-
-/// Out-of-the-box `compositeVerdictMode` default when the YAML omits
-/// the field: `observed`, the no-release-authority default every
-/// pre-existing policy behaves as. Mirrors
-/// [`CompositeVerdictMode::default`].
-fn default_composite_verdict_mode() -> String {
-    CompositeVerdictMode::default().to_string()
 }
 
 /// Parse one `ScanPolicy` envelope.
@@ -420,23 +412,6 @@ pub fn validate_scan_policy(env: &Envelope<ScanPolicySpec>) -> Vec<ValidationErr
             field: "spec.enforcement",
             got: env.spec.enforcement.clone(),
             expected: vec!["reject", "record"],
-        });
-    }
-
-    // `compositeVerdictMode` parses via the domain enum. An unknown
-    // value is a typed reject naming the field and the two valid values
-    // — mirrors `enforcement`, and for the same reason: the mode is
-    // enforced at runtime by the scan orchestrator's composite path, so
-    // silently defaulting a typo to `observed` would tell an operator
-    // their composed-image verdicts gate release while nothing gates
-    // (ADR 0015). The `promoted` × empty-`scanBackends` combination is a
-    // separate, cross-field rule and belongs to the apply-time linter
-    // row, not here.
-    if CompositeVerdictMode::from_str(&env.spec.composite_verdict_mode).is_err() {
-        errors.push(ValidationError::UnknownEnumValue {
-            field: "spec.compositeVerdictMode",
-            got: env.spec.composite_verdict_mode.clone(),
-            expected: vec!["observed", "promoted"],
         });
     }
 
@@ -1039,30 +1014,48 @@ mod tests {
         );
     }
 
-    // `compositeVerdictMode` round-trip + default + validation
-    // (ADR 0064 D6).
+    // `compositeVerdictMode` is retired: the parse keeps the field so the
+    // apply-time refusal can replace an `unknown field` error, and the
+    // only thing this layer asserts is that absence and presence are
+    // distinguishable. The refusal itself lives with the other
+    // retired-field rows (`crate::desired`).
     #[test]
-    fn parse_round_trips_explicit_composite_verdict_mode_promoted() {
-        let body = "
+    fn a_declared_composite_verdict_mode_still_parses_and_is_distinguishable() {
+        for declared in ["promoted", "observed", "anything"] {
+            let body = format!(
+                "
   scope: global
   severityThreshold: high
   quarantineDuration: 24h
   requireApproval: true
-  compositeVerdictMode: promoted
-  licensePolicy: {}
-";
-        let env = parse_scan_policy(&p(), yaml("with-composite", body).as_bytes()).unwrap();
-        assert_eq!(env.spec.composite_verdict_mode, "promoted");
-        assert!(validate_scan_policy(&env).is_empty());
+  compositeVerdictMode: {declared}
+  licensePolicy: {{}}
+"
+            );
+            let env = parse_scan_policy(&p(), yaml("with-composite", &body).as_bytes()).unwrap();
+            assert_eq!(
+                env.spec.composite_verdict_mode.as_deref(),
+                Some(declared),
+                "the field must still parse, so the retirement refusal can \
+                 replace an `unknown field` parse error"
+            );
+            // Not a per-envelope error: the refusal is a `DesiredState`
+            // rule beside the other retired-field rows, and this layer
+            // must not reject the value twice with two messages.
+            assert!(
+                validate_scan_policy(&env).is_empty(),
+                "the value itself is no longer validated against a taxonomy"
+            );
+        }
     }
 
+    /// **Absence is distinguishable from a declared value**, which is the
+    /// precondition the refusal rests on. While the field carried a
+    /// `#[serde(default)]` a document that omitted it and one that set it
+    /// to the default deserialised identically, so a refusal written
+    /// against the field could only refuse every tree or none of them.
     #[test]
-    fn parse_omitted_composite_verdict_mode_defaults_to_observed() {
-        // Zero-migration guarantee: an existing policy file that never
-        // mentions `compositeVerdictMode` parses to the no-authority
-        // default, so every deployed tree keeps gating exactly what it
-        // gates today — promotion is an operator act, never something a
-        // release performs on their behalf (ADR 0064 D6).
+    fn an_omitted_composite_verdict_mode_parses_to_none() {
         let body = "
   scope: global
   severityThreshold: high
@@ -1071,53 +1064,11 @@ mod tests {
   licensePolicy: {}
 ";
         let env = parse_scan_policy(&p(), yaml("default-composite", body).as_bytes()).unwrap();
-        assert_eq!(env.spec.composite_verdict_mode, "observed");
-        assert!(validate_scan_policy(&env).is_empty());
-    }
-
-    #[test]
-    fn validate_rejects_unknown_composite_verdict_mode() {
-        let body = "
-  scope: global
-  severityThreshold: high
-  quarantineDuration: 24h
-  requireApproval: false
-  compositeVerdictMode: enforce
-  licensePolicy: {}
-";
-        let env = parse_scan_policy(&p(), yaml("p", body).as_bytes()).unwrap();
-        let errors = validate_scan_policy(&env);
-        assert!(errors.iter().any(|e| matches!(
-            e,
-            ValidationError::UnknownEnumValue { field, got, expected }
-                if *field == "spec.compositeVerdictMode"
-                    && got == "enforce"
-                    && *expected == vec!["observed", "promoted"]
-        )));
-    }
-
-    #[test]
-    fn validate_rejects_near_miss_composite_verdict_mode_typo() {
-        // The footgun: a typo that silently defaulted to `observed`
-        // would leave an operator believing their composed-image
-        // verdicts gate release while nothing gates.
-        let body = "
-  scope: global
-  severityThreshold: high
-  quarantineDuration: 24h
-  requireApproval: false
-  compositeVerdictMode: promotd
-  licensePolicy: {}
-";
-        let env = parse_scan_policy(&p(), yaml("p", body).as_bytes()).unwrap();
-        let errors = validate_scan_policy(&env);
-        assert!(
-            errors.iter().any(|e| {
-                let s = e.to_string();
-                s.contains("compositeVerdictMode") && s.contains("promotd")
-            }),
-            "a near-miss composite verdict mode must reject loudly: {errors:?}"
+        assert_eq!(
+            env.spec.composite_verdict_mode, None,
+            "a tree that never named the field must stay applicable"
         );
+        assert!(validate_scan_policy(&env).is_empty());
     }
 
     // `rescanIntervalHours` round-trip + default + validation.

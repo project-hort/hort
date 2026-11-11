@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Migration notice
+
+- **A `ScanPolicy` that sets `compositeVerdictMode` is refused at apply.**
+  The field is retired, including the value `promoted`, which earlier releases
+  accepted. Remove the line from every policy document before upgrading, or
+  the first gitops apply after the upgrade fails and `hort-server` exits
+  non-zero at boot. Nothing to do if no policy document sets it.
+- **A composed OCI image's scan verdict now decides its manifest's release
+  unconditionally.** On the previous default the composition was assessed
+  without release authority and a single constituent layer hort could not
+  analyse in isolation (`UnsupportedContainer`, `NoAnalyzerMatched`) withheld
+  the manifest with no deadline; such a layer no longer holds the artifact on
+  its own, and the composite verdict decides. Images held this way become
+  deliverable; images whose composite verdict carries blocking findings are
+  rejected where the per-layer rule previously let them through.
+- **Artifacts already stored are reassessed by the `cron-rescan-tick` sweep,
+  which the chart ships disabled.** Run `hort-cli admin task invoke
+  cron-rescan-tick` once after upgrading and repeat while its
+  `result_summary` reports a non-zero `stranded_eligible` or
+  `composite_unassessed` count; each invocation enqueues at most 1000 scans
+  per population. Without it, layers held under the old rule stay held and
+  images with no composite assessment keep serving. See
+  `docs/architecture/how-to/recover-stranded-artifacts.md`.
+- **The database column is not dropped in this release.**
+  `policy_projections.composite_verdict_mode` and its CHECK constraint still
+  exist and are no longer read. The migration that removes them ships in a
+  later release, per the expand/contract policy (ADR 0030) — do not expect the
+  column to be gone after upgrading, and no action is needed for it.
+
 ### Added
 
 - `api_tokens` rows record which issuance path minted them (`issued_via`, also
@@ -35,12 +64,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An OCI manifest declaring more than 255 blob references, more than 8 GiB of
+  content, or a `config`/`layers[]` descriptor with no readable `size` (which
+  the image spec requires), is now refused at the push (`400 MANIFEST_INVALID`)
+  and not mirrored from an upstream (`400 UNSUPPORTED`): such an image used to
+  be accepted and then held with no verdict for ever (#428).
+- A non-image OCI artifact manifest — an SBOM attachment, a signature referrer,
+  a BuildKit attestation manifest — is no longer held as an image with an
+  unsupported layer; a multi-arch image carries one attestation manifest per
+  platform, and a scan policy held every one of them indefinitely (#428).
+- An OCI blob a manifest declares to be something other than an image layer —
+  a Helm chart's content, an SBOM or signature payload — is no longer scanned
+  as a root filesystem and records "not applicable" instead of package
+  findings; a layer, and a blob no manifest names yet, are scanned as before
+  (#428).
+- A gitops apply now fails when a `ScanPolicy` waives scanning
+  (`scanBackends: []`) for an `oci` repository: the composed image is such an
+  artifact's only assessment, and the waiver skips it while itself authorising
+  release. Declare the backends that should assess the composition, or scope a
+  policy with backends to that repository. The waiver is unchanged for every
+  other format (#428).
 - A scan in which every backend ran and none could analyse the artifact now
   leaves its job row `completed` with the reason in `result_summary`, and ticks
   the new `hort_scan_jobs_total{result="nothing_analysable"}` instead of
   `failed`. The artifact is still held `scan_indeterminate`; it no longer
-  appears under `?kind=scan&status=failed` and is no longer re-enqueued by the
-  stranded-rescan sweep — list it with
+  appears under `?kind=scan&status=failed`, and the stranded sweep re-asks only
+  once the policy's rescan interval has elapsed — list it with
   `GET /api/v1/admin/curation/queue?status=scan_indeterminate` and recover it
   by fixing the policy's `scanBackends` and rescanning (#427).
 - `hort-cli curation waive <artifact_id>` is now `curation waive artifact
@@ -49,6 +98,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An OCI image manifest whose composition could not be produced within the
+  scan's attempt budget — an unreachable upstream or a store that did not
+  answer — is now held `quarantined` rather than terminal
+  `scan_indeterminate`, so a write-granted read still reaches it and the
+  `cron-rescan-tick` sweep re-asks once the condition clears. Counted on
+  `hort_scan_record_outcome_failures_total{result="composition_not_produced"}`
+  (#428).
 - The `transitive_deps` prefetch trigger no longer enqueues a dependency-walk
   job for an artifact that declares none — only the format's own manifest
   document is walked. Skips are counted on
@@ -60,6 +116,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ever enforced, so a gitops apply declaring the field now fails — drop the
   line to apply. The admin effective-config response no longer reports it
   (#280).
+- `compositeVerdictMode` on a `ScanPolicy` envelope is retired: the composed
+  image's verdict decides its manifest's release unconditionally, so a gitops
+  apply declaring the field now fails — drop the line to apply. The admin
+  effective-config response no longer reports it (#428).
 
 ## [0.17.3] - 2026-11-08
 

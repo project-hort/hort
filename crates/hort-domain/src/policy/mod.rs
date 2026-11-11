@@ -67,8 +67,8 @@ pub use rescan_drive_liveness::{
     evaluate_rescan_drive_liveness, DeclaredCadence, RescanDriveLiveness,
 };
 pub use scan::{
-    composite_verdict_mode_of, effective_quarantine_deadline, evaluate_scan_result,
-    evaluate_scan_summary, has_license_policy, DefaultPolicy, ScanOutcome,
+    effective_quarantine_deadline, evaluate_scan_result, evaluate_scan_summary, has_license_policy,
+    DefaultPolicy, ScanOutcome,
 };
 pub use scan_delta::compute_added_findings;
 pub use staging_sweep_liveness::{evaluate_staging_sweep_liveness, StagingSweepLiveness};

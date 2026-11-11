@@ -664,7 +664,7 @@ so they don't all hit the snapshot queries on the same edge
 | Metric | Type | Labels | Unit | Description |
 |---|---|---|---|---|
 | `hort_dispatcher_principal_resolved_total` | counter | `source ∈ {snapshot_present, snapshot_empty_admin, snapshot_empty_no_admin}` | — | One increment per principal synthesis in the subscription-delivery dispatcher — one per **active subscription per reconcile pass**, since the principal is re-synthesised for a running task as well as a new one, so the rate tracks the active-subscription count rather than the spawn rate. 3-series. `snapshot_present` = `subscription.snapshot_claims` was non-empty and was used as the evaluation claim set; `snapshot_empty_admin` = `snapshot_claims` empty but the owner carries the admin bit (evaluates with admin authority); `snapshot_empty_no_admin` = `snapshot_claims` empty and owner is not an admin — the operator diagnostic for "subscription created via PAT by a non-admin user" (such a subscription can never match a claims-scoped grant). |
-| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired); `scan_policy_license_policy_not_implemented` fires per offending `ScanPolicy` declaring a non-inert `licensePolicy` (the scan path evaluates it against an empty licence list, so every rule in it matches nothing — retired when a port surfaces an artifact's licences); `exclusion_scope_not_implemented` fires per offending `Exclusion` whose `scope` names a repository (the finding filter never reads the scope, so the waiver clears its CVE for every repository the parent policy governs — retired when per-repository scoping is enforced); `virtual_member_format_not_enforced` fires per offending (virtual repository, `virtualMembers` entry) pair whose formats differ (nothing compares them, so the member is resolved for the virtual's format and owns the names it holds there — retired when a format-compatibility model ships); `scan_policy_max_artifact_age_not_implemented` fires per offending `ScanPolicy` declaring a `maxArtifactAge` (the cap is projected, event-sourced and persisted while the age evaluator has no caller on any scan, release or retention path, so no artifact is ever flagged for age — retired when a consumer feeds the projected cap and the artifact's ingest instant through `evaluate_age_gates`); `composite_verdict_promoted_requires_scan_backends` fires per offending `ScanPolicy` pairing `compositeVerdictMode: promoted` with an empty `scanBackends` — the ADR 0016 cross-opt-in rule on the composition axis, and the second rule whose other half is the same empty backend list: the waiver returns before a composed image is resolved, so the promotion grants release authority to a verdict no manifest in scope ever carries (never retired — a waived scan has nothing to promote under any implementation); `repository_storage_path_deprecated` fires per offending `ArtifactRepository` declaring the deprecated `storage.path` — the only *lint-row* rule that emits `result="warn"` rather than `result="reject"` (the four grant rules span all three results), because unlike its inert-field siblings the field was effectively mandatory before it became optional, so rejecting it would fail the first apply after an upgrade for every operator at once over a value that routes nothing (placement is the one global CAS selected by `HORT_STORAGE_BACKEND`); retired in the same commit that removes `StorageSpec.path`; `repository_quota_bytes_retired` fires per offending `ArtifactRepository` declaring `quotaBytes` — the same ADR 0015 inert-field rule on the capacity axis, and the only one whose label does not end in `_not_implemented` because the field is **retired rather than deferred**: no use case ever compared the value to a usage figure, so every byte past the declared limit was admitted, and the maintainer decided against enforcing it rather than postponing it. The sharpest form of the anti-pattern in the catalog, because the apply *range-checked* the value and the admin effective-config response echoed it back, which is a stronger claim that a field works than merely accepting it; the field stays in the `deny_unknown_fields` spec solely so this rejection replaces an `unknown field` parse error (retired when the field leaves the spec or gains a real consumer). `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented`, `scan_policy_license_policy_not_implemented`, `exclusion_scope_not_implemented`, `virtual_member_format_not_enforced`, `scan_policy_max_artifact_age_not_implemented`, `composite_verdict_promoted_requires_scan_backends`, `repository_storage_path_deprecated`, `repository_quota_bytes_retired` — cardinality is fixed at the rule count (16). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 16 rules × 3 results = 48. |
+| `hort_apply_config_linter_total` | counter | `rule`, `result ∈ {pass, warn, reject}` | — | One increment per evaluated lint subject per rule. The subject depends on the rule: `single-claim-grant` / `direct-user-grant-without-justification` / `wildcard-repo-non-admin` / `claim-name-collision` fire per `PermissionGrant`; `trust_upstream_publish_time_requires_scan_backends` fires per `RepositoryUpstreamMapping` (the ADR 0016 cross-opt-in rule); `prefetch_max_age_days_not_implemented` fires per `PrefetchPolicy`-on-repository and `prefetch_trigger_requires_version_discovery` per offending `prefetchPolicy.triggers` entry (the ADR 0015 inert-field rules); `scan_backend_capability` fires per offending (ScanPolicy, repository, `scanBackends` entry) pairing — the same ADR 0015 rule on the scan axis, rejecting a backend the compiled-in scanner capability map says cannot analyse that repository's format; `retention_unused_for_not_implemented` fires per offending `RetentionPolicy` whose predicate uses `UnusedFor` at the root or nested in a `Composite` (the same ADR 0015 rule on the retention axis, in its mislabelled rather than merely inert form — no last-download signal exists, so the evaluator falls back to the creation time and the predicate silently decides on age; the rule is retired when a real last-download anchor is wired); `scan_policy_license_policy_not_implemented` fires per offending `ScanPolicy` declaring a non-inert `licensePolicy` (the scan path evaluates it against an empty licence list, so every rule in it matches nothing — retired when a port surfaces an artifact's licences); `exclusion_scope_not_implemented` fires per offending `Exclusion` whose `scope` names a repository (the finding filter never reads the scope, so the waiver clears its CVE for every repository the parent policy governs — retired when per-repository scoping is enforced); `virtual_member_format_not_enforced` fires per offending (virtual repository, `virtualMembers` entry) pair whose formats differ (nothing compares them, so the member is resolved for the virtual's format and owns the names it holds there — retired when a format-compatibility model ships); `scan_policy_max_artifact_age_not_implemented` fires per offending `ScanPolicy` declaring a `maxArtifactAge` (the cap is projected, event-sourced and persisted while the age evaluator has no caller on any scan, release or retention path, so no artifact is ever flagged for age — retired when a consumer feeds the projected cap and the artifact's ingest instant through `evaluate_age_gates`); `scan_policy_composite_verdict_mode_retired` fires per offending `ScanPolicy` declaring the retired `compositeVerdictMode` — the same ADR 0015 inert-field rule on the composition axis, and like `repository_quota_bytes_retired` a **retirement rather than a deferral**: the composed image's verdict decides its manifest's release unconditionally (ADR 0064 D2), so neither value selects anything and no future implementation gives the field a consumer. In its sharpest form too, because the field used to decide whether the composed verdict reached the artifact at all, so accepting it now would silently void an operator's threat-model decision; the field stays in the `deny_unknown_fields` spec solely so this rejection replaces an `unknown field` parse error (retired when the field leaves the spec); `repository_storage_path_deprecated` fires per offending `ArtifactRepository` declaring the deprecated `storage.path` — the only *lint-row* rule that emits `result="warn"` rather than `result="reject"` (the four grant rules span all three results), because unlike its inert-field siblings the field was effectively mandatory before it became optional, so rejecting it would fail the first apply after an upgrade for every operator at once over a value that routes nothing (placement is the one global CAS selected by `HORT_STORAGE_BACKEND`); retired in the same commit that removes `StorageSpec.path`; `repository_quota_bytes_retired` fires per offending `ArtifactRepository` declaring `quotaBytes` — the same ADR 0015 inert-field rule on the capacity axis, and the only one whose label does not end in `_not_implemented` because the field is **retired rather than deferred**: no use case ever compared the value to a usage figure, so every byte past the declared limit was admitted, and the maintainer decided against enforcing it rather than postponing it. The sharpest form of the anti-pattern in the catalog, because the apply *range-checked* the value and the admin effective-config response echoed it back, which is a stronger claim that a field works than merely accepting it; the field stays in the `deny_unknown_fields` spec solely so this rejection replaces an `unknown field` parse error (retired when the field leaves the spec or gains a real consumer); `oci_repository_requires_scan_backends` fires per offending (ScanPolicy, repository) pairing where an **effective** policy waives scanning outright (`scanBackends: []`) for a `format: oci` repository — the surviving half of the retired `composite_verdict_promoted_requires_scan_backends`, whose other half (`compositeVerdictMode: promoted`) stopped being an operator opt-in when the composed verdict became unconditionally authoritative (ADR 0064 D2). The composition is the unit of assessment for an OCI artifact and the only thing that carries a verdict on one, and the waiver returns before a composition is resolved, so no image is ever assessed while the waiver is itself the release authority. The exact complement of `scan_backend_capability`, which skips the empty list this rule judges, so the two partition `scanBackends`; the waiver stays supported for every non-`oci` format, which is why this is a separate rule rather than a wider reading of that one. Not retired by a future implementation: a waived scan composes nothing under any scanner that ships later. `rule` is one of the fixed lint-rule keys: `single-claim-grant`, `direct-user-grant-without-justification`, `wildcard-repo-non-admin`, `claim-name-collision`, `trust_upstream_publish_time_requires_scan_backends`, `prefetch_max_age_days_not_implemented`, `prefetch_trigger_requires_version_discovery`, `scan_backend_capability`, `retention_unused_for_not_implemented`, `scan_policy_license_policy_not_implemented`, `exclusion_scope_not_implemented`, `virtual_member_format_not_enforced`, `scan_policy_max_artifact_age_not_implemented`, `scan_policy_composite_verdict_mode_retired`, `repository_storage_path_deprecated`, `repository_quota_bytes_retired`, `oci_repository_requires_scan_backends` — cardinality is fixed at the rule count (17). `result`: `pass` = subject satisfied the rule (or the rule did not apply to this shape); `warn` = rule flagged the subject but the configured action is non-blocking (apply continues, CI surfaces the warning); `reject` = rule rejected the subject and the gitops apply fails. Max series = 17 rules × 3 results = 51. |
 | `hort_effective_permissions_lookups_total` | counter | `result ∈ {ok, denied, not_found}` | — | One increment per call to the admin effective-permissions endpoint (`GET /api/v1/admin/users/:user_id/effective-permissions`). 3-series. `ok` = admin caller, inspected user resolved, view returned; `denied` = `require_admin()` rejected the caller (emitted before the early return; the inspected user was never resolved); `not_found` = caller was admin but the inspected `user_id` did not resolve to a user row. |
 
 Emitted by
@@ -2914,7 +2914,7 @@ intentionally NOT operator-tunable.
 | `hort_finding_component_relation_total` | counter | `format`, `result` | — | `result ∈ {subject, contained, not_contained, not_established}` |
 | `hort_sbom_components_skipped_total` | counter | `format` | — | — (the skip count rides the counter's value) |
 | `hort_artifact_became_vulnerable_total` | counter | `repository`, `severity`, `ingest_source` | — | `severity ∈ {critical, high, medium, low}`; `ingest_source ∈ {direct, proxied}` |
-| `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large, nothing_analysable, inert_pairing}`; `scanner ∈ {(none), trivy, osv, …registered backend names}` |
+| `hort_scan_record_outcome_failures_total` | counter | `result`, `scanner` | — | `result ∈ {failed_branch, report_too_large, nothing_analysable, inert_pairing, composition_not_produced}`; `scanner ∈ {(none), composite, trivy, osv, …registered backend names}` |
 
 Source of truth for the result enums:
 - `hort_app::metrics::ScanJobsResult` for `hort_scan_jobs_total.result`.
@@ -3260,7 +3260,7 @@ to surface DB-side outages; sustained non-zero rate means scan jobs are
 silently looping back into pending without their backoff state
 landing.
 
-The counter's other three `result` values are emitted by
+The counter's next three `result` values are emitted by
 [`ScanOrchestrationUseCase::run_scan`](../crates/hort-app/src/use_cases/scan_orchestration.rs)
 and are per-*backend*, not per-transition-failure:
 
@@ -3302,7 +3302,34 @@ and are per-*backend*, not per-transition-failure:
   backend covers is not counted here — there is no covering backend to
   switch to, so it asks nothing of an operator and logs at `debug!`.
 
-`result` carries the failure classifier (closed taxonomy of 4):
+The fifth value is per-*job* and is emitted by
+[`ScanOrchestrationUseCase::record_outcome`](../crates/hort-app/src/use_cases/scan_orchestration.rs):
+
+- `composition_not_produced` — the scan job spent its whole attempt
+  budget without the manifest's **composition** ever becoming
+  producible: a store or an upstream that did not answer, or an
+  acquisition phase that ran out of clock
+  ([ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+  D1's *transient* refusal). `scanner="composite"` — the unit that went
+  unassessed is the composition rather than any one backend.
+
+  The distinction from `nothing_analysable` is the reason the label
+  exists: there, a backend ran over the artifact and answered, so the
+  scan reached a deterministic result and the artifact is held
+  terminally (`scan_indeterminate`). Here the scan never got as far as
+  having something to analyse, so the artifact is held **recoverably**
+  (`quarantined`) and `select_stranded` re-asks once the condition
+  clears. Reading the two as one population reports a pull-through
+  estate behind a flaky upstream as a mispaired policy, and points the
+  operator at `scanBackends` instead of at the upstream or the
+  credential.
+
+  Unlike the four values above it is **not** an artifact-terminal
+  decision, so it deliberately has no `hort_scan_terminal_total` tick
+  beside it. A sustained non-zero rate means images are being held for
+  want of constituents Hort cannot acquire.
+
+`result` carries the failure classifier (closed taxonomy of 5):
 
 - `failed_branch` — emitted by
   [`hort_worker::poll_loop::emit_failed_branch_alert`](../crates/hort-worker/src/poll_loop.rs)
@@ -3326,10 +3353,15 @@ and are per-*backend*, not per-transition-failure:
 - `nothing_analysable` / `inert_pairing` — the two per-backend
   no-verdict values documented above. `scanner` carries the abstaining
   (respectively skipped) backend name.
+- `composition_not_produced` — the per-job no-verdict value documented
+  above, emitted by
+  [`ScanOrchestrationUseCase::record_outcome`](../crates/hort-app/src/use_cases/scan_orchestration.rs).
+  `scanner` carries the `composite` unit name.
 
 `scanner` carries the originating scanner backend's name when the
 failure is attributable to one (the `report_too_large`,
-`nothing_analysable` and `inert_pairing` paths), otherwise the `(none)`
+`nothing_analysable` and `inert_pairing` paths), the `composite` unit
+name on the `composition_not_produced` path, and otherwise the `(none)`
 sentinel (the `failed_branch` path).
 
 Cardinality:
@@ -3351,12 +3383,13 @@ Cardinality:
   `METRICS_INCLUDE_REPOSITORY_LABEL=false` toggle — when disabled,
   the ceiling drops to `4 × 2 = 8` series. The toggle is the
   operator's escape hatch when scaling past 1k repositories.
-- `hort_scan_record_outcome_failures_total`: 2 result values
-  (`failed_branch`, `report_too_large`) × ≤3 scanner attributions
-  (`(none)`, `trivy`, `osv`, plus any operator-registered backend) →
-  small bounded ceiling. The metric is alerting-only — series count is
-  bounded by the closed `result` taxonomy and the registered-backend
-  count.
+- `hort_scan_record_outcome_failures_total`: 5 result values
+  (`failed_branch`, `report_too_large`, `nothing_analysable`,
+  `inert_pairing`, `composition_not_produced`) × ≤4 scanner
+  attributions (`(none)`, `composite`, `trivy`, `osv`, plus any
+  operator-registered backend) → small bounded ceiling. The metric is
+  alerting-only — series count is bounded by the closed `result`
+  taxonomy and the registered-backend count.
 
 Per the architect skill's "high-cardinality metric labels" rule,
 `artifact_id` is NOT a label on any of these metrics. Per-artifact
@@ -3454,25 +3487,43 @@ without a verdict is therefore wrong in both directions — it omits the
 abstentions and it says nothing about which of the two a `failed` row
 is. The per-job `result` label is what tells them apart.
 
+**The same holds for an unproduced composition, and from every prior
+status.** A scan that spent its whole attempt budget without the
+manifest's composition becoming producible holds the artifact
+`quarantined` — staying there if it already was, and transitioning from
+the permissive `None` default if it was not — and reaches no
+artifact-terminal decision either, so it ticks this counter zero times.
+What it does tick is
+`hort_scan_record_outcome_failures_total{result="composition_not_produced",
+scanner="composite"}` and `hort_scan_jobs_total{result=failed}`. Absence
+from this counter is therefore not an oversight in either case: it is
+how the two recoverable holds are told apart from the three terminal
+decisions.
+
 Cardinality: 4 result values → 4 series ceiling. `artifact_id` is
 NOT a label (architect "high-cardinality metric labels" rule);
 per-artifact drill-down is the `info!` audit line on the
 `→ scan_indeterminate` transition
 (`QuarantineUseCase::record_scan_indeterminate`).
 
-### Shadow composite scan
+### Composite scan
 
-The composed assessment of an OCI image manifest (ADR 0064) carries **no
-release authority** until an operator promotes it (ADR 0064 D6). These
-two counters are how the promotion criteria — baseline completion,
-coverage, error rate, and the incremental findings a promotion would
-add — become something an operator can watch move. The durable
-`composite_scan_observations` projection beside them answers only the
-estate's *current* state, one row per manifest.
+The composed assessment of an OCI image manifest **is** that manifest's
+filesystem verdict (ADR 0064 D1/D2): the composition is the unit of
+assessment, so its findings are the manifest's and its absence is the
+manifest's absent verdict. These two counters are how coverage, error
+rate and the composition's contribution become something an operator can
+watch move. The durable `composite_scan_observations` projection beside
+them answers only the estate's *current* state, one row per manifest.
+
+**The `authority` label is retired.** The counter carried one until the
+composed verdict's release authority was an operator-granted per-policy
+posture (`compositeVerdictMode`); with the verdict unconditional, every
+assessment decides and the label could take only one value.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_scan_composite_assessment_total` | counter | `result`, `authority` | — | `result`: `assessed`, `nothing_to_compose`, `deterministic_refusal`, `transient_refusal`; `authority`: `observed`, `promoted` |
+| `hort_scan_composite_assessment_total` | counter | `result` | — | `result`: `assessed`, `nothing_to_compose`, `deterministic_refusal`, `transient_refusal` |
 | `hort_scan_composite_comparison_total` | counter | `result` | — | `agree`, `composite_stricter`, `composite_permissive` |
 
 Source of truth for the result enums:
@@ -3485,18 +3536,8 @@ Source of truth for the result enums:
   column value and its `CHECK` constraint. Deliberately the same strings
   in all three places: a `GROUP BY assessment` over the table and a
   `sum by (result)` over this counter are the same question, and an
-  operator reading D6's criteria combines them. The parity is pinned by
+  operator combines them. The parity is pinned by
   `composite_assessment_result_mirrors_the_stored_column_value`.
-- `hort_app::metrics::CompositeAuthority` for
-  `hort_scan_composite_assessment_total.authority`. Its two values are
-  lifted from `hort_domain::entities::scan_policy::CompositeVerdictMode`
-  via `From`, and the wire strings are **identical** to that enum's
-  `Display` — which is also the
-  `policy_projections.composite_verdict_mode` column value and its
-  `CHECK` constraint, for the reason above: an operator correlating
-  "which policies are promoted?" (a SQL question) with "what is
-  promotion gating?" (a PromQL one) is combining the two. Pinned by
-  `composite_authority_mirrors_the_policy_column_value`.
 - `hort_app::metrics::CompositeComparisonResult` for
   `hort_scan_composite_comparison_total.result`. No domain counterpart:
   the row stores the two gate decisions, not their comparison, so there
@@ -3525,10 +3566,10 @@ at 4:
   chart. The steady state for a large share of OCI rows and **not an
   alert** — a sustained stream of these is the expected shape.
 - `deterministic_refusal` — a composition was expected and could not be
-  assembled, for a reason re-running reproduces. This is the **coverage
-  gap**: every tick is a manifest the composite verdict would have
-  nothing to say about, which is exactly what D6's baseline-completion
-  criterion is about. Operators watch the ratio against `assessed`.
+  assembled, for a reason re-running reproduces. Every tick is a
+  manifest held `scan_indeterminate` fail-closed, because the absent
+  verdict is what ADR 0007 holds on. Operators watch the ratio against
+  `assessed`.
 - `transient_refusal` — the same absence for a condition that may clear
   (a store that did not answer, an unreachable upstream). Kept apart
   from the value above because a momentary hiccup and a permanent
@@ -3543,36 +3584,23 @@ assessment happened; what could not be done was judging its two sides by
 the same rules, and a counter that skipped it would understate coverage
 exactly when the exclusion read is failing.
 
-The `authority` label is the resolved policy's `composite_verdict_mode`
-(ADR 0064 D6) — whether this assessment **decided** the manifest's
-release or only measured it. The `result` arms cannot say: under
-`observed` a `deterministic_refusal` is the coverage gap an operator is
-weighing before promoting, and under `promoted` the same arm is a
-manifest held `scan_indeterminate` fail-closed. `observed` is the
-default and the value every policy that predates the field reports; a
-repository with no resolved policy at all reports `observed` too, since
-promotion is an operator act and the built-in default policy has no
-operator behind it. `promoted` on a series an operator did not expect is
-the signal that a promotion is wider in scope than they intended.
-
 **`hort_scan_composite_comparison_total` semantics** — emitted at the
 same site, **one increment per assessed composition**, derived from the
 observation row's `composite_findings_decision` and
-`primary_findings_decision`. This is D6's promotion criterion as a rate:
-"if the composite verdict carried authority, how many artifacts would
-change outcome, and in which direction?" Closed taxonomy of 3:
+`primary_findings_decision`. This is "what did assessing the composition
+contribute to this manifest's verdict, and in which direction?" as a
+rate. Closed taxonomy of 3:
 
-- `agree` — the two sides hold the artifact the same way. Promoting
-  would change nothing for this artifact, and a promotion decision needs
-  this to be overwhelmingly the common value.
+- `agree` — the two sides hold the artifact the same way, so the
+  composition contributed nothing this artifact's own bytes did not
+  already say.
 - `composite_stricter` — the composite findings block where the primary
-  axis's do not. Promoting would **add** a hold. This is the measured
+  axis's do not. The composition **adds** a hold. This is the measured
   gap ADR 0064 exists for (packages a per-constituent scan never
-  assessed) and also where a false positive from the new analysis path
-  shows up first — which is why the verdict is readable before it is
-  enforcing.
+  assessed) and also where a false positive from the composed analysis
+  path shows up first.
 - `composite_permissive` — the primary axis's findings block where the
-  composite's do not. Promoting would **remove** a hold: the composed
+  composite's do not. The composition **removes** a hold: the composed
   filesystem does not carry what a constituent's isolated scan condemned
   it for, a package a later layer deletes being the canonical shape.
 
@@ -3588,9 +3616,9 @@ emitted.
 
 **Neither counter carries a decision.** No `GateDecision` value reaches
 either series: `composite_stricter` says the composite blocks where the
-primary does not, without naming which blocking variant. The composite
-verdict carries no release authority, and a dashboard series keyed on
-its value would be that verdict escaping into something acted on.
+primary does not, without naming which blocking variant. A dashboard
+series keyed on a `GateDecision` value would be the recorded verdict
+escaping the projection into something acted on.
 `artifact_id`, the manifest digest and the vulnerability ids are
 likewise not labels — per-manifest drill-down is the
 `composite_scan_observations` row and the `tracing` span.
@@ -3601,15 +3629,8 @@ The acquisition egress these assessments cause has its own series and is
 rather than `format="oci"`).
 
 Cardinality:
-- `hort_scan_composite_assessment_total`: 4 result × 2 authority values
-  → 8 series.
+- `hort_scan_composite_assessment_total`: 4 result values → 4 series.
 - `hort_scan_composite_comparison_total`: 3 result values → 3 series.
-  Deliberately **not** split by `authority`: the comparison is the
-  promotion criterion, and the question "what would promoting change?"
-  is asked of an estate that has not promoted yet. After promotion the
-  same series reads as "is the promotion still behaving as the
-  measurement predicted?", which is the same two columns and does not
-  need a second label to separate.
 
 ### Rescan and advisory watch
 
@@ -3625,7 +3646,8 @@ the OSV bulk diff).
 | `hort_advisory_diff_processed_total` | counter | `ecosystem`, `result` | — | OSV bulk-archive ecosystem labels (`npm`, `PyPI`, `crates.io`, `Maven`, `Go`, `RubyGems`, `NuGet`, `Packagist`, `Hex`, `Pub`, `Conda`); `result ∈ {ok, fetch_error, parse_error, timeout, incomplete}` |
 | `hort_advisory_diff_duration_seconds` | histogram | `ecosystem` | seconds | per OSV bulk-archive ecosystem label |
 | `hort_cron_rescan_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation; operator alarms on sustained `> batch_size` (cron loop can't keep up) |
-| `hort_cron_rescan_stranded_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation to the count `RescanCandidatesRepository::select_stranded` returned (issue #6) — `quarantine_status='quarantined'` artifacts whose last scan attempt errored (every backend failed to run) and exhausted retries, with no in-flight scan job. Distinct operational signal from the row above: non-zero here means artifacts are stuck because a scanner backend is down, not that the routine interval-based sweep is falling behind. Operators alarm on sustained `> 0` — a recovered scanner drains this to zero every tick as the sweep re-enqueues each stranded artifact. |
+| `hort_cron_rescan_stranded_eligible_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation to the count `RescanCandidatesRepository::select_stranded` returned (issue #6) — artifacts in one of the two holds whose last scan attempt errored and exhausted retries or was never made, plus absent-verdict holds whose last scan request is older than the resolved rescan interval, with no in-flight scan job. Distinct operational signal from the row above: non-zero here means artifacts are stuck because a scanner backend is down or because nothing could analyse them, not that the routine interval-based sweep is falling behind. Operators alarm on sustained `> 0` — a recovered scanner drains this to zero every tick as the sweep re-enqueues each stranded artifact. |
+| `hort_cron_rescan_composite_unassessed_artifacts` | gauge | (none) | artifacts | set per `CronRescanTickHandler` invocation to the count `RescanCandidatesRepository::select_composite_unassessed` returned — live (`released` / permissive-default `NULL`) OCI image manifests with no composite assessment on record, with no in-flight scan job. The third distinct signal from the one handler: not a backlog and not an outage, but images still serving on evidence the composed-verdict rule did not produce (ADR 0064 D2). The number an operator watches drain to zero when driving the existing-estate reassessment after an upgrade; it stays at zero afterwards, because every composite scan records an assessment. |
 | `hort_policy_reevaluation_artifacts_total` | counter | `result` | — | `result ∈ {released, re_held, unchanged}` — per-artifact terminal outcome of an async scan-policy re-evaluation pass (ADR 0041 Item 3). One increment per in-scope artifact the pass reached a verdict for. NO high-cardinality labels (`policy_id` / `artifact_id` forbidden). |
 | `hort_policy_reevaluation_population` | gauge | (none) | artifacts | set once at the completion of a `policy-reevaluation` pass to the in-scope population it walked (loosen + tighten); the **completeness** signal — a partial pass (loosen-list truncation, a tighten-page read failure) reports the population it actually walked, so a population/counter gap is observable rather than silent |
 | `hort_policy_reevaluation_enqueue_failed_total` | counter | (none) | — | incremented when a gate-affecting policy mutation committed but its async `policy-reevaluation` pass failed to enqueue (the best-effort enqueue swallowed the error so the mutation still succeeds). The **alertable signal that a pass never ran** — the `_artifacts_total` / `_population` metrics emit only at pass completion, so a swallowed enqueue is otherwise invisible. For a TIGHTEN, the now-non-compliant population stays downloadable until a later gate-affecting mutation re-enqueues or the operator re-applies the policy; alert on a non-zero rate. Bare counter (no labels — the failed `policy_id` / `trigger` is on the warn-level log line). |
@@ -3810,18 +3832,40 @@ cap.
 
 **`hort_cron_rescan_stranded_eligible_artifacts` semantics** (issue #6)
 — set by the same `CronRescanTickHandler::run` tick, independently, to
-the count returned by `RescanCandidatesRepository::select_stranded(BATCH_SIZE)`.
+the count returned by
+`RescanCandidatesRepository::select_stranded(BATCH_SIZE, now)`.
 Same `BATCH_SIZE` cap and gauge shape as
 `hort_cron_rescan_eligible_artifacts`, but a structurally different
-predicate (`quarantine_status='quarantined'` + last-scan-errored, not
-`released`/interval-elapsed) and a different alert meaning: sustained
-`> 0` means artifacts are stuck behind a scanner outage, not that the
+predicate (one of the two holds + last-scan-errored-or-absent, or an
+absent-verdict hold whose last scan request is older than the resolved
+rescan interval — not `released`/interval-elapsed) and a different alert
+meaning: sustained
+`> 0` means artifacts are stuck behind a scanner outage or behind
+analysers that cannot read them, not that the
 routine sweep is falling behind. Candidates enqueued from this source
 land in the same `hort_scan_jobs_enqueued_total{trigger_source="cron"}`
 counter as interval-based candidates (both come from the same handler);
 this gauge, plus the per-artifact `info!` line
-(`cron rescan tick: re-enqueued a stranded artifact`), are the way to
-distinguish the two sources.
+(`cron rescan tick: re-enqueued an artifact no sweep would otherwise
+reach`, with a `source` field), are the way to
+distinguish the sources.
+
+**`hort_cron_rescan_composite_unassessed_artifacts` semantics** — set by
+the same tick, independently again, to the count returned by
+`RescanCandidatesRepository::select_composite_unassessed(BATCH_SIZE)`.
+Same `BATCH_SIZE` cap and gauge shape as its two siblings, and a third
+predicate: a live OCI image manifest with no `composite_scan_observations`
+row at all. A composed image's scan verdict is the manifest's and that is
+unconditional (ADR 0064 D2), but a manifest released under the earlier
+rule keeps its release until a scan is driven — so a non-zero value here
+is an estate still serving on evidence the current rule did not produce.
+Alert meaning differs from both siblings: this is not a rate problem and
+not an outage, it is an **upgrade** that has not finished, and the
+operator action is to keep driving the tick
+(`hort-cli admin task invoke cron-rescan-tick`, since the chart ships the
+CronJob disabled) until it reads zero. It cannot climb again on its own:
+every composite scan records an assessment, so a manifest ingested after
+the upgrade never enters the set.
 
 The earlier-drafted `hort_scheduler_leader_active` gauge does NOT exist.
 Leader election was removed in favour of k8s CronJob
@@ -3836,6 +3880,7 @@ Cardinality:
   configured ecosystem). Default deployment 8 histograms.
 - `hort_cron_rescan_eligible_artifacts`: 1 gauge (no labels).
 - `hort_cron_rescan_stranded_eligible_artifacts`: 1 gauge (no labels).
+- `hort_cron_rescan_composite_unassessed_artifacts`: 1 gauge (no labels).
 - `hort_policy_reevaluation_artifacts_total`: 3 result values → 3 series.
 - `hort_policy_reevaluation_population`: 1 gauge (no labels).
 - `hort_policy_reevaluation_enqueue_failed_total`: 1 counter (no labels).
@@ -3853,6 +3898,8 @@ stay bounded by the closed-taxonomy axes above.
 
 Source: `hort_app::metrics::{emit_scan_jobs_enqueued, emit_advisory_diff,
 observe_advisory_diff_duration, set_cron_rescan_eligible_artifacts,
+set_cron_rescan_stranded_eligible_artifacts,
+set_cron_rescan_composite_unassessed_artifacts,
 emit_patch_candidates_listed, TriggerSourceLabel, AdvisoryDiffResult,
 PatchCandidateListResult}`.
 

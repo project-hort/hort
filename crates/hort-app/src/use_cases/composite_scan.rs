@@ -1,5 +1,5 @@
 //! Resolving an OCI image manifest's **composed** scan unit, and running
-//! it as a shadow assessment.
+//! it as the manifest's assessment.
 //!
 //! The unit of filesystem assessment for an OCI image is the image
 //! manifest (ADR 0064 D1). A layer scanned on its own is evidence, not a
@@ -42,7 +42,8 @@
 //! │   → strict_manifest_nomination  (every manifest-side refusal, 0 I/O)  │
 //! │   → acquire the config          (phase 1)                             │
 //! │   → read the config bytes                                             │
-//! │   → complete_with_config        (is this a runnable image?)           │
+//! │   → complete_with_config        (is this a runnable image, and can   │
+//! │                                  its layers be opened?)              │
 //! │   → acquire the layers          (phase 2)                             │
 //! └───────────────────────────────────────────────────────────────────────┘
 //!   → materialise and scan        (its own span, in the adapter)
@@ -62,41 +63,56 @@
 //! set up front would fetch every one of their layers before learning
 //! there is nothing to compose.
 //!
-//! # Nothing here carries release authority
+//! One kind of artifact manifest does not say it there and is refused
+//! before phase 1 runs at all: a **BuildKit attestation manifest** carries
+//! a synthesised image config (`rootfs.type: layers`, one `diff_id` per
+//! payload), so only its layer's declared payload format
+//! (`application/vnd.in-toto+json`) distinguishes it — and that is in the
+//! manifest, which the nomination stage already holds. Every multi-arch
+//! index `docker buildx` produces binds one per platform, so this is the
+//! difference between a proxied modern image costing zero extra upstream
+//! fetches and costing one per attestation child, per scan.
 //!
-//! The composite assessment is produced, mapped, logged and **recorded
-//! as a shadow observation**. It transitions no artifact, writes no
-//! `ScanCompleted`, and never reaches the release predicate — ADR 0064
-//! D6: a new analysis path whose first production act can be
-//! irreversible is the thing to avoid, because `Rejected` is terminal
-//! and the periodic rescan never revisits it. The manifest row's own
-//! assessment is exactly what it was before this module existed.
+//! # The verdict is the manifest's, and the row is not
 //!
-//! The observation is a **projection**, deliberately not an event: the
-//! artifact's event stream is where release authority is derived from,
-//! so a shadow verdict written there is a verdict a future reader can
-//! mistake for one that counts. It is written outside the transaction
-//! that records the artifact's own scan result, through a sink whose
-//! `record` cannot return an error, so a storage failure costs one stale
-//! row and nothing else. Alongside the composite verdict it carries the
-//! **counterfactual** — what the release gate would have decided had
-//! that verdict carried authority — and what the same gate, under the
-//! same policy, the same exclusion set and the same instant, decided
-//! over the findings the manifest's own bytes produced. Those two
-//! columns are what makes D6's promotion criterion a query.
+//! The composite assessment **is** the manifest's filesystem verdict
+//! (ADR 0064 D2): the composition is the unit of assessment, so its
+//! findings are the manifest row's findings and its *absence* is the
+//! manifest's absent verdict. That answer leaves here as a
+//! [`CompositeVerdict`] and the caller folds it into the per-unit
+//! bookkeeping a backend's answer over the manifest's own bytes goes
+//! into — the path the manifest's verdict already takes, rather than a
+//! second release path of its own.
 //!
-//! Three things it *does* reach, all deliberately short of authority.
+//! What nothing here carries is authority **through the projection**.
+//! The observation row is a record beside the verdict, deliberately a
+//! projection and not an event: the artifact's event stream is where
+//! release authority is derived from, so a row written there is a
+//! verdict a future reader can mistake for one that counts. It is
+//! written outside the transaction that records the artifact's own scan
+//! result, through a sink whose `record` cannot return an error, so a
+//! storage failure costs one stale row and nothing else. Alongside the
+//! composite findings it carries the **per-axis decision pair** — what
+//! the release gate decided over the composition's findings, and what
+//! the same gate, under the same policy, the same exclusion set and the
+//! same instant, decided over the findings the manifest's own bytes
+//! produced. Those two columns are what makes "what did assessing the
+//! composition contribute?" a query; the committed verdict alone cannot
+//! say.
+//!
+//! So the projection is read by nothing that decides delivery or
+//! release, which is held structurally by
+//! `crates/hort-app/tests/shadow_observation_has_no_authority.rs` rather
+//! than by inspection. Two further things this module reaches, neither
+//! of them a verdict:
 //! [`constituent_acquisition`](crate::use_cases::constituent_acquisition)
 //! writes digest-verified bytes into CAS — no row, no event, no job, no
 //! quarantine window — so it can make nothing downloadable that was not
-//! and withhold nothing that was. The observation projection is read by
-//! nothing that decides delivery or release, which is held structurally
-//! by `crates/hort-app/tests/shadow_observation_has_no_authority.rs`
-//! rather than by inspection. And a composition that could not be
+//! and withhold nothing that was. And a composition that could not be
 //! produced for a *transient* reason returns a
 //! [`CompositeDisposition::Retry`] request, which the caller may decline;
 //! the one thing it can cost when granted is a bounded delay of the
-//! manifest's own `ScanCompleted`, never a different verdict.
+//! manifest's own `ScanCompleted`.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,18 +120,17 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use hort_domain::entities::artifact::Artifact;
-use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, ScanPolicyProjection,
-};
+use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
 use hort_domain::error::DomainError;
 use hort_domain::oci::{strict_manifest_nomination, ConfigRefusal, ImageBudget, ManifestRefusal};
-use hort_domain::policy::scan::{composite_verdict_mode_of, evaluate_scan_result};
+use hort_domain::policy::scan::evaluate_scan_result;
 use hort_domain::ports::composite_scan_observation::{
     bounded_reason, distinct_vulnerability_ids, AcquisitionCost, CompositeAssessment,
     CompositeScanObservation, CompositeScanObservationRepository, GateDecision,
 };
 use hort_domain::ports::scanner::{
-    ComposedImage, EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort,
+    ComposedImage, EvidenceBasis, LayerRole, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit,
+    ScannerPort,
 };
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
@@ -126,8 +141,7 @@ use hort_domain::types::{
 
 use crate::error::AppError;
 use crate::metrics::{
-    emit_composite_assessment, emit_composite_comparison, CompositeAuthority,
-    CompositeComparisonResult,
+    emit_composite_assessment, emit_composite_comparison, CompositeComparisonResult,
 };
 use crate::use_cases::cas_bounded_read::read_cas_bounded;
 use crate::use_cases::constituent_acquisition::{
@@ -137,6 +151,13 @@ use crate::use_cases::scan_orchestration::merge_findings;
 
 /// Ceiling on one CAS read while resolving a composition — the manifest
 /// document and the image config document.
+///
+/// Shared with
+/// [`layer_role_resolution`](crate::use_cases::layer_role_resolution),
+/// which reads the same two documents through the same strict parse to
+/// answer what a manifest declares about one of its layer blobs. Two
+/// ceilings over one pair of documents would let a manifest be resolvable
+/// for the composition and unresolvable for its own layer's role.
 ///
 /// 16 MiB, the same ceiling the manifest closure walk uses, which in turn
 /// matches the default upstream manifest-body cap
@@ -148,21 +169,24 @@ use crate::use_cases::scan_orchestration::merge_findings;
 /// of kilobytes; the ceiling is a backstop, and it **refuses** rather
 /// than truncating, because a prefix of a manifest parses into a shorter
 /// layer list.
-const MAX_COMPOSITION_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_COMPOSITION_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 
 /// What resolving *and* acquiring a manifest row's composed scan unit
 /// produced.
 ///
-/// Four arms, because they ask four different things of an operator and —
-/// once the composite verdict carries authority (ADR 0064 D6) — of the
+/// Four arms, because they ask four different things of an operator and,
+/// the composite verdict being the manifest's (ADR 0064 D2), of the
 /// release gate:
 ///
 /// - [`NothingToCompose`](Self::NothingToCompose) is the steady state for
 ///   a large share of OCI rows. An image index binds references rather
-///   than a filesystem (D5), and a cosign signature, an SBOM attachment
-///   or a Helm chart is an *artifact* manifest whose config describes no
-///   root filesystem. There is no composition, so there is nothing for a
-///   composite assessment to be about and nothing for a hold to wait on.
+///   than a filesystem (D5), and a cosign signature, an SBOM attachment,
+///   a BuildKit attestation or a Helm chart is an *artifact* manifest
+///   binding a payload document. Most of them say so in their config;
+///   an attestation manifest says it only in its layer's declared
+///   payload format, its config being image-shaped. There is no
+///   composition either way, so there is nothing for a composite
+///   assessment to be about and nothing for a hold to wait on.
 /// - [`Deterministic`](Self::Deterministic) is a composition that was
 ///   expected and could not be assembled, for a reason re-running
 ///   reproduces exactly. Completeness is a precondition of a verdict (D1):
@@ -240,8 +264,9 @@ pub(crate) async fn resolve_composition(
 /// The cost is an out-parameter rather than a payload on each arm
 /// because **every** outcome has one and only one of them is a success:
 /// a transient refusal that timed out after fetching three layers spent
-/// exactly the egress an operator is being asked to pay for the shadow,
-/// and an arm that could not carry it would report that run as free.
+/// exactly the egress an operator is being asked to pay for the
+/// assessment, and an arm that could not carry it would report that run
+/// as free.
 /// Updated once after each phase, so a refusal returned from the match
 /// below cannot be the branch that forgot to.
 async fn resolve_under(
@@ -392,6 +417,21 @@ fn document_read_refusal(subject: &str, hash: &ContentHash, err: &AppError) -> C
 ///
 /// Nothing on this side is transient: every arm is a statement the manifest
 /// bytes make about themselves, and acquiring a blob cannot change one.
+///
+/// A layer whose declared container nothing can open is deliberately **not**
+/// here: that is a statement about what a scanner reads out of the composed
+/// layout, so it waits for the config to establish that a composed layout is
+/// what this artifact is — see [`classify_config_refusal`].
+///
+/// A layer whose declared payload is **not a filesystem at all** is, and the
+/// two must not be read as one. That one needs no config — an attestation, a
+/// signature or an SBOM document is not a root filesystem whatever a config
+/// says about `rootfs` — so the manifest stage settles it, and it lands on the
+/// "not a composition" side here. Keeping it off the other side is the whole
+/// point: a BuildKit attestation manifest's config *is* image-shaped, so the
+/// config-side arm reported it as a runnable image hort could not finish
+/// composing, which gates, and every multi-arch index built by BuildKit for
+/// years has carried one of those per platform.
 fn classify_manifest_refusal(refusal: ManifestRefusal) -> CompositeResolution {
     match refusal {
         // --- not a composition ---------------------------------------
@@ -401,6 +441,11 @@ fn classify_manifest_refusal(refusal: ManifestRefusal) -> CompositeResolution {
         ),
         ManifestRefusal::NoLayers => CompositeResolution::NothingToCompose(
             "the manifest declares no layers, so there is no composed filesystem",
+        ),
+        ManifestRefusal::NonFilesystemLayer => CompositeResolution::NothingToCompose(
+            "a layer declares a payload format that is not a filesystem — an attestation, a \
+             signature or an SBOM document — so these bytes are an artifact manifest rather \
+             than a runnable image",
         ),
 
         // --- a composition that could not be assembled ---------------
@@ -417,33 +462,44 @@ fn classify_manifest_refusal(refusal: ManifestRefusal) -> CompositeResolution {
                 "the manifest's {slot:?} descriptor does not name a blob ({problem:?})"
             ))
         }
-        ManifestRefusal::UnsupportedLayer { index, media_type } => {
-            CompositeResolution::Deterministic(format!(
-                "layers[{index}] declares a container the composition cannot be described \
-                 with: {media_type}"
-            ))
-        }
     }
 }
 
 /// Turn a config-side refusal into a resolution.
 ///
-/// Two of the three arms are **not** refusals of an image at all: there is
+/// Two of the four arms are **not** refusals of an image at all: there is
 /// a large, legitimate population of OCI artifact manifests — cosign
 /// signatures, SBOM attachments, Helm charts — whose config is deliberately
 /// not an image config, and an operator must not be warned once per such
-/// row. The third is a config that describes a *different* image from the
-/// one its manifest declares, which is a disagreement worth reporting.
+/// row.
+///
+/// Those two were once claimed to be *what keeps an artifact manifest off the
+/// unsupported-layer arm* — an SBOM referrer's `application/spdx+json` layer
+/// being recognised by its config before its container was asked about. That
+/// held only for an artifact manifest whose config is not an image config, and
+/// the largest population of them does not qualify: a BuildKit attestation
+/// manifest carries a synthesised image config declaring `rootfs.type: layers`
+/// with one `diff_id` per payload, so it passed both config-side checks and
+/// was reported as a runnable image with an unsupported layer. What keeps an
+/// artifact manifest off this arm is the manifest stage recognising its payload
+/// format ([`classify_manifest_refusal`]'s `NonFilesystemLayer`); these two
+/// arms catch the ones whose config says it too.
+///
+/// The other two are statements about an artifact whose config has already
+/// said "layered root filesystem, this many layers": a config describing a
+/// *different* image from the one its manifest declares, and a layer whose
+/// container the materialisation cannot open. Both are a runnable image hort
+/// holds an incomplete composition of, and both are worth reporting.
 ///
 /// Reached only once acquisition has made the config's bytes present, so
-/// none of the three is about availability and none is transient.
+/// none of the four is about availability and none is transient.
 ///
 /// By reference, unlike its manifest-side counterpart, because none of the
-/// three arms carries anything into the resolution: two are fixed phrases
-/// and the third quotes two numbers. The config parser's own complaint is
-/// deliberately not quoted — an artifact manifest's config *not* parsing as
-/// an image config is the expected shape of a large population, not a fault
-/// to report in detail.
+/// arms moves anything into the resolution it could not clone: two are fixed
+/// phrases, one quotes two numbers and one quotes a declared media type. The
+/// config parser's own complaint is deliberately not quoted — an artifact
+/// manifest's config *not* parsing as an image config is the expected shape
+/// of a large population, not a fault to report in detail.
 fn classify_config_refusal(refusal: &ConfigRefusal) -> CompositeResolution {
     match refusal {
         ConfigRefusal::RootfsNotLayers => CompositeResolution::NothingToCompose(
@@ -460,14 +516,19 @@ fn classify_config_refusal(refusal: &ConfigRefusal) -> CompositeResolution {
                  one of the two is not about this image"
             ))
         }
+        ConfigRefusal::UnsupportedLayer { index, media_type } => {
+            CompositeResolution::Deterministic(format!(
+                "layers[{index}] declares a container the composition cannot be described \
+                 with: {media_type}"
+            ))
+        }
     }
 }
 
 /// What the composite path leaves for the scan job to do.
 ///
-/// Independent of whether the policy promoted the composite verdict
-/// (ADR 0064 D6): a retry request is about whether the composition can be
-/// *produced*, and that question has the same answer either way.
+/// Independent of what the composition's answer turns out to be: a retry
+/// request is about whether the composition can be *produced*.
 /// Acquisition is what makes it load-bearing — with an upstream in the
 /// path, **transient failure is the routine case** (an upstream is down,
 /// rate-limits, or is slow), and the alternative is reporting an image as
@@ -489,9 +550,9 @@ pub(crate) enum CompositeDisposition {
     Retry(String),
 }
 
-/// The contributor name a **promoted** composite verdict lands under on
+/// The contributor name the composite verdict lands under on
 /// `ScanCompleted.scanner`, and in the `backend=reason` breakdown of a
-/// promoted composition's absence.
+/// composition's absence.
 ///
 /// Names the **scan unit**, not the backend, because the unit is the new
 /// information: a manifest whose `ScanCompleted` says `composite` is a
@@ -503,27 +564,25 @@ pub(crate) enum CompositeDisposition {
 pub(crate) const COMPOSITE_CONTRIBUTOR: &str = "composite";
 
 /// What a composite assessment contributes to the **manifest row's own**
-/// verdict (ADR 0064 D6).
+/// verdict (ADR 0064 D2).
 ///
-/// The composition is assessed on every manifest scan; this is where the
-/// resolved policy's `composite_verdict_mode` is spent. Under
-/// `observed` every assessment reduces to [`Withheld`](Self::Withheld)
-/// and the manifest's outcome is byte-for-byte what it would be with no
-/// composite path at all. Under `promoted` the composition's answer takes
-/// the path the manifest's own verdict already takes — the orchestrator's
-/// per-unit bookkeeping — rather than a second release path of its own,
-/// which is what keeps `composite_scan_observations` a measurement
-/// surface and nothing more.
+/// The composition is assessed on every manifest scan and **its verdict
+/// is the manifest's**: the composition is the unit of filesystem
+/// assessment (D1), so there is no posture in which the composed answer
+/// is measured and then discarded. The answer takes the path the
+/// manifest's own verdict already takes — the orchestrator's per-unit
+/// bookkeeping — rather than a second release path of its own, which is
+/// what keeps `composite_scan_observations` a measurement surface and
+/// nothing more.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CompositeVerdict {
-    /// Nothing reaches the manifest row. Either the policy has not
-    /// promoted the composite verdict, or there is no composition for one
-    /// to be about: an image index binds references rather than a
-    /// filesystem (ADR 0064 D5), and a cosign signature, an SBOM
+    /// Nothing reaches the manifest row, because there is no composition
+    /// for a verdict to be about: an image index binds references rather
+    /// than a filesystem (ADR 0064 D5), and a cosign signature, an SBOM
     /// attachment or a Helm chart is an *artifact* manifest whose config
     /// declares no layered root filesystem. Both are legitimate
-    /// populations, not unassessed images, so promotion must not make
-    /// either gate on a composition it does not have.
+    /// populations, not unassessed images, so the composite verdict must
+    /// not make either gate on a composition it does not have.
     Withheld,
     /// A backend assessed the composition. These findings are the
     /// manifest row's findings: they join the run's accumulator and reach
@@ -553,13 +612,13 @@ pub(crate) enum CompositeVerdict {
 ///
 /// Two values and not one, because the two are independent: a transient
 /// refusal both asks for another attempt **and**, if that request is
-/// declined, is a promoted manifest's absent verdict. Collapsing them
-/// would force the caller to re-derive one from the other.
+/// declined, is the manifest's absent verdict. Collapsing them would
+/// force the caller to re-derive one from the other.
 #[derive(Debug)]
 pub(crate) struct CompositeOutcome {
     /// What the composite path asks of the run.
     pub(crate) disposition: CompositeDisposition,
-    /// What a promoted policy's manifest row receives.
+    /// What the manifest row receives.
     pub(crate) verdict: CompositeVerdict,
 }
 
@@ -594,11 +653,10 @@ impl ShadowObservationSink {
     /// Write one observation, replacing this artifact's previous row.
     ///
     /// Infallible by signature. A storage failure here means an operator
-    /// reads one stale row while deciding whether to promote the
-    /// composite verdict, which is a worse answer to a question nobody
-    /// is forced to ask yet; failing the scan over it would be a shadow
-    /// path with release authority, which is the one thing this unit may
-    /// not be.
+    /// reads one stale row while asking what the composition contributed
+    /// to a manifest's verdict; failing the scan over it would make a
+    /// measurement surface able to withhold an artifact, which is the one
+    /// thing this sink may not be.
     async fn record(&self, observation: CompositeScanObservation) {
         if let Err(e) = self.repository.record(&observation).await {
             tracing::warn!(
@@ -611,11 +669,13 @@ impl ShadowObservationSink {
     }
 }
 
-/// What one shadow run produced, ready to be turned into a row.
+/// What one composite run produced — both halves of it: the row
+/// [`CompositeScan::observe`] writes, and the manifest's verdict
+/// [`CompositeScan::verdict_of`] reads off it.
 ///
-/// Assembled at each of the four exits of [`ShadowCompositeScan::run`]
-/// so that the row's shape is decided in one place and each exit only
-/// states what it knows.
+/// Assembled at each of the four exits of [`CompositeScan::run`] so that
+/// the shape is decided in one place and each exit only states what it
+/// knows.
 struct ShadowOutcome {
     /// Which of the four outcomes this run reached.
     assessment: CompositeAssessment,
@@ -630,9 +690,9 @@ struct ShadowOutcome {
     /// The composite findings, already merged across backends. Empty on
     /// every arm but [`CompositeAssessment::Assessed`].
     findings: Vec<Finding>,
-    /// Which fail-closed absence a **promoted** manifest inherits from
-    /// this run — [`CompositeScan::verdict_of`]'s answer for the two
-    /// refusal assessments.
+    /// Which fail-closed absence the manifest inherits from this run —
+    /// [`CompositeScan::verdict_of`]'s answer for the two refusal
+    /// assessments.
     ///
     /// Stated per exit rather than derived from `assessment`, because the
     /// assessment does not carry the fact it depends on. Both refusal
@@ -664,8 +724,8 @@ impl ShadowOutcome {
     /// and nothing was acquired that the resolution did not already
     /// account for.
     ///
-    /// `absence` is what a promoted manifest inherits — see the field. It
-    /// is a parameter rather than a value this constructor picks, because
+    /// `absence` is what the manifest inherits — see the field. It is a
+    /// parameter rather than a value this constructor picks, because
     /// only the call site knows whether the composition had been
     /// assembled by the time the refusal happened.
     fn refusal(assessment: CompositeAssessment, reason: &str, absence: NotAnalysable) -> Self {
@@ -696,8 +756,7 @@ fn cost_of(stats: AcquisitionStats) -> AcquisitionCost {
 }
 
 /// One manifest's composed assessment — always recorded as an
-/// observation, and gating the manifest only where the policy has
-/// promoted it (ADR 0064 D6).
+/// observation, and always the manifest's own verdict (ADR 0064 D2).
 ///
 /// A struct rather than a free function with eight arguments: the caller
 /// assembles it from values `run_scan` already holds, and naming them at
@@ -734,7 +793,7 @@ pub(crate) struct CompositeScan<'a> {
     /// from the primary one in exactly one respect — what is being
     /// scanned.
     pub(crate) sbom: Option<&'a Sbom>,
-    /// Where the assessment's durable evidence goes (ADR 0064 D6).
+    /// Where the assessment's durable evidence goes (ADR 0064 D2).
     pub(crate) observations: &'a ShadowObservationSink,
     /// The policy the run resolved, forwarded rather than re-fetched.
     /// Both sides of the observation row are judged against it, so they
@@ -759,17 +818,15 @@ pub(crate) struct CompositeScan<'a> {
 }
 
 impl CompositeScan<'_> {
-    /// Resolve, acquire, scan, record — and, where the policy has
-    /// promoted it, hand the composition's answer back as the manifest
-    /// row's own.
+    /// Resolve, acquire, scan, record — and hand the composition's
+    /// answer back as the manifest row's own.
     ///
-    /// Cannot fail: an assessment that could fail a scan run would be a
-    /// release-authority change nobody granted, and under `observed`
-    /// every arm leaves the run exactly as it found it. Both things the
-    /// method returns are the caller's to act on — the
-    /// [`CompositeDisposition`] request, which it is free to decline, and
-    /// the [`CompositeVerdict`], which is
-    /// [`CompositeVerdict::Withheld`] on every unpromoted run.
+    /// Cannot fail: the composition is the manifest's unit of filesystem
+    /// assessment, so a *failure to assess* is a verdict
+    /// ([`CompositeVerdict::Absent`], which ADR 0007 fails closed on) and
+    /// never an error that aborts the run. Both things the method returns
+    /// are the caller's to act on — the [`CompositeDisposition`] request,
+    /// which it is free to decline, and the [`CompositeVerdict`].
     pub(crate) async fn run(self) -> CompositeOutcome {
         // Only an image manifest has a composition. Returning without a
         // log line is deliberate: every artifact in every format reaches
@@ -800,7 +857,7 @@ impl CompositeScan<'_> {
         // composed something: a refusal that timed out after fetching
         // three layers spent the egress too, and a row reporting that
         // run as free would understate exactly the number an operator
-        // weighing the shadow needs.
+        // weighing the assessment's cost needs.
         let (resolution, stats) = resolve_composition(ConstituentAcquisition {
             storage: self.storage,
             upstream_proxy: self.upstream_proxy,
@@ -846,7 +903,6 @@ impl CompositeScan<'_> {
                     artifact_id = %self.artifact.id,
                     format = self.format,
                     reason = %why,
-                    promoted = self.promoted(),
                     "composite scan: the composed image could not be produced and re-running \
                      reproduces it; no composite assessment",
                 );
@@ -926,6 +982,14 @@ impl CompositeScan<'_> {
             format: self.format,
             coords: self.coords,
             kind: self.kind,
+            // A manifest is the composition, not a constituent of one
+            // (ADR 0064 D4 — it is the row that carries the composite
+            // verdict), so hort's manifests say nothing about a layer
+            // role for it and no materialisation on this path asks. The
+            // composition's own layers reach the adapter through
+            // `ScanUnit::Image`, each with the container its descriptor
+            // declared.
+            layer_role: LayerRole::Unknown,
         };
 
         // A backend `Err` on the composition is the adapter's transient
@@ -972,7 +1036,6 @@ impl CompositeScan<'_> {
                         manifest = %image.manifest(),
                         layers = image.layers().len(),
                         finding_count = findings.len(),
-                        promoted = self.promoted(),
                         "composite scan: composed image assessed",
                     );
                     analysed_by = Some(backend.clone());
@@ -986,8 +1049,7 @@ impl CompositeScan<'_> {
                         manifest = %image.manifest(),
                         layers = image.layers().len(),
                         reason = why.as_str(),
-                        gates_release = why.gates_release(self.kind, self.composite_verdict()),
-                        promoted = self.promoted(),
+                        gates_release = why.gates_release(self.kind),
                         "composite scan: no composite verdict from this backend",
                     );
                     abstentions.push(format!("{backend}={}", why.as_str()));
@@ -998,7 +1060,6 @@ impl CompositeScan<'_> {
                         scanner = backend,
                         manifest = %image.manifest(),
                         error = %e,
-                        promoted = self.promoted(),
                         "composite scan: backend failed on the composed image",
                     );
                     transient = Some(e.to_string());
@@ -1022,7 +1083,7 @@ impl CompositeScan<'_> {
                 cost,
                 findings: merge_findings(composite_findings, self.allow_informed_downgrade),
                 // Never read — this run produced a verdict, so there is
-                // no absence for a promoted manifest to inherit.
+                // no absence for the manifest to inherit.
                 absence: NotAnalysable::NotApplicable,
             },
             (None, Some(why)) => ShadowOutcome {
@@ -1074,39 +1135,14 @@ impl CompositeScan<'_> {
         self.finish(outcome, now, disposition).await
     }
 
-    /// Whether this run's policy has promoted the composed-image verdict
-    /// to release authority (ADR 0064 D6).
-    ///
-    /// `None` — no operator policy resolved for this repository, so the
-    /// built-in default governs — is **not** promoted: the default policy
-    /// has no operator behind it, and promotion is an operator act
-    /// against named criteria. An out-of-the-box deployment therefore
-    /// measures the composition and gates on nothing, which is the state
-    /// every deployment starts in.
-    fn promoted(&self) -> bool {
-        self.composite_verdict().carries_release_authority()
-    }
-
-    /// This run's resolved composite-verdict posture.
-    ///
-    /// Through the domain's single resolver rather than off
-    /// `self.policy` directly, so this path and the orchestrator's
-    /// cannot disagree about what governs one repository — and so
-    /// "`None` is not promoted" has one statement of why rather than
-    /// two.
-    fn composite_verdict(&self) -> CompositeVerdictMode {
-        composite_verdict_mode_of(self.policy)
-    }
-
     /// The single exit of [`Self::run`]: record the observation, then say
     /// what the manifest row receives.
     ///
     /// One place, because the mapping from "which of the four outcomes"
-    /// to "what the release gate sees" is the whole of ADR 0064 D6's
+    /// to "what the release gate sees" is the whole of ADR 0064 D2's
     /// tightening and a second copy of it is a second answer. The
-    /// observation is written **either way** — promoted or not — so an
-    /// operator can confirm the promotion is behaving as the measurement
-    /// predicted.
+    /// observation is written on **every** arm, so an operator can read
+    /// back what the composition contributed to each manifest's verdict.
     async fn finish(
         &self,
         outcome: ShadowOutcome,
@@ -1120,22 +1156,24 @@ impl CompositeScan<'_> {
         }
     }
 
-    /// What a promoted policy's manifest row receives from `outcome`
-    /// (ADR 0064 D6) — exhaustive over the four assessments, because
-    /// each asks something different of the release gate and a
-    /// wildcard would answer for a future one by accident.
+    /// What the manifest row receives from `outcome` (ADR 0064 D2) —
+    /// exhaustive over the four assessments, because each asks something
+    /// different of the release gate and a wildcard would answer for a
+    /// future one by accident.
     ///
     /// - **Assessed** → the composition's findings *are* the manifest's.
     ///   An empty list is a clean verdict and releases; a blocking one
     ///   rejects, under ADR 0007's existing predicate and the policy's
     ///   own `enforcement`.
-    /// - **NothingToCompose** → withheld, and that is the answer under
-    ///   promotion too. An image index binds references rather than a
-    ///   filesystem (D5) and an artifact manifest declares no layered
-    ///   root filesystem; neither is an unassessed image, so neither may
-    ///   be made to gate on a composition it does not have.
+    /// - **NothingToCompose** → withheld. An image index binds
+    ///   references rather than a filesystem (D5) and an artifact
+    ///   manifest binds a payload document — a config that declares no
+    ///   layered root filesystem says so, and so does a layer declaring
+    ///   an attestation, a signature or an SBOM over a config that does.
+    ///   Neither is an unassessed image, so neither may be made to gate
+    ///   on a composition it does not have.
     /// - **DeterministicRefusal / TransientRefusal** → no verdict, which
-    ///   on a promoted policy is the fail-closed absence the run itself
+    ///   is the fail-closed absence the run itself
     ///   named ([`ShadowOutcome::absence`]): the composition is the unit
     ///   of filesystem assessment (D1), so an image whose filesystem went
     ///   unassessed is held by ADR 0007 either way, and *which* absence
@@ -1148,9 +1186,6 @@ impl CompositeScan<'_> {
     ///   declined that request, which it does when the attempt budget is
     ///   spent or the run has an outcome of its own.
     fn verdict_of(&self, outcome: ShadowOutcome) -> CompositeVerdict {
-        if !self.promoted() {
-            return CompositeVerdict::Withheld;
-        }
         match outcome.assessment {
             CompositeAssessment::Assessed => CompositeVerdict::Assessed {
                 // The composite loop invokes a backend only when its
@@ -1170,32 +1205,29 @@ impl CompositeScan<'_> {
     /// Record `outcome` as this artifact's current shadow observation,
     /// replacing whatever the last assessment left.
     ///
-    /// This is where the **counterfactual** is computed: ADR 0064 D6's
-    /// promotion criterion is "what would promoting the composite
-    /// verdict have changed across this estate?", and that is a question
-    /// about the release gate's decision, not about a finding list. So
-    /// both sides of the row run through
+    /// This is where the **per-axis decision pair** is computed: "what
+    /// did assessing the composition contribute to this manifest's
+    /// verdict?" is a question about the release gate's decision, not
+    /// about a finding list. So both sides of the row run through
     /// [`evaluate_scan_result`] — the pure composition of the per-rule
     /// evaluators, which reads `findings` and writes nothing — with the
     /// same coordinates, the same resolved policy, the same exclusion
     /// set and the same instant. Nothing here appends a
     /// `PolicyEvaluated`, caches a verdict or reaches
     /// `ScanEnforcement::Record`: an observation row and an enforcement
-    /// switch are different things, and D6 rules the second one out by
-    /// name.
+    /// switch are different things.
     ///
-    /// Written on a **promoted** run too. Once the composite verdict
-    /// gates, `composite_findings_decision` is no longer a
-    /// counterfactual but a record of what also happened, which is how
-    /// an operator confirms the promotion is behaving as the measurement
-    /// predicted. The two columns stay per-axis either way: the
-    /// manifest's committed verdict is taken over the *union* of the two
-    /// finding lists, and for an image manifest — whose own bytes carry
-    /// no package surface — that union is the composite column.
+    /// The row is a **record**, not an authority: the manifest's
+    /// committed verdict is taken over the *union* of the two finding
+    /// lists on the run's own path, and for an image manifest — whose
+    /// own bytes carry no package surface — that union is the composite
+    /// column. What the two columns buy is that an operator can tell the
+    /// two axes apart afterwards, which the committed verdict alone
+    /// cannot say.
     ///
     /// Takes `outcome` by reference so [`Self::finish`] can hand the
-    /// same findings on as a promoted verdict without copying them; the
-    /// two small owned fields the row needs are cloned.
+    /// same findings on as the manifest's verdict without copying them;
+    /// the two small owned fields the row needs are cloned.
     ///
     /// Infallible, by the whole unit's contract. The one way it declines
     /// to write is an unresolved exclusion set, which would make the two
@@ -1207,7 +1239,7 @@ impl CompositeScan<'_> {
         // understate coverage exactly when the exclusion read is
         // failing — which is the moment an operator most needs the
         // number to be honest.
-        emit_composite_assessment(outcome.assessment.into(), self.authority());
+        emit_composite_assessment(outcome.assessment.into());
 
         let Some(exclusions) = self.exclusions else {
             tracing::warn!(
@@ -1261,12 +1293,13 @@ impl CompositeScan<'_> {
             primary_findings_decision: self.gate(&primary, exclusions, now),
         };
 
-        // The promotion criterion as a rate, derived from the row's own
-        // two columns so the counter and the table cannot disagree.
-        // Only an assessed composition has a counterfactual, and
-        // `composite_findings_decision` is `Some` exactly then — taking
-        // the condition off the field rather than off the assessment is
-        // what keeps the two from needing to be checked in step.
+        // What the composition contributed, as a rate, derived from the
+        // row's own two columns so the counter and the table cannot
+        // disagree. Only an assessed composition has a composite-side
+        // decision, and `composite_findings_decision` is `Some` exactly
+        // then — taking the condition off the field rather than off the
+        // assessment is what keeps the two from needing to be checked in
+        // step.
         //
         // Emitted here rather than after the write: the comparison was
         // computed either way, and a counter that depended on a
@@ -1280,19 +1313,6 @@ impl CompositeScan<'_> {
         }
 
         self.observations.record(observation).await;
-    }
-
-    /// This run's posture, as the assessment counter's label.
-    ///
-    /// Derived from [`Self::promoted`] rather than read separately, so
-    /// the metric and the verdict cannot disagree about whether this run
-    /// gated anything.
-    fn authority(&self) -> CompositeAuthority {
-        if self.promoted() {
-            CompositeAuthority::Promoted
-        } else {
-            CompositeAuthority::Observed
-        }
     }
 
     /// The release gate's decision over one finding list, under this
@@ -1759,7 +1779,7 @@ mod tests {
     }
 
     /// The same run, returning everything it produced — for the tests
-    /// about ADR 0064 D6's promotion, where the verdict is the subject.
+    /// about what a manifest row receives, where the verdict is the subject.
     #[allow(clippy::too_many_arguments)]
     async fn outcome_of(
         storage: &Arc<dyn StoragePort>,
@@ -1914,6 +1934,283 @@ mod tests {
                 "an artifact manifest is not an incomplete image: {resolution:?}"
             );
         }
+    }
+
+    /// **A BuildKit attestation manifest is neither assessed nor held, and
+    /// nothing is acquired for it.** The shape every multi-arch index
+    /// `docker buildx` produces binds beside its platform children, and the
+    /// one in the production evidence: a synthesised **image-shaped** config
+    /// (`rootfs.type: layers`, one `diff_id` for one layer) and a single
+    /// `application/vnd.in-toto+json` layer.
+    ///
+    /// Three things, and the third is the one the config-side answer could not
+    /// have given:
+    ///
+    /// 1. the resolution is `NothingToCompose` and says what these bytes are;
+    /// 2. the observation records the steady state, and the manifest row's
+    ///    verdict is `Withheld` — neither assessed nor held;
+    /// 3. **not one constituent was surveyed or fetched**, because the refusal
+    ///    is settled from the manifest bytes alone. On a proxied index that is
+    ///    an upstream blob fetch per attestation child per scan, and — when
+    ///    that fetch fails — a hold the composition would have earned for a
+    ///    config it never needed.
+    ///
+    /// Before this, the config *passed* both of its checks and the layer was
+    /// then found unopenable: `DeterministicRefusal`, an absent verdict, and a
+    /// hold with no deadline. Eight of them from one proxied `redis:7-alpine`.
+    #[tokio::test]
+    async fn an_attestation_manifest_is_neither_assessed_nor_held() {
+        let config_bytes = oci_image_config_bytes(1);
+        let config = real_sha256(&config_bytes);
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config}"),
+                "size": config_bytes.len(),
+            },
+            "layers": [{
+                "mediaType": hort_domain::oci::IN_TOTO_STATEMENT_MEDIA_TYPE,
+                "digest": format!("sha256:{}", hash_of('1')),
+                "size": 1337,
+                "annotations": {
+                    "in-toto.io/predicate-type": "https://slsa.dev/provenance/v0.2",
+                },
+            }],
+        }))
+        .expect("manifest serialises");
+        let manifest = real_sha256(&manifest_bytes);
+
+        let store = Arc::new(MockStoragePort::new());
+        store.insert_content(manifest.clone(), manifest_bytes);
+        // Present, so that "nothing was acquired" is a statement about the
+        // refusal and not about the fixture: the config is right there and is
+        // still never looked at.
+        store.insert_content(config, config_bytes);
+        let storage: Arc<dyn StoragePort> = store.clone();
+        let (proxy, resolver) = hosted();
+        let artifact = manifest_artifact(manifest);
+
+        let resolution = resolve(&storage, &proxy, &resolver, &artifact).await;
+        let CompositeResolution::NothingToCompose(why) = resolution else {
+            panic!("an attestation manifest was never an image: {resolution:?}");
+        };
+        assert!(
+            why.contains("artifact manifest"),
+            "the reason must say what these bytes are: {why}"
+        );
+
+        let scanner = RecordingScanner::new("trivy", Ok(ScanAnalysis::clean()));
+        let fixture = Fixture::new();
+        let outcome = outcome_of(
+            &storage,
+            &proxy,
+            &resolver,
+            &registry(vec![scanner.clone()]),
+            &artifact,
+            "oci",
+            ArtifactKind::OciManifest,
+            &["trivy".to_string()],
+            &fixture,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.verdict,
+            CompositeVerdict::Withheld,
+            "neither assessed nor held: a composition that does not exist must not gate"
+        );
+        assert_eq!(outcome.disposition, CompositeDisposition::Settled);
+        let row = fixture.row();
+        assert_eq!(row.assessment, CompositeAssessment::NothingToCompose);
+        assert_ne!(
+            row.assessment,
+            CompositeAssessment::DeterministicRefusal,
+            "this is the arm that is a deadline-less hold, and it is what this manifest got"
+        );
+        assert_eq!(row.composite_findings_decision, None);
+        assert!(scanner.seen().is_empty());
+        assert_eq!(
+            row.cost.already_present, 0,
+            "the refusal is settled from the manifest bytes alone, so no constituent was surveyed"
+        );
+        assert_eq!(
+            row.cost.fetched, 0,
+            "and none was fetched — an attestation child of a proxied index costs no upstream \
+             round-trip"
+        );
+        assert_eq!(
+            store.size_of_call_count(),
+            0,
+            "nothing probed the config, which is what makes an unfetchable one harmless"
+        );
+    }
+
+    /// Build an **OCI artifact manifest** (a referrer): layers whose
+    /// containers nothing can open, and an *empty* config — the shape
+    /// `cosign attach sbom` and `cosign sign` both push.
+    ///
+    /// The config bytes are the real thing a producer writes for these: an
+    /// empty JSON object under `application/vnd.oci.empty.v1+json`, which
+    /// declares no `rootfs` and therefore no layered root filesystem. That is
+    /// what makes the manifest answerable as "never an image" instead of as
+    /// an image with a bad layer.
+    fn referrer_in_storage(layer_media_types: &[&str]) -> (Arc<MockStoragePort>, Artifact) {
+        let config_bytes = serde_json::to_vec(&serde_json::json!({})).expect("config serialises");
+        let config = real_sha256(&config_bytes);
+        let layers: Vec<serde_json::Value> = layer_media_types
+            .iter()
+            .enumerate()
+            .map(|(i, media_type)| {
+                serde_json::json!({
+                    "mediaType": media_type,
+                    "digest": format!("sha256:{}", hash_of((b'1' + i as u8) as char)),
+                    "size": 64,
+                })
+            })
+            .collect();
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/spdx+json",
+            "config": {
+                "mediaType": "application/vnd.oci.empty.v1+json",
+                "digest": format!("sha256:{config}"),
+                "size": config_bytes.len(),
+            },
+            "layers": layers,
+            "subject": {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": format!("sha256:{}", hash_of('e')),
+                "size": 512,
+            },
+        }))
+        .expect("manifest serialises");
+        let manifest = real_sha256(&manifest_bytes);
+
+        let store = MockStoragePort::new();
+        store.insert_content(manifest.clone(), manifest_bytes);
+        store.insert_content(config, config_bytes);
+        (Arc::new(store), manifest_artifact(manifest))
+    }
+
+    /// **A non-image OCI artifact manifest is neither assessed nor held.**
+    ///
+    /// Both shapes the OCI `PUT` path accepts and enqueues for scanning: an
+    /// SBOM referrer, whose single layer is `application/spdx+json`, and a
+    /// **mixed** signature referrer, whose first layer is cosign
+    /// `simplesigning` material and whose second is an ordinary gzip tar. The
+    /// mixed one is the reason neither `artifactType` nor one layer's media
+    /// type is a safe shortcut, and the reason a Helm-chart fixture does not
+    /// cover this: a shortcut on either would read the tar layer as an image
+    /// layer and go on composing.
+    ///
+    /// Every one of these layers is a container the materialisation cannot
+    /// open, so each used to be refused as an *unsupported image layer* —
+    /// `DeterministicRefusal`, which is a permanently absent verdict and a
+    /// hold with no deadline. The config is
+    /// what says these bytes were never an image, and the openability question
+    /// now waits for it.
+    #[tokio::test]
+    async fn a_non_image_artifact_manifest_is_neither_assessed_nor_refused() {
+        for (label, layer_media_types) in [
+            ("an SBOM referrer", vec!["application/spdx+json"]),
+            (
+                "a mixed signature referrer",
+                vec![
+                    "application/vnd.dev.cosign.simplesigning.v1+json",
+                    OCI_GZIP_LAYER_MEDIA_TYPE,
+                ],
+            ),
+        ] {
+            let (store, artifact) = referrer_in_storage(&layer_media_types);
+            let storage: Arc<dyn StoragePort> = store.clone();
+            let (proxy, resolver) = hosted();
+
+            // The resolution itself: not a composition, and not a refusal of
+            // one.
+            let resolution = resolve(&storage, &proxy, &resolver, &artifact).await;
+            let CompositeResolution::NothingToCompose(why) = resolution else {
+                panic!("{label} was never an image, so there is nothing to refuse: {resolution:?}");
+            };
+            assert!(
+                why.contains("artifact manifest"),
+                "{label}: the reason must say what these bytes are: {why}"
+            );
+
+            // And the whole run: no backend saw a composition, and the stored
+            // observation is the steady state rather than a refusal — which is
+            // what keeps the composite verdict from holding the manifest
+            // for ever.
+            let scanner = RecordingScanner::new("trivy", Ok(ScanAnalysis::clean()));
+            let fixture = Fixture::new();
+            let disposition =
+                shadow_oci_with(&storage, &proxy, &resolver, &scanner, &artifact, &fixture).await;
+            assert!(
+                matches!(disposition, CompositeDisposition::Settled),
+                "{label}: nothing to retry"
+            );
+            assert!(
+                scanner.seen().is_empty(),
+                "{label}: nothing was assessed, because there was nothing to assess"
+            );
+            let row = fixture.row();
+            assert_eq!(
+                row.assessment,
+                CompositeAssessment::NothingToCompose,
+                "{label}: a non-image must not record a refusal of an image"
+            );
+            assert_ne!(
+                row.assessment,
+                CompositeAssessment::DeterministicRefusal,
+                "{label}: this is the arm that is a deadline-less hold"
+            );
+            assert_eq!(row.composite_findings_decision, None);
+        }
+    }
+
+    /// The other direction, and the one that must **not** have moved: a
+    /// genuine image — its config declares a layered root filesystem with
+    /// matching arity — carrying a layer nothing can open is still a
+    /// deterministic refusal naming the layer and its container. hort holds an
+    /// incomplete composition of a real image, and that is fail-closed on
+    /// purpose.
+    #[tokio::test]
+    async fn an_image_with_an_unopenable_layer_is_still_a_deterministic_refusal() {
+        let config_bytes = oci_image_config_bytes(2);
+        let config = real_sha256(&config_bytes);
+        let foreign = "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
+        let manifest_bytes = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{config}"),
+                "size": config_bytes.len(),
+            },
+            "layers": [
+                { "mediaType": OCI_GZIP_LAYER_MEDIA_TYPE,
+                  "digest": format!("sha256:{}", hash_of('1')), "size": 64 },
+                { "mediaType": foreign,
+                  "digest": format!("sha256:{}", hash_of('2')), "size": 64 },
+            ],
+        }))
+        .expect("manifest serialises");
+        let manifest = real_sha256(&manifest_bytes);
+        let store = MockStoragePort::new();
+        store.insert_content(manifest.clone(), manifest_bytes);
+        store.insert_content(config, config_bytes);
+        let storage: Arc<dyn StoragePort> = Arc::new(store);
+        let (proxy, resolver) = hosted();
+        let artifact = manifest_artifact(manifest);
+
+        let resolution = resolve(&storage, &proxy, &resolver, &artifact).await;
+        let CompositeResolution::Deterministic(why) = resolution else {
+            panic!("an image hort cannot compose is refused, not excused: {resolution:?}");
+        };
+        assert!(why.contains("layers[1]"), "{why}");
+        assert!(why.contains(foreign), "{why}");
     }
 
     /// An absent manifest is a deterministic no-verdict naming the
@@ -2398,7 +2695,11 @@ mod tests {
     /// carries authority — whether the manifest holds.
     #[test]
     fn every_manifest_side_refusal_is_classified() {
-        let nothing_to_compose = [ManifestRefusal::NotAnImage, ManifestRefusal::NoLayers];
+        let nothing_to_compose = [
+            ManifestRefusal::NotAnImage,
+            ManifestRefusal::NoLayers,
+            ManifestRefusal::NonFilesystemLayer,
+        ];
         for refusal in nothing_to_compose {
             let rendered = format!("{refusal:?}");
             assert!(
@@ -2420,10 +2721,6 @@ mod tests {
                 slot: ImageDescriptorSlot::Layer(3),
                 problem: DescriptorProblem::MalformedSha256,
             },
-            ManifestRefusal::UnsupportedLayer {
-                index: 1,
-                media_type: "application/vnd.oci.image.layer.v1.tar+brotli".to_string(),
-            },
         ];
         for refusal in deterministic {
             let rendered = format!("{refusal:?}");
@@ -2435,16 +2732,6 @@ mod tests {
         }
 
         // And the refusals say enough to act on.
-        let unsupported = classify_manifest_refusal(ManifestRefusal::UnsupportedLayer {
-            index: 7,
-            media_type: "application/x-nonsense".to_string(),
-        });
-        let CompositeResolution::Deterministic(why) = unsupported else {
-            panic!("expected a deterministic refusal");
-        };
-        assert!(why.contains("layers[7]"), "{why}");
-        assert!(why.contains("application/x-nonsense"), "{why}");
-
         let malformed = classify_manifest_refusal(ManifestRefusal::MalformedDescriptor {
             slot: ImageDescriptorSlot::Config,
             problem: DescriptorProblem::MissingDigest,
@@ -2470,6 +2757,20 @@ mod tests {
             panic!("expected a deterministic refusal");
         };
         assert!(why.contains("trailing comma"), "{why}");
+
+        // The artifact-manifest arm says what the bytes are, in the same
+        // words the config-side arms use, and quotes no declared value — the
+        // reason is a fixed phrase because this population is a steady state
+        // and not a fault report.
+        let payload = classify_manifest_refusal(ManifestRefusal::NonFilesystemLayer);
+        let CompositeResolution::NothingToCompose(why) = payload else {
+            panic!("an attestation manifest was never an image, so there is nothing to refuse");
+        };
+        assert!(why.contains("artifact manifest"), "{why}");
+        assert!(
+            why.contains("not a filesystem"),
+            "the reason must say which of the two refusals this is: {why}"
+        );
     }
 
     /// Every config-side refusal, classified — the half that is decided
@@ -2499,6 +2800,20 @@ mod tests {
             panic!("a config about another image is a refusal, not an artifact manifest");
         };
         assert!(why.contains('3') && why.contains('2'), "{why}");
+
+        // The fourth arm, and the one that moved here from the manifest side:
+        // a layer container nothing can open, over a config that has already
+        // said there is a layered root filesystem. A deterministic refusal of
+        // a real image, naming the layer and the container it withheld for.
+        let unsupported = classify_config_refusal(&ConfigRefusal::UnsupportedLayer {
+            index: 7,
+            media_type: "application/x-nonsense".to_string(),
+        });
+        let CompositeResolution::Deterministic(why) = unsupported else {
+            panic!("an image hort holds an incomplete composition of is a refusal");
+        };
+        assert!(why.contains("layers[7]"), "{why}");
+        assert!(why.contains("application/x-nonsense"), "{why}");
     }
 
     // -- the shadow run --------------------------------------------------
@@ -2522,9 +2837,12 @@ mod tests {
         );
     }
 
-    /// Every arm of the backend's answer is logged and none of them
-    /// escapes: the shadow has no release authority, so a finding, an
-    /// abstention and a failure all leave the run untouched.
+    /// Every arm of the backend's answer is logged, and none of them
+    /// reaches anything by itself: what each one *means* for the manifest
+    /// is [`CompositeScan::verdict_of`]'s answer and the caller's to act
+    /// on, so this asserts only how far each arm travels — the backend is
+    /// asked exactly once, and the disposition is the only thing this
+    /// level decides.
     #[tokio::test]
     async fn the_shadow_run_absorbs_every_backend_answer() {
         let img = TwoLayerImage::new();
@@ -2991,7 +3309,7 @@ mod tests {
     /// A policy that blocks at `threshold` and enforces the block.
     fn policy_blocking_at(threshold: SeverityThreshold) -> ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
+            NegligibleAction, ProvenanceMode, ScanEnforcement,
         };
         ScanPolicyProjection {
             policy_id: Uuid::new_v4(),
@@ -3010,7 +3328,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -3075,7 +3392,7 @@ mod tests {
     }
 
     /// The acquisition's cost rides with the verdict it bought — this is
-    /// egress an operator did not ask for, and promoting the verdict
+    /// egress an operator did not ask for, and a verdict that decides
     /// means keeping it.
     #[tokio::test]
     async fn the_row_carries_what_acquiring_the_composition_cost() {
@@ -3363,17 +3680,16 @@ mod tests {
         }
     }
 
-    /// **One assessment, one tick, under its own label** — on each of
-    /// the four outcomes.
+    /// **One assessment, one tick, under its own `result`** — on each
+    /// of the four outcomes.
     ///
-    /// The counter is what turns D6's promotion criteria (baseline
-    /// completion, coverage, error rate) into something an operator can
-    /// watch move; a one-row-per-manifest projection answers only
-    /// today's snapshot. So it has to tick on the three arms that
+    /// The counter is what turns coverage and error rate into something
+    /// an operator can watch move; a one-row-per-manifest projection
+    /// answers only today's snapshot. So it has to tick on the three arms that
     /// composed nothing as well as on the one that did — "how often is
     /// there nothing to assess?" is half of the coverage question.
     #[test]
-    fn each_outcome_ticks_the_assessment_counter_exactly_once_under_its_own_label() {
+    fn each_outcome_ticks_the_assessment_counter_exactly_once_under_its_own_result() {
         for assessment in [
             CompositeAssessment::Assessed,
             CompositeAssessment::NothingToCompose,
@@ -3392,16 +3708,9 @@ mod tests {
             });
 
             assert_eq!(
-                ticks(
-                    snap,
-                    "hort_scan_composite_assessment_total",
-                    &["result", "authority"],
-                ),
-                vec![(
-                    vec![assessment.as_str().to_string(), "observed".to_string()],
-                    1,
-                )],
-                "one tick for {}, under the label the row stores and this run's posture",
+                ticks(snap, "hort_scan_composite_assessment_total", &["result"]),
+                vec![(vec![assessment.as_str().to_string()], 1)],
+                "one tick for {}, under the label the row stores",
                 assessment.as_str()
             );
             // And the counter's label is the row's column value, on the
@@ -3453,7 +3762,8 @@ mod tests {
             f
         };
         let cases = [
-            // Composite blocks, primary clean: promoting adds a hold.
+            // Composite blocks, primary clean: the composition adds a
+            // hold the manifest's own bytes would not have.
             (
                 vec![blocking()],
                 Vec::new(),
@@ -3461,7 +3771,7 @@ mod tests {
                 Some(GateDecision::Reject),
                 GateDecision::Clean,
             ),
-            // Primary blocks, composite clean: promoting removes one.
+            // Primary blocks, composite clean: the composition removes one.
             (
                 Vec::new(),
                 vec![primary_blocking()],
@@ -3657,10 +3967,10 @@ mod tests {
         );
     }
 
-    /// The two rows a promotion decision is made of. The composite finds
-    /// what the manifest's own bytes could not — so the counterfactual
-    /// *differs* — and when the primary axis already found the same
-    /// thing, the two *agree*.
+    /// The two rows the per-axis pair is made of. The composite finds
+    /// what the manifest's own bytes could not — so the two columns
+    /// *differ* — and when the primary axis already found the same
+    /// thing, they *agree*.
     #[tokio::test]
     async fn the_counterfactual_differs_when_the_composition_finds_more_and_agrees_when_it_does_not(
     ) {
@@ -3675,7 +3985,8 @@ mod tests {
 
         // Differs: the manifest's own bytes carry no package surface, so
         // the primary axis is clean while the composition rejects. This
-        // is the row that makes promotion worth something.
+        // is the row that makes assessing the composition worth
+        // something.
         let differs = Fixture::new().with_policy(policy.clone());
         shadow_oci_with(&storage, &proxy, &resolver, &scanner, &artifact, &differs).await;
         let row = differs.row();
@@ -3683,7 +3994,7 @@ mod tests {
         assert_eq!(row.composite_findings_decision, Some(GateDecision::Reject));
 
         // Agrees: the primary axis already found the same advisory, so
-        // promoting would change nothing for this artifact.
+        // the composition contributed nothing for this artifact.
         let agrees = Fixture::new()
             .with_policy(policy)
             .with_primary_findings(vec![blocking]);
@@ -3834,19 +4145,10 @@ mod tests {
         assert!(fixture.observations.rows().is_empty());
     }
 
-    // -- promotion: what a manifest row receives (ADR 0064 D6) -----------
+    // -- what a manifest row receives (ADR 0064 D2) ----------------------
 
-    /// [`policy_blocking_at`] with the composed-image verdict promoted to
-    /// release authority.
-    fn promoted_policy_blocking_at(threshold: SeverityThreshold) -> ScanPolicyProjection {
-        ScanPolicyProjection {
-            composite_verdict_mode: CompositeVerdictMode::Promoted,
-            ..policy_blocking_at(threshold)
-        }
-    }
-
-    /// Run a composite assessment of each of the four outcomes under
-    /// both postures, returning the verdict.
+    /// Run a composite assessment of one of the four outcomes, returning
+    /// the verdict.
     async fn verdict_for(
         assessment: CompositeAssessment,
         policy: ScanPolicyProjection,
@@ -3870,39 +4172,25 @@ mod tests {
         .verdict
     }
 
-    /// **Unpromoted, every outcome is withheld.** The one assertion that
-    /// makes "an unpromoted run is byte-for-byte today's behaviour" a
-    /// property of the mapping rather than of each arm downstream: there
-    /// is nothing for a caller to fold, whatever the composition said.
+    /// **Each outcome maps to exactly one thing a manifest row can
+    /// receive**, and the three refusal arms do not collapse into one
+    /// answer: "nothing to compose" is not a refusal at all, while both
+    /// ways of failing to assemble a composition are the same absent
+    /// verdict as far as the release gate is concerned.
+    ///
+    /// There is no second posture to run the matrix under. The mapping
+    /// used to reduce to [`CompositeVerdict::Withheld`] on every arm
+    /// unless an operator had promoted the composite verdict, and that
+    /// posture's shipped default was the withholding one — so an
+    /// unanalysable image was assessed, recorded, and then held by a gate
+    /// nothing could ever open.
     #[tokio::test]
-    async fn an_unpromoted_policy_withholds_every_outcome() {
-        for assessment in [
-            CompositeAssessment::Assessed,
-            CompositeAssessment::NothingToCompose,
-            CompositeAssessment::DeterministicRefusal,
-            CompositeAssessment::TransientRefusal,
-        ] {
-            assert_eq!(
-                verdict_for(assessment, policy_blocking_at(SeverityThreshold::Critical)).await,
-                CompositeVerdict::Withheld,
-                "{} must be withheld while the policy has not promoted the verdict",
-                assessment.as_str()
-            );
-        }
-    }
-
-    /// **Promoted, each outcome maps to exactly one thing a manifest row
-    /// can receive**, and the three refusal arms do not collapse into
-    /// one answer: "nothing to compose" is not a refusal at all, while
-    /// both ways of failing to assemble a composition are the same
-    /// absent verdict as far as the release gate is concerned.
-    #[tokio::test]
-    async fn a_promoted_policy_maps_each_outcome_to_what_the_manifest_receives() {
+    async fn each_outcome_maps_to_what_the_manifest_receives() {
         assert!(
             matches!(
                 verdict_for(
                     CompositeAssessment::Assessed,
-                    promoted_policy_blocking_at(SeverityThreshold::Critical),
+                    policy_blocking_at(SeverityThreshold::Critical),
                 )
                 .await,
                 CompositeVerdict::Assessed {
@@ -3915,23 +4203,19 @@ mod tests {
         assert_eq!(
             verdict_for(
                 CompositeAssessment::NothingToCompose,
-                promoted_policy_blocking_at(SeverityThreshold::Critical),
+                policy_blocking_at(SeverityThreshold::Critical),
             )
             .await,
             CompositeVerdict::Withheld,
-            "an index binds references rather than a filesystem (ADR 0064 D5), so promotion \
-             must not make it gate on a composition it does not have"
+            "an index binds references rather than a filesystem (ADR 0064 D5), so the \
+             composite verdict must not make it gate on a composition it does not have"
         );
         for refusal in [
             CompositeAssessment::DeterministicRefusal,
             CompositeAssessment::TransientRefusal,
         ] {
             assert_eq!(
-                verdict_for(
-                    refusal,
-                    promoted_policy_blocking_at(SeverityThreshold::Critical)
-                )
-                .await,
+                verdict_for(refusal, policy_blocking_at(SeverityThreshold::Critical)).await,
                 CompositeVerdict::Absent(NotAnalysable::IncompleteComposition),
                 "{} is the absent verdict ADR 0007 fails closed on — and in both \
                  of `setup_for`'s refusals the composition was never built, which \
@@ -3941,7 +4225,7 @@ mod tests {
         }
     }
 
-    /// **The absence a promoted manifest inherits names what actually
+    /// **The absence the manifest inherits names what actually
     /// happened.** Both of these hold the manifest, so neither is
     /// mis-decided; what differs is the statement left in the record of an
     /// artifact the release gate is withholding.
@@ -3966,8 +4250,7 @@ mod tests {
                 NotAnalysable::NoAnalyzerMatched,
             )),
         );
-        let fixture =
-            Fixture::new().with_policy(promoted_policy_blocking_at(SeverityThreshold::Critical));
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
         let assembled = outcome_of(
             &storage,
             &proxy,
@@ -4010,7 +4293,7 @@ mod tests {
         assert_eq!(
             verdict_for(
                 CompositeAssessment::DeterministicRefusal,
-                promoted_policy_blocking_at(SeverityThreshold::Critical),
+                policy_blocking_at(SeverityThreshold::Critical),
             )
             .await,
             CompositeVerdict::Absent(NotAnalysable::IncompleteComposition),
@@ -4030,8 +4313,7 @@ mod tests {
         // Its evidence is the supplied BOM, so the composite loop never
         // points it at the composition.
         let sbom_only = RecordingScanner::sbom_driven("osv");
-        let fixture =
-            Fixture::new().with_policy(promoted_policy_blocking_at(SeverityThreshold::Critical));
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
         let outcome = outcome_of(
             &storage,
             &proxy,
@@ -4054,17 +4336,17 @@ mod tests {
         );
     }
 
-    /// **The composition's findings are what a promoted verdict carries**
+    /// **The composition's findings are what the verdict carries**
     /// — merged with the run's own rule, not a second list and not the
     /// row's severity summary.
     #[tokio::test]
-    async fn a_promoted_assessment_carries_the_compositions_merged_findings() {
+    async fn an_assessment_carries_the_compositions_merged_findings() {
         let img = TwoLayerImage::new();
         let storage: Arc<dyn StoragePort> = img.warm_storage();
         let artifact = manifest_artifact(img.manifest.clone());
         let (proxy, resolver) = hosted();
         // The same advisory twice, once per invocation of the merge's
-        // key: a promoted verdict must carry the merged list the commit
+        // key: the verdict must carry the merged list the commit
         // path evaluates, never the raw union.
         let scanner = RecordingScanner::new(
             "trivy",
@@ -4073,8 +4355,7 @@ mod tests {
                 composite_finding("CVE-2022-0778", SeverityThreshold::Critical),
             ])),
         );
-        let fixture =
-            Fixture::new().with_policy(promoted_policy_blocking_at(SeverityThreshold::Critical));
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
 
         let verdict = outcome_of(
             &storage,
@@ -4103,12 +4384,18 @@ mod tests {
         );
     }
 
-    /// **No policy resolved is not a promotion.** The built-in default
-    /// governs a repository with no operator policy, and promotion is an
-    /// operator act against named criteria — so an out-of-the-box
-    /// deployment measures the composition and gates on nothing.
+    /// **A repository with no operator policy still gets the composite
+    /// verdict.** The built-in default governs it, and that default has
+    /// no withholding posture to be in: the composition is the unit of
+    /// filesystem assessment whoever configured the repository
+    /// (ADR 0064 D2).
+    ///
+    /// This used to assert the opposite, and it is the arm the inversion
+    /// matters most on — an out-of-the-box deployment is the one that
+    /// never promoted anything, so it is the one that measured the
+    /// composition and gated on nothing.
     #[tokio::test]
-    async fn a_repository_with_no_policy_is_never_promoted() {
+    async fn a_repository_with_no_policy_still_gets_the_composite_verdict() {
         let img = TwoLayerImage::new();
         let storage: Arc<dyn StoragePort> = img.warm_storage();
         let artifact = manifest_artifact(img.manifest.clone());
@@ -4130,61 +4417,58 @@ mod tests {
         .await
         .verdict;
 
-        assert_eq!(verdict, CompositeVerdict::Withheld);
+        assert!(
+            matches!(
+                verdict,
+                CompositeVerdict::Assessed {
+                    evidence: EvidenceBasis::MaterialisedPayload,
+                    ref findings,
+                } if findings.is_empty()
+            ),
+            "got {verdict:?}"
+        );
         assert_eq!(
             fixture.row().assessment,
             CompositeAssessment::Assessed,
-            "and the assessment still happened and was still recorded"
+            "and the assessment is still recorded beside the verdict"
         );
     }
 
-    /// **The assessment counter separates the two postures.** The four
-    /// `result` arms say what the assessment found and nothing about
-    /// whether it decided anything; under `observed` a refusal is a
-    /// coverage gap an operator is weighing, and under `promoted` the
-    /// same arm is a manifest held fail-closed.
+    /// **The assessment counter carries the result and nothing else.**
+    /// The four `result` arms say what the assessment found; there is no
+    /// second label saying whether it decided anything, because every
+    /// assessment decides. The counter used to carry one, separating a
+    /// refusal an operator was weighing as a coverage gap from the same
+    /// refusal holding a manifest fail-closed.
     #[test]
-    fn the_assessment_counter_labels_the_runs_posture() {
-        for (policy, expected) in [
-            (policy_blocking_at(SeverityThreshold::Critical), "observed"),
-            (
-                promoted_policy_blocking_at(SeverityThreshold::Critical),
-                "promoted",
-            ),
-        ] {
-            let (storage, artifact) = setup_for(CompositeAssessment::Assessed);
-            let fixture = Fixture::new().with_policy(policy);
-            let scanner = RecordingScanner::new("trivy", Ok(ScanAnalysis::clean()));
-            let (proxy, resolver) = hosted();
-            let snap = capture_metrics(|| {
-                block_on(shadow_oci_with(
-                    &storage, &proxy, &resolver, &scanner, &artifact, &fixture,
-                ));
-            });
-            assert_eq!(
-                ticks(
-                    snap,
-                    "hort_scan_composite_assessment_total",
-                    &["result", "authority"],
-                ),
-                vec![(vec!["assessed".to_string(), expected.to_string()], 1,)],
-            );
-        }
+    fn the_assessment_counter_carries_only_the_result() {
+        let (storage, artifact) = setup_for(CompositeAssessment::Assessed);
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
+        let scanner = RecordingScanner::new("trivy", Ok(ScanAnalysis::clean()));
+        let (proxy, resolver) = hosted();
+        let snap = capture_metrics(|| {
+            block_on(shadow_oci_with(
+                &storage, &proxy, &resolver, &scanner, &artifact, &fixture,
+            ));
+        });
+        assert_eq!(
+            ticks(snap, "hort_scan_composite_assessment_total", &["result"]),
+            vec![(vec!["assessed".to_string()], 1)],
+        );
     }
 
     /// **A non-manifest row is withheld without the policy being
     /// consulted.** Every artifact in every format reaches this call,
-    /// and only an image manifest has a composition — so a promoted
-    /// policy governing an npm repository changes nothing about it.
+    /// and only an image manifest has a composition — so a policy
+    /// governing an npm repository changes nothing about it.
     #[tokio::test]
-    async fn a_non_manifest_kind_is_withheld_even_under_a_promoted_policy() {
+    async fn a_non_manifest_kind_is_withheld() {
         let img = TwoLayerImage::new();
         let storage: Arc<dyn StoragePort> = img.warm_storage();
         let artifact = manifest_artifact(img.manifest.clone());
         let (proxy, resolver) = hosted();
         let scanner = RecordingScanner::new("trivy", Ok(ScanAnalysis::clean()));
-        let fixture =
-            Fixture::new().with_policy(promoted_policy_blocking_at(SeverityThreshold::Critical));
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
 
         let outcome = outcome_of(
             &storage,
@@ -4203,5 +4487,195 @@ mod tests {
         assert_eq!(outcome.disposition, CompositeDisposition::Settled);
         assert!(fixture.observations.rows().is_empty());
         assert!(scanner.seen().is_empty(), "and nothing was scanned");
+    }
+
+    // -- the deterministic refusals still hold the manifest fail-closed --
+    //
+    // The counter-direction to the whole retirement. Making the composed
+    // verdict authoritative must not turn an *incomplete image* into a
+    // releasable one: a composition hort could not assemble is a
+    // manifest whose filesystem went unassessed, and ADR 0007 fails
+    // closed on an absent verdict. Refusing an incomplete composition
+    // was right before and stays right.
+    //
+    // One test per case, each driving the real refusal end to end rather
+    // than the `setup_for` synthetic: the cases differ in *why* the
+    // composition could not be produced, and only a real one proves the
+    // classification and the verdict mapping agree. All three assert the
+    // same two facts — `Absent(IncompleteComposition)` reaches the
+    // manifest, and the disposition asks for nothing, because re-running
+    // reproduces the refusal exactly.
+
+    /// **Unparseable** — a manifest-kind row whose stored bytes are not
+    /// a manifest document. There is no legitimate population of such
+    /// rows (the PUT path parses a manifest before accepting it, the
+    /// pull-through path parses one to register its edges) and the bytes
+    /// were verified on the way out of CAS (ADR 0003), so this is
+    /// neither a normal shape nor corruption — it fails closed.
+    #[tokio::test]
+    async fn an_unparseable_manifest_holds_its_own_row_fail_closed() {
+        let store = MockStoragePort::new();
+        let manifest = hash_of('a');
+        store.insert_content(manifest.clone(), b"not json at all".to_vec());
+        let storage: Arc<dyn StoragePort> = Arc::new(store);
+        let artifact = manifest_artifact(manifest);
+        let (proxy, resolver) = hosted();
+        let scanner = RecordingScanner::new("trivy", Ok(ScanAnalysis::clean()));
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
+
+        let outcome = outcome_of(
+            &storage,
+            &proxy,
+            &resolver,
+            &registry(vec![scanner.clone()]),
+            &artifact,
+            "oci",
+            ArtifactKind::OciManifest,
+            &["trivy".to_string()],
+            &fixture,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.verdict,
+            CompositeVerdict::Absent(NotAnalysable::IncompleteComposition),
+            "a manifest row that is not a manifest has no composed filesystem \
+             verdict, and the absent verdict is what ADR 0007 holds on"
+        );
+        assert_eq!(
+            outcome.disposition,
+            CompositeDisposition::Settled,
+            "re-reading the same stored bytes reproduces it, so nothing is retried"
+        );
+        assert!(
+            scanner.seen().is_empty(),
+            "and no backend is pointed at a composition that was never described"
+        );
+        assert_eq!(
+            fixture.row().assessment,
+            CompositeAssessment::DeterministicRefusal
+        );
+    }
+
+    /// **Absent** — a constituent that is not in CAS, in a repository
+    /// with no upstream to acquire it from. The config is the first
+    /// constituent needed, so it is the one the refusal names; nothing
+    /// is fetched, because there is nowhere to fetch from.
+    #[tokio::test]
+    async fn an_absent_constituent_holds_the_manifest_fail_closed() {
+        let img = TwoLayerImage::new();
+        let storage: Arc<dyn StoragePort> = img.cold_storage();
+        let artifact = manifest_artifact(img.manifest.clone());
+        let mock_proxy = Arc::new(MockUpstreamProxy::new());
+        let proxy: Arc<dyn UpstreamProxy> = mock_proxy.clone();
+        let resolver: Arc<dyn UpstreamResolver> = Arc::new(MockUpstreamResolver::new());
+        let scanner = RecordingScanner::new("trivy", Ok(ScanAnalysis::clean()));
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
+
+        let outcome = outcome_of(
+            &storage,
+            &proxy,
+            &resolver,
+            &registry(vec![scanner.clone()]),
+            &artifact,
+            "oci",
+            ArtifactKind::OciManifest,
+            &["trivy".to_string()],
+            &fixture,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.verdict,
+            CompositeVerdict::Absent(NotAnalysable::IncompleteComposition),
+            "an image hort holds an incomplete description of is an image whose \
+             filesystem went unassessed"
+        );
+        assert_eq!(
+            outcome.disposition,
+            CompositeDisposition::Settled,
+            "a hosted repository has nowhere to acquire from, so another attempt \
+             would find exactly the same absence"
+        );
+        assert!(mock_proxy.blob_fetches().is_empty());
+        assert!(
+            scanner.seen().is_empty(),
+            "and no backend is pointed at a partial layout — completeness is a \
+             precondition of a verdict, never something the scan recovers from"
+        );
+        assert_eq!(
+            fixture.row().assessment,
+            CompositeAssessment::DeterministicRefusal
+        );
+    }
+
+    /// **Permanently absent** — a constituent the repository *does* have
+    /// an upstream for, and which that upstream answers it does not
+    /// have. For a content-addressed blob that is final: no later
+    /// attempt can produce bytes with the digest the manifest names, so
+    /// it is deterministic rather than transient, and the manifest holds
+    /// with no deadline that would clear it.
+    #[tokio::test]
+    async fn a_permanently_absent_constituent_holds_the_manifest_fail_closed() {
+        let img = TwoLayerImage::new();
+        let storage: Arc<dyn StoragePort> = img.cold_storage();
+        let artifact = manifest_artifact(img.manifest.clone());
+
+        // The config is seeded upstream and the layers are not, so the
+        // run gets past phase 1 and the refusal is a *layer* the upstream
+        // does not have — which is the shape a real pull-through hits.
+        let mock_proxy = Arc::new(MockUpstreamProxy::new());
+        mock_proxy.insert_blob(
+            "",
+            &artifact.name,
+            &format!("sha256:{}", img.config),
+            img.config_bytes.clone(),
+            None,
+        );
+        let proxy: Arc<dyn UpstreamProxy> = mock_proxy.clone();
+        let resolver: Arc<dyn UpstreamResolver> = Arc::new(MockUpstreamResolver::with_mappings(
+            vec![proxy_mapping(artifact.repository_id)],
+        ));
+        let scanner = RecordingScanner::new("trivy", Ok(ScanAnalysis::clean()));
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
+
+        let outcome = outcome_of(
+            &storage,
+            &proxy,
+            &resolver,
+            &registry(vec![scanner.clone()]),
+            &artifact,
+            "oci",
+            ArtifactKind::OciManifest,
+            &["trivy".to_string()],
+            &fixture,
+        )
+        .await;
+
+        assert_eq!(
+            outcome.verdict,
+            CompositeVerdict::Absent(NotAnalysable::IncompleteComposition),
+            "a layer the upstream does not have is a layer no attempt will \
+             produce, so the composition is permanently incomplete"
+        );
+        assert_eq!(
+            outcome.disposition,
+            CompositeDisposition::Settled,
+            "and asking again is not worth an attempt — the absence is final, \
+             which is the distinction that keeps this off the retry path"
+        );
+        assert!(
+            scanner.seen().is_empty(),
+            "no backend sees a composition missing a layer"
+        );
+        let row = fixture.row();
+        assert_eq!(row.assessment, CompositeAssessment::DeterministicRefusal);
+        assert!(
+            row.reason
+                .as_deref()
+                .is_some_and(|r| r.contains("does not have")),
+            "the record says the upstream answered, not that hort gave up: {:?}",
+            row.reason
+        );
     }
 }

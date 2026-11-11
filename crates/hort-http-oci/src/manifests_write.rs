@@ -124,6 +124,7 @@ use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::error::DomainError;
 use hort_domain::events::{Actor, ApiActor};
+use hort_domain::oci::{AdmissionRefusal, ImageBudget};
 use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::types::{ArtifactCoords, ContentHash};
 use hort_formats::oci::OciFormatHandler;
@@ -175,24 +176,96 @@ pub(crate) fn is_index_media_type(media_type: &str) -> bool {
 /// `MANIFEST_INVALID` (not `SIZE_INVALID` — size applies to blobs).
 const MANIFEST_BODY_MAX_BYTES: usize = 1024 * 1024;
 
-/// Upper bound on the number of distinct blob references (`config`
-/// digest plus `layers[*].digest`) a single manifest may carry.
+/// The bounds a manifest `PUT` and a pull-through mint are both held to:
+/// **the composite scan's own whole-image budget**, and nothing of this
+/// crate's own.
 ///
-/// The 1 MiB body cap above stops gross OOM, but a packed JSON body
-/// can fit ~10k pathologically dense `{"digest":"sha256:..."}` entries
-/// within 1 MiB — and every referenced blob triggers a
-/// `find_in_repo_by_hash` lookup against
-/// the artifact repository in [`resolve_referenced_blobs`]. A real-
-/// world OCI image carries tens of layers; 1024 is two orders of
-/// magnitude past observed maxima. Exceeding it lands as
-/// `MANIFEST_INVALID` per [`parse_manifest_blobs`]'s error envelope.
+/// hort must not accept an artifact it can never answer about. A manifest
+/// the composition can never assemble is accepted, scanned, and then
+/// refused deterministically before its config is even read — so its
+/// composite verdict is permanently absent, the release authority never
+/// arrives, and the resulting hold is deadline-less rather than "not yet".
+/// The only exit is a curator override. A refusal at the push is honest and
+/// immediately visible; a permanently stuck accepted image is not.
 ///
-/// The cap is enforced **at parse time** so the resolution loop is
-/// never entered for an over-cap manifest. Do NOT move this gate
-/// into `resolve_referenced_blobs` — that would defeat the purpose
-/// of the cap (the cost the cap protects against is N database
-/// lookups, one per referenced blob).
-pub(crate) const MAX_BLOB_REFERENCES: usize = 1024;
+/// So this is a **reference to one declaration**, not a number. The write
+/// path used to carry a `MAX_BLOB_REFERENCES = 1024` of its own, chosen
+/// against a different cost — N `find_in_repo_by_hash` lookups in
+/// [`resolve_referenced_blobs`] — and noting only that "a real-world OCI
+/// image carries tens of layers; 1024 is two orders of magnitude past
+/// observed maxima". It said nothing about assessability, and it admitted
+/// four times what the composition can compose. The lookup cost it was
+/// chosen for is bounded a fortiori by the tighter bound, so nothing it
+/// defended is given up.
+const ASSESSMENT_BUDGET: ImageBudget = ImageBudget::default_for_composite_scan();
+
+/// Render an admission refusal as the `detail.reason` of a 400
+/// `MANIFEST_INVALID`.
+///
+/// The count refusal's wording is **unchanged** — it was already
+/// OCI-conformant and already named the actual before the bound, and only the
+/// number it prints has moved. The byte refusal copies that shape
+/// deliberately: same code, same actual-then-bound phrasing, so an operator
+/// reading either learns how far past the wall they are and not merely that
+/// one exists.
+///
+/// The conformance refusal has no such pair and deliberately prints neither.
+/// It names a **constant reason plus hort's own slot** — `config`,
+/// `layers[N]`, which is what [`hort_domain::oci::ImageDescriptorSlot`]'s
+/// `Display` renders —
+/// and nothing the declarant supplied, the never-echo discipline
+/// [`check_child_against_descriptor`] records for the index-child counterpart
+/// of the same refusal. When the field is absent there is no value to
+/// withhold; a negative one *is* a value, and it stays in the server log. The
+/// slot is enough: the pusher holds the manifest, so a position in it is
+/// everything needed to find the descriptor and fix it.
+fn admission_refusal_reason(refusal: AdmissionRefusal) -> String {
+    match refusal {
+        AdmissionRefusal::TooManyBlobReferences { declared, max } => {
+            format!("manifest references {declared} blobs; max is {max}")
+        }
+        AdmissionRefusal::DeclaredBytes { declared, max } => {
+            format!("manifest declares {declared} bytes of content; max is {max}")
+        }
+        AdmissionRefusal::UnreadableDeclaredSize { slot } => {
+            format!(
+                "manifest descriptor {slot} declares no readable `size`, which the image \
+                 spec requires"
+            )
+        }
+    }
+}
+
+/// Refuse a manifest body whose declared composition the composite scan could
+/// never assess — **the admission gate**, on both paths that mint a manifest
+/// row.
+///
+/// The bound itself is
+/// [`hort_domain::oci::refuse_manifest_past_assessment_budget`]; this spends
+/// it against the one shipped budget. `Err` is the reason sentence, and the
+/// two callers put it in their own envelope rather than sharing one, because
+/// they are answering two different parties:
+///
+/// - The manifest `PUT` ([`parse_manifest_blobs`], which spends this before it
+///   collects anything) renders it as the `detail.reason` of a 400
+///   `MANIFEST_INVALID`. The client *sent* the manifest, so the numbers are
+///   its own and naming them is how it learns what to change. The conformance
+///   refusal has no numbers and names a slot instead — same code, same
+///   envelope, and nothing the declarant supplied.
+/// - The pull-through legs log it and answer a fixed message, because the
+///   numbers there came out of an **upstream** response body. That is the
+///   sanitisation discipline `DomainError::UpstreamMetadataInvalid` records:
+///   the wire layer renders a fixed message and the cause goes to the server
+///   log.
+///
+/// Spending it before the blob parse is what the retired `MAX_BLOB_REFERENCES`
+/// cap's "enforced at parse time" note was protecting: the per-reference
+/// lookup loop in [`resolve_referenced_blobs`] is never entered for a manifest
+/// hort is going to refuse.
+pub(crate) fn refuse_past_assessment_budget(body_bytes: &[u8]) -> Result<(), String> {
+    hort_domain::oci::refuse_manifest_past_assessment_budget(body_bytes, &ASSESSMENT_BUDGET)
+        .map_err(admission_refusal_reason)
+}
 
 /// `Retry-After` for a manifest write that lost to persistent storage
 /// contention, in seconds.
@@ -874,8 +947,10 @@ fn parse_referenced_blobs(
     let result = if media_type_is_index {
         parse_index_children_for_admission(body_bytes)
     } else {
-        parse_manifest_blobs(parsed_manifest).map_err(|detail| OciError::ManifestInvalid {
-            detail: Some(detail),
+        parse_manifest_blobs(parsed_manifest, body_bytes).map_err(|detail| {
+            OciError::ManifestInvalid {
+                detail: Some(detail),
+            }
         })
     };
     result.map_err(|err| {
@@ -1835,13 +1910,29 @@ pub(crate) enum BlobRole {
 /// `add_member` call sequence — the event stream records it as the
 /// audit trail; consumers of the group read unordered.
 ///
+/// `body_bytes` is the manifest blob itself, beside the parse of it,
+/// because the admission gate spent first is over two quantities and
+/// one of them — the manifest's own weight as a constituent — is a
+/// property of the bytes and not of any parse of them.
+///
 /// Error shape: returns an `Err(serde_json::Value)` carrying the
 /// `detail` object for a 400 `MANIFEST_INVALID` so the caller can
 /// surface it verbatim. This keeps all manifest-shape validation in
 /// one place and avoids leaking parser internals into the handler.
 pub(crate) fn parse_manifest_blobs(
     manifest: &serde_json::Value,
+    body_bytes: &[u8],
 ) -> Result<Vec<ReferencedBlob>, serde_json::Value> {
+    // The assessment budget, spent before anything is collected — so this
+    // parse cannot hand back a reference set larger than a composition hort
+    // would assemble, and the per-reference lookup loop in
+    // `resolve_referenced_blobs` is never entered for a manifest that is
+    // going to be refused. Inside this function rather than at its call
+    // sites because the bound on what it *returns* is its own guarantee to
+    // keep: both callers mint a manifest row on the strength of this list.
+    refuse_past_assessment_budget(body_bytes)
+        .map_err(|reason| serde_json::json!({ "reason": reason }))?;
+
     let mut out: Vec<ReferencedBlob> = Vec::new();
 
     // config.digest — REQUIRED by the single-image shape.
@@ -1880,20 +1971,6 @@ pub(crate) fn parse_manifest_blobs(
                 role: BlobRole::Layer,
             });
         }
-    }
-
-    // Bound the referenced-blob count at parse time so the per-blob
-    // lookup loop in `resolve_referenced_blobs` is never entered for
-    // an over-cap manifest. Surfaces as `MANIFEST_INVALID` at the
-    // call site.
-    if out.len() > MAX_BLOB_REFERENCES {
-        return Err(serde_json::json!({
-            "reason": format!(
-                "manifest references {} blobs; max is {}",
-                out.len(),
-                MAX_BLOB_REFERENCES,
-            ),
-        }));
     }
 
     Ok(out)
@@ -2105,9 +2182,13 @@ fn parse_blob_digest(raw: &str) -> Result<ContentHash, serde_json::Value> {
 /// resolving to an artifact in a terminal state
 /// ([`QuarantineStatus::is_terminal`](hort_domain::entities::artifact::QuarantineStatus::is_terminal)
 /// — `Rejected` / `ScanIndeterminate`) counts as **not present** and joins
-/// `missing`, because the blob GET refuses that very row (404
-/// `BLOB_UNKNOWN` for `Rejected`, 503 for `ScanIndeterminate` —
-/// `blobs.rs`, the exhaustive status match). Accepting the manifest over
+/// `missing`, because the blob GET refuses that very row (`403 DENIED`
+/// naming the digest and the rejection axis for `Rejected`, `503
+/// UNAVAILABLE` with no `Retry-After` for `ScanIndeterminate` —
+/// `blobs.rs`, the exhaustive status match). Neither is a 404: a terminal
+/// verdict answers with its own envelope precisely so the refusal is
+/// distinguishable from "no such blob", which is the one fact that ends a
+/// caller's search (ADR 0055). Accepting the manifest over
 /// it is how a push reports success and the subsequent pull answers `not
 /// found` on a layer. The status arrives with the row
 /// `find_in_repo_by_hash` already returns, so this costs no extra port
@@ -2445,7 +2526,7 @@ pub(crate) fn pull_membership_claims(
                 return Vec::new();
             }
         };
-        match parse_manifest_blobs(&parsed) {
+        match parse_manifest_blobs(&parsed, body) {
             Ok(r) => r,
             Err(detail) => {
                 tracing::warn!(
@@ -7742,20 +7823,30 @@ mod tests {
         assert_eq!(location, "/v2/myrepo/library/nginx/manifests/v1");
     }
 
-    // -------------------- parse_manifest_blobs blob-count cap --------------------
+    // ----------- the admission gate: what assessment can reach -----------
     //
-    // The 1 MiB body cap stops gross OOM but a manifest body can pack
-    // ~10k pathologically dense entries within 1 MiB — each entry
-    // triggers a `find_in_repo_by_hash` lookup in
-    // `resolve_referenced_blobs`. Cap the blob-reference count at 1024
-    // at parse time, before the lookup loop is entered.
+    // hort must not accept an artifact it can never answer about. A
+    // manifest the composite scan cannot assemble is accepted, scanned, and
+    // then refused deterministically before its config is read — so its
+    // composite verdict is permanently absent, the release authority never
+    // arrives, and the resulting hold is deadline-less. So the accepted set
+    // is derived from the assessable set: the one declaration is
+    // `ImageBudget::default_for_composite_scan()`, and the write path reads
+    // it through `max_manifest_blob_references()` rather than declaring a
+    // number of its own (it used to declare `MAX_BLOB_REFERENCES = 1024`,
+    // four times what the composition can compose).
+    //
+    // The gate is also spent before anything is collected, which is what
+    // the retired cap's "at parse time" note protected: the per-reference
+    // `find_in_repo_by_hash` loop in `resolve_referenced_blobs` is never
+    // entered for a manifest hort is going to refuse.
 
     /// Build a manifest JSON with `n` distinct synthetic layer digests
-    /// plus one config digest. Total referenced blobs = n + 1.
-    /// Digests are unique-by-construction (the index is encoded into
-    /// the hex), so the cap counts distinct entries, not deduplicated
-    /// hashes.
-    fn build_manifest_with_n_layers(n: usize) -> serde_json::Value {
+    /// plus one config digest, each declaring `layer_size` bytes. Total
+    /// referenced blobs = n + 1. Digests are unique-by-construction (the
+    /// index is encoded into the hex), so the count bound counts distinct
+    /// entries, not deduplicated hashes.
+    fn build_manifest_with_n_sized_layers(n: usize, layer_size: u64) -> serde_json::Value {
         // Use a stable config hash and unique-per-index layer hashes.
         // 64 hex chars per digest; index encoded as 16-hex prefix.
         let config_digest = format!("sha256:{}", "c".repeat(64));
@@ -7765,7 +7856,7 @@ mod tests {
                 serde_json::json!({
                     "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
                     "digest": format!("sha256:{hex}"),
-                    "size": 0,
+                    "size": layer_size,
                 })
             })
             .collect();
@@ -7781,68 +7872,438 @@ mod tests {
         })
     }
 
-    #[test]
-    fn parse_manifest_blobs_accepts_1023_layers_plus_config() {
-        // 1023 layers + 1 config = 1024 referenced blobs, exactly at
-        // the cap. Must succeed.
-        let manifest = build_manifest_with_n_layers(1023);
-        let result = parse_manifest_blobs(&manifest);
-        assert!(
-            result.is_ok(),
-            "1024 referenced blobs (1023 layers + 1 config) must be accepted; got {result:?}"
-        );
-        let blobs = result.unwrap();
-        assert_eq!(blobs.len(), 1024, "must include config + 1023 layers");
+    /// The same, declaring nothing for any layer's weight.
+    fn build_manifest_with_n_layers(n: usize) -> serde_json::Value {
+        build_manifest_with_n_sized_layers(n, 0)
     }
 
-    #[test]
-    fn parse_manifest_blobs_accepts_1024_layers_when_total_is_1025_fails() {
-        // Sanity: 1024 layers + 1 config = 1025 referenced blobs,
-        // exactly one over the cap. Must fail.
-        let manifest = build_manifest_with_n_layers(1024);
-        let result = parse_manifest_blobs(&manifest);
-        assert!(
-            result.is_err(),
-            "1025 referenced blobs (1024 layers + 1 config) must be rejected; got {result:?}"
-        );
-        let detail = result.unwrap_err();
-        let reason = detail
+    /// Parse a manifest value the way the handler does — the serialised
+    /// body beside the parse of it, because the manifest's own weight as a
+    /// constituent is a property of the bytes.
+    fn parse_value(manifest: &serde_json::Value) -> Result<Vec<ReferencedBlob>, serde_json::Value> {
+        let body = serde_json::to_vec(manifest).expect("fixture serialises");
+        parse_manifest_blobs(manifest, &body)
+    }
+
+    /// The reason sentence out of a refusal's `detail`.
+    fn refusal_reason(detail: &serde_json::Value) -> String {
+        detail
             .get("reason")
             .and_then(|v| v.as_str())
-            .expect("error detail must carry `reason`");
-        assert!(
-            reason.contains("1025") && reason.contains("1024"),
-            "reason must surface both the count and the cap; got {reason:?}"
+            .expect("error detail must carry `reason`")
+            .to_string()
+    }
+
+    /// **The boundary itself, from the composition's side.** The budget
+    /// counts *constituents* — manifest + config + layers — so the largest
+    /// composable image declares `max_blobs - 2` layers, and the largest
+    /// admissible manifest declares `max_blobs - 1` blob references. Both
+    /// bounds are inclusive, and this is the case the slice must not get
+    /// wrong in the other direction: refusing an image the composition
+    /// would have assembled.
+    #[test]
+    fn a_manifest_exactly_at_the_assessment_bound_is_admitted() {
+        let budget = ImageBudget::default_for_composite_scan();
+        let references = budget.max_manifest_blob_references();
+        let blobs = parse_value(&build_manifest_with_n_layers(references - 1))
+            .expect("a composition that exactly fits the budget must be admitted");
+        assert_eq!(
+            blobs.len(),
+            references,
+            "config + {} layers is exactly the bound",
+            references - 1
         );
+        // And the same count is what the composition will spend: the
+        // manifest is the constituent the manifest's own descriptors do not
+        // name.
+        assert_eq!(blobs.len() + 1, budget.max_blobs);
+    }
+
+    /// One layer past the bound — a **255-layer** image under the shipped
+    /// budget — is refused, naming the actual and then the bound.
+    ///
+    /// 255 layers is a valid image that the registry used to accept and the
+    /// composition then refused: 2 + 255 constituents against a ceiling of
+    /// 256. It is the exact case the maintainer's 2026-11-09 decision
+    /// (refuse at admission) was taken over.
+    #[test]
+    fn a_manifest_one_reference_past_the_bound_is_refused_naming_actual_then_bound() {
+        let budget = ImageBudget::default_for_composite_scan();
+        let references = budget.max_manifest_blob_references();
+        let detail = parse_value(&build_manifest_with_n_layers(references))
+            .expect_err("one reference past the bound must be refused");
+        let reason = refusal_reason(&detail);
+        assert_eq!(
+            reason,
+            format!(
+                "manifest references {} blobs; max is {references}",
+                references + 1
+            ),
+            "the refusal names the actual, then the bound"
+        );
+        // The shipped numbers, spelled out so a silent drift in either is a
+        // failing test rather than a quietly looser registry.
+        assert_eq!(references, 255);
+        assert_eq!(reason, "manifest references 256 blobs; max is 255");
     }
 
     #[test]
     fn parse_manifest_blobs_rejects_2048_layers() {
-        // Far over the cap — proves the check fires regardless of how
-        // far over the manifest is.
+        // Far over the bound — proves the check fires regardless of how
+        // far over the manifest is, and that the actual is the real count
+        // rather than a clamp.
         let manifest = build_manifest_with_n_layers(2048);
-        let result = parse_manifest_blobs(&manifest);
-        assert!(result.is_err(), "2049 referenced blobs must be rejected");
-        let detail = result.unwrap_err();
-        let reason = detail
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .expect("error detail must carry `reason`");
+        let detail = parse_value(&manifest).expect_err("2049 referenced blobs must be rejected");
+        let reason = refusal_reason(&detail);
         assert!(
-            reason.contains("2049") && reason.contains("1024"),
-            "reason must report actual count 2049 and cap 1024; got {reason:?}"
+            reason.contains("2049") && reason.contains("255"),
+            "reason must report actual count 2049 and bound 255; got {reason:?}"
         );
     }
 
     #[test]
     fn parse_manifest_blobs_small_manifest_unchanged() {
         // Existing happy path — small single-layer manifest stays
-        // green. Regression guard: the cap must not interfere with
+        // green. Regression guard: the gate must not interfere with
         // legitimate manifests.
         let manifest = build_manifest_with_n_layers(1);
-        let blobs =
-            parse_manifest_blobs(&manifest).expect("a single-layer manifest must parse cleanly");
+        let blobs = parse_value(&manifest).expect("a single-layer manifest must parse cleanly");
         assert_eq!(blobs.len(), 2, "config + 1 layer = 2 referenced blobs");
+    }
+
+    /// **The byte bound, which admission had none of.** Checked from the
+    /// manifest's declared `layers[].size` sum plus the manifest's own
+    /// body — so nothing is fetched to reach it, which is the whole point:
+    /// an 8 GiB image used to be accepted, its blobs pulled, and the
+    /// composition then refused on bytes.
+    ///
+    /// The refusal copies the count refusal's shape exactly: same code,
+    /// actual then bound.
+    #[test]
+    fn a_manifest_declaring_more_bytes_than_the_budget_is_refused_naming_actual_then_bound() {
+        let budget = ImageBudget::default_for_composite_scan();
+        // Two layers, each half the whole-image byte budget: the pair alone
+        // is exactly the budget, and the manifest body itself puts the sum
+        // over it.
+        let manifest = build_manifest_with_n_sized_layers(2, budget.max_bytes / 2);
+        let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+        let detail = parse_manifest_blobs(&manifest, &body)
+            .expect_err("a composition the budget cannot hold must be refused");
+        let reason = refusal_reason(&detail);
+        assert_eq!(
+            reason,
+            format!(
+                "manifest declares {} bytes of content; max is {}",
+                budget.max_bytes + body.len() as u64,
+                budget.max_bytes
+            ),
+            "the byte refusal names the actual, then the bound: {reason}"
+        );
+        assert!(reason.contains("8589934592"), "the shipped 8 GiB: {reason}");
+    }
+
+    /// The byte bound is **inclusive**, matching the layout writer's (an
+    /// image whose total is exactly the budget assembles). The manifest
+    /// body is a constituent too — the writer copies it first and charges
+    /// it — so the sum that must fit is `body + config + layers`.
+    #[test]
+    fn a_manifest_declaring_exactly_the_byte_budget_is_admitted() {
+        let budget = ImageBudget::default_for_composite_scan();
+        // The layer's declared size has to be `max_bytes` minus the body it
+        // is written *into*, and writing it changes that body's length — so
+        // solve the small self-reference by iterating to a fixed point. It
+        // converges in two steps (the digit count of the size field is what
+        // moves), and the bound is there so a non-converging change fails
+        // loudly instead of hanging.
+        let mut layer_size = budget.max_bytes;
+        let (manifest, body) = (0..8)
+            .find_map(|_| {
+                let manifest = build_manifest_with_n_sized_layers(1, layer_size);
+                let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+                let want = budget.max_bytes - body.len() as u64;
+                if want == layer_size {
+                    return Some((manifest, body));
+                }
+                layer_size = want;
+                None
+            })
+            .expect("the declared-size fixed point must converge");
+
+        parse_manifest_blobs(&manifest, &body)
+            .expect("a composition that exactly fits the byte budget must be admitted");
+
+        // And one byte more is refused — so the assertion above is pinning
+        // the boundary rather than a bound nothing reaches. Same body
+        // length, since the size field's digit count has not moved.
+        let over = build_manifest_with_n_sized_layers(1, layer_size + 1);
+        let over_body = serde_json::to_vec(&over).expect("fixture serialises");
+        assert_eq!(over_body.len(), body.len(), "same body, one byte declared");
+        parse_manifest_blobs(&over, &over_body)
+            .expect_err("one byte past the budget must be refused");
+    }
+
+    /// **The wire, both bounds, through the real handler.** The unit tests
+    /// above pin the gate; this pins what a pushing client is told and that
+    /// nothing is left behind — no artifact row, so no permanently-absent
+    /// verdict to hold and nothing for a curator to waive.
+    ///
+    /// `MANIFEST_INVALID` with the actual before the bound in
+    /// `detail.reason`: the client sent the manifest, so the numbers are its
+    /// own and naming them is how it learns what to change. The count arm's
+    /// wording is unchanged from the cap this gate replaced — only the number
+    /// it prints moved.
+    #[test]
+    fn put_past_either_assessment_bound_is_refused_and_mints_nothing() {
+        let budget = ImageBudget::default_for_composite_scan();
+        let references = budget.max_manifest_blob_references();
+        let over_count = build_manifest_with_n_layers(references);
+        let over_bytes = build_manifest_with_n_sized_layers(2, budget.max_bytes / 2);
+
+        for (label, manifest, expected) in [
+            (
+                "one blob reference past the bound",
+                over_count,
+                format!(
+                    "manifest references {} blobs; max is {references}",
+                    references + 1
+                ),
+            ),
+            (
+                "more declared bytes than the whole-image budget",
+                over_bytes.clone(),
+                {
+                    let body = serde_json::to_vec(&over_bytes).expect("serialises");
+                    format!(
+                        "manifest declares {} bytes of content; max is {}",
+                        budget.max_bytes + body.len() as u64,
+                        budget.max_bytes
+                    )
+                },
+            ),
+        ] {
+            let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+            let (status, envelope, minted) = run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+
+                let router = router().with_state(h.ctx.clone());
+                let uri = "/v2/myrepo/library/nginx/manifests/v1";
+                let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+                let status = resp.status();
+                let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("an OCI error envelope is JSON");
+                let minted = h
+                    .artifacts
+                    .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                    .await
+                    .unwrap();
+                (status, envelope, minted.is_some())
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(
+                envelope["errors"][0]["code"], "MANIFEST_INVALID",
+                "{label}: {envelope}"
+            );
+            assert_eq!(
+                envelope["errors"][0]["detail"]["reason"],
+                serde_json::Value::String(expected),
+                "{label}: the refusal names the actual, then the bound: {envelope}"
+            );
+            assert!(
+                !minted,
+                "{label}: the gate is spent before the mint, so there is no row to hold"
+            );
+        }
+    }
+
+    /// **A size hort cannot read is refused at the push, by slot.** `size` is
+    /// REQUIRED on every `config` / `layers[]` descriptor by the OCI image
+    /// spec, so this is malformed input and not a composition that is too
+    /// large — the posture `check_child_against_descriptor` already takes one
+    /// descriptor type over, for an index child.
+    ///
+    /// Charging an absent `size` as zero let a manifest declaring one layer of
+    /// unstated weight clear the byte bound whatever it really weighed, be
+    /// minted, and then be refused by the assessment — accepted, then
+    /// permanently unassessable, which is the state admission exists to
+    /// prevent.
+    ///
+    /// Two things are asserted beyond the status code: the `detail.reason`
+    /// names **hort's own slot** and the declarant's value does not reach the
+    /// envelope anywhere — a *negative* size is a value, unlike an absent one,
+    /// so the sentinel below is the case that can leak.
+    #[test]
+    fn put_with_an_unreadable_declared_size_is_refused_by_slot_and_mints_nothing() {
+        // Distinctive enough that a substring search over the whole envelope
+        // is a real test: no bound, count or body length can coincide with it.
+        const SENTINEL: i64 = -4242424242;
+
+        for (label, manifest, expected_slot) in [
+            (
+                "a layer declaring no `size` at all",
+                serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "config": {
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "c".repeat(64)),
+                        "size": 0,
+                    },
+                    "layers": [
+                        {
+                            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                            "digest": format!("sha256:{}", "1".repeat(64)),
+                            "size": 64,
+                        },
+                        {
+                            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                            "digest": format!("sha256:{}", "2".repeat(64)),
+                        },
+                    ],
+                }),
+                "layers[1]",
+            ),
+            (
+                "a config declaring a negative `size`",
+                serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "config": {
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "c".repeat(64)),
+                        "size": SENTINEL,
+                    },
+                    "layers": [{
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                        "digest": format!("sha256:{}", "1".repeat(64)),
+                        "size": 64,
+                    }],
+                }),
+                "config",
+            ),
+        ] {
+            let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+            let (status, envelope, minted) = run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+
+                let router = router().with_state(h.ctx.clone());
+                let uri = "/v2/myrepo/library/nginx/manifests/v1";
+                let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+                let status = resp.status();
+                let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("an OCI error envelope is JSON");
+                let minted = h
+                    .artifacts
+                    .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                    .await
+                    .unwrap();
+                (status, envelope, minted.is_some())
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(
+                envelope["errors"][0]["code"], "MANIFEST_INVALID",
+                "{label}: {envelope}"
+            );
+            assert_eq!(
+                envelope["errors"][0]["detail"]["reason"],
+                serde_json::Value::String(format!(
+                    "manifest descriptor {expected_slot} declares no readable `size`, which \
+                     the image spec requires"
+                )),
+                "{label}: the refusal names hort's own slot: {envelope}"
+            );
+            let serialized = envelope.to_string();
+            assert!(
+                !serialized.contains("4242424242"),
+                "{label}: a declared size must not reach the envelope: {serialized}"
+            );
+            assert!(
+                !minted,
+                "{label}: the gate is spent before the mint, so there is no row to hold"
+            );
+        }
+    }
+
+    /// **The counter-assertion on the wire: a conformant manifest is still
+    /// admitted, `size: 0` included.** Zero is readable, conformant and
+    /// legitimate — the empty config blob weighs two bytes — so refusing it
+    /// would be an off-by-one into the valid range, and the fixture every
+    /// bound test in this module builds on declares exactly that for its
+    /// config.
+    #[test]
+    fn put_admits_a_conformant_manifest_whose_descriptors_declare_zero() {
+        let manifest = build_manifest_with_n_sized_layers(2, 0);
+        let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+        parse_manifest_blobs(&manifest, &body)
+            .expect("every descriptor declares a readable `size`, and zero is one");
+    }
+
+    /// **One declaration, both readers.** Not two numbers that agree: the
+    /// budget is *moved* and admission follows it, on both bounds, through
+    /// `refuse_manifest_past_assessment_budget` — the same function the
+    /// shipped gate spends.
+    ///
+    /// A pair of constants that merely matched is how the accepted set and
+    /// the assessable set came apart in the first place, so what is asserted
+    /// here is the derivation and not a value.
+    #[test]
+    fn moving_the_assessment_budget_moves_admission() {
+        use hort_domain::oci::{refuse_manifest_past_assessment_budget, AdmissionRefusal};
+
+        // A budget that admits four blob references (five constituents).
+        let tight = ImageBudget {
+            max_blobs: 5,
+            ..ImageBudget::default_for_composite_scan()
+        };
+        assert_eq!(tight.max_manifest_blob_references(), 4);
+        let at_bound = serde_json::to_vec(&build_manifest_with_n_layers(3)).expect("serialises");
+        refuse_manifest_past_assessment_budget(&at_bound, &tight)
+            .expect("config + 3 layers is exactly four references");
+        let over = serde_json::to_vec(&build_manifest_with_n_layers(4)).expect("serialises");
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(&over, &tight),
+            Err(AdmissionRefusal::TooManyBlobReferences {
+                declared: 5,
+                max: 4
+            }),
+            "the bound moved with the budget, and so did the number the refusal prints"
+        );
+        // The same manifest is admitted under the shipped budget, so what
+        // moved is the budget and not the manifest.
+        refuse_manifest_past_assessment_budget(&over, &ImageBudget::default_for_composite_scan())
+            .expect("five references are far inside the shipped bound");
+
+        // And the byte bound moves the same way.
+        let small = serde_json::to_vec(&build_manifest_with_n_sized_layers(1, 64)).expect("ser");
+        let bytes_budget = ImageBudget {
+            max_bytes: small.len() as u64 + 64,
+            ..ImageBudget::default_for_composite_scan()
+        };
+        refuse_manifest_past_assessment_budget(&small, &bytes_budget)
+            .expect("the body plus its one declared layer is exactly the byte budget");
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(
+                &small,
+                &ImageBudget {
+                    max_bytes: small.len() as u64 + 63,
+                    ..ImageBudget::default_for_composite_scan()
+                }
+            ),
+            Err(AdmissionRefusal::DeclaredBytes {
+                declared: small.len() as u64 + 64,
+                max: small.len() as u64 + 63
+            }),
+            "one byte less of budget refuses the same manifest"
+        );
     }
 
     /// `config.digest` is fully attacker-controlled manifest-JSON
@@ -7851,10 +8312,15 @@ mod tests {
     #[test]
     fn parse_manifest_blobs_malformed_config_digest_does_not_echo_raw_value() {
         let manifest = serde_json::json!({
-            "config": {"digest": "xsentinel-not-a-digest-at-all"},
+            // Conformant `size`, so the admission gate the parse spends first
+            // passes this descriptor through to the digest grammar that is
+            // what this test is about. Dropping it moves the refusal to the
+            // missing-`size` arm and the never-echo property below goes
+            // untested.
+            "config": {"digest": "xsentinel-not-a-digest-at-all", "size": 0},
             "layers": [],
         });
-        let detail = parse_manifest_blobs(&manifest).unwrap_err();
+        let detail = parse_value(&manifest).unwrap_err();
         assert_eq!(detail["reason"], "malformed digest in manifest");
         assert!(
             detail.get("digest").is_none(),
@@ -7873,10 +8339,14 @@ mod tests {
     #[test]
     fn parse_manifest_blobs_unsupported_config_digest_algo_does_not_echo_algorithm() {
         let manifest = serde_json::json!({
-            "config": {"digest": format!("xsentinelalgo:{}", "a".repeat(64))},
+            // Conformant `size`, for the reason the malformed-digest test
+            // above records: without it the admission gate refuses on the
+            // descriptor's `size` and the algorithm never reaches the arm
+            // under test.
+            "config": {"digest": format!("xsentinelalgo:{}", "a".repeat(64)), "size": 0},
             "layers": [],
         });
-        let detail = parse_manifest_blobs(&manifest).unwrap_err();
+        let detail = parse_value(&manifest).unwrap_err();
         assert_eq!(detail["reason"], "unsupported digest algorithm in manifest");
         assert!(
             detail.get("digest").is_none(),
