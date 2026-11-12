@@ -184,7 +184,7 @@ the result instead.
 | fnv | 1.0.7 | MIT | https://github.com/servo/rust-fnv |
 | stable_deref_trait | 1.2.1 | MIT | https://github.com/storyyeller/stable_deref_trait |
 | stringprep | 0.1.5 | MIT | https://github.com/sfackler/rust-stringprep |
-| arc-swap | 1.9.4 | MIT | https://github.com/vorner/arc-swap |
+| arc-swap | 1.9.5 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
 | h2 | 0.4.16 | MIT | https://github.com/hyperium/h2 |
 | http | 1.5.0 | MIT | https://github.com/hyperium/http |
@@ -9006,7 +9006,7 @@ SOFTWARE.
 
 ```
 
-### arc-swap 1.9.4 — MIT
+### arc-swap 1.9.5 — MIT
 
 Repository: https://github.com/vorner/arc-swap
 
