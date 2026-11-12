@@ -33,22 +33,24 @@ use hort_domain::entities::rbac::{ClaimMapping, GrantSubject, Permission, Permis
 /// "everything") when the inputs resolve to admin — `claims` contains the
 /// synthetic `admin` claim OR `is_admin` is set. The list is **never** an
 /// enumeration of every repository (unbounded, useless); the marker stands
-/// in for the full authority — with ONE exception: `Permission::ReadMetrics`
-/// (#113 / D3) is deliberately excluded from the marker, so `cells` may
-/// carry an explicit `(repo, ReadMetrics)` entry alongside
+/// in for the full authority — with the exception of the
+/// **admin-orthogonal** permissions
+/// ([`hort_domain::entities::rbac::ADMIN_ORTHOGONAL_PERMISSIONS`]), which
+/// the marker does not cover: `cells` may carry an explicit
+/// `(repo, perm)` entry for one of those alongside
 /// `is_global_admin: true` when the admin also holds that grant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffectiveGrantSet {
     /// `true` ⇒ the authority set is a full admin: `cells` is empty for
-    /// every permission except `ReadMetrics` and the marker means "holds
-    /// everything else". `false` ⇒ `cells` is the exact held footprint
-    /// (possibly empty = holds nothing).
+    /// every permission except the admin-orthogonal ones and the marker
+    /// means "holds everything else". `false` ⇒ `cells` is the exact held
+    /// footprint (possibly empty = holds nothing).
     pub is_global_admin: bool,
     /// `(None, perm)` = global grant; `(Some(repo), perm)` = per-repo.
     /// De-duplicated, insertion-order preserved. Empty + `!is_global_admin`
     /// = the authority set holds nothing. When `is_global_admin` is `true`
     /// this is empty UNLESS the admin also holds an explicit
-    /// `ReadMetrics` grant, in which case that one cell is present — see
+    /// admin-orthogonal grant, in which case those cells are present — see
     /// [`RbacEvaluator::effective_grants`].
     pub cells: Vec<(Option<Uuid>, Permission)>,
 }
@@ -375,15 +377,20 @@ impl RbacEvaluator {
         // DB metadata kept in sync with the synthetic `admin` claim by
         // construction.
         //
-        // `Permission::ReadMetrics` is excluded from this short-circuit
-        // (#113 / design doc §2 D3, DECIDED 2026-08-05: orthogonal — an
-        // admin does not implicitly hold `ReadMetrics`, and a scraper does
-        // not implicitly hold admin authority). Every other permission
-        // keeps the short-circuit unchanged. Falls through to the ordinary
-        // grant scan below, identical to a non-admin principal — a
-        // `read_metrics` grant on the `admin` claim (or on any claim/user
-        // the admin also carries) still authorizes it there.
-        if permission != Permission::ReadMetrics && principal.claims.iter().any(|c| c == "admin") {
+        // The **admin-orthogonal** permissions are excluded from this
+        // short-circuit — `Permission::is_admin_orthogonal` reads the one
+        // declaration of that set
+        // (`hort_domain::entities::rbac::ADMIN_ORTHOGONAL_PERMISSIONS`),
+        // which three other readers consume too (the `effective_grants`
+        // marker carve-out, `derive_cli_session_cap`'s admin branch, and
+        // whoami's global-admin projection). An admin does not implicitly
+        // hold one of them, and holding one does not imply admin
+        // authority. Every other permission keeps the short-circuit
+        // unchanged. An orthogonal permission falls through to the ordinary
+        // grant scan below, identical to a non-admin principal — a grant on
+        // the `admin` claim (or on any claim/user the admin also carries)
+        // still authorizes it there.
+        if !permission.is_admin_orthogonal() && principal.claims.iter().any(|c| c == "admin") {
             // B1 (ADR 0036): a cap-bound native token (Pat/ServiceAccount) carrying
             // the admin claim MUST also carry a cap — `authenticate_pat` always
             // constructs `Some(cap)`. A `None` cap here is an anomalous construction;
@@ -438,17 +445,16 @@ impl RbacEvaluator {
     ///
     /// When `claims` contains the case-sensitive lowercase `"admin"` claim
     /// OR `is_admin` is set, `is_global_admin` is `true` and `cells` is
-    /// empty for every permission EXCEPT `Permission::ReadMetrics` (#113 /
-    /// design doc §2 D3, DECIDED 2026-08-05: orthogonal — an admin does not
-    /// implicitly hold `ReadMetrics`). A full admin holds every OTHER
-    /// authority; enumerating every repository for those would be
+    /// empty for every permission EXCEPT the **admin-orthogonal** ones
+    /// ([`hort_domain::entities::rbac::ADMIN_ORTHOGONAL_PERMISSIONS`] —
+    /// an admin does not implicitly hold those). A full admin holds every
+    /// OTHER authority; enumerating every repository for those would be
     /// unbounded and useless, so the marker stands in for them. An explicit
-    /// `read_metrics` grant the admin also holds still surfaces as an
-    /// ordinary `(repo, ReadMetrics)` cell — mirroring
-    /// [`Self::user_grants_authorize`]'s matching carve-out exactly, so an
-    /// admin's self-view here never claims authority `authorize()` would
-    /// actually deny (the "one authority source" invariant this function
-    /// exists to uphold — see
+    /// orthogonal grant the admin also holds still surfaces as an
+    /// ordinary `(repo, perm)` cell — reading the same declared set
+    /// [`Self::user_grants_authorize`] reads, so an admin's self-view here
+    /// never claims authority `authorize()` would actually deny (the "one
+    /// authority source" invariant this function exists to uphold — see
     /// `effective_grants_agrees_with_authorize_per_cell`).
     ///
     /// # Cap-agnostic by design
@@ -471,12 +477,16 @@ impl RbacEvaluator {
 
         let mut cells: Vec<(Option<Uuid>, Permission)> = Vec::new();
         for grant in self.grants.iter() {
-            // Marker-only for a global admin on every permission except
-            // `ReadMetrics` — never enumerate what the marker already
-            // covers. A non-admin scans every permission (this condition
-            // is always `false` when `is_global_admin` is `false`,
-            // reproducing the pre-carve-out behavior exactly).
-            if is_global_admin && grant.permission != Permission::ReadMetrics {
+            // Marker-only for a global admin on every permission the
+            // marker covers — never enumerate what it already stands in
+            // for. The exceptions are exactly the admin-orthogonal
+            // permissions, read from the one declaration via
+            // `Permission::is_admin_orthogonal` (the same call the
+            // request-time short-circuit makes), so this enumeration and
+            // that gate cannot disagree about a member. A non-admin scans
+            // every permission (this condition is always `false` when
+            // `is_global_admin` is `false`).
+            if is_global_admin && !grant.permission.is_admin_orthogonal() {
                 continue;
             }
             if !subject_matches(&grant.subject, claims, user_id) {
@@ -491,38 +501,6 @@ impl RbacEvaluator {
             is_global_admin,
             cells,
         }
-    }
-
-    /// Does `principal` satisfy a required claim set, using the **same**
-    /// subset-match primitive and synthetic-`"admin"` short-circuit as
-    /// the `GrantSubject::Claims` arm of [`Self::user_grants_authorize`]?
-    ///
-    /// This is the claim model's set-membership test exposed as a
-    /// standalone predicate so callers that need a *claim requirement*
-    /// that is not itself a `Permission` grant (the
-    /// destructive-task tier: `Permission::AdminTaskInvoke` **AND** the
-    /// `task:destructive` claim) reuse the evaluator instead of
-    /// hand-rolling a parallel subset test. It deliberately mirrors
-    /// `user_grants_authorize`'s `GrantSubject::Claims(required)` arm
-    /// (`required.iter().all(|c| principal.claims.contains(c))`) and its
-    /// case-sensitive lowercase-`"admin"` short-circuit so there is one
-    /// claim-match semantics in the codebase, nothing to drift.
-    ///
-    /// Adds **no** `Permission` or `GrantSubject` variant — the closed
-    /// taxonomies are untouched; this is a read-only predicate
-    /// over the existing claim set.
-    #[must_use]
-    pub fn claims_satisfy(&self, principal: &CallerPrincipal, required: &[&str]) -> bool {
-        // Synthetic-`admin` short-circuit — identical semantics to
-        // `user_grants_authorize` (a full admin holds every authority,
-        // including any claim requirement). Case-sensitive on the exact
-        // lowercase `"admin"` literal.
-        if principal.claims.iter().any(|c| c == "admin") {
-            return true;
-        }
-        required
-            .iter()
-            .all(|c| principal.claims.iter().any(|pc| pc == c))
     }
 
     /// Derive the [`TokenCap`] for an OIDC `/exchange` CliSession mint
@@ -580,23 +558,23 @@ impl RbacEvaluator {
         requested_permissions: &[Permission],
     ) -> Option<TokenCap> {
         // Admin short-circuit — a full admin holds every requested
-        // permission globally, EXCEPT `Permission::ReadMetrics` (#113 /
-        // D3): reuse `user_grants_authorize`'s matching carve-out directly
-        // so a requested `ReadMetrics` only survives into the cap when the
-        // admin also holds an explicit `read_metrics` grant — otherwise
-        // the "valid by construction" invariant below (every cap cell
-        // re-passes `authorize()`) would be false the moment
-        // `user_grants_authorize` denies it. Mirror the existing
-        // global-cap request shape (`repository_ids: None`) so the
-        // clamp's global branch + the ≤1h admin gate run UNCHANGED for
-        // every other permission. Dedup keeps the cap shape stable if a
-        // caller repeats a permission.
+        // permission globally, EXCEPT the **admin-orthogonal** ones: read
+        // the one declaration (`Permission::is_admin_orthogonal`) and ask
+        // `user_grants_authorize` for those, so an orthogonal permission
+        // only survives into the cap when the admin also holds an explicit
+        // grant for it. Otherwise the "valid by construction" invariant
+        // below (every cap cell re-passes `authorize()`) would be false the
+        // moment `user_grants_authorize` denies it — and a member this
+        // branch forgot would ride along in every admin CLI session's cap.
+        // Mirror the existing global-cap request shape
+        // (`repository_ids: None`) so the clamp's global branch + the ≤1h
+        // admin gate run UNCHANGED for every other permission. Dedup keeps
+        // the cap shape stable if a caller repeats a permission.
         if principal.claims.iter().any(|c| c == "admin") {
             let permissions: Vec<Permission> = dedup_preserving_order(requested_permissions)
                 .into_iter()
                 .filter(|&p| {
-                    p != Permission::ReadMetrics
-                        || self.user_grants_authorize(principal, Permission::ReadMetrics, None)
+                    !p.is_admin_orthogonal() || self.user_grants_authorize(principal, p, None)
                 })
                 .collect();
             if permissions.is_empty() {
@@ -900,6 +878,7 @@ mod tests {
 
     use hort_domain::entities::api_token::TokenCap;
     use hort_domain::entities::managed_by::ManagedBy;
+    use hort_domain::entities::rbac::ADMIN_ORTHOGONAL_PERMISSIONS;
 
     // -- fixtures ----------------------------------------------------------
 
@@ -1973,52 +1952,109 @@ mod tests {
         }
     }
 
-    // -- claims_satisfy ----------------------------------------------------
+    // -- the admin-orthogonal set, read per reader -------------------------
+    //
+    // `ADMIN_ORTHOGONAL_PERMISSIONS` is declared once in `hort-domain` and
+    // read by four sites. Three of them live in this file; the fourth is
+    // whoami's global-admin projection
+    // (`hort-http-core/src/handlers/auth.rs`, covered there). The tests
+    // below loop over the declared set instead of naming its members, so a
+    // permission added to the declaration is covered at every reader the
+    // moment it is declared — the failure mode the set exists to prevent is
+    // one reader missing a member, which no member-named test can catch.
 
+    /// Reader 1 — the request-time short-circuit. An admin principal
+    /// holding no explicit grant is DENIED every member of the declared
+    /// set, and ALLOWED a permission outside it (the counter-assertion:
+    /// without it this test would also pass against an evaluator that
+    /// denies an admin everything).
     #[test]
-    fn claims_satisfy_all_required_present_is_true() {
+    fn authorize_denies_an_admin_every_admin_orthogonal_permission_without_a_grant() {
+        assert!(
+            !ADMIN_ORTHOGONAL_PERMISSIONS.is_empty(),
+            "an empty declared set makes every loop below vacuous"
+        );
         let eval = RbacEvaluator::new(Vec::new());
-        let p = principal(&["task-admin", "task:destructive"]);
-        assert!(eval.claims_satisfy(&p, &["task:destructive"]));
-        assert!(eval.claims_satisfy(&p, &["task-admin", "task:destructive"]));
+        let p = principal(&["admin"]);
+        for &perm in ADMIN_ORTHOGONAL_PERMISSIONS {
+            assert!(
+                !eval.authorize(&p, perm, None),
+                "the admin claim must NOT implicitly satisfy {perm}"
+            );
+            assert!(
+                !eval.authorize(&p, perm, Some(Uuid::new_v4())),
+                "the carve-out for {perm} must hold with a repository id too"
+            );
+        }
+        assert!(
+            eval.authorize(&p, Permission::Write, None),
+            "a permission outside the declared set still rides the admin short-circuit"
+        );
     }
 
+    /// Reader 1, the other direction — the grant is what confers it. The
+    /// same admin principal holding an explicit grant IS allowed, so the
+    /// carve-out is an orthogonality and not a blanket refusal.
     #[test]
-    fn claims_satisfy_missing_required_is_false() {
-        let eval = RbacEvaluator::new(Vec::new());
-        let p = principal(&["task-admin"]); // no task:destructive
-        assert!(!eval.claims_satisfy(&p, &["task:destructive"]));
+    fn authorize_allows_an_admin_every_admin_orthogonal_permission_with_a_grant() {
+        let p = principal(&["admin"]);
+        for &perm in ADMIN_ORTHOGONAL_PERMISSIONS {
+            let eval = RbacEvaluator::new(vec![claims_grant(&["admin"], None, perm)]);
+            assert!(
+                eval.authorize(&p, perm, None),
+                "an explicit grant must confer {perm} on an admin principal"
+            );
+        }
     }
 
+    /// The confusion case the split exists for: holding one member of the
+    /// declared set authorises **that** member and nothing else in it.
     #[test]
-    fn claims_satisfy_partial_overlap_is_false() {
-        let eval = RbacEvaluator::new(Vec::new());
-        let p = principal(&["task:destructive"]);
-        // Requires both; only one present → not a subset.
-        assert!(!eval.claims_satisfy(&p, &["task:destructive", "other"]));
+    fn holding_one_admin_orthogonal_permission_authorises_no_other() {
+        for &held in ADMIN_ORTHOGONAL_PERMISSIONS {
+            let eval = RbacEvaluator::new(vec![claims_grant(&["operator"], None, held)]);
+            let p = principal(&["operator"]);
+            assert!(eval.authorize(&p, held, None), "{held} is the held grant");
+            for &other in ADMIN_ORTHOGONAL_PERMISSIONS {
+                if other == held {
+                    continue;
+                }
+                assert!(
+                    !eval.authorize(&p, other, None),
+                    "holding {held} must not authorise {other}"
+                );
+            }
+        }
     }
 
+    /// Reader 2 — the `EffectiveGrantSet` marker carve-out. For a global
+    /// admin the cells are empty except for the declared set's held
+    /// members, so no surface built on this enumeration can report an
+    /// authority `authorize` denies (or hide one it allows).
     #[test]
-    fn claims_satisfy_admin_short_circuit_is_true_even_without_claim() {
-        let eval = RbacEvaluator::new(Vec::new());
-        let p = principal(&["admin"]); // synthetic admin, no task:destructive
-        assert!(eval.claims_satisfy(&p, &["task:destructive"]));
-    }
-
-    #[test]
-    fn claims_satisfy_admin_short_circuit_is_case_sensitive() {
-        let eval = RbacEvaluator::new(Vec::new());
-        // Uppercase must NOT short-circuit (mirrors user_grants_authorize).
-        let p = principal(&["ADMIN"]);
-        assert!(!eval.claims_satisfy(&p, &["task:destructive"]));
-    }
-
-    #[test]
-    fn claims_satisfy_empty_required_is_vacuously_true() {
-        let eval = RbacEvaluator::new(Vec::new());
-        let p = principal(&[]);
-        // No requirements ⇒ trivially satisfied (this pins the `.all()` boundary).
-        assert!(eval.claims_satisfy(&p, &[]));
+    fn effective_grants_marker_carves_out_exactly_the_declared_set() {
+        for &perm in ADMIN_ORTHOGONAL_PERMISSIONS {
+            let eval = RbacEvaluator::new(vec![
+                claims_grant(&["admin"], None, perm),
+                // A non-orthogonal grant the marker must keep covering.
+                claims_grant(&["admin"], None, Permission::Write),
+            ]);
+            let set = eval.effective_grants(&["admin".to_string()], None, false);
+            assert!(set.is_global_admin);
+            assert_eq!(
+                set.cells,
+                vec![(None, perm)],
+                "only the held orthogonal grant surfaces beside the marker"
+            );
+        }
+        // Without any orthogonal grant the marker stands alone.
+        let eval = RbacEvaluator::new(vec![claims_grant(&["admin"], None, Permission::Write)]);
+        let set = eval.effective_grants(&["admin".to_string()], None, false);
+        assert!(set.is_global_admin);
+        assert!(
+            set.cells.is_empty(),
+            "no orthogonal grant held — the marker covers the rest"
+        );
     }
 
     // -- derive_cli_session_cap --------------------------------------------
@@ -2031,6 +2067,55 @@ mod tests {
     // (or each global `perm`) re-passes `authorize` for the same
     // principal — the issuance clamp is the defense-in-depth backstop, not
     // the primary gate.
+
+    /// Reader 3 — `derive_cli_session_cap`'s admin branch. Every member
+    /// of the declared set is dropped from an admin's derived cap unless
+    /// an explicit grant backs it; everything else survives
+    /// unconditionally. A member this branch missed would ride along in
+    /// every admin CLI session's cap while `authorize` denied it.
+    #[test]
+    fn derive_cap_admin_drops_every_unheld_admin_orthogonal_permission() {
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal(&["admin"]);
+        let mut requested: Vec<Permission> = ADMIN_ORTHOGONAL_PERMISSIONS.to_vec();
+        requested.push(Permission::Read);
+        let cap = eval
+            .derive_cli_session_cap(&p, &requested)
+            .expect("the non-orthogonal permission still derives a cap");
+        assert_eq!(
+            cap.permissions,
+            vec![Permission::Read],
+            "every unheld orthogonal permission must be dropped: {:?}",
+            cap.permissions
+        );
+        assert!(cap.repository_ids.is_none());
+    }
+
+    /// Companion: a held grant puts the member back in the cap, so the
+    /// derivation stays "valid by construction" in both directions.
+    #[test]
+    fn derive_cap_admin_keeps_every_held_admin_orthogonal_permission() {
+        let p = principal(&["admin"]);
+        for &perm in ADMIN_ORTHOGONAL_PERMISSIONS {
+            let eval = RbacEvaluator::new(vec![claims_grant(&["admin"], None, perm)]);
+            let cap = eval
+                .derive_cli_session_cap(&p, &[perm, Permission::Read])
+                .expect("a held orthogonal permission derives a cap");
+            assert_eq!(cap.permissions, vec![perm, Permission::Read]);
+        }
+    }
+
+    /// And the whole cap is `None` when an admin requests only orthogonal
+    /// permissions they do not hold — minting an empty cap would look like
+    /// a success and authorize nothing.
+    #[test]
+    fn derive_cap_admin_requesting_only_unheld_orthogonal_permissions_yields_none() {
+        let eval = RbacEvaluator::new(Vec::new());
+        let p = principal(&["admin"]);
+        assert!(eval
+            .derive_cli_session_cap(&p, ADMIN_ORTHOGONAL_PERMISSIONS)
+            .is_none());
+    }
 
     #[test]
     fn derive_cap_admin_yields_global_cap_with_requested_permissions() {

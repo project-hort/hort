@@ -110,7 +110,8 @@ pub enum AdminCommand {
     ///
     /// Both go through `POST /admin/tasks/retention-evaluate`; the
     /// preview needs no destructive authority, the execution needs the
-    /// `task:destructive` claim a fresh admin session carries.
+    /// `destroy_content` permission, which is granted explicitly and is
+    /// not implied by being an admin.
     Retention(retention::RetentionArgs),
 }
 

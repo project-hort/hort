@@ -150,7 +150,7 @@ service accounts plus their standalone `serviceAccount`-subject
 |---|---|---|
 | `maintainer-dev` | global `read`, `prefetch`, `write` | `/run/secrets/hort-dev.token` (minted by the gitops role) |
 | `maintainer-curator` | global `curate` | `/run/secrets/hort-curator.token` (minted by the gitops role) |
-| `cronjob-tasks` | global `admin_task_invoke` | minted out-of-band for scheduled tasks (see *Scheduled tasks & destructive jobs*) |
+| `cronjob-tasks` | global `admin_task_invoke`, global `destroy_content` | minted out-of-band for scheduled tasks (see *Scheduled tasks & destructive jobs*) |
 
 The gitops role applies the tree (server restart → boot apply) **before** it
 mints tokens, because `issue-svc-token` requires the matching gitops
@@ -361,33 +361,67 @@ caveat — is in
 
 ## Scheduled tasks & destructive jobs
 
-The `cronjob-tasks` service account (provisioned by the gitops tree, non-admin,
-`admin_task_invoke`) runs **non-destructive** scheduled admin tasks unattended
-(noop, staging-sweep, cron-rescan-tick, advisory-watch-tick,
-eventstore-checkpoint, …) — its `hort_svc_*` token carries the
-"may enqueue an admin task" capability but no `task:destructive` claim.
+The `cronjob-tasks` service account (provisioned by the gitops tree, non-admin)
+runs the scheduled admin tasks unattended (noop, staging-sweep,
+cron-rescan-tick, advisory-watch-tick, eventstore-checkpoint, …). Its authority
+is two standalone `serviceAccount`-subject grants in the gitops tree: global
+`admin_task_invoke` (the narrow "may enqueue an admin task" capability) and
+global `destroy_content`.
 
-**Destructive housekeeping** (`eventstore-archive`, `retention-purge`,
-`retention-evaluate`) is **disabled by default**. These tasks additionally
-require the `task:destructive` claim, which a claimless non-admin svc-token
-cannot hold — so they cannot run unattended on the `cronjob-tasks` token by
-construction. Run a destructive task by hand with the bootstrap-admin token
-(see *First admin* above) — `hort-cli admin task invoke retention-purge` — or
-wait for the destructive-op approval workflow (GitLab issue #2; ADR 0038
-follow-on). This is the intended posture: there is zero standing destructive
-privilege.
+**Destructive housekeeping** (`retention-evaluate`, `retention-purge`,
+`eventstore-archive`) is **disabled by default**, and the three do not share one
+authority. Each needs `admin_task_invoke` AND a destructive permission, named
+for what it destroys:
+
+- **`destroy_content`** — `retention-evaluate` (execute mode) and
+  `retention-purge`. The `cronjob-tasks` identity **holds** it
+  (`auth/grants/cronjob-tasks-destroy-content.yaml`): an artifact's removal
+  leaves a record behind by design (`ArtifactPurged` stays on the stream), so
+  scheduled storage reclamation is something a machine identity may be trusted
+  with. These two timers stay disabled because enabling them is a
+  capacity-and-retention decision, not a capability gap.
+- **`destroy_record`** — `eventstore-archive`. **Not grantable to a service
+  account**, this one or any other: nothing reconstructs a sealed audit stream,
+  so no unattended identity gets standing authority over one. The refusal is
+  fail-closed at the apply-parse validator, the apply linter's SA-provenance
+  exemption, `issue-svc-token`, and both runtime authority checks. Run this kind
+  by hand as a human identity that holds the grant.
+
+**Being an admin does not confer either permission**: each is held only through
+an explicit `kind: PermissionGrant`, so an interactive admin is answered `403`
+until one exists for their identity. `hort-cli admin task invoke
+eventstore-archive` as such an identity is the supported path, or wait for the
+destructive-op approval workflow (GitLab issue #2; ADR 0038 follow-on).
+
+**A grant alone is not enough for the machine identity — the token has to be
+rotated.** A svc-token's capability is frozen at mint (ADR 0012) and
+`cronjob-tasks` is PAT-only (no `fallbackRotation`), so nothing re-snapshots it
+on an interval: a token minted before the `destroy_content` grant existed
+carries `admin_task_invoke` alone and is answered `403` on every retention
+invocation, with the grant live in the database the whole time. Read the live
+cap with `hort-cli auth status --output json` (`permissions` is the frozen cap,
+never the grant set) and converge it with `hort_timers_token_rotate: true` for
+one deploy, or directly:
+
+```bash
+hort-server admin issue-svc-token --name cronjob-tasks \
+  --permission admin_task_invoke --permission destroy_content \
+  --rotate --output file:/etc/hort/tasks-token
+```
 
 **The authority is re-checked when the job runs, not only when it is
 accepted.** `admin task invoke` enqueues a row; before the worker calls the
 handler it re-reads the live authority of the identity the row was enqueued
-under. Revoking that identity — demoting it, deactivating it, or removing its
-`admin_task_invoke` grant — therefore also stops the destructive jobs it has
-already queued: the handler is never entered, nothing is deleted or archived,
-and the row becomes a terminal `failed` job whose `last_error` begins
-`destructive task refused at execution`. Check with `hort-cli admin task get
-<job-id>`. Note the corollary: because the `task:destructive` claim resolves
-from the IdP at login and is not persisted, only an **admin** requester's
-destructive authority survives the wait.
+under. Revoking that identity — deactivating it, or removing either of its
+grants — therefore also stops the destructive jobs it has already queued: the
+handler is never entered, nothing is deleted or archived, and the row becomes a
+terminal `failed` job whose `last_error` begins `destructive task refused at
+execution`. Check with `hort-cli admin task get <job-id>`. Note the corollary:
+the re-check rebuilds the requester from the user row, which carries no
+IdP-resolved claims, so a destructive grant must be reachable from the
+persisted identity — a `serviceAccount`- or `User`-subject grant, or a claims
+grant on `admin` for an admin user. A destructive grant bound to any other
+claim passes the enqueue and is refused at execution, every time.
 
 ## Role summary
 

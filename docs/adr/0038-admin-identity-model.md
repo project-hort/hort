@@ -27,7 +27,7 @@
   bootstrap-session note), [0020](0020-single-flight-seal-pool-backstop.md) (the
   single-flight surface the destructive-approval follow-on touches —
   **security co-review**), [0028](0028-destructive-task-idempotency.md)
-  (`task:destructive` idempotency), [0036](0036-oci-auth-capability-token.md)
+  (destructive-task idempotency), [0036](0036-oci-auth-capability-token.md)
   (admin off the OCI surface; the B1 backstop), [0037](0037-gitops-service-account-grant.md)
   (serviceAccount-subject grants — how non-admin SAs hold scoped authority).
 
@@ -120,18 +120,42 @@ path:
   considered and dropped — once the IdP is wired you use the IdP; the
   bootstrap-session is just the one-time wire-up (or break-glass).
 
-### 4. Zero standing destructive privilege — the `task:destructive`-as-claim property is KEPT
+### 4. Destructive authority is never *ambient* admin authority
 
 Irreversible operations (retention-purge / eventstore-archive / retention-evaluate)
-require the `task:destructive` *claim*, which is satisfiable only by a **fresh,
-claim-bearing admin session** — never a static token. With an IdP, the fresh admin
-CliSession is that session. This property is **good and deliberately kept**: there
-is zero *standing* destructive privilege, so unattended machine execution of a
-destructive op is intentionally impossible. A non-admin cron SA holding only
+require authority **beyond** `admin_task_invoke`, and that authority is never
+something an identity has merely by being admin. A non-admin cron SA holding only
 `admin_task_invoke` can enqueue non-destructive admin tasks but **cannot** run the
-destructive ones. In the interim, the deploy may keep destructive CronJobs
-disabled by default (the reset's choice) or run them by hand with a Dex
-CliSession; the production answer is the approval-workflow follow-on below.
+destructive ones. The deploy keeps the destructive CronJobs disabled by default and
+runs them by hand; the production answer is the approval-workflow follow-on below.
+
+> **Mechanism updated — the authority is a `Permission`, not a claim.** This
+> section originally described the extra factor as a registry **claim** named
+> for destructive tasks, "satisfiable only by a fresh, claim-bearing admin
+> session — never a static token". It is now two explicit permissions, split by
+> what is destroyed: `destroy_content` (artifact content, whose removal leaves
+> `ArtifactPurged` behind) and `destroy_record` (the audit record itself, which
+> nothing reconstructs). Both are orthogonal to `Admin` — an admin caller does
+> **not** implicitly hold either, which is strictly tighter than the claim was,
+> because the synthetic `admin` claim satisfied every claim requirement.
+>
+> Two statements in the original wording do not survive the change, and both
+> are recorded here rather than quietly dropped. First, the "never a static
+> token" half was already untrue: an admin PAT carries the synthetic `admin`
+> claim and so passed the claim gate. Second, what the claim bought was not a
+> freshness check (there is no `acr`, no `amr`, no session-freshness test
+> anywhere in the code) but the CliSession lifetime cap; a `PermissionGrant` has
+> no such bound and is standing until revoked. What replaces it is audited
+> conferral — the apply path commits `PermissionGrantApplied` /
+> `PermissionGrantRevoked`, where the claim arrived from `user.is_admin` with no
+> recorded decision behind it — plus live re-resolution of user grants on every
+> call and a second check against the live grant set immediately before a queued
+> destructive row reaches its handler.
+>
+> **This ADR's own decisions are unchanged**: admin stays IdP-assumed, a service
+> account stays strictly non-admin, and `bootstrap-session` stays the only
+> no-IdP admin path. The capability itself carries its own standing-decision
+> record; read that ADR for the split and its consequences.
 
 ## Consequences
 
@@ -144,8 +168,12 @@ CliSession; the production answer is the approval-workflow follow-on below.
 - The compose E2E uses **Keycloak** (which emits `groups`); the k8s no-IdP tier
   moves to the chart's **Dex** sidecar for the OIDC → CliSession path. The tested
   path is the recommended path.
-- Destructive housekeeping has no unattended machine path by construction; this is
-  the intended posture, with the approval workflow as the production-scale answer.
+- Destructive housekeeping has no unattended machine path **as shipped**: the
+  `cronjob-tasks` identity holds neither destructive permission, and its token's
+  cap carries neither. Under the claim model this was impossible *by
+  construction* (a native token resolved no claims at all); it is now a property
+  of what an operator declares, which the capability's own ADR owns. The
+  approval workflow stays the production-scale answer.
 
 ## Follow-ons (recorded in the open-items register, `0000`)
 
@@ -173,10 +201,13 @@ CliSession; the production answer is the approval-workflow follow-on below.
   security primitives; PAM revives the Entry-9 password surface and couples auth to
   the host (broken in containers / k8s). "I control the infra" is expressed as the
   DSN-gated bootstrap, not PAM.
-- **Allow an admin service account for destructive housekeeping.** Rejected — it
-  reintroduces standing destructive privilege, the exact property the
-  `task:destructive`-as-claim model exists to prevent. The approval-workflow
-  follow-on is the de-admined replacement.
+- **Allow an admin service account for destructive housekeeping.** Rejected — a
+  service account is strictly non-admin (this ADR's own decision), and under the
+  claim model admin was the *only* way a credential could reach the destructive
+  gate, so "an admin SA" was the whole proposal. Destructive authority is now
+  expressible without admin at all, which is what makes the rejection cheap to
+  keep rather than a trade-off. The approval-workflow follow-on stays the
+  de-admined answer for unattended execution.
 - **Document "a static Dex admin is a Hort admin."** Rejected as **factually
   wrong** — Dex `staticPasswords` emit no `groups` claim, so no `admin` mapping
   resolves (the accuracy correction above).

@@ -28,6 +28,7 @@
 //! the resolved `(repository, permission)` footprint *this present token*
 //! can exercise (`grants ∩ claims ∩ cap`). See [`WhoamiEffectiveGrants`].
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -39,7 +40,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use hort_domain::entities::api_token::{cap_allows_optional_repo, TokenCap};
-use hort_domain::entities::rbac::Permission;
+use hort_domain::entities::rbac::{Permission, ADMIN_ORTHOGONAL_PERMISSIONS};
 
 use crate::context::AppContext;
 use crate::middleware::auth::AuthenticatedPrincipal;
@@ -91,9 +92,11 @@ pub struct WhoamiResponse {
 ///
 /// Serializes either as a list of `(repository, permission)` cells (for a
 /// non-admin caller, or an admin caller whose token carries a *narrowing*
-/// cap) or as the `{ "global_admin": true }` marker (an unrestricted admin
-/// — `token_cap = None`). The admin path renders a marker, **never** an
-/// enumeration of every repository (unbounded, useless).
+/// cap) or as the `{ "global_admin": true, … }` marker (an unrestricted
+/// admin — `token_cap = None`), which also carries one boolean per
+/// admin-orthogonal permission because the marker does not imply those.
+/// The admin path renders a marker, **never** an enumeration of every
+/// repository (unbounded, useless).
 ///
 /// # What this reports — and the staleness caveat
 ///
@@ -121,26 +124,37 @@ pub struct WhoamiResponse {
 #[serde(untagged)]
 pub enum WhoamiEffectiveGrants {
     /// Unrestricted admin (synthetic `admin` claim / `is_admin`) carrying
-    /// no narrowing cap. Renders `{ "global_admin": true, "read_metrics":
-    /// bool }`.
+    /// no narrowing cap. Renders
+    /// `{ "global_admin": true, "destroy_content": bool,
+    /// "destroy_record": bool, "read_metrics": bool }`.
     GlobalAdmin {
         /// Always `true` — the field exists so the marker serializes as
         /// the documented `{ "global_admin": true, ... }` object, distinct
         /// from the cell-list array variant.
         global_admin: bool,
-        /// **Additive field (#113 / D3, item 2c).** `Permission::ReadMetrics`
-        /// is the ONE permission the admin marker does not imply — see
-        /// `RbacEvaluator::user_grants_authorize`'s carve-out
-        /// (`hort-app/src/rbac.rs`). `true` iff the admin also holds an
-        /// explicit `read_metrics` grant (surfaced as a
-        /// `(repo, ReadMetrics)` cell in
-        /// [`RbacEvaluator::effective_grants`]'s otherwise-empty `cells`
-        /// for a global admin); `false` otherwise. Every other permission
-        /// stays implied by `global_admin: true` as before — this field
-        /// exists so a whoami caller can tell "I hold `read_metrics`"
-        /// from "I don't" without that one exception being silently
-        /// swallowed by the marker.
-        read_metrics: bool,
+        /// One boolean per **admin-orthogonal** permission
+        /// ([`ADMIN_ORTHOGONAL_PERMISSIONS`]), keyed by that permission's
+        /// wire literal and flattened into the marker object, so the
+        /// rendered shape is `"read_metrics": bool` exactly as before
+        /// plus one field per other member.
+        ///
+        /// These are the permissions the admin marker does **not** imply —
+        /// `RbacEvaluator::user_grants_authorize`'s carve-out reads the
+        /// same declared set (`hort-app/src/rbac.rs`). Each value is
+        /// `true` iff the admin also holds an explicit grant for that
+        /// permission (surfaced as a `(repo, perm)` cell in
+        /// `RbacEvaluator::effective_grants`'s otherwise-empty `cells` for
+        /// a global admin); `false` otherwise. Every other permission
+        /// stays implied by `global_admin: true`.
+        ///
+        /// **Derived from the declaration, never enumerated here.** A
+        /// member added to the declared set appears on this surface with
+        /// no code change — which is the point: the evaluator denying an
+        /// admin a permission while whoami still implied they held it is
+        /// the surface disagreement the one declaration exists to
+        /// prevent.
+        #[serde(flatten)]
+        orthogonal_grants: BTreeMap<String, bool>,
     },
     /// The exact `(repository, permission)` cells this token can exercise.
     /// Empty = the token holds nothing.
@@ -290,18 +304,27 @@ async fn resolve_effective_grants(
         // grant already surfaces as an ordinary cell in that enumeration
         // (see `cap_cells` / item 2c's capped-admin audit).
         if caller.token_cap.is_none() {
-            // `Permission::ReadMetrics` is the one exception the marker
-            // doesn't cover (#113 / D3) — `effective_grants` surfaces it
-            // as an explicit cell in `grant_set.cells` even though
+            // The admin-orthogonal permissions are the exceptions the
+            // marker doesn't cover — `effective_grants` surfaces each held
+            // one as an explicit cell in `grant_set.cells` even though
             // `is_global_admin` is `true`; every other permission never
-            // appears there for a global admin.
-            let read_metrics = grant_set
-                .cells
+            // appears there for a global admin. Built by walking the one
+            // declaration, so this projection reports exactly the set the
+            // evaluator carves out.
+            let orthogonal_grants = ADMIN_ORTHOGONAL_PERMISSIONS
                 .iter()
-                .any(|&(_, perm)| perm == Permission::ReadMetrics);
+                .map(|&perm| {
+                    // `Display` is the canonical wire spelling of a
+                    // `Permission`, the same one `render_cells` emits.
+                    (
+                        perm.to_string(),
+                        grant_set.cells.iter().any(|&(_, held)| held == perm),
+                    )
+                })
+                .collect();
             return WhoamiEffectiveGrants::GlobalAdmin {
                 global_admin: true,
-                read_metrics,
+                orthogonal_grants,
             };
         }
         let cells = cap_cells(caller.token_cap.as_ref());
@@ -866,6 +889,60 @@ mod tests {
             v["effective_grants"].as_array().is_none(),
             "still the marker object, not a cell array, even with the flag set: {v}"
         );
+    }
+
+    // (b4) The cross-surface assertion. For EVERY admin-orthogonal
+    // permission, an admin without the grant must be denied by the
+    // evaluator **and** must not appear to hold it on whoami; with the
+    // grant, both surfaces must say held. The two halves are asserted in
+    // one test on purpose: the failure this guards against is not "a
+    // surface is wrong", it is "two surfaces disagree", and a test that
+    // only reads one of them cannot see it. The loop walks the declared
+    // set, so a permission added there is covered here the moment it is
+    // declared.
+    #[tokio::test]
+    async fn whoami_marker_and_the_evaluator_agree_on_every_admin_orthogonal_permission() {
+        assert!(
+            !ADMIN_ORTHOGONAL_PERMISSIONS.is_empty(),
+            "an empty declared set makes this test vacuous"
+        );
+        for &perm in ADMIN_ORTHOGONAL_PERMISSIONS {
+            let field = perm.to_string();
+            let user_id = Uuid::new_v4();
+
+            let principal =
+                principal_with_cap(user_id, &["admin"], Some(TokenKind::CliSession), None);
+
+            // -- ungranted: both surfaces must say "not held" ------------
+            // The evaluator is built from the same grant set the router
+            // gets, so the two answers below are about one authority
+            // state and a disagreement is the surfaces', not the inputs'.
+            let ungranted: Vec<PermissionGrant> = Vec::new();
+            assert!(
+                !RbacEvaluator::new(ungranted.clone()).authorize(&principal, perm, None),
+                "{field}: the evaluator must deny an admin with no grant"
+            );
+            let (router, _) = build_enabled_router(ungranted, Vec::new());
+            let v = whoami_json(router, &principal).await;
+            assert_eq!(v["effective_grants"]["global_admin"], true);
+            assert_eq!(
+                v["effective_grants"][&field], false,
+                "{field}: the evaluator denies it, so the marker must not imply it: {v}"
+            );
+
+            // -- granted: both surfaces must say "held" ------------------
+            let granted = vec![claims_grant(&["admin"], None, perm)];
+            assert!(
+                RbacEvaluator::new(granted.clone()).authorize(&principal, perm, None),
+                "{field}: the evaluator must admit an admin holding the explicit grant"
+            );
+            let (router, _) = build_enabled_router(granted, Vec::new());
+            let v = whoami_json(router, &principal).await;
+            assert_eq!(
+                v["effective_grants"][&field], true,
+                "{field}: held by grant, so the marker must report it: {v}"
+            );
+        }
     }
 
     // (b3) Non-admin whoami is byte-identical to pre-item-2c: the new

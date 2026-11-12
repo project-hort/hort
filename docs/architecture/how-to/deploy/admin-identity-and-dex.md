@@ -99,23 +99,35 @@ standing admin credential.
 
 ## Destructive housekeeping (retention / archive)
 
-Destructive tasks (`retention-purge`, `eventstore-archive`,
-`retention-evaluate`) require the `task:destructive` *claim*, satisfiable only by
-a **fresh admin CliSession** — there is intentionally no unattended machine admin
-(ADR 0038). A non-admin cron SA with `admin_task_invoke` can enqueue
-*non-destructive* admin tasks but not these. Until the destructive-op approval
-workflow lands (ADR 0038 follow-on), run destructive housekeeping by hand with a
-Dex CliSession, or keep those CronJobs disabled (the deploy default).
+Destructive tasks require a destructive *permission* in addition to
+`admin_task_invoke`: `destroy_content` for `retention-purge` and
+`retention-evaluate`, `destroy_record` for `eventstore-archive`. **Neither is
+implied by being an admin** — each is held only through an explicit
+`kind: PermissionGrant`, so an admin CliSession alone is answered `403` until
+that grant exists for the identity
+([`enable-admin-task-cronjobs.md`](enable-admin-task-cronjobs.md) §5.1).
+
+There is still intentionally no unattended machine **admin** (ADR 0038), but
+the two destructive authorities differ on whether a machine identity may hold
+them at all. `destroy_content` may be held by a cron service account, so the
+retention pair is automatable on an explicit grant plus a token rotation
+(`enable-admin-task-cronjobs.md` §5.3) — the removal leaves `ArtifactPurged`
+on the stream. `destroy_record` may **not** be held by one, at five
+independent enforcement points (§5.4), because nothing reconstructs a sealed
+audit stream; `eventstore-archive` therefore stays a by-hand operation until
+the destructive-op approval workflow lands (ADR 0038 follow-on). All three
+CronJobs ship disabled.
 
 The authority is also re-checked when the worker runs the job, against the
-live state of the user it was enqueued under — so revoking that user's admin
-(or deactivating them) stops the destructive jobs they already queued, which
-land as terminal `failed` rows naming the cause. The corollary for a
-`ClaimMapping` you might be tempted to add: a group → `task:destructive`
-mapping on a **non-admin** group lets its members enqueue a destructive task
-that is then refused at execution, because the claim resolves from the IdP at
-login and nothing persists it. Map such groups to `admin`
-([`enable-admin-task-cronjobs.md`](enable-admin-task-cronjobs.md) §5.1).
+live state of the user it was enqueued under — so deactivating that user, or
+removing either grant, stops the destructive jobs they already queued, which
+land as terminal `failed` rows naming the cause. The corollary for the grant's
+*shape*: the re-check rebuilds the requester from the `users` row, which
+carries no IdP-resolved claims, so a destructive grant bound to a claim other
+than `admin` lets its holder enqueue a destructive task that is then refused
+at execution. Bind the grant to the identity (`kind: user` /
+`kind: serviceAccount`), per
+[`enable-admin-task-cronjobs.md`](enable-admin-task-cronjobs.md) §5.1.
 
 ## See also
 

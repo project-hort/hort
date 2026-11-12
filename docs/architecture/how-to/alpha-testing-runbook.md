@@ -878,10 +878,12 @@ Its row count is `0` on a same-day walk (nothing in `npm-proxy` is a day
 old yet) and non-zero once the stack has held cached npm content across a
 day — that is the policy working, not a failure either way. Executing the
 proposal (`hort-cli admin retention apply`) additionally requires the
-`task:destructive` claim, which the `admin` claim satisfies (a full admin
-holds every claim requirement). So execution is **Track B only**, on the
-admin OIDC session from §5·B; the Track A svc-token carries no claims at
-all and is refused at the execute step by design.
+`destroy_content` permission, which is **not** implied by `admin` — it is
+held through an explicit `kind: PermissionGrant` bound to the identity
+([`enable-admin-task-cronjobs.md`](deploy/enable-admin-task-cronjobs.md)
+§5.1). So execution needs **Track B plus that grant**, on the admin OIDC
+session from §5·B; the Track A svc-token holds `admin_task_invoke` only and
+is refused at the execute step by design.
 
 ---
 

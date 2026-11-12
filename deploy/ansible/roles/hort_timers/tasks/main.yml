@@ -34,7 +34,7 @@
 # admin_task_invoke User-subject grant) and applied BEFORE this mint, else the
 # mint errors on a missing SA user. Until Fix B lands, the system-mint path
 # below is the correct (and only wired) way to provision it.
-- name: Mint (or re-mint) the cronjob-tasks service-account token (admin_task_invoke)
+- name: Mint (or re-mint) the cronjob-tasks service-account token
   # No `creates:` guard (issue #75). `issue-svc-token` is idempotent by name:
   # when the token row already EXISTS it prints "already exists" and exits 0
   # WITHOUT touching --output (it cannot re-emit the hashed secret — see
@@ -44,16 +44,50 @@
   # survives) without churning a valid token. The old `creates:`-on-file guard
   # keyed on the on-disk FILE, not token validity — exactly what left
   # registry.hort.rs's token-gated cron ticks silently 401ing after a DB rebuild.
+  #
+  # IDEMPOTENT BY NAME IS NOT CONVERGENT BY CAPABILITY. A token's capability
+  # is frozen at mint (ADR 0012) and this SA is PAT-only (no
+  # `fallbackRotation`, so nothing re-snapshots it), so changing the
+  # `--permission` list below does NOT reach a token that already exists —
+  # the mint says "already exists" and the stale cap stays. Set
+  # `hort_timers_token_rotate: true` for one deploy to converge it; the
+  # rotation step below is the same command with `--rotate`.
   ansible.builtin.command:
     cmd: >-
       {{ gitops_admin_cmd }} issue-svc-token
       --name cronjob-tasks
-      --permission admin_task_invoke
+      {% for permission in hort_timers_token_permissions %}--permission {{ permission }} {% endfor %}
       --output file:{{ hort_timers_token_file }}
   register: hort_timers_token_mint
   changed_when: "'already exists' not in (hort_timers_token_mint.stderr | default(''))"
   environment: "{{ gitops_admin_env }}"
   when: hort_timers_any_admin_task | bool
+
+- name: Rotate the cronjob-tasks token onto the declared capability
+  # The convergence step for an EXISTING token whose frozen cap predates a
+  # change to `hort_timers_token_permissions` — the frozen-cap trap: the
+  # gitops grant can be live in the database and in the evaluator while the
+  # mounted token still 403s, because effective authority is grants AND cap.
+  # `--rotate` revokes the old row, mints a fresh one at the declared cap and
+  # rewrites the token file; the systemd units read the file at exec time, so
+  # nothing needs restarting. Re-running it converges to the same state, so
+  # it is safe to repeat — but it does invalidate the previous token, which
+  # is why it is opt-in rather than unconditional.
+  #
+  # Mirrors the Helm chart's `scheduledTasks.svcTokens[].rotate`: set true
+  # once, deploy, set back to false.
+  ansible.builtin.command:
+    cmd: >-
+      {{ gitops_admin_cmd }} issue-svc-token
+      --name cronjob-tasks
+      {% for permission in hort_timers_token_permissions %}--permission {{ permission }} {% endfor %}
+      --rotate
+      --output file:{{ hort_timers_token_file }}
+  changed_when: true
+  environment: "{{ gitops_admin_env }}"
+  when:
+    - hort_timers_any_admin_task | bool
+    - hort_timers_token_rotate | bool
 
 - name: Secure the cronjob-tasks token file (readable only by the run user)
   ansible.builtin.file:

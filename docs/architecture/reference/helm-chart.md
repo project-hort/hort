@@ -353,7 +353,10 @@ of this umbrella).
   gitops `cronjob-tasks` `ServiceAccount` plus a global `admin_task_invoke`
   `PermissionGrant` — the chart never provisions either, and
   `issue-svc-token --require-authority` fails the bootstrap Job loudly if
-  the grant is missing. See
+  the grant is missing. Every entry added to a `svcTokens` entry's
+  `permissions` needs its own backing grant for the same reason, and needs
+  that entry's `rotate: true` for one upgrade to reach an already-minted
+  token (the cap is frozen at mint). See
   [enable-admin-task-cronjobs.md](../how-to/deploy/enable-admin-task-cronjobs.md).
 - **Rotation single toggle:**
   `scheduledTasks.serviceAccountRotation.enabled` is the **single**

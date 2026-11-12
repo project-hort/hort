@@ -324,9 +324,24 @@ mod tests {
 
     // -- Permission parsing ------------------------------------------------
 
+    /// Every DB enum literal the `permission_type` enum carries must
+    /// round-trip through the mapper: the column is the only thing that
+    /// stands between a stored grant and the evaluator, so a literal the
+    /// mapper cannot parse is a grant that silently stops authorizing.
     #[test]
     fn parse_permission_accepts_every_variant() {
-        for name in ["read", "write", "delete", "admin", "admin_task_invoke"] {
+        for name in [
+            "read",
+            "write",
+            "delete",
+            "admin",
+            "admin_task_invoke",
+            "curate",
+            "prefetch",
+            "read_metrics",
+            "destroy_content",
+            "destroy_record",
+        ] {
             let p = parse_permission_from_text(name).expect("known permission");
             assert_eq!(p.to_string(), name);
         }

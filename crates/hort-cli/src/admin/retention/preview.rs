@@ -6,7 +6,7 @@
 //!
 //! The dry run appends no events and deletes nothing, so this subcommand
 //! needs `Permission::AdminTaskInvoke` and nothing further — in
-//! particular **not** the `task:destructive` claim, which the server
+//! particular **not** `Permission::DestroyContent`, which the server
 //! requires only for `mode=execute`. An operator can therefore read the
 //! proposal with an ordinary admin session and needs the destructive
 //! authority only at the moment of acting on it.

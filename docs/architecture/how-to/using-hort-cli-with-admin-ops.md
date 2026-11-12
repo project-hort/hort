@@ -390,27 +390,33 @@ rather than the world, instead of reporting it as the proposal changing.
 `delta.proposal.window_limited` is the same fact for a script.
 
 Authority: `preview` needs only the ordinary admin-task permission;
-`apply`'s execute step additionally needs the `task:destructive` claim,
-which the `--admin` session above carries. Nothing here introduces a new
-permission, claim, or token lifetime.
+`apply`'s execute step additionally needs the `destroy_content`
+permission, which the `--admin` session does **not** carry on its own —
+it is held through an explicit `kind: PermissionGrant` bound to your
+identity, because destructive authority is deliberately not implied by
+being an admin. Apply it per
+[`enable-admin-task-cronjobs.md`](deploy/enable-admin-task-cronjobs.md)
+§5.1; without it, `preview` works and `apply` is refused at the execute
+step.
 
 **That authority is checked twice: once when the job is accepted, and
 again when the worker is about to run it.** A destructive job is queued,
 not executed inline, so the second check reads the live authority of the
 user the job was enqueued under. If it was revoked in between — the
-account demoted or deactivated, or its `admin_task_invoke` grant removed
-— the handler is never called, nothing is destroyed, and the job becomes
-a terminal `failed` row whose `last_error` begins `destructive task
-refused at execution`. It reaches a scheduled run the same way, where a
-deployment drives a destructive kind on a schedule: the CronJob invokes
-through this same surface, so revoking the identity it authenticates as
-stops scheduled retention too. See
+account deactivated, or either of its grants removed — the handler is
+never called, nothing is destroyed, and the job becomes a terminal
+`failed` row whose `last_error` begins `destructive task refused at
+execution`. It reaches a scheduled run the same way, where a deployment
+drives a destructive kind on a schedule: the CronJob invokes through this
+same surface, so revoking the identity it authenticates as stops
+scheduled retention too. See
 [`enable-admin-task-cronjobs.md`](deploy/enable-admin-task-cronjobs.md)
-§5.1 for the operator-facing detail. One consequence worth knowing
-before you grant: the claim is resolved from your IdP at login and is not
-persisted, so only an `admin` requester's destructive authority survives
-the wait — a non-admin holder of a `task:destructive` `ClaimMapping` can
-submit a job that is then refused at execution.
+§5.2 for the operator-facing detail. One consequence worth knowing
+before you ask for the grant: the second check rebuilds you from your
+`users` row, which carries no IdP-resolved claims, so a destructive grant
+must be bound to your identity (`kind: user`) rather than to a claim —
+a claim-bound one lets you submit a job that is then refused at
+execution.
 
 Exit codes worth scripting against: `0` ran and the result was read, `3`
 the job outlived `--wait-timeout` (the job id is printed and nothing is

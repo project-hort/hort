@@ -59,17 +59,23 @@ fn router_with_index_emulation() -> (axum::Router, MockPorts) {
     let (ctx, mocks) = build_mock_ctx(handle);
     mocks.jobs.enforce_idempotency_keys();
 
-    let grant = PermissionGrant {
+    let grant = |required: &[&str], permission| PermissionGrant {
         id: Uuid::new_v4(),
-        subject: GrantSubject::Claims(vec!["task-admin".into()]),
+        subject: GrantSubject::Claims(required.iter().map(|c| (*c).to_string()).collect()),
         repository_id: None,
-        permission: Permission::AdminTaskInvoke,
+        permission,
         created_at: Utc::now(),
         managed_by: ManagedBy::Local,
         managed_by_digest: None,
     };
+    // Factor 1 for `task-admin`; factor 2 — the content authority the
+    // retention kinds need — for `destructive`. `destroy_record` is
+    // deliberately NOT granted: nothing in this file invokes
+    // `eventstore-archive`, and a grant nobody needs would hide a gate
+    // that stopped asking.
     let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
-        grant,
+        grant(&["task-admin"], Permission::AdminTaskInvoke),
+        grant(&["destructive"], Permission::DestroyContent),
     ])));
     let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
     let uc = Arc::new(TaskUseCase::new(mocks.jobs.clone(), events, rbac));
@@ -94,9 +100,10 @@ fn principal(claims: &[&str]) -> CallerPrincipal {
     }
 }
 
-/// Holds `task:destructive` — may execute as well as observe.
+/// Holds `Permission::DestroyContent` through the `destructive` claim its
+/// grant is bound to — may execute as well as observe.
 fn executing_operator() -> CallerPrincipal {
-    principal(&["task-admin", "task:destructive"])
+    principal(&["task-admin", "destructive"])
 }
 
 /// Holds only the coarse admin-task permission — may observe, not execute.
@@ -257,27 +264,84 @@ async fn a_preview_does_not_suppress_the_execution_that_follows_it() {
 }
 
 // ---------------------------------------------------------------------------
+// The dry run is outside both destructive authorities
+// ---------------------------------------------------------------------------
+
+/// **Factor 2 is resolved per invocation, never per kind.** A dry run
+/// destroys nothing, so it is invocable with *neither* destructive
+/// permission — `Permission::AdminTaskInvoke` alone — while the executing
+/// mode of the same kind needs the content authority.
+///
+/// This is the test that fails if the invocation predicate is replaced by
+/// the kind predicate, which is the natural-looking simplification:
+/// `task_kind_is_destructive("retention-evaluate")` is `true`, so a
+/// kind-shaped gate would answer `403` to the first assertion below, and
+/// a kind-shaped key derivation would hand the dry run a per-UTC-day
+/// single-flight claim — the second. An observation has no destructive
+/// hazard and must stay repeatable; both halves are asserted because the
+/// swap can be made in either reader independently.
+#[tokio::test]
+async fn a_dry_run_needs_neither_destructive_permission_while_execute_needs_one() {
+    let (router, mocks) = router_with_index_emulation();
+
+    // 1. The observing operator holds no destructive permission at all.
+    let (dry_status, dry_job) = invoke(&router, "dry_run", observing_operator()).await;
+    assert_eq!(
+        dry_status,
+        StatusCode::ACCEPTED,
+        "a dry run must be invocable with neither destructive permission — a per-kind \
+         factor 2 would refuse it, because the kind is a destructive kind",
+    );
+    assert!(dry_job.is_some(), "the dry run enqueued a job");
+
+    // 2. ... and it claims no durable key, so a second one is a second
+    //    sweep rather than a dedup hit on the first.
+    let keys = mocks.jobs.enqueue_idem_keys();
+    assert_eq!(keys.len(), 1);
+    assert!(
+        keys[0].is_none(),
+        "a dry run must claim no per-UTC-day key — a per-kind derivation would give it \
+         one: {:?}",
+        keys[0],
+    );
+
+    // 3. The same caller, the same kind, execute mode: refused, because
+    //    *this* invocation destroys and they hold no content authority.
+    let (execute_status, _) = invoke(&router, "execute", observing_operator()).await;
+    assert_eq!(
+        execute_status,
+        StatusCode::FORBIDDEN,
+        "the executing mode needs the content authority the observer does not hold",
+    );
+
+    // 4. And with that authority it is accepted — so step 3 is an
+    //    authority refusal, not a broken route.
+    let (granted_status, _) = invoke(&router, "execute", executing_operator()).await;
+    assert_eq!(granted_status, StatusCode::ACCEPTED);
+}
+
+// ---------------------------------------------------------------------------
 // The two consumers of the one decision
 // ---------------------------------------------------------------------------
 
-/// The `task:destructive` claim gate and the durable-key derivation read
+/// The destructive-authority gate and the durable-key derivation read
 /// the same answer to "will this invocation destroy anything?", so they
 /// cannot disagree about any mode.
 ///
 /// For each mode this observes both answers independently — whether a
-/// caller lacking `task:destructive` is refused, and whether the handler
+/// caller lacking the destructive permission is refused, and whether the handler
 /// claims a durable key — and asserts they moved together. Re-deriving
 /// either answer next to the other, which is how they came apart in the
 /// first place, fails here as soon as the two derivations differ for any
 /// mode: the gate would refuse a call the key treats as harmless, or the
 /// key would single-flight a call the gate waves through.
 #[tokio::test]
-async fn the_claim_gate_and_the_key_derivation_cannot_disagree() {
+async fn the_authority_gate_and_the_key_derivation_cannot_disagree() {
     for mode in ["execute", "dry_run"] {
-        // Answer 1 — does this invocation need the destructive claim?
+        // Answer 1 — does this invocation need a destructive permission?
         let (router, _) = router_with_index_emulation();
         let (status, _) = invoke(&router, mode, observing_operator()).await;
-        let claim_required = match status {
+        let authority_required = match status {
             StatusCode::FORBIDDEN => true,
             StatusCode::ACCEPTED => false,
             other => panic!("mode {mode:?}: unexpected status {other} for an observing caller"),
@@ -296,10 +360,10 @@ async fn the_claim_gate_and_the_key_derivation_cannot_disagree() {
         let key_claimed = keys[0].is_some();
 
         assert_eq!(
-            claim_required, key_claimed,
-            "mode {mode:?}: the destructive-claim gate says {claim_required} and the \
+            authority_required, key_claimed,
+            "mode {mode:?}: the destructive-authority gate says {authority_required} and the \
              durable-key derivation says {key_claimed}. Both must read the one \
-             `task_invocation_is_destructive` answer; a second derivation beside the \
+             `task_invocation_destructive_authority` answer; a second derivation beside the \
              first is what let a dry run take a single-flight key it has no reason \
              to hold.",
         );

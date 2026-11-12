@@ -93,17 +93,23 @@ async fn create_test_user(pool: &PgPool) -> Uuid {
 fn rbac_with_task_invoke() -> Arc<ArcSwap<RbacEvaluator>> {
     // Claim-based RBAC (ADR 0012) — global AdminTaskInvoke grant bound
     // to the `task-admin` claim (there is no role-keyed grant map; a
-    // principal carrying the `task-admin` claim matches).
-    let grant = PermissionGrant {
+    // principal carrying the `task-admin` claim matches), plus the two
+    // destructive permissions bound to `destructive`, which the
+    // destructive kinds' second factor needs.
+    let grant = |required: &[&str], permission| PermissionGrant {
         id: Uuid::new_v4(),
-        subject: GrantSubject::Claims(vec!["task-admin".into()]),
+        subject: GrantSubject::Claims(required.iter().map(|c| (*c).to_string()).collect()),
         repository_id: None,
-        permission: Permission::AdminTaskInvoke,
+        permission,
         created_at: chrono::Utc::now(),
         managed_by: ManagedBy::Local,
         managed_by_digest: None,
     };
-    Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![grant])))
+    Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+        grant(&["task-admin"], Permission::AdminTaskInvoke),
+        grant(&["destructive"], Permission::DestroyContent),
+        grant(&["destructive"], Permission::DestroyRecord),
+    ])))
 }
 
 /// Walk every value in `ADMIN_INVOKABLE_TASK_KINDS` through
@@ -150,14 +156,14 @@ async fn enqueue_accepts_every_valid_kind() {
         email: "task-uc-it@example.test".into(),
         // Claim-based RBAC (ADR 0012) — the `task-admin` claim matches
         // the `rbac_with_task_invoke` grant (claims, not roles).
-        // `task:destructive` is the
-        // additional claim the destructive-kind
-        // gate (ADR 0028) requires on top of `Permission::AdminTaskInvoke` for the
-        // destructive kinds in `ADMIN_INVOKABLE_TASK_KINDS` (`retention-evaluate`,
-        // `retention-purge`, `eventstore-archive`); this test asserts a
-        // sufficiently-privileged actor can enqueue *every* valid kind,
-        // so it must carry it.
-        claims: vec!["task-admin".into(), "task:destructive".into()],
+        // `destructive` is the claim the two destructive permissions'
+        // grants are bound to; the destructive-kind gate requires one of
+        // them on top of `Permission::AdminTaskInvoke` for the
+        // destructive kinds in `ADMIN_INVOKABLE_TASK_KINDS`
+        // (`retention-evaluate`, `retention-purge`, `eventstore-archive`);
+        // this test asserts a sufficiently-privileged actor can enqueue
+        // *every* valid kind, so it must hold both.
+        claims: vec!["task-admin".into(), "destructive".into()],
         token_kind: None,
         issued_at: chrono::Utc::now(),
         token_cap: None,

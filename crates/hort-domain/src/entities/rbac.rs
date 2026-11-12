@@ -14,8 +14,10 @@ use crate::error::DomainError;
 
 /// Coarse-grained permission label attached to role grants.
 ///
-/// The six variants mirror the canonical `permission_type` enum in
-/// `migrations/001_users_roles_rbac.sql`. They are used throughout the authorization
+/// Every variant mirrors a value of the canonical `permission_type`
+/// enum in `migrations/001_users_roles_rbac.sql` (extended by the
+/// later `ALTER TYPE ... ADD VALUE` migrations). They are used
+/// throughout the authorization
 /// pipeline: stored on `PermissionGrant` rows, checked against the caller's
 /// resolved role set by the evaluator, and surfaced in the
 /// `hort_authz_decisions_total{permission=...}` metric.
@@ -63,6 +65,155 @@ pub enum Permission {
     /// and `docs/adr/0052-scoped-metrics-read-capability.md`, the standing
     /// decision record for this capability.
     ReadMetrics,
+    /// Authority to invoke an admin task that destroys **artifact
+    /// content** — `retention-purge`, and `retention-evaluate` in
+    /// execute mode (which appends the `ArtifactExpired` the purge acts
+    /// on). Required **in addition to**
+    /// [`Permission::AdminTaskInvoke`]; the two-factor AND is the
+    /// authority shape, and a dry-run `retention-evaluate` destroys
+    /// nothing and needs neither. DB enum literal:
+    /// `'destroy_content'`. Granted via the audited
+    /// `ApplyConfigUseCase` apply path. Orthogonal to `Admin` — an
+    /// admin caller does not implicitly hold this grant (see
+    /// [`ADMIN_ORTHOGONAL_PERMISSIONS`]).
+    ///
+    /// **Named for the object destroyed, not the purpose.** Artifact
+    /// content is the thing itself and the record of its removal
+    /// survives by design (`ArtifactPurged` stays on the stream), which
+    /// is what separates this authority from
+    /// [`Permission::DestroyRecord`]. A purpose label
+    /// ("housekeeping") moves, and the next destructive operation
+    /// someone files under it would inherit the authority.
+    DestroyContent,
+    /// Authority to invoke an admin task that destroys the **record**
+    /// of what happened — `eventstore-archive`, which seals and
+    /// archives audit streams: authentication audit, download audit,
+    /// token use. Required **in addition to**
+    /// [`Permission::AdminTaskInvoke`]. DB enum literal:
+    /// `'destroy_record'`. Granted via the audited
+    /// `ApplyConfigUseCase` apply path. Orthogonal to `Admin` — an
+    /// admin caller does not implicitly hold this grant (see
+    /// [`ADMIN_ORTHOGONAL_PERMISSIONS`]).
+    ///
+    /// **Deliberately not the same authority as
+    /// [`Permission::DestroyContent`].** Nothing reconstructs a deleted
+    /// audit record, so an identity trusted to reclaim storage is not
+    /// thereby trusted to cut audit history; the two are split by what
+    /// is destroyed, which is why "does this authority cover it?"
+    /// answers itself from the object rather than from a label.
+    DestroyRecord,
+}
+
+/// The permissions the synthetic `admin` claim does **not** imply —
+/// the admin-orthogonal set, declared once.
+///
+/// A member of this set is held only through an explicit
+/// [`PermissionGrant`]: an admin principal falls through the
+/// evaluator's admin short-circuit to the ordinary grant scan for it,
+/// and surfaces it on every read surface exactly as a non-admin would.
+/// Everything *not* in this set stays implied by `Admin`.
+///
+/// **Four readers, and the fourth is why this is a declaration rather
+/// than four `!=` comparisons.** `RbacEvaluator::user_grants_authorize`
+/// (the request-time gate), `RbacEvaluator::effective_grants` (the
+/// `is_global_admin` marker carve-out, which the whoami self-view, the
+/// per-user endpoint and the what-if resolver all read),
+/// `RbacEvaluator::derive_cli_session_cap` (the admin branch, which
+/// must not let an unheld orthogonal permission ride along into a
+/// derived CLI-session cap) and the whoami global-admin projection
+/// (which renders one cell per member). A reader that misses a member
+/// produces a *surface disagreement* — the evaluator denying an admin
+/// while another surface still reports the authority as held — so the
+/// set is declared here, next to the enum, and read from here.
+///
+/// Membership is a decision about the authority, not about its
+/// implementation: a permission belongs here when an admin holding it
+/// implicitly would defeat the point of having it (a scrape identity
+/// that is not an operator; a destructive authority nobody decided to
+/// confer).
+pub const ADMIN_ORTHOGONAL_PERMISSIONS: &[Permission] = &[
+    Permission::ReadMetrics,
+    Permission::DestroyContent,
+    Permission::DestroyRecord,
+];
+
+/// The permissions a **machine identity may never hold**, each paired
+/// with the reason — declared once, so the points that refuse them
+/// cannot come to refuse different sets.
+///
+/// A service account's authority is otherwise exactly its explicit
+/// `serviceAccount`-subject grants (ADR 0037), so this set is the one
+/// place that says "not this one, whatever the grant says". It is the
+/// *identity* answer and deliberately not a *declaration-form* answer:
+/// a grant naming an SA's backing user through a direct
+/// [`GrantSubject::User`] subject is syntactically ordinary, so the
+/// refusal has to be reachable from a caller as well as from an
+/// envelope.
+///
+/// **Five readers, and that is why the reason travels with the
+/// member.** Three refuse a *declaration* — `hort-config`'s
+/// `validate_permission_grant` at apply-parse, the apply linter's
+/// SA-provenance exemption (`lint::permission_grants`), and
+/// `hort-server admin issue-svc-token` on the mint path — and two
+/// refuse an *identity at runtime*: the admin-task authorization gate
+/// (`TaskUseCase::authorize_kind`, which sees the caller's
+/// `TokenKind::ServiceAccount` credential) and the execution-time
+/// re-authorization of a queued row
+/// (`DestructiveTaskReauthorizer`, which sees the persisted
+/// `users.is_service_account` identity instead, because no credential
+/// is persisted on a `jobs` row). Each composes its own surface's
+/// wording around the shared reason rather than restating why.
+///
+/// Membership is a decision about standing machine authority: a
+/// permission belongs here when an unattended identity holding it is
+/// not what was decided, however carefully the grant was authored.
+/// `Permission::DestroyContent` deliberately does **not** belong —
+/// reclaiming artifact storage is exactly the scheduled housekeeping a
+/// machine identity exists for, and `ArtifactPurged` stays on the
+/// stream behind it.
+pub const SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS: &[(Permission, &str)] = &[
+    (
+        Permission::Admin,
+        "service accounts are strictly non-admin (ADR 0038) — express scoped authority as \
+         `serviceAccount`-subject grants instead, run admin operations as an IdP-assumed \
+         human admin, and reach the first admin through the DSN-gated \
+         `hort-server admin bootstrap-session`",
+    ),
+    (
+        Permission::DestroyRecord,
+        "`eventstore-archive` destroys the audit record itself — authentication audit, \
+         download audit, token use — and nothing reconstructs a sealed stream, so no \
+         unattended identity is given standing authority over it. Grant `destroy_content` \
+         for the retention tasks, which a machine identity may hold, and run \
+         `eventstore-archive` by hand as a human identity that holds `destroy_record`",
+    ),
+];
+
+impl Permission {
+    /// `true` when `self` is in [`ADMIN_ORTHOGONAL_PERMISSIONS`] — the
+    /// one predicate every reader of the admin-orthogonal set calls.
+    #[must_use]
+    pub fn is_admin_orthogonal(self) -> bool {
+        ADMIN_ORTHOGONAL_PERMISSIONS.contains(&self)
+    }
+
+    /// `Some(reason)` when a service account may never hold `self` —
+    /// the one lookup every reader of
+    /// [`SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS`] calls.
+    ///
+    /// The reason is returned rather than a bare `bool` because every
+    /// refusal point has an operator on the other end of it who is
+    /// trying to automate something: "may not hold this" without "and
+    /// here is what to automate instead" sends them looking for a
+    /// wider credential, which is the outcome the refusal exists to
+    /// prevent.
+    #[must_use]
+    pub fn service_account_refusal(self) -> Option<&'static str> {
+        SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS
+            .iter()
+            .find(|(p, _)| *p == self)
+            .map(|(_, reason)| *reason)
+    }
 }
 
 impl fmt::Display for Permission {
@@ -76,6 +227,8 @@ impl fmt::Display for Permission {
             Self::Curate => f.write_str("curate"),
             Self::Prefetch => f.write_str("prefetch"),
             Self::ReadMetrics => f.write_str("read_metrics"),
+            Self::DestroyContent => f.write_str("destroy_content"),
+            Self::DestroyRecord => f.write_str("destroy_record"),
         }
     }
 }
@@ -97,6 +250,8 @@ impl FromStr for Permission {
             "curate" => Ok(Self::Curate),
             "prefetch" => Ok(Self::Prefetch),
             "read_metrics" => Ok(Self::ReadMetrics),
+            "destroy_content" => Ok(Self::DestroyContent),
+            "destroy_record" => Ok(Self::DestroyRecord),
             _ => Err(DomainError::Validation(format!("unknown permission: {s}"))),
         }
     }
@@ -220,6 +375,8 @@ mod tests {
         assert_eq!(Permission::Curate.to_string(), "curate");
         assert_eq!(Permission::Prefetch.to_string(), "prefetch");
         assert_eq!(Permission::ReadMetrics.to_string(), "read_metrics");
+        assert_eq!(Permission::DestroyContent.to_string(), "destroy_content");
+        assert_eq!(Permission::DestroyRecord.to_string(), "destroy_record");
     }
 
     #[test]
@@ -233,6 +390,8 @@ mod tests {
             "curate",
             "prefetch",
             "read_metrics",
+            "destroy_content",
+            "destroy_record",
         ] {
             let parsed: Permission = name.parse().unwrap();
             assert_eq!(parsed.to_string(), *name);
@@ -260,6 +419,12 @@ mod tests {
             ("READ_METRICS", Permission::ReadMetrics),
             ("Read_Metrics", Permission::ReadMetrics),
             ("read_metrics", Permission::ReadMetrics),
+            ("DESTROY_CONTENT", Permission::DestroyContent),
+            ("Destroy_Content", Permission::DestroyContent),
+            ("destroy_content", Permission::DestroyContent),
+            ("DESTROY_RECORD", Permission::DestroyRecord),
+            ("Destroy_Record", Permission::DestroyRecord),
+            ("destroy_record", Permission::DestroyRecord),
         ];
         for (input, expected) in cases {
             let parsed: Permission = input.parse().unwrap();
@@ -324,6 +489,37 @@ mod tests {
     }
 
     #[test]
+    fn permission_destroy_content_copy_and_eq() {
+        let a = Permission::DestroyContent;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn permission_destroy_record_copy_and_eq() {
+        let a = Permission::DestroyRecord;
+        let b = a;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn permission_destructive_variants_serde_round_trip() {
+        for perm in [Permission::DestroyContent, Permission::DestroyRecord] {
+            let json = serde_json::to_string(&perm).expect("serialize");
+            let back: Permission = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, perm);
+        }
+    }
+
+    #[test]
+    fn permission_destroy_content_and_destroy_record_are_distinct() {
+        // The whole point of the split: an identity holding one does not
+        // hold the other, so the two must never compare equal (a copy-paste
+        // of the same variant into both arms of a mapping would).
+        assert_ne!(Permission::DestroyContent, Permission::DestroyRecord);
+    }
+
+    #[test]
     fn permission_exhaustive_match() {
         // Force a compile error if a new variant is added without updating
         // this test. Update this test and the match arms above when adding
@@ -337,11 +533,195 @@ mod tests {
             Permission::Curate,
             Permission::Prefetch,
             Permission::ReadMetrics,
+            Permission::DestroyContent,
+            Permission::DestroyRecord,
         ] {
             let _display = perm.to_string();
             let _roundtrip: Permission = _display.parse().unwrap();
             assert_eq!(_roundtrip, perm);
         }
+    }
+
+    // -- ADMIN_ORTHOGONAL_PERMISSIONS ---------------------------------------
+
+    /// The declared set, classified variant by variant with a
+    /// **no-wildcard** match, so adding a `Permission` without deciding
+    /// whether `Admin` implies it is a compile error here rather than a
+    /// silent "yes, it does" at four reading sites.
+    #[test]
+    fn every_permission_is_consciously_classified_against_the_admin_short_circuit() {
+        for perm in [
+            Permission::Read,
+            Permission::Write,
+            Permission::Delete,
+            Permission::Admin,
+            Permission::AdminTaskInvoke,
+            Permission::Curate,
+            Permission::Prefetch,
+            Permission::ReadMetrics,
+            Permission::DestroyContent,
+            Permission::DestroyRecord,
+        ] {
+            let expected_orthogonal = match perm {
+                // Held only through an explicit grant: a scrape identity
+                // is not an operator, and a destructive authority is one
+                // somebody decided to confer.
+                Permission::ReadMetrics
+                | Permission::DestroyContent
+                | Permission::DestroyRecord => true,
+                // Implied by `Admin`, unchanged.
+                Permission::Read
+                | Permission::Write
+                | Permission::Delete
+                | Permission::Admin
+                | Permission::AdminTaskInvoke
+                | Permission::Curate
+                | Permission::Prefetch => false,
+            };
+            assert_eq!(
+                perm.is_admin_orthogonal(),
+                expected_orthogonal,
+                "{perm} classification drifted from the exhaustive guard"
+            );
+        }
+    }
+
+    /// `Admin` itself can never be orthogonal to itself — the
+    /// short-circuit would deny the permission it is the short-circuit
+    /// for, which is unreachable-authority, not a tightening.
+    #[test]
+    fn admin_is_not_admin_orthogonal() {
+        assert!(!Permission::Admin.is_admin_orthogonal());
+        assert!(!ADMIN_ORTHOGONAL_PERMISSIONS.contains(&Permission::Admin));
+    }
+
+    /// The predicate is the set — nothing re-states membership.
+    #[test]
+    fn is_admin_orthogonal_reads_the_declared_set() {
+        for perm in ADMIN_ORTHOGONAL_PERMISSIONS {
+            assert!(
+                perm.is_admin_orthogonal(),
+                "{perm} is declared orthogonal but the predicate disagrees"
+            );
+        }
+        assert_eq!(
+            ADMIN_ORTHOGONAL_PERMISSIONS.len(),
+            3,
+            "a change to the declared set is a change to four readers at once —              see the const's doc comment"
+        );
+    }
+
+    // -- SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS ------------------------------
+
+    /// The declared set, classified variant by variant with a
+    /// **no-wildcard** match, so adding a `Permission` without deciding
+    /// whether a machine identity may hold it is a compile error here
+    /// rather than a silent "yes, it may" at five refusal points.
+    #[test]
+    fn every_permission_is_consciously_classified_against_machine_identity() {
+        for perm in [
+            Permission::Read,
+            Permission::Write,
+            Permission::Delete,
+            Permission::Admin,
+            Permission::AdminTaskInvoke,
+            Permission::Curate,
+            Permission::Prefetch,
+            Permission::ReadMetrics,
+            Permission::DestroyContent,
+            Permission::DestroyRecord,
+        ] {
+            let expected_forbidden = match perm {
+                // No unattended identity holds instance-wide authority
+                // (ADR 0038), and none gets standing authority to cut
+                // audit history nothing reconstructs.
+                Permission::Admin | Permission::DestroyRecord => true,
+                // Every machine-holdable permission, including
+                // `DestroyContent`: scheduled storage reclamation is
+                // what a machine identity is for, and `ArtifactPurged`
+                // stays on the stream behind it.
+                Permission::Read
+                | Permission::Write
+                | Permission::Delete
+                | Permission::AdminTaskInvoke
+                | Permission::Curate
+                | Permission::Prefetch
+                | Permission::ReadMetrics
+                | Permission::DestroyContent => false,
+            };
+            assert_eq!(
+                perm.service_account_refusal().is_some(),
+                expected_forbidden,
+                "{perm} classification drifted from the exhaustive guard"
+            );
+        }
+    }
+
+    /// The lookup is the set — nothing re-states membership — and every
+    /// member carries a non-empty reason, because every refusal point
+    /// renders it to an operator who is trying to automate something.
+    #[test]
+    fn service_account_refusal_reads_the_declared_set() {
+        for (perm, reason) in SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS {
+            assert_eq!(
+                perm.service_account_refusal(),
+                Some(*reason),
+                "{perm} is declared forbidden but the lookup disagrees"
+            );
+            assert!(
+                !reason.trim().is_empty(),
+                "{perm}'s refusal carries no reason"
+            );
+        }
+        assert_eq!(
+            SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS.len(),
+            2,
+            "a change to the declared set is a change to five refusal points at once \
+             — see the const's doc comment"
+        );
+    }
+
+    /// The two halves of the destructive split are on opposite sides of
+    /// this set, and that asymmetry is the decision — not an accident of
+    /// how the list was typed. A set holding both would make the shipped
+    /// `cronjob-tasks` retention grant unprovisionable; a set holding
+    /// neither would hand a scheduled job standing authority to seal
+    /// audit streams.
+    #[test]
+    fn the_destructive_split_straddles_the_machine_identity_refusal() {
+        assert!(
+            Permission::DestroyContent
+                .service_account_refusal()
+                .is_none(),
+            "a machine identity must be able to hold destroy_content"
+        );
+        let record = Permission::DestroyRecord
+            .service_account_refusal()
+            .expect("destroy_record must be refused to a machine identity");
+        // The reason names *why* and what to automate instead — "no"
+        // alone sends an operator looking for a wider credential, which
+        // is the outcome the refusal exists to prevent.
+        assert!(
+            record.contains("nothing reconstructs a sealed stream"),
+            "the reason must name why: {record}"
+        );
+        assert!(
+            record.contains("destroy_content"),
+            "the reason must name what to automate instead: {record}"
+        );
+    }
+
+    /// Admin-orthogonality and machine-identity refusal are different
+    /// questions and the two sets are deliberately not nested:
+    /// `read_metrics` is orthogonal to `admin` yet perfectly holdable by
+    /// a scraper SA, and `admin` is refused to a machine identity while
+    /// being the one permission that can never be orthogonal to itself.
+    #[test]
+    fn the_two_declarations_are_independent() {
+        assert!(Permission::ReadMetrics.is_admin_orthogonal());
+        assert!(Permission::ReadMetrics.service_account_refusal().is_none());
+        assert!(!Permission::Admin.is_admin_orthogonal());
+        assert!(Permission::Admin.service_account_refusal().is_some());
     }
 
     // -- GrantSubject -------------------------------------------------------

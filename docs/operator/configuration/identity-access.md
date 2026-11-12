@@ -84,4 +84,10 @@ For federated CI, verify the trusted `OidcIssuer`, audience, and an identifying 
 
 Reading `/metrics` requires a **global `read_metrics` grant** and an authorized token. Being an administrator does not automatically imply this permission. The metrics listener must also be enabled and protected; see [Monitoring & troubleshooting](../operations/monitoring.md).
 
+## Destructive task authority is separate
+
+Invoking an admin task that destroys something requires a **global destructive grant** in addition to `admin_task_invoke`, and being an administrator does not automatically imply it: `destroy_content` for the retention tasks (which delete artifact content) and `destroy_record` for `eventstore-archive` (which deletes the audit record itself). The two are deliberately not interchangeable — an identity trusted to reclaim storage is not thereby trusted to cut audit history. Bind such a grant to an identity (`kind: user` or `kind: serviceAccount`), not to a claim: the authority is re-checked immediately before a queued destructive job runs, and that check cannot re-derive IdP claims.
+
+The same asymmetry decides which may be automated. A service account may hold `destroy_content`, so a scheduled retention job can run as its own identity — declare the grant, add the permission to the token's mint, and **rotate the token**, because a token's capability is frozen when it is issued and a later grant does not reach it. A service account may **not** hold `destroy_record` at all; `eventstore-archive` is run by a person holding that grant.
+
 **Related guides:** [Declarative configuration](declarative.md) · [Server & workers](../operations/workers.md).

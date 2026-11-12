@@ -70,19 +70,24 @@ async fn create_test_user(pool: &PgPool) -> Uuid {
 }
 
 /// `RbacEvaluator` that grants `Permission::AdminTaskInvoke` to the
-/// `task-admin` claim. The `task:destructive` claim is checked
-/// separately by `authorize_kind` against the caller's claim set.
+/// `task-admin` claim and both destructive permissions to the
+/// `destructive` claim — `authorize_kind`'s second factor is a grant, so
+/// a destructive caller needs one here rather than a claim of its own.
 fn rbac_with_task_invoke() -> Arc<ArcSwap<RbacEvaluator>> {
-    let grant = PermissionGrant {
+    let grant = |required: &[&str], permission| PermissionGrant {
         id: Uuid::new_v4(),
-        subject: GrantSubject::Claims(vec!["task-admin".into()]),
+        subject: GrantSubject::Claims(required.iter().map(|c| (*c).to_string()).collect()),
         repository_id: None,
-        permission: Permission::AdminTaskInvoke,
+        permission,
         created_at: chrono::Utc::now(),
         managed_by: ManagedBy::Local,
         managed_by_digest: None,
     };
-    Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![grant])))
+    Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+        grant(&["task-admin"], Permission::AdminTaskInvoke),
+        grant(&["destructive"], Permission::DestroyContent),
+        grant(&["destructive"], Permission::DestroyRecord),
+    ])))
 }
 
 fn destructive_caller(user_id: Uuid) -> CallerPrincipal {
@@ -91,7 +96,7 @@ fn destructive_caller(user_id: Uuid) -> CallerPrincipal {
         external_id: "idem-post-failure".into(),
         username: "idem-post-failure".into(),
         email: "idem-post-failure@example.test".into(),
-        claims: vec!["task-admin".into(), "task:destructive".into()],
+        claims: vec!["task-admin".into(), "destructive".into()],
         token_kind: None,
         issued_at: chrono::Utc::now(),
         token_cap: None,

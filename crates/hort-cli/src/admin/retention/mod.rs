@@ -18,11 +18,11 @@
 //!
 //! Neither subcommand introduces authority. Both go through the existing
 //! `POST /api/v1/admin/tasks/retention-evaluate`, which gates on
-//! `Permission::AdminTaskInvoke` and — for `mode=execute` only — the
-//! `task:destructive` claim. A fresh IdP-backed admin `CliSession`
-//! already carries both; a session without the destructive claim can
-//! still run `preview` and will be refused at `apply`'s execute step by
-//! the server, which is exactly the intended split.
+//! `Permission::AdminTaskInvoke` and — for `mode=execute` only —
+//! `Permission::DestroyContent`. The second is **not** implied by being
+//! an admin: it is held through an explicit grant, so a session without
+//! that grant can still run `preview` and will be refused at `apply`'s
+//! execute step by the server, which is exactly the intended split.
 //!
 //! # Dep-graph invariant
 //!
@@ -131,8 +131,8 @@ pub enum RetentionCommand {
     /// `--from-preview <task_job_id>` that fresh preview is compared
     /// against the earlier one you name, and any difference must be
     /// confirmed separately — a proposal you read an hour ago is not
-    /// the one that would run now. Requires the `task:destructive`
-    /// claim, which a fresh admin `CliSession` carries.
+    /// the one that would run now. Requires the `destroy_content`
+    /// permission, held through an explicit grant.
     Apply(apply::ApplyArgs),
 }
 

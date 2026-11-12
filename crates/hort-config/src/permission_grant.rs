@@ -301,8 +301,7 @@ pub fn validate_permission_grant(env: &Envelope<PermissionGrantSpec>) -> Vec<Val
                     detail: "subject.name (serviceAccount) must not be blank".into(),
                 });
             }
-            // ADR 0038: service accounts are strictly non-admin — no
-            // exception, including on the standalone-grant axis. The
+            // A machine identity may not hold every permission. The
             // §9 `serviceAccount`-subject grant resolves to a
             // `GrantSubject::User(backing_user_id)`, so without this
             // gate an operator could author a `serviceAccount` subject
@@ -311,16 +310,27 @@ pub fn validate_permission_grant(env: &Envelope<PermissionGrantSpec>) -> Vec<Val
             // `User`-subject row is rejected by the linter). This is
             // the earliest + clearest gate; the `hort-app` apply-config
             // linter's scoped provenance exemption is defense-in-depth.
-            if matches!(
-                Permission::from_str(&env.spec.permission),
-                Ok(Permission::Admin)
-            ) {
+            //
+            // Membership and the reason both come from
+            // `Permission::service_account_refusal` — the one
+            // declaration the apply linter and `issue-svc-token` read
+            // too, so the three points cannot come to refuse different
+            // sets. The reason is carried into the message rather than
+            // restated here: an operator reaching for one of these is
+            // automating something and needs to know what to automate
+            // instead.
+            if let Some(reason) = Permission::from_str(&env.spec.permission)
+                .ok()
+                .and_then(Permission::service_account_refusal)
+            {
                 errors.push(ValidationError::Invalid {
                     kind: Kind::PermissionGrant,
                     name: env.metadata.name.clone(),
-                    detail: "spec.permission: a serviceAccount subject may not hold 'admin' \
-                             — service accounts are strictly non-admin (ADR 0038)"
-                        .into(),
+                    detail: format!(
+                        "spec.permission: a serviceAccount subject may not hold \
+                         '{}' — {reason}",
+                        env.spec.permission.to_lowercase()
+                    ),
                 });
             }
         }
@@ -343,6 +353,8 @@ pub fn validate_permission_grant(env: &Envelope<PermissionGrantSpec>) -> Vec<Val
                 "curate",
                 "prefetch",
                 "read_metrics",
+                "destroy_content",
+                "destroy_record",
             ],
         });
     }
@@ -582,14 +594,62 @@ mod tests {
         );
     }
 
+    /// The first of the three declaration/mint points that refuse
+    /// `destroy_record` to a machine identity (the other two are the
+    /// apply linter's SA-provenance exemption and `issue-svc-token`).
+    /// Asserted here on its own, not only end-to-end: a point that
+    /// silently stopped refusing would leave the other two still green.
+    #[test]
+    fn validate_rejects_service_account_subject_destroy_record_permission() {
+        let body = "
+  subject: { kind: serviceAccount, name: cronjob-tasks }
+  permission: destroy_record
+";
+        let env = parse_permission_grant(&p(), yaml("sa-destroy-record", body).as_bytes()).unwrap();
+        let errors = validate_permission_grant(&env);
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|e| e.contains("serviceAccount subject may not hold 'destroy_record'")),
+            "serviceAccount + permission: destroy_record must be a validation error: {rendered:?}"
+        );
+        // The message says *why* and what to automate instead, not only
+        // *what* — an operator reaching for it is automating something,
+        // and "no" alone sends them looking for a wider credential.
+        assert!(
+            rendered
+                .iter()
+                .any(|e| e.contains("nothing reconstructs a sealed stream")),
+            "the refusal must name why: {rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|e| e.contains("Grant `destroy_content`")),
+            "the refusal must name what to automate instead: {rendered:?}"
+        );
+    }
+
     #[test]
     fn validate_accepts_service_account_subject_non_admin_permissions() {
-        // The reject is scoped to `admin` ONLY — every other permission
+        // The reject is scoped to the permissions no machine identity
+        // may hold (`admin`, `destroy_record`) — every other permission
         // a serviceAccount subject may legitimately hold (notably
-        // `admin_task_invoke` for the cronjob SA, plus `curate`/`read`/
-        // `write`/`delete`) must still validate cleanly. Guards against
-        // over-rejecting legitimate SA grants.
-        for perm in ["admin_task_invoke", "curate", "read", "write", "delete"] {
+        // `admin_task_invoke` and `destroy_content` for the cronjob SA,
+        // plus `curate`/`read`/`write`/`delete`) must still validate
+        // cleanly. Guards against over-rejecting legitimate SA grants,
+        // and pins the half of the destructive split that IS grantable
+        // to a machine identity — without it the refusal above could be
+        // widened to both and nothing would notice.
+        for perm in [
+            "admin_task_invoke",
+            "destroy_content",
+            "curate",
+            "read",
+            "write",
+            "delete",
+        ] {
             let body = format!(
                 "
   subject: {{ kind: serviceAccount, name: cronjob-sa }}
@@ -920,13 +980,15 @@ mod tests {
             Permission::Curate => "curate",
             Permission::Prefetch => "prefetch",
             Permission::ReadMetrics => "read_metrics",
+            Permission::DestroyContent => "destroy_content",
+            Permission::DestroyRecord => "destroy_record",
         }
     }
 
     /// Every `Permission` variant, for the diagnostic-list and acceptance
     /// loops. Kept adjacent to [`wire_literal`], whose exhaustive match is
     /// the staleness guard for both.
-    const ALL_PERMISSIONS: [Permission; 8] = [
+    const ALL_PERMISSIONS: [Permission; 10] = [
         Permission::Read,
         Permission::Write,
         Permission::Delete,
@@ -935,6 +997,8 @@ mod tests {
         Permission::Curate,
         Permission::Prefetch,
         Permission::ReadMetrics,
+        Permission::DestroyContent,
+        Permission::DestroyRecord,
     ];
 
     /// Validation must accept every `Permission` variant that

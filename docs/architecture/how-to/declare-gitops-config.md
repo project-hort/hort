@@ -425,13 +425,22 @@ section documents the operator-facing YAML and apply semantics.
   is how service accounts hold authority — the SA envelope itself
   carries none
   ([ADR 0044](../../adr/0044-service-accounts-identity-only.md)). A
-  grant naming an absent SA fails apply (dangling reference). A
-  `serviceAccount` subject with `permission: admin` is rejected at
-  parse — service accounts are strictly non-admin
-  ([ADR 0038](../../adr/0038-admin-identity-model.md)).
+  grant naming an absent SA fails apply (dangling reference). Two
+  permissions are rejected at parse for a `serviceAccount` subject:
+  `admin`, because service accounts are strictly non-admin
+  ([ADR 0038](../../adr/0038-admin-identity-model.md)), and
+  `destroy_record`, because nothing reconstructs a sealed audit stream and
+  so no machine identity is given standing authority over one. The
+  rejection names what to grant instead. `destroy_content` **is**
+  grantable to a service account — an artifact's removal leaves
+  `ArtifactPurged` on the stream, so scheduled storage reclamation is
+  authority a machine identity may hold.
 
 **Permission** is a single string, one of
-`read | write | delete | admin | admin_task_invoke | curate | prefetch`.
+`read | write | delete | admin | admin_task_invoke | curate | prefetch |
+read_metrics | destroy_content | destroy_record`. The last three are
+**orthogonal to `admin`** — an admin caller does not implicitly hold them,
+so each is only ever held through a grant like this one.
 
 **Repository** is a single optional `ArtifactRepository.metadata.name`
 reference. **Omit the field entirely** for a global grant; a blank
