@@ -20,7 +20,7 @@ use crate::client::AkClient;
 use crate::config::OutputFormat;
 use crate::output::format_json;
 
-use super::dto::{FreedBytes, ProposalDigest, RetentionRunSummary};
+use super::dto::{ByteFigure, FreedBytes, ProposalDigest, RetentionRunSummary};
 use super::render::JobFacts;
 use super::{render, render_still_running, run_sweep, RetentionExit, SweepOptions, SweepResult};
 
@@ -98,7 +98,11 @@ pub async fn run_with_output(
 /// `freed_bytes.measured` is the boolean a script must branch on: a
 /// consumer that reads `bytes` without it would treat an unmeasured run
 /// as zero bytes, which is the same misreading the human rendering goes
-/// out of its way to prevent. The row counts are named `artifact_rows`
+/// out of its way to prevent. `bytes` is present only for a figure that
+/// covers every reclaimable target; a figure the server could measure
+/// only in part arrives as `bytes_at_least` beside
+/// `unresolved_targets`, so the key that means a total is never filled
+/// by a bound. The row counts are named `artifact_rows`
 /// rather than `rows` for the same reason the human output labels them —
 /// so a machine consumer cannot casually sum them as a size either.
 pub fn preview_json(
@@ -184,22 +188,47 @@ pub fn proposal_digest_json(digest: Option<&ProposalDigest>) -> serde_json::Valu
 }
 
 /// Project the byte accounting so no consumer can read an unmeasured run
-/// as zero.
+/// as zero — or a partly measured one as a total.
+///
+/// `measured` stays `true` only for a figure that covers every
+/// reclaimable target, so a floor reads as unmeasured to a script
+/// written before the status existed. That is the safe direction: such a
+/// script sees what it has always seen rather than a total short by an
+/// unknown amount. The floor is there for a script that asks for it by
+/// name, under `bytes_at_least` — `bytes` stays reserved for a total, so
+/// no reader of that key can be handed a bound.
 pub fn freed_bytes_json(freed: &FreedBytes) -> serde_json::Value {
-    match freed {
-        FreedBytes::Exact { bytes } => json!({
-            "status": "exact",
+    // Two matches, because the two answer different questions and only
+    // one of them is the operator's. The status word is the enum's own
+    // name for itself, which a machine consumer needs in order to tell
+    // "the server omitted this" from "this CLI did not recognise the
+    // status" — a distinction the figure deliberately collapses, because
+    // neither supports printing a number.
+    let status = match freed {
+        FreedBytes::Exact { .. } => "exact",
+        FreedBytes::AtLeast { .. } => "at_least",
+        FreedBytes::Omitted { .. } => "omitted",
+        FreedBytes::Unrecognised => "unrecognised",
+    };
+    match freed.figure() {
+        ByteFigure::Total(bytes) => json!({
+            "status": status,
             "measured": true,
             "bytes": bytes,
         }),
-        FreedBytes::Omitted { .. } | FreedBytes::Unrecognised => json!({
-            "status": if matches!(freed, FreedBytes::Omitted { .. }) {
-                "omitted"
-            } else {
-                "unrecognised"
-            },
+        ByteFigure::Floor {
+            bytes,
+            unresolved_targets,
+        } => json!({
+            "status": status,
             "measured": false,
-            "reason": freed.omission_reason(),
+            "bytes_at_least": bytes,
+            "unresolved_targets": unresolved_targets,
+        }),
+        ByteFigure::Unmeasured { reason } => json!({
+            "status": status,
+            "measured": false,
+            "reason": reason,
         }),
     }
 }
@@ -347,6 +376,34 @@ mod tests {
             freed["reason"].as_str().expect("a reason"),
             OMITTED_BYTES_REASON,
             "the reason is the server's, carried through untouched",
+        );
+    }
+
+    /// A floor reaches a script under its own key and never under
+    /// `bytes`: the one that means a total stays empty, so a consumer
+    /// written before this status existed reads the run as unmeasured
+    /// rather than as a total that is short by an unknown amount.
+    #[test]
+    fn json_projects_a_floor_under_its_own_key_and_leaves_the_total_empty() {
+        let doc = preview_json(
+            "preview",
+            &facts(),
+            &summary(FreedBytes::AtLeast {
+                bytes: 4_096,
+                unresolved_targets: 3,
+            }),
+        );
+        let freed = &doc["totals"]["freed_bytes"];
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(freed["measured"], false);
+        assert!(
+            freed["bytes"].is_null(),
+            "the key that means a total is never filled by a bound: {freed}"
+        );
+        assert_eq!(freed["bytes_at_least"], 4_096);
+        assert_eq!(
+            freed["unresolved_targets"], 3,
+            "the count is what makes the figure readable: {freed}"
         );
     }
 
