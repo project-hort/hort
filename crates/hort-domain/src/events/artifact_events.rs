@@ -6,7 +6,7 @@ use crate::entities::artifact::QuarantineStatus;
 use crate::entities::scan_policy::SeverityThreshold;
 use crate::error::{DomainError, DomainResult};
 use crate::ports::provenance::{ProvenanceHoldReason, ProvenanceRejectReason, SignerIdentity};
-use crate::retention::ExpirationReason;
+use crate::retention::{ExpirationReason, HeldStateEntry};
 use crate::types::checksum::HashAlgorithm;
 use crate::types::{ArtifactCoords, ContentHash, Finding};
 
@@ -1449,6 +1449,43 @@ pub struct ArtifactExpired {
     /// log recorded it"), matching the `ArtifactCorrupted.detected_at`
     /// convention.
     pub eligible_at: DateTime<Utc>,
+    /// The **held-state authority** for this expiry, when the artifact
+    /// was in a held quarantine state at the moment the policy decided.
+    ///
+    /// `None` is an ordinary expiry: the artifact was `none` or
+    /// `released`, five independent gates admitted it on that basis
+    /// alone, and this event authorises nothing beyond what it always
+    /// did. Every event written before the held-state exception
+    /// existed decodes as `None` (the field is `#[serde(default)]`),
+    /// and that is the right reading — a legacy event supplies **no**
+    /// held-state authority.
+    ///
+    /// `Some` is the whole mechanism by which a held artifact can
+    /// reach the purge. The purge does not consult the artifact's bare
+    /// status to decide whether collecting evidence is allowed — a
+    /// status says what the artifact *is*, never that anything
+    /// authorised disposing of it. It consults *this*: a policy that
+    /// named this held state, evaluated this artifact, and found its
+    /// age bound elapsed **in that state**.
+    ///
+    /// ## Why the entry's stream position travels with the state
+    ///
+    /// All three held states are re-enterable, so the state name alone
+    /// does not identify an occupancy. An artifact rejected in March,
+    /// expired by a policy whose span had run, released by a curator
+    /// and rejected again in September is `rejected` both times: an
+    /// authority carrying only `state: Rejected` would let the March
+    /// decision purge the September occupancy, whose own span has not
+    /// elapsed. So the authority carries
+    /// [`HeldStateEntry::entry_stream_position`] and the purge requires
+    /// the artifact's **current** status and its **latest** entry event
+    /// to match it before anything is deleted.
+    ///
+    /// Immutable, like every other field here: it snapshots what the
+    /// policy saw, and a later re-read of a policy that may since have
+    /// been archived or re-scoped can neither confirm nor widen it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_state_authority: Option<HeldStateEntry>,
 }
 
 impl ArtifactExpired {
@@ -1653,6 +1690,7 @@ mod retention_event_tests {
 
     fn valid_expired() -> ArtifactExpired {
         ArtifactExpired {
+            held_state_authority: None,
             artifact_id: Uuid::nil(),
             policy_id: Uuid::nil(),
             policy_name: "90-day-age".into(),

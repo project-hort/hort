@@ -69,6 +69,12 @@ pub struct RetentionPolicyRow {
     pub predicate: crate::retention::PolicyPredicate,
     /// serde of B1's [`RetentionScope`](crate::retention::RetentionScope).
     pub scope: crate::retention::RetentionScope,
+    /// serde of the held-state opt-in
+    /// ([`RetentionPolicy::held_states`]) — the states this policy may
+    /// expire an artifact out of. Empty for every policy that does not
+    /// say otherwise; a row written before the column existed reads as
+    /// empty.
+    pub held_states: std::collections::BTreeSet<crate::retention::HeldState>,
     pub archived: bool,
     /// 0-based position of the last applied event — the
     /// optimistic-concurrency anchor (scan-policy-projection parity).
@@ -101,6 +107,7 @@ impl RetentionPolicyRow {
             name: policy.name,
             predicate: policy.predicate,
             scope: policy.scope,
+            held_states: policy.held_states,
             archived: policy.archived,
             stream_version: policy.stream_version,
             last_evaluated_at: policy.last_evaluated_at,
@@ -122,6 +129,7 @@ impl RetentionPolicyRow {
             name: self.name,
             predicate: self.predicate,
             scope: self.scope,
+            held_states: self.held_states,
             archived: self.archived,
             created_at: self.created_at,
             updated_at: self.updated_at,
@@ -196,6 +204,7 @@ mod tests {
             name: "retain-proxied-30d".into(),
             predicate: PolicyPredicate::AgeExceeds(2_592_000),
             scope: RetentionScope::AllRepos,
+            held_states: std::collections::BTreeSet::new(),
             archived: false,
             stream_version: 3,
             last_evaluated_at: None,

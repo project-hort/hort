@@ -450,6 +450,7 @@ mod tests {
 
         let policy_id = Uuid::new_v4();
         let policy = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: policy_id,
             name: format!("dry-run-policy-{}", policy_id.simple()),
             predicate: PolicyPredicate::AgeExceeds(1),
@@ -499,7 +500,7 @@ mod tests {
             .expect("seed artifact stream");
 
         let row = PgRetentionCandidateReader::new(pool.clone())
-            .list_candidates(100, None, Utc::now())
+            .list_candidates(100, None, Utc::now(), &[])
             .await
             .expect("candidates")
             .into_iter()

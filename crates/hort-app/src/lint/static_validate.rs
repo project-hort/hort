@@ -2000,6 +2000,7 @@ mod tests {
             spec: RetentionPolicySpec {
                 predicate,
                 scope: serde_json::json!("AllRepos"),
+                held_states: Default::default(),
             },
         }
     }

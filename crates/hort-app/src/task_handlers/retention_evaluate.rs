@@ -164,7 +164,7 @@ use hort_domain::ports::retention_preview::{
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
-use hort_domain::retention::RetentionEvaluationMode;
+use hort_domain::retention::{HeldState, RetentionEvaluationMode};
 use hort_domain::types::ContentHash;
 
 use crate::use_cases::retention_use_case::{
@@ -474,6 +474,7 @@ impl TaskHandler for RetentionEvaluateHandler {
                         "expired": 0,
                         "already_expired": 0,
                         "skipped_protected": 0,
+                        "skipped_unanchored_held_state": 0,
                         "skipped_stale_scan": 0,
                         "errors": 0,
                         "preview": if mode == RetentionEvaluationMode::DryRun {
@@ -502,6 +503,37 @@ impl TaskHandler for RetentionEvaluateHandler {
                 });
             }
 
+            // The held states this sweep admits into the enumeration:
+            // the union of every active policy's opt-in. A union is the
+            // right granularity and the only available one — the
+            // candidate query takes no policy, so it cannot know which
+            // policy a held artifact would be evaluated against. What
+            // it widens is who is *looked at*; which policy may expire
+            // which state stays the evaluator's decision, taken
+            // per-policy against the artifact's own stream.
+            //
+            // Empty unless some policy opted in, and that matters
+            // beyond tidiness: widening the shared query
+            // unconditionally is not decision-inert, because held rows
+            // consume slots in a bounded page and move the per-policy
+            // evaluated / skipped counters even when nothing could
+            // expire them.
+            let admit_held: Vec<HeldState> = {
+                let union: BTreeSet<HeldState> = policies
+                    .iter()
+                    .filter(|p| !p.archived)
+                    .flat_map(|p| p.held_states.iter().copied())
+                    .collect();
+                union.into_iter().collect()
+            };
+            if !admit_held.is_empty() {
+                tracing::info!(
+                    admit_held = ?admit_held,
+                    "retention-evaluate: at least one active policy opts in to a held \
+                     state — the candidate enumeration is widened to admit it"
+                );
+            }
+
             let mut total = EvaluateSummary::default();
             let mut matches = Vec::new();
             let mut cursor: Option<uuid::Uuid> = resume_after.map(|c| c.after_artifact_id);
@@ -512,7 +544,7 @@ impl TaskHandler for RetentionEvaluateHandler {
             for _ in 0..self.max_batches_per_tick {
                 let rows = match self
                     .candidates
-                    .list_candidates(self.batch_size, cursor, now)
+                    .list_candidates(self.batch_size, cursor, now, &admit_held)
                     .await
                 {
                     Ok(r) => r,
@@ -602,6 +634,7 @@ impl TaskHandler for RetentionEvaluateHandler {
                 expired = total.expired,
                 already_expired = total.already_expired,
                 skipped_protected = total.skipped_protected,
+                skipped_unanchored_held_state = total.skipped_unanchored_held_state,
                 skipped_stale_scan = total.skipped_stale_scan,
                 errors = total.errors,
                 resumed = resume_after.is_some(),
@@ -625,6 +658,7 @@ impl TaskHandler for RetentionEvaluateHandler {
                     "expired": total.expired,
                     "already_expired": total.already_expired,
                     "skipped_protected": total.skipped_protected,
+                    "skipped_unanchored_held_state": total.skipped_unanchored_held_state,
                     "skipped_stale_scan": total.skipped_stale_scan,
                     "errors": total.errors,
                     "preview": preview,
@@ -918,6 +952,7 @@ fn accumulate(
     total.expired += batch.summary.expired;
     total.already_expired += batch.summary.already_expired;
     total.skipped_protected += batch.summary.skipped_protected;
+    total.skipped_unanchored_held_state += batch.summary.skipped_unanchored_held_state;
     total.skipped_stale_scan += batch.summary.skipped_stale_scan;
     total.errors += batch.summary.errors;
     matches.extend(batch.matches);
@@ -1056,19 +1091,30 @@ mod tests {
     struct MockCandidates {
         pages: Mutex<Vec<Vec<RetentionCandidateRow>>>,
         err: Mutex<Option<DomainError>>,
+        /// What the handler asked the enumeration to admit, one entry
+        /// per call. The widening is the only way a held artifact can
+        /// reach the sweep at all, so a test that asserts the
+        /// *absence* of held candidates has to be able to see what was
+        /// requested rather than inferring it from an empty page.
+        admitted: Mutex<Vec<Vec<HeldState>>>,
     }
     impl MockCandidates {
         fn new(pages: Vec<Vec<RetentionCandidateRow>>) -> Self {
             Self {
                 pages: Mutex::new(pages),
                 err: Mutex::new(None),
+                admitted: Mutex::new(Vec::new()),
             }
         }
         fn failing() -> Self {
             Self {
                 pages: Mutex::new(Vec::new()),
                 err: Mutex::new(Some(DomainError::Invariant("boom".into()))),
+                admitted: Mutex::new(Vec::new()),
             }
+        }
+        fn admitted(&self) -> Vec<Vec<HeldState>> {
+            self.admitted.lock().unwrap().clone()
         }
     }
     impl RetentionCandidateReader for MockCandidates {
@@ -1077,7 +1123,9 @@ mod tests {
             _b: u32,
             _after: Option<Uuid>,
             _now: DateTime<Utc>,
+            admit_held: &'a [HeldState],
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
+            self.admitted.lock().unwrap().push(admit_held.to_vec());
             if let Some(e) = self.err.lock().unwrap().take() {
                 return Box::pin(async move { Err(e) });
             }
@@ -1335,12 +1383,79 @@ mod tests {
         }
     }
 
+    /// An age policy opting in to `states`, with a span long enough
+    /// that nothing in these fixtures matches — the handler tests are
+    /// about the enumeration request and the counters, not the match.
+    fn held_state_policy(states: &[HeldState]) -> RetentionPolicy {
+        RetentionPolicy::project(&[hort_domain::retention::RetentionPolicyEvent::Created {
+            id: Uuid::new_v4(),
+            name: "collect-held".into(),
+            predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(100 * 365 * 24 * 3600),
+            scope: hort_domain::retention::RetentionScope::AllRepos,
+            held_states: states.iter().copied().collect(),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        }])
+        .expect("an age-bounded opt-in is valid")
+    }
+
+    /// **With no active policy opted in, the old enumeration runs.**
+    ///
+    /// Asserted on what the sweep *asked for* and on the counters, not
+    /// on the absence of an expiry: the hazard the empty default
+    /// guards against is not a wrong decision, it is held rows
+    /// consuming slots in a bounded page and moving the per-policy
+    /// counters in a deployment that opted in to nothing.
+    #[tokio::test]
+    async fn with_no_opt_in_the_enumeration_admits_no_held_state() {
+        let candidates = Arc::new(MockCandidates::new(vec![vec![]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates.clone(),
+        );
+        match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["skipped_protected"], 0);
+                assert_eq!(result_summary["skipped_unanchored_held_state"], 0);
+                assert_eq!(result_summary["evaluated"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(
+            candidates.admitted(),
+            vec![Vec::<HeldState>::new()],
+            "no policy opted in, so the enumeration is the pre-exception one"
+        );
+    }
+
+    /// The admitted set is the **union** over active policies, ordered
+    /// and de-duplicated, because the enumeration takes no policy and
+    /// the per-policy decision stays in the evaluator.
+    #[tokio::test]
+    async fn the_admitted_set_is_the_union_over_active_policies() {
+        let candidates = Arc::new(MockCandidates::new(vec![vec![]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![
+                held_state_policy(&[HeldState::Rejected]),
+                held_state_policy(&[HeldState::ScanIndeterminate, HeldState::Rejected]),
+                age_policy(),
+            ])),
+            candidates.clone(),
+        );
+        h.run(&serde_json::Value::Null, ctx()).await.expect("Ok");
+        assert_eq!(
+            candidates.admitted(),
+            vec![vec![HeldState::Rejected, HeldState::ScanIndeterminate]],
+            "the union, de-duplicated, in the enum's own order"
+        );
+    }
+
     fn age_policy() -> RetentionPolicy {
         // A pure-age policy that matches nothing here (artifacts are
         // UNIX_EPOCH..now; the evaluator's pure match is exercised by
         // the use-case's own tests — this handler test only asserts
         // orchestration counts + the projection/JSON shape).
         RetentionPolicy::project(&[hort_domain::retention::RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::new_v4(),
             name: "p".into(),
             predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(100 * 365 * 24 * 3600),
@@ -1354,6 +1469,7 @@ mod tests {
         let id = Uuid::new_v4();
         RetentionPolicy::project(&[
             hort_domain::retention::RetentionPolicyEvent::Created {
+                held_states: Default::default(),
                 id,
                 name: "archived".into(),
                 predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(1),
@@ -2287,6 +2403,7 @@ mod tests {
             batch_size: u32,
             _after: Option<Uuid>,
             _now: DateTime<Utc>,
+            _admit_held: &'a [HeldState],
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
             let rows = vec![self.row.clone(); batch_size as usize];
             Box::pin(async move { Ok(rows) })
@@ -2380,6 +2497,7 @@ mod tests {
             batch_size: u32,
             after: Option<Uuid>,
             _now: DateTime<Utc>,
+            _admit_held: &'a [HeldState],
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
             let page: Vec<RetentionCandidateRow> = self
                 .rows

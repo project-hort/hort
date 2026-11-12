@@ -384,6 +384,7 @@ mod tests {
             .is_empty());
 
         let inputs = EvaluationInputs {
+            held_state_entry: None,
             now,
             created_at: now,
             last_downloaded_at: None,

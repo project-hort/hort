@@ -114,6 +114,14 @@ outcome of the model, not a weakening of it.
   last row for a hash, a later re-ingest of the same bytes anchors at that
   ingest. That direction is conservative — a lost observation can only lengthen a
   window, never shorten one.
+
+  *(Clarified 2026-11-09, issue #288 — wording pending maintainer approval:
+  the **set** of rows retention can purge now includes held ones, where a
+  policy explicitly opts their state in and bounds the span by time in that
+  state. The effect stated above is unchanged in every respect — the last row
+  for a hash going away still means a later re-ingest anchors at that ingest,
+  and that is still the conservative direction. All this names is one more way
+  for a row to be the last one.)*
 - **ADR 0016 matrix entry required.** The two-source rule is a new
   operator-influenced input to the release-gate computation and must be
   registered in the cross-opt-in interaction matrix, including its interaction

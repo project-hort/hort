@@ -779,22 +779,63 @@ No deadline. No time window for the signature. Under `Required`, unsigned ⇒
 held **indefinitely** (`Quarantined`, answering `503`). An artifact leaves
 the hold on the provenance axis only by being verified — directly, or by the
 §11 cascade — or through an operator authority that already exists: an admin
-release, a curator waiver, or an explicit deletion. Note that retention is
-**not** one of them, in either state: the GC-protection filter below excludes
-`quarantined` and `rejected` alike, so neither state ages out on its own.
+release, a curator waiver, or an explicit deletion.
+
+**Retention can dispose of a held artifact; it cannot end the hold (amended
+2026-11-09; issue #288 — *wording pending maintainer approval*).** As first
+written this paragraph said retention was "**not** one of them, in either
+state", resting on a GC-protection filter that excluded `quarantined` and
+`rejected` unconditionally. That filter is now per-policy and per-state:
+a `RetentionPolicy` may name a held state in `spec.heldStates`, and then
+only with a positive age bound on **every** successful branch of its
+predicate, measured from the artifact's **entry into that state** rather than
+from its content anchor. This amendment is the mechanism the last paragraph of
+this section already named as the answer — "a retention rule that can reclaim
+held or terminal *evidence* on its own explicit terms".
+
+The distinction is the whole of the amendment, and it is narrow on purpose:
+
+- **Nothing ages out.** A held artifact never becomes `released` and never
+  becomes `rejected` by the passage of time. There is still no deadline, no
+  signing window, and no status transition driven by a clock. An operator who
+  configures no `heldStates` sees exactly the behaviour this ADR described
+  before the amendment, and that is the default.
+- **What a span can do is dispose.** The outcome is `ArtifactExpired` →
+  `ArtifactPurged`: the row is retired and the bytes are reclaimed. At no
+  point is the artifact deliverable, so the `503` this section is about is
+  never answered differently — it becomes a `404` when the artifact is gone,
+  which is what a retired artifact has always answered.
+- **The decision is independently authorised, and the purge checks the
+  authority rather than the status.** `ArtifactExpired` carries a
+  `held_state_authority` naming the state **and the stream position of the
+  entry event** for the occupancy it was decided about, and the purge
+  requires the artifact's current status and its latest entry event to match
+  that before deleting anything. An artifact that re-enters the state, or
+  that a curator releases, is not covered by the earlier decision. "Disposal
+  is operator-confirmed and never automatically" becomes: disposal is
+  **policy-authorised**, by a policy the operator wrote, naming the state and
+  bounding the span — and never by the mere fact that an artifact is in a
+  held state.
 
 A deadline ("held, but rejected after N") was considered and is **rejected**.
 Each argument for one dissolves on inspection:
 
-- **Storage reclamation — no.** `retention_candidate_reader` filters
+- **Storage reclamation — no.** `retention_candidate_reader` filtered
   `quarantine_status NOT IN ('quarantined', 'rejected', 'scan_indeterminate')`
-  *before any retention predicate runs*, and `retention_use_case`'s invariant
-  1 names this GC-protection: *"a terminal-failure artifact is evidence, not
-  GC fodder."* `Rejected` is reclaimed exactly as little as `Quarantined`, so
-  a deadline moves an artifact between two equally GC-protected states and
-  buys no bytes back. Note the direction this existing decision actually
+  *before any retention predicate ran*, and `retention_use_case`'s invariant
+  1 named this GC-protection: *"a terminal-failure artifact is evidence, not
+  GC fodder."* `Rejected` was reclaimed exactly as little as `Quarantined`, so
+  a deadline moved an artifact between two equally GC-protected states and
+  bought no bytes back. Note the direction this existing decision actually
   points: if both states are retained as evidence anyway, then **"waiting" is
   the truthful label** for an artifact that is waiting.
+
+  *(The filter is per-policy and per-state as of the 2026-11-09 amendment
+  above, so an operator who wants the bytes back can now have them without a
+  deadline — which strengthens this bullet rather than weakening it. The
+  argument against a deadline was never that the bytes are unreachable; it
+  was that a status transition is the wrong instrument for reaching them, and
+  an explicit retention rule is the right one.)*
 - **Sweep load is real, bounded, and load-bearing — it is not to be
   optimised away.** *(Corrected 2026-09-12 during implementation; as first
   written this bullet claimed a `Pending` artifact "can be skipped by the
@@ -825,8 +866,12 @@ Each argument for one dissolves on inspection:
   operator's view of the held set is **not a metric**: it is the
   authoritative surface over the projection — today the admin curation
   queue (reads `events` via `LATERAL`), and, once it exists, retention's
-  overview (#244), where disposal is decided operator-confirmed and never
-  automatically. The hold itself already ticks the existing
+  overview (#244), which previews what a configured span would take. *(The
+  2026-11-09 amendment above replaces "disposal is decided
+  operator-confirmed and never automatically" with "disposal is
+  policy-authorised": the operator's decision is the `heldStates` opt-in and
+  its age bound, taken in reviewed YAML rather than per artifact. The hold
+  itself is still never ended automatically.)* The hold itself already ticks the existing
   `hort_provenance_verify_total{result="held_pending_signature"}` value — no
   new label value is required for it.
 - **The cost is concrete, and it is the reason this is a hard no.** A
@@ -844,6 +889,12 @@ becomes load-bearing, the answer is a retention rule that can reclaim held or
 terminal *evidence* on its own explicit terms, not a status transition whose
 purpose is to smuggle the artifact past a filter that was written to protect
 it.
+
+*(2026-11-09, issue #288 — wording pending maintainer approval: that rule now
+exists. `RetentionPolicy.spec.heldStates` is the "own explicit terms" this
+paragraph asked for, and the amendment at the head of D4 states what it may
+and may not do. The sentence above is the shape of the decision that was
+taken, not a prediction that turned out otherwise.)*
 
 ### D5 — no `Retry-After` on a hold with no self-resolving deadline
 

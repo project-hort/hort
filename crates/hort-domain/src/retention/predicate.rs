@@ -119,6 +119,77 @@ impl PolicyPredicate {
         }
     }
 
+    /// `true` iff **every** branch of this predicate that can match
+    /// carries a positive [`AgeExceeds`](Self::AgeExceeds) bound.
+    ///
+    /// The admission test for a held-state opt-in
+    /// ([`RetentionPolicy::held_states`](super::RetentionPolicy::held_states)).
+    /// An opted-in policy evaluates a *held* artifact — retained scan
+    /// evidence, or an artifact awaiting a signature — and
+    /// `AgeExceeds` is re-anchored to the held-state entry for exactly
+    /// that evaluation
+    /// ([`EvaluationInputs::held_state_entry`](super::EvaluationInputs::held_state_entry)),
+    /// so a positive `AgeExceeds` *is* the held-state age bound and
+    /// this function is where "the exception is time-bounded" becomes
+    /// a decidable property of the predicate tree.
+    ///
+    /// **"Mentions an age predicate" is not this test, and the
+    /// difference is the whole point.** Three variants look like an age
+    /// bound and are not one:
+    ///
+    /// - [`HasFindingDetectedFor`](Self::HasFindingDetectedFor)
+    ///   measures how long the *vulnerability* has been known, from the
+    ///   advisory's publication date — a date that can precede the
+    ///   artifact's ingest by years, let alone its held-state entry. It
+    ///   is satisfied the moment a long-public CVE is reported.
+    /// - [`UnusedFor`](Self::UnusedFor) has no download anchor, so it
+    ///   decides exactly what `AgeExceeds` decides *from the content
+    ///   anchor* — and it is already rejected at apply for saying one
+    ///   thing and doing another.
+    /// - a [`Composite`](Self::Composite) `Or` can carry an age bound
+    ///   on one arm and match immediately through another:
+    ///   `Or([AgeExceeds(30d), HasFindingAboveSeverity(High)])`
+    ///   mentions an age predicate and expires a severe finding the
+    ///   instant it is reported.
+    ///
+    /// So the recursion follows what a match actually requires:
+    ///
+    /// - `And` — every child must hold for the conjunction to match, so
+    ///   **one** child carrying the bound bounds every successful
+    ///   branch.
+    /// - `Or` — each child can match on its own, so **every** child
+    ///   must carry the bound. An empty `Or` cannot match at all;
+    ///   [`Self::validate`] rejects it first and this answers `false`
+    ///   for it rather than vacuously `true`.
+    ///
+    /// Exhaustive with no wildcard arm: a new predicate variant is a
+    /// compile error here rather than a silent `false` — which would
+    /// fail closed, but by refusing every opt-in rather than by being
+    /// decided.
+    #[must_use]
+    pub fn every_branch_has_positive_age_bound(&self) -> bool {
+        match self {
+            Self::AgeExceeds(secs) => *secs > 0,
+            Self::UnusedFor(_)
+            | Self::KeepLastN(_)
+            | Self::HasFindingAboveSeverity(_)
+            | Self::HasFindingAboveCvss(_)
+            | Self::HasFixAvailable
+            | Self::HasFindingDetectedFor(_) => false,
+            Self::Composite(op, children) => match op {
+                BooleanOp::And => children
+                    .iter()
+                    .any(Self::every_branch_has_positive_age_bound),
+                BooleanOp::Or => {
+                    !children.is_empty()
+                        && children
+                            .iter()
+                            .all(Self::every_branch_has_positive_age_bound)
+                }
+            },
+        }
+    }
+
     /// Structural validation. Pure — no I/O, no projection access.
     ///
     /// - `Composite` must be non-empty, within child- and depth-bounds.
@@ -531,5 +602,159 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, PolicyPredicate::KeepLastN(6));
         assert!(format!("{a:?}").contains("KeepLastN"));
+    }
+
+    // -- every_branch_has_positive_age_bound --------------------------------
+
+    /// The decisive case: an `Or` whose *other* arm matches at once.
+    ///
+    /// `Composite(Or, [AgeExceeds(30d), HasFindingAboveSeverity(High)])`
+    /// mentions an age predicate, passes any "is there an age bound
+    /// anywhere?" test, and expires a held artifact the moment a severe
+    /// finding is reported against it — no time in the state at all.
+    /// This is the test that decides whether the admission rule is the
+    /// right rule.
+    #[test]
+    fn or_whose_other_arm_matches_immediately_is_not_age_bounded() {
+        let p = PolicyPredicate::Composite(
+            BooleanOp::Or,
+            vec![
+                PolicyPredicate::AgeExceeds(30 * 24 * 3600),
+                PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High),
+            ],
+        );
+        assert!(
+            !p.every_branch_has_positive_age_bound(),
+            "the severity arm fires on its own, so not every successful branch is bounded"
+        );
+        // …and the same tree would pass a naive "mentions an age
+        // predicate" reading. Asserted so the two readings are shown to
+        // disagree here rather than taken on faith.
+        assert!(mentions_an_age_predicate(&p));
+    }
+
+    /// A naive "does the tree mention an age predicate?" walk, written
+    /// out only so the test above can show the two readings disagreeing.
+    /// Never used in production — the production rule is
+    /// `every_branch_has_positive_age_bound`.
+    fn mentions_an_age_predicate(p: &PolicyPredicate) -> bool {
+        match p {
+            PolicyPredicate::AgeExceeds(_) => true,
+            PolicyPredicate::Composite(_, kids) => kids.iter().any(mentions_an_age_predicate),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn a_bare_positive_age_exceeds_is_age_bounded() {
+        assert!(PolicyPredicate::AgeExceeds(1).every_branch_has_positive_age_bound());
+    }
+
+    /// `AgeExceeds(0)` is rejected by `validate` too; the admission rule
+    /// answers `false` for it independently, so a caller that checks
+    /// admission before structural validity cannot admit a zero span.
+    #[test]
+    fn a_zero_age_exceeds_is_not_age_bounded() {
+        assert!(!PolicyPredicate::AgeExceeds(0).every_branch_has_positive_age_bound());
+    }
+
+    /// Every variant that is *not* an age bound answers `false`,
+    /// including the two that look like durations.
+    #[test]
+    fn no_other_leaf_is_an_age_bound() {
+        for p in [
+            PolicyPredicate::UnusedFor(30 * 24 * 3600),
+            PolicyPredicate::KeepLastN(3),
+            PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::Low),
+            PolicyPredicate::HasFindingAboveCvss(0.0),
+            PolicyPredicate::HasFixAvailable,
+            PolicyPredicate::HasFindingDetectedFor(7 * 24 * 3600),
+        ] {
+            assert!(
+                !p.every_branch_has_positive_age_bound(),
+                "{p:?} is not a held-state age bound"
+            );
+        }
+    }
+
+    /// `And` — one bounded child bounds the conjunction, because every
+    /// child has to hold for it to match. This is the canonical
+    /// operator shape for the exception: "severe, fixable, and it has
+    /// sat in this state for 30 days".
+    #[test]
+    fn and_is_age_bounded_when_any_child_is() {
+        let p = PolicyPredicate::Composite(
+            BooleanOp::And,
+            vec![
+                PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High),
+                PolicyPredicate::AgeExceeds(30 * 24 * 3600),
+            ],
+        );
+        assert!(p.every_branch_has_positive_age_bound());
+    }
+
+    #[test]
+    fn and_with_no_bounded_child_is_not_age_bounded() {
+        let p = PolicyPredicate::Composite(
+            BooleanOp::And,
+            vec![
+                PolicyPredicate::HasFixAvailable,
+                PolicyPredicate::HasFindingDetectedFor(7 * 24 * 3600),
+            ],
+        );
+        assert!(!p.every_branch_has_positive_age_bound());
+    }
+
+    /// `Or` — every arm bounded is the one accepting shape.
+    #[test]
+    fn or_with_every_arm_bounded_is_age_bounded() {
+        let p = PolicyPredicate::Composite(
+            BooleanOp::Or,
+            vec![
+                PolicyPredicate::AgeExceeds(30 * 24 * 3600),
+                PolicyPredicate::Composite(
+                    BooleanOp::And,
+                    vec![
+                        PolicyPredicate::HasFixAvailable,
+                        PolicyPredicate::AgeExceeds(7 * 24 * 3600),
+                    ],
+                ),
+            ],
+        );
+        assert!(p.every_branch_has_positive_age_bound());
+    }
+
+    /// An empty `Or` cannot match, so it answers `false` rather than
+    /// vacuously `true` — an `all` over nothing is the one place this
+    /// recursion could have admitted a predicate by accident.
+    #[test]
+    fn an_empty_or_is_not_age_bounded() {
+        let p = PolicyPredicate::Composite(BooleanOp::Or, vec![]);
+        assert!(!p.every_branch_has_positive_age_bound());
+    }
+
+    /// An empty `And` is `true` by the same vacuity, and that is also
+    /// refused: `any` over nothing is `false`.
+    #[test]
+    fn an_empty_and_is_not_age_bounded() {
+        let p = PolicyPredicate::Composite(BooleanOp::And, vec![]);
+        assert!(!p.every_branch_has_positive_age_bound());
+    }
+
+    /// Nesting: an unbounded arm two levels down still disqualifies the
+    /// tree, so the rule cannot be escaped by wrapping.
+    #[test]
+    fn a_nested_unbounded_or_arm_disqualifies_the_tree() {
+        let p = PolicyPredicate::Composite(
+            BooleanOp::And,
+            vec![PolicyPredicate::Composite(
+                BooleanOp::Or,
+                vec![
+                    PolicyPredicate::AgeExceeds(30 * 24 * 3600),
+                    PolicyPredicate::HasFixAvailable,
+                ],
+            )],
+        );
+        assert!(!p.every_branch_has_positive_age_bound());
     }
 }

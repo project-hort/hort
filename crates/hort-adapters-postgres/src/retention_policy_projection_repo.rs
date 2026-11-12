@@ -19,6 +19,8 @@
 //! unexpected sqlx errors log at `warn!`. Never SQL text or bind
 //! values.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use sqlx::{postgres::PgRow, PgPool, Row};
 use uuid::Uuid;
@@ -27,7 +29,7 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::retention_policy_projection_repository::{
     RetentionPolicyProjectionRepository, RetentionPolicyRow,
 };
-use hort_domain::retention::{PolicyPredicate, RetentionPolicy, RetentionScope};
+use hort_domain::retention::{HeldState, PolicyPredicate, RetentionPolicy, RetentionScope};
 
 use crate::BoxFuture;
 
@@ -43,7 +45,8 @@ impl PgRetentionPolicyProjectionRepository {
 }
 
 const SELECT_COLS: &str = r#"
-    SELECT policy_id, name, predicate, scope, archived, stream_version,
+    SELECT policy_id, name, predicate, scope, held_states, archived,
+           stream_version,
            last_evaluated_at, last_matched_count, last_expired_count,
            created_at, updated_at
     FROM retention_policy_projections
@@ -65,6 +68,20 @@ fn row_to_row(row: &PgRow) -> DomainResult<RetentionPolicyRow> {
             "retention_policy_projections.scope decode for {policy_id}: {e}"
         ))
     })?;
+    // The held-state opt-in. `NOT NULL DEFAULT '[]'`, so a row written
+    // before the column existed decodes to the empty set — which is the
+    // opt-in every policy had before it, not a value this read has to
+    // guess at. A malformed value is an `Invariant` like the two
+    // columns above: the table is gitops-managed and an unreadable
+    // opt-in must never fall back to a wider one.
+    let held_states_json: serde_json::Value =
+        row.try_get("held_states").map_err(|e| map_row_err(&e))?;
+    let held_states: BTreeSet<HeldState> =
+        serde_json::from_value(held_states_json).map_err(|e| {
+            DomainError::Invariant(format!(
+                "retention_policy_projections.held_states decode for {policy_id}: {e}"
+            ))
+        })?;
     let archived: bool = row.try_get("archived").map_err(|e| map_row_err(&e))?;
     let stream_version_i64: i64 = row.try_get("stream_version").map_err(|e| map_row_err(&e))?;
     let stream_version = u64::try_from(stream_version_i64).map_err(|_| {
@@ -89,6 +106,7 @@ fn row_to_row(row: &PgRow) -> DomainResult<RetentionPolicyRow> {
         name,
         predicate,
         scope,
+        held_states,
         archived,
         stream_version,
         last_evaluated_at,
@@ -202,6 +220,16 @@ impl RetentionPolicyProjectionRepository for PgRetentionPolicyProjectionReposito
                 })
             }
         };
+        let held_states = match serde_json::to_value(&row.held_states) {
+            Ok(v) => v,
+            Err(e) => {
+                return Box::pin(async move {
+                    Err(DomainError::Invariant(format!(
+                        "held_states serialise: {e}"
+                    )))
+                })
+            }
+        };
         let archived = row.archived;
         let raw_version = row.stream_version;
         let Ok(stream_version) = i64::try_from(raw_version) else {
@@ -221,17 +249,19 @@ impl RetentionPolicyProjectionRepository for PgRetentionPolicyProjectionReposito
             tracing::debug!(entity = "retention_policy", lookup_key = %policy_id, "upsert");
             sqlx::query(
                 r#"INSERT INTO retention_policy_projections (
-                       policy_id, name, predicate, scope, archived,
+                       policy_id, name, predicate, scope, held_states,
+                       archived,
                        stream_version, last_evaluated_at,
                        last_matched_count, last_expired_count,
                        created_at, updated_at
                    ) VALUES (
-                       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11
+                       $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12
                    )
                    ON CONFLICT (policy_id) DO UPDATE SET
                        name               = EXCLUDED.name,
                        predicate          = EXCLUDED.predicate,
                        scope              = EXCLUDED.scope,
+                       held_states        = EXCLUDED.held_states,
                        archived           = EXCLUDED.archived,
                        stream_version     = EXCLUDED.stream_version,
                        last_evaluated_at  = EXCLUDED.last_evaluated_at,
@@ -243,6 +273,7 @@ impl RetentionPolicyProjectionRepository for PgRetentionPolicyProjectionReposito
             .bind(&name)
             .bind(&predicate)
             .bind(&scope)
+            .bind(&held_states)
             .bind(archived)
             .bind(stream_version)
             .bind(last_evaluated_at)
@@ -303,6 +334,7 @@ mod tests {
         use hort_domain::entities::scan_policy::SeverityThreshold;
         let now = Utc::now();
         RetentionPolicyRow {
+            held_states: BTreeSet::new(),
             policy_id,
             name: name.into(),
             predicate: PolicyPredicate::Composite(
@@ -399,5 +431,76 @@ mod tests {
             .expect("archived row still findable");
         assert!(arch.archived);
         assert_eq!(arch.stream_version, 1);
+    }
+
+    /// Every JSONB column on the row **fails closed**: a value the
+    /// domain cannot decode is a `DomainError::Invariant` naming the
+    /// column and the policy, not a default.
+    ///
+    /// The `held_states` arm is the one that matters for the held-state
+    /// exception. Its decoded value decides whether a policy may expire
+    /// retained scan evidence, and the empty set is the *restrictive*
+    /// reading — so a corrupt value silently decoding to empty would
+    /// look safe while hiding the fact that the operator's opt-in is
+    /// unreadable. The opposite reading would be worse, which is why
+    /// neither is taken: the read fails and the sweep says so.
+    ///
+    /// `predicate` and `scope` are asserted in the same loop because
+    /// the three are one rule ("this table is gitops-managed; corrupt
+    /// JSON is a bug, not a request error") and a rule with one tested
+    /// column is a rule that will differ from itself.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_unreadable_jsonb_column_fails_closed() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = PgRetentionPolicyProjectionRepository::new(pool.clone());
+
+        for column in ["held_states", "predicate", "scope"] {
+            let id = Uuid::new_v4();
+            let name = format!("retain-corrupt-{column}-{}", id.simple());
+            repo.upsert(&canonical_fixture(id, &name, 0))
+                .await
+                .expect("seed a readable row first");
+
+            // `"not-a-value"` is valid JSONB and decodes to none of the
+            // three types, so the failure is the domain's rather than
+            // Postgres's.
+            // Injection audit: `column` is one of three string
+            // literals from the loop above, never a runtime value. The
+            // only runtime value is bound ($1).
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "UPDATE retention_policy_projections SET {column} = '\"not-a-value\"'::jsonb \
+                 WHERE policy_id = $1"
+            )))
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("corrupt the column");
+
+            let err = repo
+                .find_by_name(&name)
+                .await
+                .expect_err("an unreadable column must not read as a default");
+            match err {
+                DomainError::Invariant(msg) => {
+                    assert!(
+                        msg.contains(column),
+                        "the error must name the column, got: {msg}"
+                    );
+                    assert!(
+                        msg.contains(&id.to_string()),
+                        "the error must name the policy, got: {msg}"
+                    );
+                }
+                other => panic!("{column}: expected Invariant, got {other:?}"),
+            }
+
+            let _ = sqlx::query("DELETE FROM retention_policy_projections WHERE policy_id = $1")
+                .bind(id)
+                .execute(&pool)
+                .await;
+        }
     }
 }

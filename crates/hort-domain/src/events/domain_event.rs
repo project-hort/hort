@@ -1099,6 +1099,7 @@ pub(crate) mod tests {
                 reason: "policy".into(),
             }),
             DomainEvent::ArtifactExpired(ArtifactExpired {
+                held_state_authority: None,
                 artifact_id: Uuid::nil(),
                 policy_id: Uuid::nil(),
                 policy_name: "90-day-age".into(),
@@ -1434,6 +1435,7 @@ pub(crate) mod tests {
             // discriminations (wrapper shape). Created carries the
             // predicate + scope that re-validate in `validate()`.
             DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
+                held_states: Default::default(),
                 id: Uuid::nil(),
                 name: "retain-proxied-30d".into(),
                 predicate: PolicyPredicate::AgeExceeds(2_592_000),
@@ -1441,6 +1443,7 @@ pub(crate) mod tests {
                 created_at: Utc::now(),
             }),
             DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id: Uuid::nil(),
                 predicate: PolicyPredicate::AgeExceeds(5_184_000),
                 scope: RetentionScope::AllRepos,
@@ -1468,6 +1471,7 @@ pub(crate) mod tests {
     #[test]
     fn retention_policy_changed_event_type_discriminates_inner_variant() {
         let created = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "p".into(),
             predicate: PolicyPredicate::AgeExceeds(60),
@@ -1477,6 +1481,7 @@ pub(crate) mod tests {
         assert_eq!(created.event_type(), "RetentionPolicyCreated");
 
         let updated = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Updated {
+            held_states: Default::default(),
             id: Uuid::nil(),
             predicate: PolicyPredicate::AgeExceeds(60),
             scope: RetentionScope::AllRepos,
@@ -1508,6 +1513,7 @@ pub(crate) mod tests {
     #[test]
     fn retention_policy_changed_validate_delegates_to_inner() {
         let ok = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "ok".into(),
             predicate: PolicyPredicate::AgeExceeds(60),
@@ -1517,6 +1523,7 @@ pub(crate) mod tests {
         assert!(ok.validate().is_ok());
 
         let bad = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "bad".into(),
             // A zero-second TTL is a footgun and is rejected by

@@ -31,13 +31,13 @@
 //! The apply-time `IngestSource(Direct)` warning lands in
 //! `ApplyConfigUseCase`, NOT here — this layer is pure schema.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::DomainResult;
 use hort_domain::events::IngestSource;
-use hort_domain::retention::{PolicyPredicate, RetentionScope, MAX_REPOS_IN_SCOPE};
+use hort_domain::retention::{HeldState, PolicyPredicate, RetentionScope, MAX_REPOS_IN_SCOPE};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -205,6 +205,33 @@ pub struct RetentionPolicySpec {
     /// rationale as `predicate`. The `Repos` list holds repository
     /// `metadata.name`s, never ids.
     pub scope: serde_json::Value,
+    /// The **held** quarantine states this policy may expire an
+    /// artifact out of: `heldStates: [Rejected, ScanIndeterminate]`.
+    /// Absent or `[]` — the default, and the state of every policy
+    /// that does not mention it — means the policy cannot expire a
+    /// held artifact at all.
+    ///
+    /// A held artifact (`quarantined` / `rejected` /
+    /// `scan_indeterminate`) is retained scan evidence or an artifact
+    /// awaiting a decision, and five independent gates refuse to
+    /// collect it. Naming a state here is the only thing that opens
+    /// them, and only for this policy and only for that state.
+    ///
+    /// Typed rather than a `serde_json::Value`, unlike `predicate` and
+    /// `scope`: it is a plain list of unit-variant names with no
+    /// externally-tagged shape for the YAML layer to mangle, so there
+    /// is no wire form to protect by going through JSON, and binding
+    /// the field to the enum makes an unknown state name a parse error
+    /// naming the field instead of an opt-in that resolves later.
+    ///
+    /// **Paired requirement, enforced at apply:** a non-empty
+    /// `heldStates` needs a `predicate` whose **every** successful
+    /// branch carries a positive `AgeExceeds`, which is then measured
+    /// from the artifact's entry into the held state rather than from
+    /// its creation. See
+    /// [`validate_retention_policy`].
+    #[serde(default)]
+    pub held_states: BTreeSet<HeldState>,
 }
 
 /// Parse one `RetentionPolicy` envelope.
@@ -233,6 +260,34 @@ pub fn parse_retention_policy(
 ///   non-zero)
 /// - `scope` passes [`RetentionScopeSpec::validate`] (non-empty /
 ///   bounded `Repos`, bounded `PackageNamePattern`)
+/// - a non-empty `heldStates` has a `predicate` whose **every**
+///   successful branch carries a positive `AgeExceeds`
+///   ([`PolicyPredicate::every_branch_has_positive_age_bound`](hort_domain::retention::PolicyPredicate::every_branch_has_positive_age_bound))
+///
+/// ## Why the held-state rule is a reject and not a warning
+///
+/// `heldStates` is the operator surface that lets a retention policy
+/// collect **retained scan evidence** — a rejected artifact, a
+/// quarantined one, one whose scan terminally failed. An opt-in whose
+/// predicate can fire without time in that state expires such an
+/// artifact the moment it is first judged, which is the one outcome
+/// the whole exception exists to avoid. So the admission test is on
+/// the predicate's structure and it is fail-closed: the operator
+/// either states a span or does not get the exception.
+///
+/// "Mentions an age predicate" is deliberately **not** the test.
+/// `HasFindingDetectedFor` dates the vulnerability, not the artifact's
+/// time in the state; `UnusedFor` has no download anchor and is
+/// rejected elsewhere for deciding on age while naming usage; and a
+/// `Composite(Or, …)` can carry an age bound on one arm and match
+/// immediately through another. The rule follows what a match
+/// actually requires — see the domain function's own docs.
+///
+/// Scoped to this envelope's own spec, like the two validators above,
+/// which is why it lives here rather than as a `LinterRule` in the
+/// `hort-app` lint registry: it needs no other envelope, no registry
+/// and no capability map to decide, and `DesiredState::validate` runs
+/// it on every apply.
 ///
 /// The cross-spec rule — every `Repos` entry names a declared
 /// `ArtifactRepository` — lives in [`crate::desired`], the only layer
@@ -261,6 +316,32 @@ pub fn validate_retention_policy(env: &Envelope<RetentionPolicySpec>) -> Vec<Val
                     kind: Kind::RetentionPolicy,
                     name: env.metadata.name.clone(),
                     detail: format!("spec.predicate is invalid: {e}"),
+                });
+            }
+            if !env.spec.held_states.is_empty() && !predicate.every_branch_has_positive_age_bound()
+            {
+                // `HeldState`'s `Debug` names are its variant names, which
+                // are the names an operator writes in `heldStates` — so
+                // the message quotes the YAML back without a third
+                // hand-written copy of the vocabulary to keep in step.
+                let states = format!("{:?}", env.spec.held_states);
+                errors.push(ValidationError::Invalid {
+                    kind: Kind::RetentionPolicy,
+                    name: env.metadata.name.clone(),
+                    detail: format!(
+                        "`spec.heldStates` is {states}, so this policy may expire retained \
+                         scan evidence — but `spec.predicate` has a branch that can match \
+                         with no positive `AgeExceeds` bound, which would expire such an \
+                         artifact the moment it is judged. Every branch that can fire must \
+                         carry one: under a `heldStates` opt-in `AgeExceeds` is measured \
+                         from the artifact's entry into the held state, not from its \
+                         creation. Note that an `Or` needs the bound on *every* arm (one \
+                         arm matching on its own skips the others), that \
+                         `HasFindingDetectedFor` dates the vulnerability rather than time \
+                         in the state, and that an `And` needs it on only one child. \
+                         Remove `heldStates` or add the bound. (retention policy: `{name}`)",
+                        name = env.metadata.name,
+                    ),
                 });
             }
         }
@@ -584,5 +665,182 @@ mod tests {
         );
         let err = parse_retention_policy(&p(), doc.as_bytes()).unwrap_err();
         assert!(matches!(err, ParseError::EmptyMetadataName));
+    }
+
+    // -- heldStates --------------------------------------------------------
+
+    #[test]
+    fn held_states_defaults_to_empty() {
+        let body = "
+  predicate:
+    AgeExceeds: 2592000
+  scope: AllRepos
+";
+        let env = parse_retention_policy(&p(), yaml("retain-30d", body).as_bytes()).unwrap();
+        assert!(
+            env.spec.held_states.is_empty(),
+            "a policy that does not mention heldStates opts in to nothing"
+        );
+        assert!(validate_retention_policy(&env).is_empty());
+    }
+
+    #[test]
+    fn held_states_round_trips_with_an_age_bound() {
+        let body = "
+  predicate:
+    AgeExceeds: 7776000
+  scope: AllRepos
+  heldStates: [Rejected, ScanIndeterminate]
+";
+        let env =
+            parse_retention_policy(&p(), yaml("collect-evidence-90d", body).as_bytes()).unwrap();
+        assert_eq!(
+            env.spec.held_states,
+            BTreeSet::from([HeldState::Rejected, HeldState::ScanIndeterminate])
+        );
+        assert!(validate_retention_policy(&env).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_held_state_name_is_a_parse_error() {
+        let body = "
+  predicate:
+    AgeExceeds: 7776000
+  scope: AllRepos
+  heldStates: [Released]
+";
+        let err = parse_retention_policy(&p(), yaml("bad", body).as_bytes())
+            .expect_err("Released is not a held state");
+        // The field is bound to the enum, so the failure is a parse
+        // error that enumerates the three valid states — not an opt-in
+        // that resolves later into something nobody checked. The three
+        // names are the operator-actionable part of the message.
+        let rendered = format!("{err}");
+        for state in ["Quarantined", "Rejected", "ScanIndeterminate"] {
+            assert!(
+                rendered.contains(state),
+                "the error should enumerate the valid states, got: {rendered}"
+            );
+        }
+        assert!(rendered.contains("Released"), "{rendered}");
+    }
+
+    /// **The decisive case: an `Or` whose other arm matches
+    /// immediately.** It mentions an age predicate and would expire a
+    /// rejected artifact the moment a severe finding is reported
+    /// against it, so "has an age predicate" must not pass it.
+    #[test]
+    fn an_or_whose_other_arm_matches_immediately_is_rejected() {
+        let body = r#"
+  predicate:
+    Composite:
+      - Or
+      - - AgeExceeds: 2592000
+        - HasFindingAboveSeverity: High
+  scope: AllRepos
+  heldStates: [Rejected]
+"#;
+        let env = parse_retention_policy(&p(), yaml("collect-severe", body).as_bytes()).unwrap();
+        let errs = validate_retention_policy(&env);
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+        let rendered = format!("{:?}", errs[0]);
+        assert!(rendered.contains("heldStates"), "{rendered}");
+        assert!(rendered.contains("AgeExceeds"), "{rendered}");
+        assert!(
+            rendered.contains("Or"),
+            "the error must name the Or arm trap: {rendered}"
+        );
+        // The message quotes the opt-in back, so the operator reads
+        // which states they asked for rather than inferring it.
+        assert!(rendered.contains("Rejected"), "{rendered}");
+    }
+
+    /// The rejected message names **every** state the opt-in asked
+    /// for, in the spelling the YAML used — so an operator editing a
+    /// multi-state opt-in can see which of them the rule is about.
+    #[test]
+    fn the_rejection_names_every_opted_in_state() {
+        let body = r#"
+  predicate:
+    KeepLastN: 3
+  scope: AllRepos
+  heldStates: [Quarantined, Rejected, ScanIndeterminate]
+"#;
+        let env = parse_retention_policy(&p(), yaml("collect-all-held", body).as_bytes()).unwrap();
+        let errs = validate_retention_policy(&env);
+        assert_eq!(errs.len(), 1, "expected one error, got {errs:?}");
+        let rendered = format!("{:?}", errs[0]);
+        for state in ["Quarantined", "Rejected", "ScanIndeterminate"] {
+            assert!(
+                rendered.contains(state),
+                "the message must name {state}: {rendered}"
+            );
+        }
+    }
+
+    /// The same predicate with **no** opt-in is accepted: the rule is
+    /// the opt-in's, and an existing severity policy over served
+    /// artifacts must not have been outlawed.
+    #[test]
+    fn the_same_or_predicate_without_an_opt_in_is_accepted() {
+        let body = r#"
+  predicate:
+    Composite:
+      - Or
+      - - AgeExceeds: 2592000
+        - HasFindingAboveSeverity: High
+  scope: AllRepos
+"#;
+        let env = parse_retention_policy(&p(), yaml("expire-severe", body).as_bytes()).unwrap();
+        assert!(validate_retention_policy(&env).is_empty());
+    }
+
+    /// `HasFindingDetectedFor` dates the **vulnerability**, not time in
+    /// the state, so it is not a held-state age bound however long it
+    /// is.
+    #[test]
+    fn has_finding_detected_for_is_not_a_held_state_age_bound() {
+        let body = r#"
+  predicate:
+    HasFindingDetectedFor: 7776000
+  scope: AllRepos
+  heldStates: [Quarantined]
+"#;
+        let env =
+            parse_retention_policy(&p(), yaml("collect-known-cves", body).as_bytes()).unwrap();
+        assert_eq!(validate_retention_policy(&env).len(), 1);
+    }
+
+    /// `KeepLastN` has no time in it, so a count-based policy cannot
+    /// carry the exception.
+    #[test]
+    fn keep_last_n_is_not_a_held_state_age_bound() {
+        let body = r#"
+  predicate:
+    KeepLastN: 3
+  scope: AllRepos
+  heldStates: [Rejected]
+"#;
+        let env = parse_retention_policy(&p(), yaml("keep-three", body).as_bytes()).unwrap();
+        assert_eq!(validate_retention_policy(&env).len(), 1);
+    }
+
+    /// An `And` needs the bound on only one child: every child must
+    /// hold for the conjunction to match, so one bounded child bounds
+    /// it. This is the canonical shape for the exception.
+    #[test]
+    fn an_and_with_one_age_bounded_child_is_accepted() {
+        let body = r#"
+  predicate:
+    Composite:
+      - And
+      - - HasFindingAboveSeverity: High
+        - AgeExceeds: 7776000
+  scope: AllRepos
+  heldStates: [Rejected]
+"#;
+        let env = parse_retention_policy(&p(), yaml("collect-severe-after-90d", body).as_bytes())
+            .unwrap();
+        assert!(validate_retention_policy(&env).is_empty());
     }
 }

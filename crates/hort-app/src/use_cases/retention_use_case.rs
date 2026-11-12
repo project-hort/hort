@@ -87,15 +87,15 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
+use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::events::{retention_scheduler_actor, DomainEvent, StreamId};
 use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
 use hort_domain::ports::retention_scan_reader::RetentionScanReader;
 use hort_domain::retention::{
-    distinct_vulnerability_ids, evaluate, resolve_finding_age_anchor, EvaluationInputs,
-    EvaluationOutcome, ExpirationReason, FindingAgeAnchor, RetentionEvaluationMode,
-    RetentionPolicy,
+    distinct_vulnerability_ids, evaluate, resolve_finding_age_anchor, resolve_held_state_entry,
+    EvaluationInputs, EvaluationOutcome, ExpirationReason, FindingAgeAnchor, HeldState,
+    HeldStateEntry, RetentionEvaluationMode, RetentionPolicy,
 };
 use hort_domain::types::Finding;
 
@@ -172,8 +172,21 @@ pub struct EvaluateSummary {
     /// Pairs skipped because the artifact was already expired by this
     /// policy (idempotent no-op).
     pub already_expired: u64,
-    /// Pairs skipped by the quarantine/rejected GC-protection filter.
+    /// Pairs skipped by the quarantine/rejected GC-protection filter —
+    /// the artifact is held and this policy does not opt in to its
+    /// state.
     pub skipped_protected: u64,
+    /// Pairs where the policy *does* opt in to the artifact's held
+    /// state but its stream carries no entry event for it, so there is
+    /// no span and nothing may expire it.
+    ///
+    /// Reported apart from [`Self::skipped_protected`] because an
+    /// operator who has just written an opt-in needs to tell "the
+    /// policy does not cover this state" from "it does and these
+    /// artifacts cannot be dated". Folding them together is how an
+    /// exception that is declared and never honoured looks exactly
+    /// like one that was never declared.
+    pub skipped_unanchored_held_state: u64,
     /// Pairs skipped by the stale-scan freshness gate.
     pub skipped_stale_scan: u64,
     /// Pairs where a port read failed (sweep continued).
@@ -316,6 +329,9 @@ impl RetentionUseCase {
                         matched_count += 1;
                     }
                     EvalStep::SkippedProtected => report.summary.skipped_protected += 1,
+                    EvalStep::SkippedUnanchoredHeldState => {
+                        report.summary.skipped_unanchored_held_state += 1
+                    }
                     EvalStep::SkippedStaleScan => report.summary.skipped_stale_scan += 1,
                     EvalStep::Errored => report.summary.errors += 1,
                 }
@@ -348,31 +364,32 @@ impl RetentionUseCase {
         let artifact = &candidate.artifact;
 
         // -- quarantine / rejected GC-protection ----------
-        match artifact.quarantine_status {
-            QuarantineStatus::Quarantined => {
-                emit_retention_evaluation(
-                    policy_id_label,
-                    RetentionEvaluationResult::SkippedQuarantined,
-                );
-                tracing::debug!(
-                    policy_id = %policy.id, artifact_id = %artifact.id,
-                    "inv1: artifact quarantined — GC-protected, skipped"
-                );
-                return EvalStep::SkippedProtected;
-            }
-            QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate => {
-                emit_retention_evaluation(
-                    policy_id_label,
-                    RetentionEvaluationResult::SkippedRejected,
-                );
+        //
+        // A held artifact is retained evidence, and the ONLY thing that
+        // lets this policy evaluate one is this policy naming its state
+        // in `held_states`. The default is empty, so by default every
+        // held artifact is refused here exactly as it always was.
+        //
+        // The refusal stays *before* the stream read, which is where it
+        // has always been. Admitting an opted-in state is what lets a
+        // held artifact reach that read — and the read is where its
+        // state-entry anchor comes from, so an arrangement that refused
+        // first and resolved later would have nothing to resolve.
+        let held_state = HeldState::from_status(artifact.quarantine_status);
+        if let Some(state) = held_state {
+            if !policy.held_states.contains(&state) {
+                // The metric keeps its two-way split by status, because
+                // that is the vocabulary already in the catalog and in
+                // every dashboard reading it.
+                emit_retention_evaluation(policy_id_label, skip_metric_for(state));
                 tracing::debug!(
                     policy_id = %policy.id, artifact_id = %artifact.id,
                     status = %artifact.quarantine_status,
-                    "inv1: artifact rejected/indeterminate — evidence, skipped"
+                    "inv1: artifact is held evidence and this policy does not opt in to \
+                     its state — GC-protected, skipped"
                 );
                 return EvalStep::SkippedProtected;
             }
-            QuarantineStatus::None | QuarantineStatus::Released => {}
         }
 
         // -- idempotency on (policy_id, artifact_id) ----------------------
@@ -388,12 +405,44 @@ impl RetentionUseCase {
             Ok(s) => s,
             Err(e) => return self.errored(policy_id_label, policy, artifact, "read_stream", e),
         };
-        if stream.iter().any(
-            |ev| matches!(&ev.event, DomainEvent::ArtifactExpired(x) if x.policy_id == policy.id),
-        ) {
+        // -- the state-entry anchor, for an opted-in held artifact --------
+        //
+        // Resolved from the stream just read, not from a second query:
+        // the entry event is already in hand. `None` means the stream
+        // carries no entry event for the state the artifact is in, and
+        // that is **no span** — not a fallback to the content anchor,
+        // which would fire first and hardest on exactly the oldest
+        // streams in the system.
+        let held_state_entry = match held_state {
+            None => None,
+            Some(state) => match resolve_held_state_entry(state, &stream) {
+                Some(entry) => Some(entry),
+                None => {
+                    tracing::warn!(
+                        policy_id = %policy.id, artifact_id = %artifact.id,
+                        status = %artifact.quarantine_status,
+                        "this policy opts in to the artifact's held state but its stream \
+                         carries no entry event for it — no span, so nothing may expire \
+                         it; the artifact stays held"
+                    );
+                    // The same by-status metric value: on that axis
+                    // this is a held artifact that was not evaluated,
+                    // which is what the label says. The reason it was
+                    // not is the summary's own counter, which does not
+                    // have to be squeezed into a label vocabulary
+                    // every existing dashboard already reads.
+                    emit_retention_evaluation(policy_id_label, skip_metric_for(state));
+                    return EvalStep::SkippedUnanchoredHeldState;
+                }
+            },
+        };
+
+        if let Some(prior) = prior_expiry_by_policy(&stream, policy.id, held_state_entry) {
             tracing::debug!(
                 policy_id = %policy.id, artifact_id = %artifact.id,
-                "idempotent: artifact already expired by this policy — no-op"
+                prior_authority = ?prior,
+                "idempotent: artifact already expired by this policy for this occupancy \
+                 — no-op"
             );
             return EvalStep::AlreadyExpired;
         }
@@ -509,6 +558,14 @@ impl RetentionUseCase {
             findings: &findings,
             finding_age_anchor,
             latest_scan_at,
+            // `Some` exactly when this is an opted-in policy's
+            // evaluation of a held artifact, which is the only way a
+            // held artifact reaches here at all. It re-anchors
+            // `AgeExceeds` to the state entry; without it the bound
+            // would measure the age of the *content*, and a two-year-old
+            // artifact rejected five minutes ago is already past any
+            // span.
+            held_state_entry,
         };
 
         match evaluate(&policy.predicate, &inputs) {
@@ -526,8 +583,11 @@ impl RetentionUseCase {
                         &stream_id,
                         artifact,
                         policy,
-                        reason.clone(),
-                        now,
+                        ExpiryDecision {
+                            reason: reason.clone(),
+                            eligible_at: now,
+                            held_state_authority: held_state_entry,
+                        },
                         stream.len() as u64,
                     )
                     .await
@@ -696,8 +756,7 @@ impl RetentionUseCase {
         stream_id: &StreamId,
         artifact: &Artifact,
         policy: &RetentionPolicy,
-        reason: ExpirationReason,
-        now: DateTime<Utc>,
+        decision: ExpiryDecision,
         stream_len: u64,
     ) -> AppResult<()> {
         // The sweep appends exactly one `ArtifactExpired`, so one is the
@@ -707,8 +766,13 @@ impl RetentionUseCase {
             artifact_id: artifact.id,
             policy_id: policy.id,
             policy_name: policy.name.clone(),
-            reason,
-            eligible_at: now,
+            reason: decision.reason,
+            eligible_at: decision.eligible_at,
+            // The authority the purge will check, and the only thing
+            // that makes a held artifact collectable. It names the
+            // occupancy this decision was taken about, so a later
+            // re-entry into the same state is not covered by it.
+            held_state_authority: decision.held_state_authority,
         };
         event.validate().map_err(AppError::Domain)?;
         let batch = AppendEvents {
@@ -752,6 +816,40 @@ impl RetentionUseCase {
     }
 }
 
+/// The `hort_retention_evaluation_total{result}` value for a held
+/// artifact this sweep did not evaluate.
+///
+/// Two values, split by status rather than by reason, because that is
+/// the label vocabulary already in the metrics catalog and in every
+/// dashboard reading it. One function so the two call sites — "no
+/// policy opted in to this state" and "a policy did and the artifact
+/// has no entry event" — cannot drift into two mappings.
+fn skip_metric_for(state: HeldState) -> RetentionEvaluationResult {
+    match state {
+        HeldState::Quarantined => RetentionEvaluationResult::SkippedQuarantined,
+        HeldState::Rejected | HeldState::ScanIndeterminate => {
+            RetentionEvaluationResult::SkippedRejected
+        }
+    }
+}
+
+/// What one match decided, as the `ArtifactExpired` payload needs it.
+///
+/// The three values travel together because they are one decision taken
+/// at one instant, and bundling them is also what keeps
+/// [`RetentionUseCase::append_expired`] inside the argument-count lint
+/// without an `#[allow]`.
+struct ExpiryDecision {
+    /// The snapshotted reason the predicate produced.
+    reason: ExpirationReason,
+    /// The sweep's pinned `now` — when the policy decided.
+    eligible_at: DateTime<Utc>,
+    /// The held-state authority, `Some` only for an opted-in policy's
+    /// evaluation of a held artifact. See
+    /// [`ArtifactExpired::held_state_authority`](hort_domain::events::ArtifactExpired::held_state_authority).
+    held_state_authority: Option<HeldStateEntry>,
+}
+
 /// Per-pair evaluation result, folded into [`EvaluateSummary`] by the
 /// caller. Internal — the public surface is [`EvaluateSummary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -760,8 +858,59 @@ enum EvalStep {
     NoMatch,
     AlreadyExpired,
     SkippedProtected,
+    /// The policy opts in to the artifact's held state, but its stream
+    /// carries no entry event for that state — so there is no instant
+    /// the span could be measured from, and nothing may expire it.
+    /// Counted apart from [`Self::SkippedProtected`] because the two
+    /// answer different operator questions: that one is "no policy
+    /// claims this state", this one is "a policy does and the artifact
+    /// cannot be dated".
+    SkippedUnanchoredHeldState,
     SkippedStaleScan,
     Errored,
+}
+
+/// The `ArtifactExpired` on `stream` that makes a fresh expiry by
+/// `policy_id` a no-op, if there is one.
+///
+/// Two rules, because an expiry decision means two different things
+/// depending on whether it was authorised by a held state:
+///
+/// - **Ordinary evaluation** (`held_state_entry` is `None`): any
+///   `ArtifactExpired` by this policy. Unchanged — running the sweep
+///   twice yields exactly one event, which is the property the
+///   idempotency check has always had.
+/// - **Held-state evaluation**: only an `ArtifactExpired` by this
+///   policy whose authority names **this** occupancy.
+///
+/// The second rule is what keeps the sixth veto from swallowing the
+/// exception. Held states are re-enterable, so without it an *older*
+/// decision by the same policy — an ordinary expiry from when the
+/// artifact was released, or a held-state expiry for a previous
+/// rejection — would stop a new, correctly-spanned occupancy from ever
+/// recording its own authority. The purge checks the authority, so the
+/// artifact would then sit in the pending set forever: refused by the
+/// purge for want of a matching authority, and refused by the evaluator
+/// for already having been expired.
+///
+/// Equality over the whole [`HeldStateEntry`] is the comparison, and it
+/// is exact rather than conservative on purpose: both values come from
+/// the same resolver over the same append-only stream, so an unchanged
+/// occupancy produces an identical value and a changed one cannot
+/// produce a colliding position.
+fn prior_expiry_by_policy(
+    stream: &[hort_domain::events::PersistedEvent],
+    policy_id: Uuid,
+    held_state_entry: Option<HeldStateEntry>,
+) -> Option<Option<HeldStateEntry>> {
+    stream.iter().find_map(|ev| match &ev.event {
+        DomainEvent::ArtifactExpired(x)
+            if x.policy_id == policy_id && x.held_state_authority == held_state_entry =>
+        {
+            Some(x.held_state_authority)
+        }
+        _ => None,
+    })
 }
 
 #[cfg(test)]

@@ -91,6 +91,14 @@ impl ApplyConfigUseCase {
             // cross-spec validator, which is why the resolver panics
             // rather than degrading.
             let scope = resolve_retention_scope(&scope_spec, repo_id_by_name);
+            // The held-state opt-in travels verbatim from the
+            // envelope: it is already the domain's own enum set, so
+            // there is nothing to resolve. `validate_retention_policy`
+            // has already refused an opt-in whose predicate has an
+            // unbounded successful branch, and
+            // `RetentionPolicyEvent::validate` refuses it again at the
+            // append.
+            let held_states = env.spec.held_states.clone();
 
             // A security-driven predicate must exclude
             // direct uploads, or the operator is told (advisory, NOT
@@ -112,7 +120,10 @@ impl ApplyConfigUseCase {
                     // short-circuits an unchanged predicate+scope to
                     // a no-op (Ok, zero events) — mirror the
                     // ScanPolicy unchanged/updated accounting.
-                    if existing.predicate == predicate && existing.scope == scope {
+                    if existing.predicate == predicate
+                        && existing.scope == scope
+                        && existing.held_states == held_states
+                    {
                         emit_gitops_object(
                             gitops_kind::RETENTION_POLICY,
                             GitopsObjectResult::Unchanged,
@@ -126,6 +137,7 @@ impl ApplyConfigUseCase {
                                     policy_id: existing.policy_id,
                                     predicate,
                                     scope,
+                                    held_states,
                                 },
                                 actor.clone(),
                             )
@@ -153,6 +165,7 @@ impl ApplyConfigUseCase {
                                 name: name.clone(),
                                 predicate,
                                 scope,
+                                held_states,
                             },
                             actor.clone(),
                         )
@@ -413,7 +426,11 @@ mod tests {
                 api_version: ApiVersion::V1,
                 kind: Kind::RetentionPolicy,
                 metadata: Metadata { name: name.into() },
-                spec: RetentionPolicySpec { predicate, scope },
+                spec: RetentionPolicySpec {
+                    predicate,
+                    scope,
+                    held_states: Default::default(),
+                },
             }
         }
 

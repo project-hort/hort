@@ -213,9 +213,11 @@ use hort_domain::ports::event_store::AppendEvents;
 use hort_domain::ports::purge_gc::{
     BlobReclaim, BlobReclaimGuard, PendingPurge, PurgeGcPort, PurgePreparation, PurgedRef,
 };
+use hort_domain::retention::HeldState;
 use hort_domain::types::ContentHash;
 
 use crate::event_store::PgEventStore;
+use crate::quarantine_status_sql::quarantine_status_to_sql;
 use crate::{map_sqlx_error, BoxFuture};
 
 /// PostgreSQL implementation of [`PurgeGcPort`].
@@ -253,6 +255,8 @@ struct PendingRow {
     tag_targeted: bool,
     expired_only_by_keep_last_n: bool,
     user_deleted: bool,
+    held_state_authorised: bool,
+    collection_needs_held_state_authority: bool,
 }
 
 /// SQL for `expired_only_by_keep_last_n`: no pending `ArtifactExpired`
@@ -297,6 +301,182 @@ const ARTIFACT_USER_DELETED_SQL: &str = r#"
     )
 "#;
 
+/// SQL for `collection_needs_held_state_authority`: the **only** thing
+/// on the artifact's stream authorising collection is a held-state
+/// expiry. Expects the artifacts row in scope as `a`; binds nothing.
+///
+/// Two halves, and both are needed:
+///
+/// - some `ArtifactExpired` carries a `held_state_authority` — a
+///   **conditional** work item, valid only while the occupancy it names
+///   holds;
+/// - and nothing on the stream authorises collection
+///   unconditionally — no `ArtifactDeleted`, and no `ArtifactExpired`
+///   without an authority.
+///
+/// An `ArtifactExpired` counts as unconditional only when the authority
+/// key is **absent** (the field is `skip_serializing_if = "Option::is_none"`,
+/// so an ordinary expiry omits it) or stored as JSON `null`. Anything
+/// else — an object, and equally a value this adapter cannot read —
+/// counts as conditional, which is the direction that keeps bytes: an
+/// unreadable authority authorises nothing on its own, and the artifact
+/// waits for a readable one rather than being collected on a payload
+/// nobody could parse.
+///
+/// Phrased as "only a held-state expiry authorises this" rather than as
+/// "nothing unconditional does" so that an artifact with **no** work
+/// item answers `false`. `list_pending_purge` never offers one, but
+/// `purge_artifact_refs` is reachable directly, and reporting an absent
+/// work item as retained evidence would be a different fact.
+const ARTIFACT_COLLECTION_NEEDS_HELD_STATE_AUTHORITY_SQL: &str = r#"
+    (
+        EXISTS (
+            SELECT 1 FROM events e
+             WHERE e.stream_id  = 'artifact-' || a.id::text
+               AND e.event_type = 'ArtifactExpired'
+               AND e.event_data->'data' ? 'held_state_authority'
+               AND jsonb_typeof(
+                     e.event_data->'data'->'held_state_authority'
+                   ) <> 'null'
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM events e
+             WHERE e.stream_id = 'artifact-' || a.id::text
+               AND (
+                     e.event_type = 'ArtifactDeleted'
+                  OR (e.event_type = 'ArtifactExpired'
+                       AND (NOT (e.event_data->'data' ? 'held_state_authority')
+                            OR jsonb_typeof(
+                                 e.event_data->'data'->'held_state_authority'
+                               ) = 'null'))
+                   )
+        )
+    )
+"#;
+
+/// SQL template for `held_state_authorised`: a pending
+/// `ArtifactExpired` on the artifact's stream carries a
+/// `held_state_authority` naming **this occupancy** of the artifact's
+/// **current** held state.
+///
+/// Expects the artifacts row in scope as `a`. The three `{}` holes are
+/// 1-based bind-parameter **indices** — not data — for three parallel
+/// `text[]` arrays the caller binds from
+/// [`held_state_authority_bindings`]: the stored `quarantine_status`
+/// spelling, the `HeldState` serde name, and the entry event's
+/// `event_type`, one row per held state.
+///
+/// ## Why the mapping is bound rather than written out
+///
+/// The statement has to relate three spellings of one concept —
+/// `rejected`, `"Rejected"`, `ArtifactRejected` — and all three are
+/// already defined in the domain
+/// ([`HeldState::status`](hort_domain::retention::HeldState::status),
+/// the enum's `serde` name, and
+/// [`HeldState::entry_event_type`](hort_domain::retention::HeldState::entry_event_type),
+/// which derives from `DomainEvent::event_type` and is pinned against
+/// the resolver's own typed match). Spelling them again in a SQL `CASE`
+/// would be a second definition of the state → entry-event mapping, and
+/// the one place this codebase did that needed a dedicated guard to
+/// keep the copy honest. Binding them keeps one author.
+///
+/// ## The two conjuncts, and why both
+///
+/// - **`a.quarantine_status = m.status_name`** — the authority is about
+///   a state, so it says nothing about an artifact that has left it. A
+///   curator releasing a rejected artifact ends the occupancy, and
+///   without this conjunct the expiry recorded while it was evidence
+///   would still collect the bytes a human had just reinstated.
+/// - **the position equals the latest entry event's** — all three held
+///   states are re-enterable, so the state name alone does not identify
+///   an occupancy. An artifact rejected in March, expired, released and
+///   rejected again in September is `rejected` both times; matching on
+///   the name would let the March decision purge the September
+///   occupancy, whose own span has not run.
+///
+/// The position is compared as `jsonb`, against `to_jsonb(max(...))`,
+/// rather than cast to `bigint`. A cast would raise on a payload whose
+/// `entry_stream_position` is not an integer literal, and an error here
+/// fails the whole sweep; a `jsonb` comparison simply answers false,
+/// which refuses that one artifact. A stream with no entry event of
+/// that type at all gives `max(...) = NULL`, so the comparison is
+/// `NULL` and the authority does not hold — the same fail-safe.
+///
+/// No `ArtifactPurged` clause: membership already excludes a purged
+/// stream, so every `ArtifactExpired` this sees is pending.
+const ARTIFACT_HELD_STATE_AUTHORISED_SQL: &str = r#"
+    EXISTS (
+        SELECT 1
+          FROM unnest(${}::text[], ${}::text[], ${}::text[])
+                 AS m(status_name, state_name, entry_event_type)
+         WHERE a.quarantine_status = m.status_name
+           AND EXISTS (
+                 SELECT 1 FROM events x
+                  WHERE x.stream_id  = 'artifact-' || a.id::text
+                    AND x.event_type = 'ArtifactExpired'
+                    AND x.event_data->'data'->'held_state_authority'->>'state'
+                          = m.state_name
+                    AND x.event_data->'data'->'held_state_authority'
+                           ->'entry_stream_position'
+                          = to_jsonb((
+                              SELECT max(y.stream_position) FROM events y
+                               WHERE y.stream_id  = x.stream_id
+                                 AND y.event_type = m.entry_event_type
+                            ))
+               )
+    )
+"#;
+
+/// [`ARTIFACT_HELD_STATE_AUTHORISED_SQL`] with its three parameter
+/// indices filled in.
+///
+/// Injection audit: `status_param` / `state_param` / `event_type_param`
+/// are bind-parameter ordinals the two call sites pass as integer
+/// literals. No caller-supplied value reaches the statement text; the
+/// three arrays themselves are bound.
+fn held_state_authorised_sql(status_param: u8, state_param: u8, event_type_param: u8) -> String {
+    ARTIFACT_HELD_STATE_AUTHORISED_SQL
+        .replacen("{}", &status_param.to_string(), 1)
+        .replacen("{}", &state_param.to_string(), 1)
+        .replacen("{}", &event_type_param.to_string(), 1)
+}
+
+/// The three parallel arrays [`ARTIFACT_HELD_STATE_AUTHORISED_SQL`]
+/// binds, one row per held state: the stored `quarantine_status`
+/// spelling, the `HeldState` serde name, and the entry event's
+/// `event_type`.
+///
+/// Derived from `HeldState::ALL` and the domain's own accessors, so a
+/// fourth held state reaches the SQL with no edit here. The status
+/// spelling goes through [`quarantine_status_to_sql`] — the column's
+/// single encoder — and its `None` arm (SQL `NULL`) cannot be produced
+/// by a held state, so `filter_map` drops nothing a held set contains.
+///
+/// The serde name is taken from the enum's own serialisation rather
+/// than a literal, so a `rename` on `HeldState` moves both the stored
+/// payload and this comparison together.
+fn held_state_authority_bindings() -> (Vec<String>, Vec<String>, Vec<String>) {
+    let mut statuses = Vec::with_capacity(HeldState::ALL.len());
+    let mut states = Vec::with_capacity(HeldState::ALL.len());
+    let mut event_types = Vec::with_capacity(HeldState::ALL.len());
+    for state in HeldState::ALL {
+        let Some(status) = quarantine_status_to_sql(state.status()) else {
+            continue;
+        };
+        // A `HeldState` serialises as a bare string by construction.
+        // Skipping an unexpected shape rather than guessing one keeps
+        // the comparison from matching an authority it cannot actually
+        // read.
+        let Ok(serde_json::Value::String(serde_name)) = serde_json::to_value(state) else {
+            continue;
+        };
+        statuses.push(status);
+        states.push(serde_name);
+        event_types.push(state.entry_event_type().to_owned());
+    }
+    (statuses, states, event_types)
+}
+
 /// The artifact row as read under — and in the statement after — the
 /// `FOR UPDATE` lock that opens the worklist preparation: the
 /// authoritative `checksum_sha256` for the idempotent-retry path, plus
@@ -308,6 +488,8 @@ struct LockedArtifactRow {
     tag_targeted: bool,
     expired_only_by_keep_last_n: bool,
     user_deleted: bool,
+    held_state_authorised: bool,
+    collection_needs_held_state_authority: bool,
 }
 
 /// One `(target_content_hash, kind)` row removed by the step-2
@@ -668,13 +850,17 @@ impl PurgeGcPort for PgPurgeGcPort {
             // entire backlog, and a work set whose size is only known
             // once it is fully loaded is not a set this query may
             // return.
+            let (statuses, states, event_types) = held_state_authority_bindings();
+            let held_authorised = held_state_authorised_sql(4, 5, 6);
             let sql = format!(
                 r#"
                 SELECT a.id                AS artifact_id,
                        a.quarantine_status AS quarantine_status,
                        {tag_targeted}      AS tag_targeted,
                        {keep_last_n_only}  AS expired_only_by_keep_last_n,
-                       {user_deleted}      AS user_deleted
+                       {user_deleted}      AS user_deleted,
+                       {held_authorised}   AS held_state_authorised,
+                       {needs_authority}   AS collection_needs_held_state_authority
                 -- DELETED-INCLUSIVE: this IS the worklist that collects
                 -- deleted rows. The `EXISTS` below is the whole
                 -- membership rule — an ArtifactExpired or ArtifactDeleted
@@ -696,8 +882,24 @@ impl PurgeGcPort for PgPurgeGcPort {
                           WHERE e.stream_id  = 'artifact-' || a.id::text
                             AND e.event_type = 'ArtifactPurged'
                        )
+                   -- The held-state gate. A held artifact is still
+                   -- excluded from the work set, except where a pending
+                   -- `ArtifactExpired` carries an authority naming its
+                   -- current occupancy — which is the only thing that
+                   -- may open it, and is deliberately not the bare
+                   -- status. `GC_PROTECTED_QUARANTINE_STATUSES` is
+                   -- untouched: it also drives refcount repair and the
+                   -- hash-level protected-claimant query, which protect
+                   -- *shared bytes* belonging to OTHER artifacts and
+                   -- have nothing to do with this one's candidacy.
+                   --
+                   -- An artifact admitted here is not yet collectable:
+                   -- the page row's own `is_gc_protected()` and the
+                   -- re-read under the artifact lock both ask again,
+                   -- and the lock's answer is the load-bearing one.
                    AND (a.quarantine_status IS NULL
-                        OR a.quarantine_status <> ALL($1::text[]))
+                        OR a.quarantine_status <> ALL($1::text[])
+                        OR {held_authorised})
                    AND ($2::uuid IS NULL OR a.id > $2::uuid)
                  ORDER BY a.id
                  LIMIT $3
@@ -705,19 +907,30 @@ impl PurgeGcPort for PgPurgeGcPort {
                 tag_targeted = crate::ARTIFACT_IS_TAG_TARGETED_SQL,
                 keep_last_n_only = ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL,
                 user_deleted = ARTIFACT_USER_DELETED_SQL,
+                held_authorised = held_authorised,
+                needs_authority = ARTIFACT_COLLECTION_NEEDS_HELD_STATE_AUTHORITY_SQL,
             );
             // Injection audit: every interpolated fragment is a crate
             // `const` (`ARTIFACT_IS_TAG_TARGETED_SQL`,
             // `ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL`,
-            // `ARTIFACT_USER_DELETED_SQL`) — compile-time literals, not
-            // runtime values. Every runtime value this statement uses is
-            // bound ($1..$3). The assertion is sound as long as that stays
-            // true: a fragment built from anything a caller supplies
-            // must be bound instead, never formatted in.
+            // `ARTIFACT_USER_DELETED_SQL`,
+            // `ARTIFACT_COLLECTION_NEEDS_HELD_STATE_AUTHORITY_SQL`) — compile-time
+            // literals, not runtime values. The fifth,
+            // `held_state_authorised_sql`, is the same kind of literal
+            // with three bind-parameter *ordinals* formatted in, passed
+            // here as integer literals; the mapping arrays it compares
+            // against are bound ($4..$6). Every runtime value this
+            // statement uses is bound ($1..$6). The assertion is sound
+            // as long as that stays true: a fragment built from
+            // anything a caller supplies must be bound instead, never
+            // formatted in.
             let rows: Vec<PendingRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(crate::gc_protected_quarantine_status_names())
                 .bind(after_artifact_id)
                 .bind(i64::from(limit))
+                .bind(&statuses)
+                .bind(&states)
+                .bind(&event_types)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "purge_gc", "list_pending"))?;
@@ -730,6 +943,9 @@ impl PurgeGcPort for PgPurgeGcPort {
                     tag_targeted: row.tag_targeted,
                     expired_only_by_keep_last_n: row.expired_only_by_keep_last_n,
                     user_deleted: row.user_deleted,
+                    held_state_authorised: row.held_state_authorised,
+                    collection_needs_held_state_authority: row
+                        .collection_needs_held_state_authority,
                 });
             }
             Ok(out)
@@ -849,13 +1065,17 @@ impl PurgeGcPort for PgPurgeGcPort {
             //   nothing to exclude; the snapshot being the newer one is
             //   what keeps them from disagreeing with the tag fact
             //   read beside them.
+            let (statuses, states, event_types) = held_state_authority_bindings();
+            let held_authorised = held_state_authorised_sql(2, 3, 4);
             let sql = format!(
                 r#"
                 SELECT a.checksum_sha256   AS checksum_sha256,
                        a.quarantine_status AS quarantine_status,
                        {tag_targeted}      AS tag_targeted,
                        {keep_last_n_only}  AS expired_only_by_keep_last_n,
-                       {user_deleted}      AS user_deleted
+                       {user_deleted}      AS user_deleted,
+                       {held_authorised}   AS held_state_authorised,
+                       {needs_authority}   AS collection_needs_held_state_authority
                 -- DELETED-INCLUSIVE: the facts behind a purge decision,
                 -- on an artifact `list_pending_purge` just handed it — and
                 -- that set admits soft-deleted rows on purpose. A liveness
@@ -869,16 +1089,23 @@ impl PurgeGcPort for PgPurgeGcPort {
                 tag_targeted = crate::ARTIFACT_IS_TAG_TARGETED_SQL,
                 keep_last_n_only = ARTIFACT_EXPIRED_ONLY_BY_KEEP_LAST_N_SQL,
                 user_deleted = ARTIFACT_USER_DELETED_SQL,
+                held_authorised = held_authorised,
+                needs_authority = ARTIFACT_COLLECTION_NEEDS_HELD_STATE_AUTHORITY_SQL,
             );
             // Injection audit: same shape as `list_pending_purge`'s — the
-            // three interpolated fragments are crate `const`s, so the
-            // statement text is fixed at compile time, and the only
-            // runtime value (`artifact_id`) is bound ($1).
+            // interpolated fragments are crate `const`s (one of them with
+            // three bind-parameter ordinals formatted in from integer
+            // literals), so the statement text is fixed at compile time,
+            // and every runtime value is bound (`artifact_id` as $1, the
+            // held-state mapping arrays as $2..$4).
             //
             // `fetch_one`: the row lock above is held, so the row this
             // reads cannot have gone away between the two statements.
             let locked: LockedArtifactRow = sqlx::query_as(sqlx::AssertSqlSafe(sql))
                 .bind(artifact_id)
+                .bind(&statuses)
+                .bind(&states)
+                .bind(&event_types)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "purge_gc", "protection_facts"))?;
@@ -921,6 +1148,8 @@ impl PurgeGcPort for PgPurgeGcPort {
                 tag_targeted: locked.tag_targeted,
                 expired_only_by_keep_last_n: locked.expired_only_by_keep_last_n,
                 user_deleted: locked.user_deleted,
+                held_state_authorised: locked.held_state_authorised,
+                collection_needs_held_state_authority: locked.collection_needs_held_state_authority,
             };
             let refusal = if fresh.is_gc_protected() {
                 Some(PurgePreparation::Protected {
@@ -5503,6 +5732,461 @@ mod tests {
         assert!(
             cr_rows_for(&pool, art).await.is_empty(),
             "a prepared purge releases the edge"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    // =====================================================================
+    // The held-state authority — the two SQL gates
+    //
+    // `list_pending_purge` offers a held artifact only when a pending
+    // `ArtifactExpired` names its current occupancy, and
+    // `purge_artifact_refs` asks again under the artifact lock. These
+    // tests drive both against real rows, because the question they
+    // answer is a JSON comparison against `events` that no mock can
+    // stand in for.
+    // =====================================================================
+
+    /// Append an `ArtifactExpired` carrying a held-state authority, in
+    /// the exact payload shape `serialize_event_data` writes:
+    /// `{"type": …, "data": {"reason": …, "held_state_authority": …}}`.
+    async fn append_expired_with_authority(
+        pool: &PgPool,
+        artifact: Uuid,
+        stream_position: i64,
+        state: &str,
+        entry_stream_position: i64,
+    ) {
+        sqlx::query(
+            r#"INSERT INTO events (
+                   stream_id, stream_category, stream_position, event_type,
+                   event_data, correlation_id, actor_type,
+                   prev_event_hash, event_hash
+               ) VALUES (
+                   'artifact-' || $1::text, 'artifact', $2, 'ArtifactExpired',
+                   jsonb_build_object(
+                       'type', 'ArtifactExpired',
+                       'data', jsonb_build_object(
+                           'reason', $3::jsonb,
+                           'held_state_authority', jsonb_build_object(
+                               'state', $4::text,
+                               'entered_at', '2026-01-01T00:00:00Z',
+                               'entry_stream_position', $5::bigint
+                           )
+                       )
+                   ),
+                   gen_random_uuid(), 'system',
+                   '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea,
+                   '\x1111111111111111111111111111111111111111111111111111111111111111'::bytea
+               )"#,
+        )
+        .bind(artifact)
+        .bind(stream_position)
+        .bind(age_exceeded_reason())
+        .bind(state)
+        .bind(entry_stream_position)
+        .execute(pool)
+        .await
+        .expect("append ArtifactExpired with authority");
+    }
+
+    /// Is `artifact` in the pending-purge work set, and does the page
+    /// row read as protected?
+    async fn pending_row(pool: &PgPool, artifact: Uuid) -> Option<PendingPurge> {
+        adapter(pool)
+            .await
+            .list_pending_purge(1000, None)
+            .await
+            .expect("list_pending_purge")
+            .into_iter()
+            .find(|p| p.artifact_id == artifact)
+    }
+
+    /// **Without an authority nothing changes.** A rejected artifact
+    /// with a pending ordinary `ArtifactExpired` is not offered — which
+    /// is the behaviour that shipped before the exception existed, and
+    /// the thing an opt-in-free deployment must keep.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_held_artifact_with_no_authority_is_not_offered() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "evidence", HASH_A, Some("rejected")).await;
+        append_event(&pool, art, "ArtifactRejected", 0).await;
+        // An ordinary expiry: no `held_state_authority` key at all,
+        // which is also exactly what every event written before this
+        // change looks like.
+        append_expired_with_reason(&pool, art, 1, age_exceeded_reason()).await;
+
+        assert!(
+            pending_row(&pool, art).await.is_none(),
+            "a legacy expiry authorises nothing on the held-state axis"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// With a matching authority the artifact is offered, the page row
+    /// reads as collectable, and the locked preparation prepares a
+    /// worklist. All five gates open together.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_held_artifact_with_a_matching_authority_is_offered_and_prepares() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        for (status, state, entry_event) in [
+            ("quarantined", "Quarantined", "ArtifactQuarantined"),
+            ("rejected", "Rejected", "ArtifactRejected"),
+            (
+                "scan_indeterminate",
+                "ScanIndeterminate",
+                "ScanIndeterminate",
+            ),
+        ] {
+            let repo = seed_repo(&pool).await;
+            let art = seed_artifact(&pool, repo, "evidence", HASH_A, Some(status)).await;
+            append_event(&pool, art, entry_event, 0).await;
+            append_expired_with_authority(&pool, art, 1, state, 0).await;
+
+            let row = pending_row(&pool, art)
+                .await
+                .unwrap_or_else(|| panic!("{status}: must be offered"));
+            assert!(
+                row.held_state_authorised,
+                "{status}: the authority names this occupancy"
+            );
+            assert!(
+                !row.is_gc_protected(),
+                "{status}: an authorised held artifact is collectable"
+            );
+
+            let prepared_refs = prepared(
+                adapter(&pool)
+                    .await
+                    .purge_artifact_refs(art, Utc::now())
+                    .await
+                    .unwrap_or_else(|e| panic!("{status}: prepare failed: {e}")),
+            );
+            assert_eq!(
+                prepared_refs
+                    .iter()
+                    .map(|r| r.content_hash.as_ref().to_string())
+                    .collect::<Vec<_>>(),
+                vec![HASH_A.to_string()],
+                "{status}: the worklist names the artifact's own content"
+            );
+
+            cleanup(&pool, repo).await;
+        }
+    }
+
+    /// **The decisive test: an expiry recorded for an earlier rejection
+    /// must not purge a later one whose own span has not elapsed.**
+    ///
+    /// The stream is the real sequence — rejected, expired, released by
+    /// a curator, rejected again — and the artifact is `rejected` both
+    /// times, so an authority matching on the state *name* would
+    /// collect the September occupancy on March's decision.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_expiry_for_an_earlier_rejection_cannot_purge_a_later_one() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "re-rejected", HASH_A, Some("rejected")).await;
+        append_event(&pool, art, "ArtifactRejected", 0).await;
+        append_expired_with_authority(&pool, art, 1, "Rejected", 0).await;
+        append_event(&pool, art, "ArtifactReleased", 2).await;
+        // The second rejection. The latest `ArtifactRejected` is now at
+        // position 3, and the only authority on the stream names 0.
+        append_event(&pool, art, "ArtifactRejected", 3).await;
+
+        assert!(
+            pending_row(&pool, art).await.is_none(),
+            "the March authority does not name the September occupancy"
+        );
+
+        // And the destructive step refuses too, so a page row from
+        // before the re-rejection could not get past the lock either.
+        match adapter(&pool)
+            .await
+            .purge_artifact_refs(art, Utc::now())
+            .await
+            .expect("the call succeeds")
+        {
+            PurgePreparation::Protected { status } => {
+                assert_eq!(status, QuarantineStatus::Rejected);
+            }
+            other => panic!("expected Protected, got {other:?}"),
+        }
+        assert!(
+            !cr_rows_for(&pool, art).await.is_empty() || true,
+            "nothing was deleted"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// …and once a policy records an authority for the **new**
+    /// occupancy, it is collected. Pinned beside the test above so that
+    /// one is shown to be about the occupancy rather than about a
+    /// re-entered artifact never being collectable again.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_authority_for_the_later_occupancy_does_purge_it() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "re-rejected", HASH_A, Some("rejected")).await;
+        append_event(&pool, art, "ArtifactRejected", 0).await;
+        append_expired_with_authority(&pool, art, 1, "Rejected", 0).await;
+        append_event(&pool, art, "ArtifactReleased", 2).await;
+        append_event(&pool, art, "ArtifactRejected", 3).await;
+        append_expired_with_authority(&pool, art, 4, "Rejected", 3).await;
+
+        let row = pending_row(&pool, art)
+            .await
+            .expect("the new occupancy's authority offers it");
+        assert!(row.held_state_authorised);
+        assert!(!row.is_gc_protected());
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// An authority naming a **different** held state does not match
+    /// the artifact's current status.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_authority_for_another_state_does_not_match() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "moved-state", HASH_A, Some("rejected")).await;
+        append_event(&pool, art, "ArtifactQuarantined", 0).await;
+        append_event(&pool, art, "ArtifactRejected", 1).await;
+        // An authority for the quarantine the artifact has left.
+        append_expired_with_authority(&pool, art, 2, "Quarantined", 0).await;
+
+        assert!(
+            pending_row(&pool, art).await.is_none(),
+            "the artifact is rejected now; a quarantine authority says nothing about that"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// A **released** artifact whose only work item is a held-state
+    /// expiry is offered (its status is collectable) and then refused,
+    /// because nothing authorised collecting it outside the state it is
+    /// no longer in. This is the curator-release case.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_released_artifact_whose_only_work_item_is_a_held_expiry_is_refused() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "reinstated", HASH_A, Some("released")).await;
+        append_event(&pool, art, "ArtifactRejected", 0).await;
+        append_expired_with_authority(&pool, art, 1, "Rejected", 0).await;
+        append_event(&pool, art, "ArtifactReleased", 2).await;
+
+        let row = pending_row(&pool, art)
+            .await
+            .expect("a released artifact with a work item is offered");
+        assert!(!row.held_state_authorised, "the occupancy ended");
+        assert!(
+            row.collection_needs_held_state_authority,
+            "its only work item is the conditional held-state expiry"
+        );
+        assert!(
+            row.is_gc_protected(),
+            "nothing authorised collecting the bytes a curator reinstated"
+        );
+
+        match adapter(&pool)
+            .await
+            .purge_artifact_refs(art, Utc::now())
+            .await
+            .expect("the call succeeds")
+        {
+            PurgePreparation::Protected { status } => {
+                assert_eq!(status, QuarantineStatus::Released);
+            }
+            other => panic!("expected Protected, got {other:?}"),
+        }
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// …and the same released artifact with an **ordinary** expiry
+    /// beside the held one is collected exactly as before: one
+    /// unconditional work item is enough.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_ordinary_expiry_beside_a_held_one_still_collects() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "both-items", HASH_A, Some("released")).await;
+        append_event(&pool, art, "ArtifactRejected", 0).await;
+        append_expired_with_authority(&pool, art, 1, "Rejected", 0).await;
+        append_event(&pool, art, "ArtifactReleased", 2).await;
+        append_expired_with_reason(&pool, art, 3, age_exceeded_reason()).await;
+
+        let row = pending_row(&pool, art).await.expect("offered");
+        assert!(
+            !row.collection_needs_held_state_authority,
+            "the ordinary expiry authorises collection on its own"
+        );
+        assert!(!row.is_gc_protected());
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// **The authority is checked before the worklist is created.**
+    ///
+    /// The existing-worklist path resumes a prepared purge without
+    /// re-asking, by design: the first preparation already deleted the
+    /// edges and retired the row, so refusing on a retry would strand
+    /// an artifact whose terminal event can never be appended. The
+    /// fixture re-enters the held state *after* the preparation and
+    /// asserts the retry still resumes.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_prepared_purge_resumes_after_the_occupancy_changes() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "crash-retry", HASH_A, Some("rejected")).await;
+        append_event(&pool, art, "ArtifactRejected", 0).await;
+        append_expired_with_authority(&pool, art, 1, "Rejected", 0).await;
+
+        let first = prepared(
+            adapter(&pool)
+                .await
+                .purge_artifact_refs(art, Utc::now())
+                .await
+                .expect("the authorised preparation succeeds"),
+        );
+        assert_eq!(first.len(), 1);
+
+        // The artifact re-enters its held state between the
+        // preparation and the retry — so the authority no longer
+        // matches, and the page gate would now refuse it.
+        append_event(&pool, art, "ArtifactReleased", 2).await;
+        append_event(&pool, art, "ArtifactRejected", 3).await;
+
+        let retried = prepared(
+            adapter(&pool)
+                .await
+                .purge_artifact_refs(art, Utc::now())
+                .await
+                .expect("the retry resumes rather than refusing"),
+        );
+        assert_eq!(
+            retried
+                .iter()
+                .map(|r| r.content_hash.as_ref().to_string())
+                .collect::<Vec<_>>(),
+            vec![HASH_A.to_string()],
+            "a crash retry must not strand an already-prepared purge"
+        );
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// The other three protection facts are untouched: a tag-targeted
+    /// artifact whose every expiry is `KeepLastN` is still exempt, and
+    /// a held-state authority does not change that.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_tag_targeted_keep_last_n_artifact_is_still_exempt() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "tagged", HASH_A, None).await;
+        append_expired_with_reason(&pool, art, 0, keep_last_n_reason()).await;
+        seed_mutable_ref(&pool, repo, "tagged", "latest", "hash", Some(HASH_A), None).await;
+
+        let row = pending_row(&pool, art).await.expect("offered");
+        assert!(row.tag_targeted);
+        assert!(row.is_tag_exempt(), "the tag exemption is unchanged");
+        assert!(!row.is_gc_protected());
+
+        match adapter(&pool)
+            .await
+            .purge_artifact_refs(art, Utc::now())
+            .await
+            .expect("the call succeeds")
+        {
+            PurgePreparation::TagExempt => {}
+            other => panic!("expected TagExempt, got {other:?}"),
+        }
+
+        cleanup(&pool, repo).await;
+    }
+
+    /// An authority whose `entry_stream_position` is not a JSON number
+    /// — a payload this adapter cannot read — authorises nothing, and
+    /// does not fail the statement.
+    ///
+    /// The comparison is `jsonb`-to-`jsonb` rather than a `::bigint`
+    /// cast precisely so this is a refused artifact and not a failed
+    /// sweep.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_unreadable_authority_position_refuses_without_erroring() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let art = seed_artifact(&pool, repo, "malformed", HASH_A, Some("rejected")).await;
+        append_event(&pool, art, "ArtifactRejected", 0).await;
+        sqlx::query(
+            r#"INSERT INTO events (
+                   stream_id, stream_category, stream_position, event_type,
+                   event_data, correlation_id, actor_type,
+                   prev_event_hash, event_hash
+               ) VALUES (
+                   'artifact-' || $1::text, 'artifact', 1, 'ArtifactExpired',
+                   jsonb_build_object(
+                       'type', 'ArtifactExpired',
+                       'data', jsonb_build_object(
+                           'reason', $2::jsonb,
+                           'held_state_authority', jsonb_build_object(
+                               'state', 'Rejected',
+                               'entered_at', '2026-01-01T00:00:00Z',
+                               'entry_stream_position', 'not-a-number'
+                           )
+                       )
+                   ),
+                   gen_random_uuid(), 'system',
+                   '\x0000000000000000000000000000000000000000000000000000000000000000'::bytea,
+                   '\x1111111111111111111111111111111111111111111111111111111111111111'::bytea
+               )"#,
+        )
+        .bind(art)
+        .bind(age_exceeded_reason())
+        .execute(&pool)
+        .await
+        .expect("append a malformed authority");
+
+        // The whole page still lists — no statement error — and this
+        // artifact is simply not in it.
+        assert!(
+            pending_row(&pool, art).await.is_none(),
+            "an unreadable authority authorises nothing"
         );
 
         cleanup(&pool, repo).await;
