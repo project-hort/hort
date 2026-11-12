@@ -154,7 +154,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::error::DomainResult;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::retention_candidate_reader::RetentionCandidateReader;
 use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
@@ -753,7 +753,23 @@ impl RetentionEvaluateHandler {
         {
             Ok(RetentionContentSimulation::Exact(hashes)) => {
                 match sum_target_sizes(self.storage.as_ref(), hashes).await {
-                    Ok(bytes) => json!({ "status": "exact", "bytes": bytes }),
+                    // `exact` is reserved for a sum over every target, and
+                    // the literal zero in the pattern is what reserves it: a
+                    // figure that left a target out travels as `at_least`,
+                    // carrying the count that says how many are missing from
+                    // it. The common case keeps its shape on the wire.
+                    Ok(TargetSizes {
+                        bytes,
+                        unresolved_targets: 0,
+                    }) => json!({ "status": "exact", "bytes": bytes }),
+                    Ok(TargetSizes {
+                        bytes,
+                        unresolved_targets,
+                    }) => json!({
+                        "status": "at_least",
+                        "bytes": bytes,
+                        "unresolved_targets": unresolved_targets,
+                    }),
                     Err(reason) => json!({ "status": "omitted", "reason": reason }),
                 }
             }
@@ -870,62 +886,84 @@ fn proposal_digest(scope: &str, pairs: &ProposalPairs) -> serde_json::Value {
     })
 }
 
-/// Sum the stored size of every reclaimable target, or say why no sum may be
-/// reported. Fans the probes out [`SIZE_PROBE_CONCURRENCY`] at a time.
+/// What probing every reclaimable target's stored size established: the sum
+/// over the targets storage answered for, and how many it did not.
 ///
-/// # Why the two failure reasons are ranked rather than raced
+/// The two halves travel together because neither is interpretable alone.
+/// `bytes` is a total when `unresolved_targets` is zero and a lower bound
+/// otherwise, so the count is the only thing that says which — a consumer
+/// handed the figure without it is holding a floor it will render as a total.
+struct TargetSizes {
+    bytes: u64,
+    unresolved_targets: u64,
+}
+
+/// Sum the stored size of every reclaimable target, counting the targets
+/// storage did not answer for instead of abandoning the figure. Fans the
+/// probes out [`SIZE_PROBE_CONCURRENCY`] at a time.
 ///
-/// Concurrently, "the first error" is a property of the scheduler, not of the
-/// input: which of several failing probes lands first varies run to run, and
-/// so would the sentence the operator reads. Both failures are ranked instead,
-/// so the verdict is a function of the target set and the storage's answers
-/// alone and reproduces across runs:
+/// # A failed probe lowers the figure; it does not erase it
 ///
-/// 1. **A failed probe outranks everything.** It is not a preference: a failed
-///    probe means the set of measured targets is incomplete, and no claim
-///    about the total — including the claim that it overflowed — can be
-///    founded on addends that were never observed. The fan-out is abandoned
-///    the moment one probe fails, which also keeps a doomed preview from
-///    paying for the remaining round trips.
-/// 2. **Overflow is decided only over a complete set.** The accumulator is
-///    widened to `u128`, which cannot overflow for any input this path admits
-///    (at most [`MAX_SIMULATION_TARGETS`] addends below `2^64`, so below
-///    `2^81`), and the narrowing to `u64` happens once, at the end. Order
-///    therefore cannot change the answer: addition commutes, and the
-///    intermediate sums no longer have a ceiling to trip over. `saturating_add`
-///    keeps the impossible case impossible rather than a debug-build panic; a
-///    saturated total still fails the narrowing and is reported as an
-///    overflow.
+/// The sum over the targets that resolved is a lower bound on what a purge
+/// would free in **every** failure mode, which is why one count covers all of
+/// them and the two modes need not be ranked:
 ///
-/// A partial sum is never returned: the only `Ok` is a total over every
-/// target, narrowed without loss.
+/// - a target storage reports as **absent** frees nothing when purged anyway
+///   — [`StoragePort::delete`] is success-on-missing and the purge treats an
+///   already-absent blob as a clean no-op — so the sum is in fact exact for
+///   what would really be freed;
+/// - any **other** storage error leaves that target's size unknown and the
+///   object possibly present, so the sum is a genuine floor.
+///
+/// An informational figure must therefore degrade rather than vanish: one
+/// unanswered probe out of thousands used to suppress the whole number, which
+/// told an operator strictly less than the floor does. Each failure still
+/// emits its own `warn` naming its hash — the log is where an operator finds
+/// *which* objects, the count says *how many* — and the summary names no
+/// hash, because "whichever probe failed first" under a concurrent fan-out is
+/// a property of the scheduler rather than of the target set, and cannot tell
+/// one missing object from a thousand.
+///
+/// # Overflow is the one outcome with no number behind it
+///
+/// The accumulator is widened to `u128`, which cannot overflow for any input
+/// this path admits (at most [`MAX_SIMULATION_TARGETS`] addends below `2^64`,
+/// so below `2^81`), and the narrowing to `u64` happens once, at the end.
+/// Order therefore cannot change the answer: addition commutes, and the
+/// intermediate sums have no ceiling to trip over. `saturating_add` keeps the
+/// impossible case impossible rather than a debug-build panic; a saturated
+/// total still fails the narrowing.
+///
+/// A sum that does not fit in `u64` is the only `Err` this reports, and it
+/// outranks any count of unresolved targets — not as a preference, but
+/// because a floor that cannot be represented is not a floor anyone can read,
+/// and `u64::MAX` would be a saturated number dressed up as a sum.
 async fn sum_target_sizes(
     storage: &dyn StoragePort,
     hashes: Vec<ContentHash>,
-) -> Result<u64, String> {
+) -> Result<TargetSizes, String> {
     let mut probes = futures::stream::iter(hashes)
         .map(|hash| async move { (hash.clone(), storage.size_of(&hash).await) })
         .buffer_unordered(SIZE_PROBE_CONCURRENCY);
 
     let mut total: u128 = 0;
+    let mut unresolved_targets: u64 = 0;
     while let Some((hash, outcome)) = probes.next().await {
         match outcome {
             Ok(size) => total = total.saturating_add(u128::from(size)),
             Err(error) => {
                 tracing::warn!(hash = %hash, error = %error, "retention dry-run storage size lookup failed");
-                return Err(match error {
-                    DomainError::NotFound {
-                        entity: "content", ..
-                    } => {
-                        format!("reclaimable target {hash} is missing from storage")
-                    }
-                    _ => format!("storage did not answer for reclaimable target {hash}: {error}"),
-                });
+                unresolved_targets += 1;
             }
         }
     }
 
-    u64::try_from(total).map_err(|_| "byte total overflowed u64".to_string())
+    u64::try_from(total)
+        .map(|bytes| TargetSizes {
+            bytes,
+            unresolved_targets,
+        })
+        .map_err(|_| "byte total overflowed u64".to_string())
 }
 
 /// Phrase a bound rejection so the operator can act on it: which ceiling, what
@@ -1225,11 +1263,15 @@ mod tests {
     struct InertStorage {
         sizes: std::collections::HashMap<ContentHash, u64>,
         fail_size: bool,
-        missing_size: Option<ContentHash>,
-        /// When set, only this target's probe fails and every other one
-        /// answers from `sizes`. Lets one run carry both a failing probe and
-        /// a sum that would overflow, which is what pins which verdict wins.
-        fail_only: Option<ContentHash>,
+        /// Targets whose probe answers `NotFound`.
+        missing_sizes: std::collections::HashSet<ContentHash>,
+        /// Targets whose probe answers a non-`NotFound` error; every other
+        /// one answers from `sizes`. A set rather than one hash because two
+        /// properties need more than a single failure: that a run can carry
+        /// failing probes *and* a sum that would overflow, which pins which
+        /// verdict wins, and that several failures report a count rather
+        /// than one of themselves.
+        unanswered: std::collections::HashSet<ContentHash>,
         /// How many `yield_now` points each probe passes before answering.
         /// Zero — the default — resolves on the first poll, which is what
         /// every test that is not about the fan-out wants. A non-zero value
@@ -1248,7 +1290,7 @@ mod tests {
         }
         fn missing(hash: ContentHash) -> Self {
             Self {
-                missing_size: Some(hash),
+                missing_sizes: [hash].into(),
                 ..Default::default()
             }
         }
@@ -1264,7 +1306,22 @@ mod tests {
         ) -> Self {
             Self {
                 sizes,
-                fail_only: Some(hash),
+                unanswered: [hash].into(),
+                ..Default::default()
+            }
+        }
+        /// Several unresolved targets at once, across both failure modes:
+        /// `missing` answers `NotFound`, `unanswered` answers some other
+        /// error, and every other target answers from `sizes`.
+        fn with_unresolved(
+            sizes: std::collections::HashMap<ContentHash, u64>,
+            missing: impl IntoIterator<Item = ContentHash>,
+            unanswered: impl IntoIterator<Item = ContentHash>,
+        ) -> Self {
+            Self {
+                sizes,
+                missing_sizes: missing.into_iter().collect(),
+                unanswered: unanswered.into_iter().collect(),
                 ..Default::default()
             }
         }
@@ -1314,13 +1371,13 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                if self.missing_size.as_ref() == Some(&hash) {
+                if self.missing_sizes.contains(&hash) {
                     return Err(DomainError::NotFound {
                         entity: "content",
                         id: hash.to_string(),
                     });
                 }
-                if self.fail_size || self.fail_only.as_ref() == Some(&hash) {
+                if self.fail_size || self.unanswered.contains(&hash) {
                     return Err(DomainError::Invariant("size unavailable".into()));
                 }
                 Ok(self.sizes.get(&hash).copied().unwrap_or(0))
@@ -2155,25 +2212,63 @@ mod tests {
         );
     }
 
+    /// Nothing resolving is the boundary of the floor rather than a case of
+    /// its own: the sum over no answers is zero, and the count beside it is
+    /// what keeps that zero from reading as "nothing to free".
     #[tokio::test]
-    async fn preview_omits_bytes_when_storage_size_is_unavailable() {
-        let hash: ContentHash = "1111111111111111111111111111111111111111111111111111111111111111"
-            .parse()
-            .unwrap();
+    async fn a_run_where_no_probe_answers_reports_a_zero_floor_and_the_full_count() {
+        let targets: Vec<ContentHash> = (0..3).map(hash_n).collect();
         let h = preview_handler(
-            Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![hash]))),
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
             Arc::new(InertStorage::failing()),
         );
-        let omitted = h.build_preview(Utc::now(), &[]).await;
-        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
-        assert!(omitted["freed_bytes"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("size"));
+
+        let freed = h.build_preview(Utc::now(), &[]).await["freed_bytes"].clone();
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(freed["bytes"], 0, "{freed}");
+        assert_eq!(freed["unresolved_targets"], 3, "{freed}");
     }
 
+    /// The common case is the one real cost of adding a status, so pin its
+    /// shape and not only its value: an all-resolved run carries the two keys
+    /// it has always carried and no third one, so a consumer written against
+    /// the older wire reads it exactly as before.
     #[tokio::test]
-    async fn preview_distinguishes_missing_target_from_store_failure_without_partial_bytes() {
+    async fn every_target_resolving_keeps_the_shape_the_wire_already_had() {
+        let targets: Vec<ContentHash> = (0..3).map(hash_n).collect();
+        let sizes = targets
+            .iter()
+            .map(|t| (t.clone(), 7_u64))
+            .collect::<std::collections::HashMap<_, _>>();
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
+            Arc::new(InertStorage::with_sizes(sizes)),
+        );
+
+        let freed = h.build_preview(Utc::now(), &[]).await["freed_bytes"].clone();
+        assert_eq!(freed["status"], "exact");
+        assert_eq!(freed["bytes"], 21, "{freed}");
+        let keys: BTreeSet<&str> = freed
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["status", "bytes"]),
+            "an all-resolved run carries no count: {freed}"
+        );
+    }
+
+    /// Both failure modes support the same claim — the figure is a floor —
+    /// so both report it, and nothing in the summary tells them apart. An
+    /// absent target frees nothing when purged, so the floor is in fact exact
+    /// there; any other error leaves the size unknown and the object possibly
+    /// present, so the floor is a genuine bound. Neither supports a sentence
+    /// the other does not.
+    #[tokio::test]
+    async fn an_absent_target_and_an_unanswered_one_report_the_same_floor() {
         let hash = hash_n(7);
         let preview = || {
             Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![
@@ -2187,27 +2282,16 @@ mod tests {
             .build_preview(Utc::now(), &[])
             .await;
 
-        for outcome in [&missing, &unavailable] {
-            assert_eq!(outcome["freed_bytes"]["status"], "omitted");
-            assert!(outcome["freed_bytes"]["bytes"].is_null(), "{outcome}");
-        }
-        let missing_reason = missing["freed_bytes"]["reason"].as_str().expect("reason");
-        let unavailable_reason = unavailable["freed_bytes"]["reason"]
-            .as_str()
-            .expect("reason");
-        assert!(missing_reason.contains("missing"), "{missing_reason}");
-        assert!(
-            unavailable_reason.contains("storage did not answer"),
-            "{unavailable_reason}"
+        assert_eq!(
+            missing["freed_bytes"], unavailable["freed_bytes"],
+            "one label covers both failure modes"
         );
-        assert_ne!(missing_reason, unavailable_reason);
+        let freed = &missing["freed_bytes"];
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(freed["unresolved_targets"], 1, "{freed}");
         assert!(
-            missing_reason.contains(&hash.to_string()),
-            "{missing_reason}"
-        );
-        assert!(
-            unavailable_reason.contains(&hash.to_string()),
-            "{unavailable_reason}"
+            !freed.to_string().contains(&hash.to_string()),
+            "the hash belongs in the log, not the summary: {freed}"
         );
     }
 
@@ -2272,14 +2356,14 @@ mod tests {
         );
     }
 
-    /// The property with no acceptable failure mode: whatever a failing probe
-    /// does to the verdict, it must never leave a figure behind. The failing
-    /// target is the last of 128 here and every other one answers, so a
-    /// short-circuit that kept its accumulator would be holding a large,
-    /// plausible, wrong number at the moment it gave up.
+    /// One unanswered probe out of 128 used to suppress the whole figure,
+    /// which told an operator strictly less than the floor does. The failing
+    /// target is the last one here and every other answers, so the figure
+    /// reported is the sum over the rest — never presented as a total.
     #[tokio::test]
-    async fn a_failed_probe_omits_the_figure_instead_of_reporting_what_it_did_measure() {
+    async fn one_unresolved_target_reports_the_floor_over_the_targets_that_answered() {
         let targets: Vec<ContentHash> = (0..SIZE_PROBE_CONCURRENCY * 2).map(hash_n).collect();
+        let answered = targets.len() as u64 - 1;
         let sizes = targets
             .iter()
             .map(|t| (t.clone(), 1_000_u64))
@@ -2290,16 +2374,115 @@ mod tests {
             Arc::new(InertStorage::failing_only(doomed, sizes)),
         );
 
-        let omitted = h.build_preview(Utc::now(), &[]).await;
-        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
-        assert!(
-            omitted["freed_bytes"]["bytes"].is_null(),
-            "a partial sum must never be emitted, as `exact` or otherwise: {omitted}"
+        let freed = h.build_preview(Utc::now(), &[]).await["freed_bytes"].clone();
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(freed["unresolved_targets"], 1, "{freed}");
+        assert_eq!(
+            freed["bytes"],
+            serde_json::json!(answered * 1_000),
+            "the floor is the sum over the targets that answered: {freed}"
         );
-        assert!(omitted["freed_bytes"]["reason"]
-            .as_str()
-            .expect("reason")
-            .contains("size"));
+    }
+
+    /// The assertion that pins the actual defect. The old summary named
+    /// whichever probe failed first under the fan-out — a scheduler property
+    /// that cannot tell one missing object from a thousand. A count can, and
+    /// it is a count in both failure modes at once.
+    #[tokio::test]
+    async fn several_unresolved_targets_report_how_many_rather_than_which_one() {
+        let targets: Vec<ContentHash> = (0..10).map(hash_n).collect();
+        let sizes = targets
+            .iter()
+            .map(|t| (t.clone(), 5_u64))
+            .collect::<std::collections::HashMap<_, _>>();
+        let absent = [hash_n(0), hash_n(1), hash_n(2)];
+        let unanswered = [hash_n(9)];
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
+            Arc::new(InertStorage::with_unresolved(
+                sizes,
+                absent.clone(),
+                unanswered.clone(),
+            )),
+        );
+
+        let freed = h.build_preview(Utc::now(), &[]).await["freed_bytes"].clone();
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(
+            freed["unresolved_targets"], 4,
+            "four targets did not resolve, in two different modes: {freed}"
+        );
+        assert_eq!(
+            freed["bytes"], 30,
+            "six targets of five bytes answered: {freed}"
+        );
+        let rendered = freed.to_string();
+        for hash in absent.iter().chain(unanswered.iter()) {
+            assert!(
+                !rendered.contains(&hash.to_string()),
+                "the summary says how many, never which: {rendered}"
+            );
+        }
+    }
+
+    /// The count says how many; the log says which. Every failing probe keeps
+    /// its own line, because the hash an operator needs in order to act on a
+    /// target the registry references and storage does not hold is only there.
+    #[test]
+    fn every_failed_probe_names_its_own_hash_in_its_own_warning() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let targets: Vec<ContentHash> = (0..4).map(hash_n).collect();
+        let sizes = targets
+            .iter()
+            .map(|t| (t.clone(), 2_u64))
+            .collect::<std::collections::HashMap<_, _>>();
+        let unresolved = [hash_n(0), hash_n(2), hash_n(3)];
+        let (preview, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a current-thread runtime, so every warning is captured");
+            rt.block_on(async {
+                preview_handler(
+                    Arc::new(FixedPreview(RetentionContentSimulation::Exact(
+                        targets.clone(),
+                    ))),
+                    Arc::new(InertStorage::with_unresolved(
+                        sizes,
+                        [hash_n(0), hash_n(2)],
+                        [hash_n(3)],
+                    )),
+                )
+                .build_preview(Utc::now(), &[])
+                .await
+            })
+        });
+
+        assert_eq!(preview["freed_bytes"]["unresolved_targets"], 3);
+        let probe_lines: Vec<_> = captured
+            .iter()
+            .filter(|e| e.message().contains("storage size lookup failed"))
+            .collect();
+        assert_eq!(
+            probe_lines.len(),
+            unresolved.len(),
+            "one warning per failed probe, not one for the run"
+        );
+        assert!(
+            probe_lines.iter().all(|e| e.level == tracing::Level::WARN),
+            "a target the registry references and storage cannot size is a warning"
+        );
+        let logged: BTreeSet<String> = probe_lines
+            .iter()
+            .filter_map(|e| e.field("hash"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            logged,
+            unresolved.iter().map(ContentHash::to_string).collect(),
+            "each line names its own target"
+        );
     }
 
     /// Overflow is decided once, over the complete target set, and by a
@@ -2330,14 +2513,14 @@ mod tests {
             .contains("overflowed"));
     }
 
-    /// Concurrently there is no "first" error, so the two failure reasons are
-    /// ranked rather than raced. A failed probe wins: with one target
-    /// unmeasured, "the total overflowed" would be a claim about addends that
-    /// were never observed. The run here makes both conditions true at once —
-    /// the two measured targets alone overflow `u64`, and a third probe fails
-    /// — so only the ranking decides the sentence the operator reads.
+    /// A floor the wire cannot carry is the one outcome with no number
+    /// behind it, so overflow outranks the count. The run here makes both
+    /// conditions true at once — the two targets that answer overflow `u64`
+    /// between them, and a third probe fails — so only the ranking decides
+    /// what the operator reads. Saturating to `u64::MAX` and labelling it a
+    /// floor would be a figure nothing measured.
     #[tokio::test]
-    async fn a_failed_probe_outranks_an_overflowing_total() {
+    async fn an_unrepresentable_floor_is_omitted_whatever_the_unresolved_count() {
         let measured = [hash_n(1), hash_n(2)];
         let doomed = hash_n(3);
         let sizes = measured
@@ -2354,10 +2537,17 @@ mod tests {
         assert_eq!(omitted["freed_bytes"]["status"], "omitted");
         let reason = omitted["freed_bytes"]["reason"].as_str().expect("reason");
         assert!(
-            reason.contains("unavailable"),
-            "an unmeasured target outranks an overflow verdict it would have to invent: {reason}"
+            reason.contains("overflowed"),
+            "a floor that does not fit in u64 is no floor to report: {reason}"
         );
-        assert!(!reason.contains("overflowed"), "{reason}");
+        assert!(
+            omitted["freed_bytes"]["bytes"].is_null(),
+            "an omission never carries a figure: {omitted}"
+        );
+        assert!(
+            omitted["freed_bytes"]["unresolved_targets"].is_null(),
+            "nor a count, which would read as a floor it does not carry: {omitted}"
+        );
     }
 
     /// The width's justification is a range rather than a point: a fan-out

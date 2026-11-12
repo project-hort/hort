@@ -114,6 +114,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A retention dry run's `freed_bytes` estimate no longer vanishes because one
+  reclaimable target is missing from storage: it reports the sum over the
+  targets it could size as `at_least`, with a count of the ones it could not,
+  and `hort-cli admin retention preview` renders that as a floor (#281).
 - An OCI image index is refused at push when a child it names has no manifest
   in the repository (only a blob under that digest), or when anything the
   child itself binds carries a terminal verdict — previously both pushes
