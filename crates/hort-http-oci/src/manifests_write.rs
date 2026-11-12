@@ -1882,13 +1882,17 @@ async fn put_manifest_dispatch_inner(
     let manifest_event_id = ingest_outcome.ingested_event_id;
     let manifest_digest = hashes.computed_hash.clone();
 
-    // The unresolved-reference answer lands HERE — after the mint — and
-    // that is the unchanged contract, not an oversight: a manifest
-    // referencing blobs the client has not pushed yet stays committed so the
-    // retry-after-pushing path is idempotent. A manifest refused for a
-    // TERMINAL constituent stays committed too, and that half buys the
-    // client nothing — no re-push changes the answer — but it is the
-    // behaviour this route already had and a decision of its own to change.
+    // The unresolved-reference answer lands HERE — after the mint — and the
+    // mint is the decided behaviour, not an inherited default: a principal
+    // holding Write may execute a PUT and rely on the artifact existing
+    // afterwards, so a refusal binds delivery and never ingest (ADR 0062).
+    // For a merely ABSENT constituent that guarantee is also what makes the
+    // retry-after-pushing path idempotent. For a TERMINAL one no re-push
+    // changes the answer, and the mint is not conditioned on that:
+    // deliverability is resolved from the manifest's own bytes on the next
+    // read rather than from anything recorded here, so if curation ever
+    // clears the constituent the manifest is already present to become
+    // deliverable, with nothing pushed a second time.
     // Either way the manifest carries no membership claims, which is what
     // the post-ingest insert loop this replaced already left behind on this
     // path (its gate returned before the first insert).

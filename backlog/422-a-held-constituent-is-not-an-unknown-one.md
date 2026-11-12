@@ -109,7 +109,11 @@ read route it mirrors.
   decision, but it carries its own blast radius — idempotency of a later
   re-push, the artifact's event stream, and the `capped_stream_writes`
   discipline — so it is a separate decision, queued for the maintainer. **Keep
-  the current mint behaviour exactly as it is.**
+  the current mint behaviour exactly as it is.** *(Answered 2026-11-12: ADR
+  0062's amendment withdraws the mint half of §2 — a principal holding Write
+  may execute a PUT and rely on the artifact existing afterwards — so the mint
+  on a refused path is the decided behaviour and no longer a queued decision.
+  The instruction above stands, for that reason instead of this one.)*
 - The `incomplete_composition` media-type vocabulary gap
   (`layer_media_type_is_openable` accepting the uncompressed OCI spelling but
   not Docker's). Separate finding, separate measurement.
