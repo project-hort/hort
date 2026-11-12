@@ -109,6 +109,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An OCI image index is refused at push when a child it names has no manifest
+  in the repository (only a blob under that digest), or when anything the
+  child itself binds carries a terminal verdict — previously both pushes
+  answered `201` and the image could never be pulled (#429).
+- An OCI manifest or blob `GET` whose artifact turns terminal mid-request now
+  answers that status's own refusal (`403`/`503`) and records it, instead of
+  `500` with nothing in the registry's own log (#429).
 - An artifact whose embedded dependency declaration cannot be read is no
   longer recorded as a clean scan under a policy whose only backend adjudicates
   the component list — it is held instead. Affects PyPI, Cargo and Maven

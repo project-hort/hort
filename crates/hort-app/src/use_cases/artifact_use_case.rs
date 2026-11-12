@@ -1123,6 +1123,42 @@ impl ArtifactUseCase {
         }
     }
 
+    /// Repo-scoped **path** lookup — the sibling of
+    /// [`Self::find_in_repo_by_hash`] for a caller that must resolve the
+    /// same row a later read of that path will resolve. The caller
+    /// supplies a pre-authz'd `repo_id` (typically from
+    /// `WriteRepoAccess` on a manifest PUT), exactly as the hash-keyed
+    /// sibling does.
+    ///
+    /// **Why a second repo-scoped loader rather than a filter on the
+    /// first.** `artifacts` is unique on `(repository_id, path)` and not
+    /// on the checksum, so one repository can hold several rows for one
+    /// hash — a format's own layout is what keeps them apart, and the
+    /// OCI adapter relies on exactly that to let a manifest and a blob
+    /// share bytes. The hash-keyed lookup behind
+    /// [`Self::find_in_repo_by_hash`] is a `LIMIT 1` with no `ORDER BY`,
+    /// so it answers "some row for these bytes" and cannot answer "the
+    /// row a reader addressing this path would get". A caller that must
+    /// agree with a read path — one admitting a document that names
+    /// another, where the admission verdict and the later delivery have
+    /// to be about the same row — asks here instead, and the row it sees
+    /// is the row delivery sees.
+    ///
+    /// Hydrated through [`Self::hydrate_quarantine_deadline`], like
+    /// every other read-path loader, so a consumer cannot tell from the
+    /// row which one produced it.
+    #[tracing::instrument(skip(self))]
+    pub async fn find_in_repo_by_path(
+        &self,
+        repo_id: Uuid,
+        path: &str,
+    ) -> AppResult<Option<Artifact>> {
+        match self.artifacts.find_by_path(repo_id, path).await? {
+            Some(artifact) => Ok(Some(self.hydrate_quarantine_deadline(artifact).await?)),
+            None => Ok(None),
+        }
+    }
+
     /// Range-aware download. Folds the `storage.get_range` bypass from
     /// OCI `blobs.rs:334`. Callers pre-authz'd via
     /// [`Self::find_visible_by_path`] / [`Self::find_visible_by_id`];
@@ -5071,6 +5107,148 @@ mod visibility_extension_tests {
             .await
             .unwrap();
         assert!(got.is_none());
+    }
+
+    // -- find_in_repo_by_path ---------------------------------------------
+
+    /// The whole reason this loader exists beside the hash-keyed one: a
+    /// repository may hold two rows for one hash under different paths,
+    /// and only the path says which one a reader addressing that path
+    /// gets. The hash-keyed lookup is a `LIMIT 1` with no `ORDER BY`, so
+    /// it can answer either — which is why a caller that has to agree
+    /// with a read path cannot be built on it.
+    #[tokio::test]
+    async fn find_in_repo_by_path_picks_the_row_at_that_path_among_rows_sharing_a_hash() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let blob_row = artifact_in_repo(repo_id, "blobs/sha256:x", VALID_SHA256);
+        let manifest_row = artifact_in_repo(repo_id, "manifests/sha256:x", VALID_SHA256);
+        artifacts.insert(blob_row.clone());
+        artifacts.insert(manifest_row.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert_eq!(
+            uc.find_in_repo_by_path(repo_id, "manifests/sha256:x")
+                .await
+                .unwrap()
+                .expect("the manifest row resolves")
+                .id,
+            manifest_row.id
+        );
+        assert_eq!(
+            uc.find_in_repo_by_path(repo_id, "blobs/sha256:x")
+                .await
+                .unwrap()
+                .expect("the blob row resolves")
+                .id,
+            blob_row.id
+        );
+    }
+
+    /// Repo-scoped, like its hash-keyed sibling: the same path in another
+    /// repository is not a candidate (ADR 0008 cross-repo isolation).
+    #[tokio::test]
+    async fn find_in_repo_by_path_isolates_across_repos() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let repo_a = public_repo("repo-a");
+        let repo_b = public_repo("repo-b");
+        let (id_a, id_b) = (repo_a.id, repo_b.id);
+        repos.insert(repo_a);
+        repos.insert(repo_b);
+        artifacts.insert(artifact_in_repo(id_a, "manifests/sha256:x", VALID_SHA256));
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert!(uc
+            .find_in_repo_by_path(id_a, "manifests/sha256:x")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            uc.find_in_repo_by_path(id_b, "manifests/sha256:x")
+                .await
+                .unwrap()
+                .is_none(),
+            "a path in another repository is not a candidate"
+        );
+    }
+
+    /// Hydrated like every other read-path loader, so a consumer cannot
+    /// tell from the row which one produced it — the deadline measured
+    /// from the stored anchor, not from `now`.
+    #[tokio::test]
+    async fn find_in_repo_by_path_hydrates_the_deadline_from_the_stored_anchor() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_policy(repo_id, 600));
+
+        let anchor = Utc::now() - chrono::Duration::minutes(5);
+        let mut a = artifact_in_repo(repo_id, "manifests/sha256:x", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(anchor);
+        artifacts.insert(a);
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies);
+        let got = uc
+            .find_in_repo_by_path(repo_id, "manifests/sha256:x")
+            .await
+            .unwrap()
+            .expect("the seeded row must resolve");
+        assert_eq!(
+            got.quarantine_deadline,
+            Some(anchor + chrono::Duration::seconds(600))
+        );
+    }
+
+    /// A port failure propagates rather than reading as "no such row":
+    /// an admission check built on this must not take a failed lookup
+    /// for an absent child.
+    #[tokio::test]
+    async fn find_in_repo_by_path_propagates_a_port_failure() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        artifacts.fail_next_find_by_path(DomainError::Invariant("boom".into()));
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert!(uc
+            .find_in_repo_by_path(Uuid::new_v4(), "manifests/sha256:x")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn find_in_repo_by_path_returns_none_when_the_path_is_not_in_the_repo() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert!(uc
+            .find_in_repo_by_path(Uuid::new_v4(), "manifests/sha256:absent")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // -- download_range ---------------------------------------------------

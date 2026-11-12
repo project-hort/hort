@@ -67,6 +67,7 @@ use hort_formats::oci::OciFormatHandler;
 
 use super::coords::oci_blob_coords;
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
+use super::download_refusal::{self, FailedDownload};
 use super::error::OciError;
 use super::quarantine;
 use super::refusal::{log_refused_read, ReadRoute, RefusalReason, RefusedRead};
@@ -799,6 +800,11 @@ pub(super) async fn serve(
                 if head {
                     return build_206_response(&artifact, &hash, &range, /* body = */ None);
                 }
+                // A refusal from the ranged read is answered in the
+                // refused status's own envelope and recorded, not
+                // reported as a server fault: the row can turn terminal
+                // between step 5's gate and `download_range`'s own
+                // re-read. See `crate::download_refusal`.
                 let (_a, stream) = match ctx
                     .artifact_use_case
                     .download_range(artifact.id, range.clone())
@@ -806,12 +812,16 @@ pub(super) async fn serve(
                 {
                     Ok(r) => r,
                     Err(e) => {
-                        tracing::error!(
-                            artifact_id = %artifact.id,
-                            error = %e,
-                            "OCI blob download_range failed after lookup"
-                        );
-                        return OciError::Internal.into_response();
+                        return download_refusal::response_for(
+                            &ctx,
+                            &FailedDownload {
+                                error: &e,
+                                artifact_id: artifact.id,
+                                operation: "blob_download_range",
+                                refused: &refused,
+                            },
+                        )
+                        .await;
                     }
                 };
                 return build_206_response(
@@ -838,16 +848,21 @@ pub(super) async fn serve(
     // above (`download_range`) is intentionally not audited — ranged
     // resume fetches are mid-transfer bookkeeping, not new download
     // events.
+    // Same mid-read flip as the ranged path above, same answer.
     let (_artifact_after_download, stream) =
         match ctx.artifact_use_case.download(artifact.id, actor).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(
-                    artifact_id = %artifact.id,
-                    error = %e,
-                    "OCI blob download failed after lookup"
-                );
-                return OciError::Internal.into_response();
+                return download_refusal::response_for(
+                    &ctx,
+                    &FailedDownload {
+                        error: &e,
+                        artifact_id: artifact.id,
+                        operation: "blob_download",
+                        refused: &refused,
+                    },
+                )
+                .await;
             }
         };
 
@@ -6123,6 +6138,246 @@ mod tests {
             StatusCode::OK,
             "the premise of this test is an exempted probe, not a refusal"
         );
+        crate::refusal::assert_no_refusal_line(&events);
+    }
+
+    // -- the status flip inside the read ----------------------------------
+
+    /// Drive one anonymous blob `GET` of a `Released` blob whose row
+    /// flips to `flip_to` **between** the handler's own status gate and
+    /// `ArtifactUseCase::download`'s re-read of the same row — the
+    /// window a concurrent rescan lands in during normal operation.
+    ///
+    /// `ranged` selects which download call the request reaches, because
+    /// the ranged path is a second call site with its own error arm and a
+    /// fix applied to one of them is not a fix.
+    ///
+    /// Returns the status, the `Retry-After`, the body and every
+    /// `tracing` event: before this, every error from those calls mapped
+    /// to `500` and recorded nothing, so a status assertion alone cannot
+    /// settle it.
+    #[allow(clippy::type_complexity)]
+    fn blob_read_with_status_flip(
+        flip_to: QuarantineStatus,
+        axis: Option<RejectionReason>,
+        ranged: bool,
+    ) -> ((StatusCode, Option<String>, Vec<u8>), Vec<CapturedEvent>) {
+        let content = b"flipped mid-read".to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let ctx = with_provenance_hold_hydration(&h.ctx);
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let artifact_id = seed_blob(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &hex,
+                    &content,
+                    QuarantineStatus::Released,
+                );
+                if flip_to == QuarantineStatus::Rejected {
+                    h.events.set_stream(
+                        &hort_domain::events::StreamId::artifact(artifact_id),
+                        axis.map(|reason| {
+                            vec![persisted_artifact_rejected(artifact_id, reason, 1)]
+                        })
+                        .unwrap_or_default(),
+                    );
+                }
+                // The flip lands on the handler's own read: it is served
+                // the `Released` row and admits the read, and every later
+                // read of that row — the download's gate, and the refusal
+                // mapping's re-read — sees the new status.
+                h.artifacts
+                    .set_status_after_next_find_by_path(artifact_id, flip_to);
+
+                let mut request = Request::get(format!("/v2/myrepo/nginx/blobs/sha256:{hex}"));
+                if ranged {
+                    request = request.header(axum::http::header::RANGE, "bytes=0-3");
+                }
+                let resp = blob_router(ctx)
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let retry_after = resp
+                    .headers()
+                    .get("Retry-After")
+                    .map(|v| v.to_str().unwrap().to_string());
+                let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+                (status, retry_after, body)
+            })
+        })
+    }
+
+    /// **Acceptance, blob route.** The flip to `Rejected` answers that
+    /// status's own `403 DENIED` naming the digest and the axis — not the
+    /// `500` that told the caller the server broke — and leaves a
+    /// `rejected` refusal line, which this path used to leave nothing of.
+    ///
+    /// Asserted on **both** download call sites: the full-blob `GET` and
+    /// the ranged one.
+    #[test]
+    fn a_blob_read_whose_row_turns_rejected_mid_read_answers_403_and_records_it() {
+        for ranged in [false, true] {
+            let ((status, _, body), events) = blob_read_with_status_flip(
+                QuarantineStatus::Rejected,
+                Some(RejectionReason::Scanner),
+                ranged,
+            );
+            let rendered = String::from_utf8_lossy(&body);
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "ranged={ranged}: a withheld read is not a server fault: {rendered}"
+            );
+            let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(parsed["errors"][0]["code"], "DENIED", "ranged={ranged}");
+            assert_eq!(
+                parsed["errors"][0]["detail"]["axis"], "scanner",
+                "ranged={ranged}"
+            );
+            crate::refusal::assert_refusal_line(
+                &events,
+                &crate::refusal::ExpectedRefusal {
+                    level: tracing::Level::WARN,
+                    route: "blob",
+                    repository: "myrepo",
+                    name: "nginx",
+                    reference: &format!(
+                        "sha256:{}",
+                        hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"flipped mid-read"))
+                    ),
+                    digest: &hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                        b"flipped mid-read",
+                    )),
+                    status: 403,
+                    reason: "rejected",
+                },
+            );
+        }
+    }
+
+    /// The other terminal state on the same window: `503` with no
+    /// `Retry-After`, recorded as `scan_indeterminate`.
+    #[test]
+    fn a_blob_read_whose_row_turns_indeterminate_mid_read_answers_503_without_a_deadline() {
+        let ((status, retry_after, body), events) =
+            blob_read_with_status_flip(QuarantineStatus::ScanIndeterminate, None, false);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after, None, "no self-resolving deadline");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        assert!(events
+            .iter()
+            .any(|e| e.fields.contains("reason=scan_indeterminate ")));
+    }
+
+    /// **Acceptance: a genuine infrastructure failure is untouched.** The
+    /// row is `Released` and stays `Released`; the CAS read behind it
+    /// fails. The caller gets the `500` it always got, the failure is
+    /// still an `error!`, and **nothing** is recorded as a refused read —
+    /// hort did not withhold this blob, it failed to read it.
+    #[test]
+    fn a_blob_read_whose_cas_read_fails_still_answers_500_and_records_no_refusal() {
+        let content = b"unreadable".to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let ((status, body), events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                seed_blob(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &hex,
+                    &content,
+                    QuarantineStatus::Released,
+                );
+                // Every `get` for these bytes fails from here on, which is
+                // what a storage backend being unreachable looks like to
+                // the download.
+                h.storage.fail_get_persistent(hex.parse().unwrap());
+                let resp = blob_router(h.ctx.clone())
+                    .oneshot(
+                        Request::get(format!("/v2/myrepo/nginx/blobs/sha256:{hex}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+                (status, body)
+            })
+        });
+        // Hoisted: an argument to a panic message is only evaluated when
+        // the assertion fails, so inside the `assert_eq!` this line reads
+        // as uncovered in a green run.
+        let rendered = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed CAS read is a server fault and must keep saying so: {rendered}"
+        );
+        assert!(
+            events.iter().any(|e| e
+                .fields
+                .contains("the CAS download failed after the artifact was")),
+            "and it is still logged as an error: {events:?}"
+        );
+        crate::refusal::assert_no_refusal_line(&events);
+    }
+
+    /// The converse of all three: a read that is neither withheld nor
+    /// broken records nothing and serves the bytes. Without it, a
+    /// regression that refused every blob would still satisfy the
+    /// assertions above.
+    #[test]
+    fn a_blob_read_with_no_flip_and_no_fault_still_serves() {
+        let content = b"plain bytes".to_vec();
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let (status, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                seed_blob(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &hex,
+                    &content,
+                    QuarantineStatus::Released,
+                );
+                blob_router(h.ctx.clone())
+                    .oneshot(
+                        Request::get(format!("/v2/myrepo/nginx/blobs/sha256:{hex}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        });
+        assert_eq!(status, StatusCode::OK);
         crate::refusal::assert_no_refusal_line(&events);
     }
 }

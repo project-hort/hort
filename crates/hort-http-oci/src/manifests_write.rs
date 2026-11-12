@@ -33,11 +33,20 @@
 //!    media-type shape. A single-image manifest yields `config.digest` +
 //!    `layers[*].digest`; an image index / manifest list yields
 //!    `manifests[*].digest` (child **manifest** references). Resolve
-//!    each referenced blob / child through
-//!    [`ArtifactRepository::find_by_checksum`]; enforce
-//!    `artifact.repository_id == repo` (cross-repo isolation) and that
-//!    the resolved row's quarantine status is not terminal (a row the
-//!    blob read would refuse is not a satisfied reference).
+//!    each one repo-scoped (cross-repo isolation) and require that the
+//!    resolved row's quarantine status is not terminal (a row the blob
+//!    read would refuse is not a satisfied reference). A config / layer
+//!    reference resolves by checksum, because the `GET` that serves
+//!    those bytes does; an index child resolves by the **manifest
+//!    path**, because that is what the child's own `GET` resolves and an
+//!    index may not name a child this registry would not serve as a
+//!    manifest.
+//!
+//!    For an index, then the **transitive** question
+//!    ([`refuse_undeliverable_closure`]): the read path refuses a
+//!    document whose closure carries a terminal verdict anywhere, so
+//!    admission asks the same closure the same question, through the
+//!    same walk, over the body in hand.
 //!
 //!    **Then the door** ([`refuse_misdeclared_signature_layers`]): when
 //!    the manifest declares EVERY layer to be signature material hort
@@ -123,6 +132,7 @@ use uuid::Uuid;
 
 use hort_app::error::AppError;
 use hort_app::use_cases::ingest_use_case::{IngestOutcome, VerifiedIngestRequest};
+use hort_app::use_cases::manifest_deliverability::ManifestDeliverability;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::error::DomainError;
@@ -136,7 +146,7 @@ use hort_http_core::authz::{DeleteRepoAccess, WriteRepoAccess};
 use hort_http_core::context::AppContext;
 use hort_http_core::limits::BoundedPath;
 
-use super::coords::{oci_group_coords, oci_manifest_coords};
+use super::coords::{oci_group_coords, oci_manifest_coords, oci_manifest_path};
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::name::validate_oci_name;
@@ -1146,16 +1156,23 @@ struct ResolvedReferenceSet {
 /// is one of the two refusal outcomes, answered after the mint so the
 /// committed-manifest contract is preserved.
 ///
-/// This is a pure read — `find_in_repo_by_hash` and nothing else — which is
-/// what makes it runnable ahead of the mint. It used to take the minted
-/// manifest's id and used it only as a log field; the pre-mint diagnostics
-/// name the body's computed digest instead.
+/// For an **index** this additionally asks the transitive question, over
+/// the body in hand: see [`refuse_undeliverable_closure`]. The direct
+/// refusals above run first, so a document naming a directly-terminal or
+/// directly-absent constituent keeps the answer it already had and the
+/// closure walk only speaks about what sits deeper.
+///
+/// The catalog reads here are pure — no mint, no write — which is what
+/// makes the whole check runnable ahead of the mint. It used to take the
+/// minted manifest's id and used it only as a log field; the pre-mint
+/// diagnostics name the body's computed digest instead.
 async fn resolve_and_check_referenced_blobs(
     ctx: &AppContext,
     repo_id: Uuid,
     referenced: &[ReferencedBlob],
     media_type_is_index: bool,
     manifest_digest: &ContentHash,
+    body_bytes: &[u8],
 ) -> Result<ResolvedReferences, Response> {
     let resolution = resolve_referenced_blobs(ctx, repo_id, referenced)
         .await
@@ -1236,12 +1253,159 @@ async fn resolve_and_check_referenced_blobs(
         return Err(OciError::Internal.into_response());
     }
 
+    if media_type_is_index {
+        if let Some(terminal) =
+            refuse_undeliverable_closure(ctx, repo_id, manifest_digest, body_bytes).await?
+        {
+            return Ok(ResolvedReferences::Terminal(terminal));
+        }
+    }
+
     Ok(ResolvedReferences::Complete(Box::new(
         ResolvedReferenceSet {
             config_artifact: resolution.config,
             layer_artifacts: resolution.layers,
         },
     )))
+}
+
+/// The transitive half of admission: **is everything this index binds, at
+/// every depth, still deliverable?**
+///
+/// Admission and delivery must answer the same question about the same
+/// closure. Checking only the direct children takes a cut the read path's
+/// own resolver rejects in writing — an index over a child whose *layers*
+/// are terminal would be admitted here, answer `201`, and then be refused
+/// at every read, which is a push reporting success for an image this
+/// registry can never serve (ADR 0062). So the question is asked of
+/// `ManifestDeliverabilityUseCase` — the **same** walk the read path
+/// takes, not a second traversal beside it. Two traversals that can
+/// disagree is the defect one level up, and this inherits every bound the
+/// read path has by inheriting its implementation: the depth cap
+/// (`MAX_CHILD_INGEST_DEPTH`, counted from this document exactly as the
+/// read path counts it from the stored one), the expansion budget, the
+/// per-read CAS ceiling, and the single catalog call over the whole
+/// closure.
+///
+/// Fed the **body in hand** rather than a CAS read, because the document
+/// is not stored yet: `resolve_pending` is that entry point, and it is
+/// what makes this runnable ahead of the mint.
+///
+/// # Only an index, and what that costs
+///
+/// A single-image manifest's constituents are blobs, and a blob binds
+/// nothing — its closure is empty, so the transitive question has no
+/// content beyond the direct one the resolution above already answered.
+/// Running the walk for it would buy a second catalog round trip per push
+/// and no additional refusal, so single-image pushes are byte-for-byte
+/// unchanged. An index pays one CAS read per child plus one catalog call;
+/// a real multi-arch index is a handful of children, and the alternative
+/// is a success response for a broken image.
+///
+/// # Only on an otherwise-complete resolution
+///
+/// A direct constituent that is terminal or absent has already decided
+/// the answer above, and that answer stays what it was: the direct
+/// terminal refusal names the constituent in its own envelope, and an
+/// absent one is `MANIFEST_BLOB_UNKNOWN` with the digests to send. The
+/// walk also cannot speak for a document whose children are not all
+/// resolvable — a child with no row has no bytes to read constituents
+/// from — and the publisher's next move reruns this check with the full
+/// closure. So the caller gates on the direct outcome and this runs only
+/// where there is a transitive question left to ask.
+///
+/// # What the refusal is
+///
+/// A [`TerminalReference`], the same shape a *direct* terminal
+/// constituent produces, so it rides the same envelope
+/// ([`TerminalReference::into_refusal`]) and the same refusal point. One
+/// fact has one answer whichever depth it was found at — and that answer
+/// is the read path's answer for the same constituent, which is the whole
+/// point. The digest it names is the constituent's own CAS hash, never
+/// the document the client pushed: that document is fine.
+///
+/// `Err` is the fail-closed answer for a closure that could not be
+/// resolved — unparseable bytes, a budget exceeded. Not knowing what a
+/// document binds is not the same as knowing it is safe (ADR 0007), and
+/// the read path refuses that case too.
+async fn refuse_undeliverable_closure(
+    ctx: &AppContext,
+    repo_id: Uuid,
+    manifest_digest: &ContentHash,
+    body_bytes: &[u8],
+) -> Result<Option<TerminalReference>, Response> {
+    let resolved = ctx
+        .manifest_deliverability_use_case
+        .resolve_pending(repo_id, manifest_digest, body_bytes.to_vec())
+        .await;
+    match resolved {
+        Ok(ManifestDeliverability::Deliverable) => Ok(None),
+        Ok(ManifestDeliverability::TerminalConstituent(constituent)) => {
+            // The decision itself is logged where it is made, naming the
+            // repository, the document and the constituent's verdict.
+            // This line adds the one fact that one cannot carry: the
+            // refusal is happening on a push rather than on a read, so an
+            // operator reading a refused `201` can tell the two apart.
+            tracing::info!(
+                manifest_digest = %manifest_digest,
+                constituent = %constituent.content_hash,
+                constituent_status = %constituent.status,
+                "image index binds a constituent carrying a terminal verdict below its direct \
+                 children; refusing the push with the refusal every read of this index would \
+                 give it"
+            );
+            Ok(Some(TerminalReference {
+                digest: format!("sha256:{}", constituent.content_hash.as_ref()),
+                verdict: match constituent.status {
+                    // The axis comes from the one definition the read
+                    // route's refusal of this same index uses
+                    // (`manifests::terminal_constituent_axis`), so the
+                    // disclosure is neither route-dependent nor
+                    // depth-dependent: a directly-terminal constituent
+                    // already names its axis here, and the read of a
+                    // stored index names it too.
+                    QuarantineStatus::Rejected => TerminalVerdict::Rejected {
+                        axis: crate::manifests::terminal_constituent_axis(
+                            ctx,
+                            repo_id,
+                            &constituent.content_hash,
+                            manifest_digest.as_ref(),
+                        )
+                        .await,
+                    },
+                    QuarantineStatus::ScanIndeterminate => TerminalVerdict::ScanIndeterminate,
+                    // Not reachable: `ConstituentStatusReader` can only
+                    // name a status `QuarantineStatus::is_terminal` holds
+                    // for, and the two arms above are that set, matched
+                    // without a wildcard so a sixth variant is a compile
+                    // error here. A port that broke its own contract is an
+                    // answer hort cannot map, so it fails closed rather
+                    // than admitting the push.
+                    QuarantineStatus::None
+                    | QuarantineStatus::Quarantined
+                    | QuarantineStatus::Released => {
+                        tracing::error!(
+                            manifest_digest = %manifest_digest,
+                            constituent = %constituent.content_hash,
+                            constituent_status = %constituent.status,
+                            "constituent-status reader named a non-terminal status as the \
+                             strongest terminal constituent; refusing the push"
+                        );
+                        return Err(OciError::Internal.into_response());
+                    }
+                },
+            }))
+        }
+        Err(e) => {
+            tracing::error!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "image index admission: constituent deliverability could not be resolved, so \
+                 what the index binds is unknown; refusing the push"
+            );
+            Err(OciError::Internal.into_response())
+        }
+    }
 }
 
 /// Identifiers shared by the post-ingest writes left in the manifest-PUT
@@ -1677,6 +1841,7 @@ async fn put_manifest_dispatch_inner(
         &referenced,
         media_type_is_index,
         &hashes.computed_hash,
+        &body_bytes,
     )
     .await
     .map_err(Box::new)?;
@@ -2350,12 +2515,18 @@ struct ReferenceResolution {
     terminal: Option<TerminalReference>,
 }
 
-/// Resolve every referenced blob by SHA-256 against the artifact
-/// repository, enforcing cross-repo isolation (ADR 0008). The call
-/// uses `find_in_repo_by_hash` which scopes the SQL query to the
-/// target repo at the port boundary — the right row is the only
-/// candidate and there is no ordering hazard from cross-repo rows
-/// sharing the same SHA-256.
+/// Resolve every reference against the artifact repository, enforcing
+/// cross-repo isolation (ADR 0008). Both lookups are repo-scoped at the
+/// port boundary, so a cross-repo row sharing the same SHA-256 is never
+/// a candidate.
+///
+/// **Which lookup depends on what the reference is**, and the loop body
+/// records why: a config / layer reference is about bytes and takes
+/// `find_in_repo_by_hash`; an index child is about a *document* and
+/// takes `find_in_repo_by_path` over the manifest path that document
+/// will be delivered under. A child with no manifest row is absent, not
+/// resolved — "some row shares these bytes" is not the question a later
+/// `GET …/manifests/sha256:<hex>` asks.
 ///
 /// **A row is not enough: the row's status decides too, and it decides
 /// which of two refusals the push gets.** A reference resolving to an
@@ -2398,14 +2569,52 @@ async fn resolve_referenced_blobs(
     let mut terminal: Option<TerminalReference> = None;
 
     for r in refs {
-        let hit = match ctx
-            .artifact_use_case
-            .find_in_repo_by_hash(repo, &r.hash)
-            .await
-        {
+        // **A child manifest is resolved the way it will be delivered,
+        // and that is not the same lookup a blob takes.** A blob
+        // reference asks about bytes: the config / layer `GET` serves
+        // whatever row holds them, so "some live row in this repository
+        // for this hash" is exactly the question. An index child is a
+        // *document*, and the client's next request for it is
+        // `GET …/manifests/sha256:<hex>`, which resolves the manifest
+        // row and nothing else. Asking the hash-keyed question for it
+        // admitted an index over a row that is not a manifest at all:
+        // arbitrary bytes pushed through the blob route leave a live row
+        // under the same hash, the index committed, and the child `GET`
+        // then answered `MANIFEST_UNKNOWN` — an advertised child this
+        // registry will not serve (ADR 0062).
+        //
+        // The row's own layout is the fact in question and the only one
+        // consulted: the manifest prefix is what separates the two kinds
+        // of row, it is what every mint path writes (the hosted PUT and
+        // the eager child ingest alike), and `(repository_id, path)` is
+        // unique — so this resolves the one row a reader addressing that
+        // digest gets, while the hash-keyed lookup is a `LIMIT 1` with
+        // no `ORDER BY` over a set a repository may legitimately hold
+        // more than one member of. Nothing here reads the child's bytes;
+        // a parse would be a second, weaker definition of "is this a
+        // manifest" than the row delivery resolves.
+        //
+        // A child with no manifest row therefore joins `absent`, which
+        // is the answer that was already true and already correct for
+        // it: this repository does not hold that child manifest, the
+        // refusal names the digest to send, and the push-then-retry path
+        // reconciles once the child is pushed as a manifest.
+        let lookup = match r.role {
+            BlobRole::ChildManifest { .. } => {
+                ctx.artifact_use_case
+                    .find_in_repo_by_path(repo, &oci_manifest_path(&r.hash))
+                    .await
+            }
+            BlobRole::Config | BlobRole::Layer => {
+                ctx.artifact_use_case
+                    .find_in_repo_by_hash(repo, &r.hash)
+                    .await
+            }
+        };
+        let hit = match lookup {
             Ok(o) => o,
             Err(e) => {
-                tracing::error!(error = %e, "find_in_repo_by_hash failed");
+                tracing::error!(error = %e, "referenced-constituent resolution failed");
                 return Err(OciError::Internal.into_response());
             }
         };
@@ -2531,11 +2740,11 @@ async fn resolve_referenced_blobs(
 /// trusted."
 ///
 /// Hort already has the digest half for free, and more strongly than the spec
-/// asks: a stored row's `sha256_checksum` IS the lookup key, and CAS reads are
-/// hash-verified on the way out (ADR 0003). What it did not have is the size
-/// half — so that is what this adds, and it is cheap: `size_bytes` arrives on
-/// the row `find_in_repo_by_hash` already returned, so the check costs no port
-/// call and no I/O.
+/// asks: the child is resolved at the manifest path its own digest names, and
+/// CAS reads are hash-verified on the way out (ADR 0003). What it did not have
+/// is the size half — so that is what this adds, and it is cheap: `size_bytes`
+/// arrives on the row the resolution already returned, so the check costs no
+/// port call and no I/O.
 ///
 /// # What is compared, and what is not
 ///
@@ -2565,21 +2774,23 @@ async fn resolve_referenced_blobs(
 /// the bytes collectable. Admission may refuse the document; a reader of
 /// already-stored bytes must not.
 ///
-/// **`mediaType`**: deliberately NOT compared. The apparent counterpart is
-/// `Artifact::content_type`, and it is not the descriptor's `mediaType` — it
-/// is the `Content-Type` header whoever wrote that row supplied: a pusher's
-/// manifest `PUT`, an upstream's response, or `application/octet-stream` when
-/// the same bytes entered through a blob upload. `artifacts` is unique on
-/// `(repository_id, path)` and not on the checksum, so one repository can hold
-/// several rows for one hash, and the repo-scoped checksum lookup behind
-/// `find_in_repo_by_hash` is a `LIMIT 1` with no `ORDER BY`. Comparing against
-/// it would make the admission verdict depend on which duplicate row the
-/// database happened to return. `size_bytes` has no such exposure: it is a
-/// property of the bytes, so every row for one hash agrees on it.
+/// **`mediaType`**: deliberately NOT compared — and the question it looks
+/// like it would answer is answered one step earlier instead. *Whether the
+/// child is a manifest at all* is settled by the resolution that produced
+/// `stored`: an index child is looked up at `manifests/sha256:<hex>`, the path
+/// every mint path writes a manifest row under and the one a later child `GET`
+/// resolves, so a row reaching here is a manifest row by construction. What a
+/// `mediaType` comparison would add on top is the *finer* distinction — index
+/// versus single image, OCI versus Docker schema — and its apparent
+/// counterpart cannot carry it: `Artifact::content_type` is not the
+/// descriptor's `mediaType` but the `Content-Type` header whoever wrote that
+/// row supplied, a pusher's manifest `PUT` or an upstream's response.
+/// `size_bytes` is in a different class — a property of the bytes, so it is
+/// the same number whichever row carries them.
 ///
-/// The one sound `mediaType` check would be against the child's **own stored
-/// bytes** (`is_image_index` over them) rather than against a header — the
-/// same "the body decides, never the declared media type" rule
+/// The one sound check of that finer distinction would be against the child's
+/// **own stored bytes** (`is_image_index` over them) rather than against a
+/// header — the same "the body decides, never the declared media type" rule
 /// [`pull_membership_claims`] records. It is not done here because it would
 /// put one CAS read per child on the manifest `PUT` path, and this resolution
 /// being a pure catalog read is what lets it run ahead of the mint at all.
@@ -2849,8 +3060,9 @@ mod tests {
     use hort_app::use_cases::test_support::{
         sample_artifact, sample_repository, GroupCommitInjection, MockArtifactGroupLifecyclePort,
         MockArtifactGroupRepository, MockArtifactLifecycle, MockArtifactRepository,
-        MockContentReferenceIndex, MockEventStore, MockPolicyProjectionRepository,
-        MockRefLifecyclePort, MockRefRegistryPort, MockRepositoryRepository, MockStoragePort,
+        MockConstituentStatusReader, MockContentReferenceIndex, MockEventStore,
+        MockPolicyProjectionRepository, MockRefLifecyclePort, MockRefRegistryPort,
+        MockRepositoryRepository, MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::artifact_group::ArtifactGroup;
@@ -2890,6 +3102,9 @@ mod tests {
         lifecycle: Arc<MockArtifactLifecycle>,
         #[allow(dead_code)]
         events: Arc<MockEventStore>,
+        /// The catalog read behind the ADR 0062 closure question, for the
+        /// admission tests that drive its fail-closed arm.
+        constituent_status: Arc<MockConstituentStatusReader>,
     }
 
     fn harness() -> Harness {
@@ -2908,6 +3123,7 @@ mod tests {
             policy_projections: mocks.policy_projections,
             lifecycle: mocks.lifecycle,
             events: mocks.events,
+            constituent_status: mocks.constituent_status,
         }
     }
 
@@ -2998,9 +3214,90 @@ mod tests {
         size: i64,
     }
 
-    /// [`seed_blob`] for a child manifest, carrying the stored byte count out
-    /// alongside the hash so the index declaring it can be conformant.
+    /// A child manifest an index may legitimately name: a **manifest row**
+    /// at the manifest path, whose CAS bytes are a real single-image
+    /// manifest, over a config blob this repository holds.
+    ///
+    /// Every one of those halves is load-bearing, and the fixture used to
+    /// have none of them — it wrapped [`seed_blob`], so it seeded a *blob*
+    /// row with opaque bytes. Fifteen index tests in this module were green
+    /// over that shape, including the positive
+    /// `put_image_index_with_present_children_is_committed_as_manifest`,
+    /// which therefore asserted that an index over blob rows commits: the
+    /// exact push that makes this registry advertise a child it answers
+    /// `MANIFEST_UNKNOWN` for. A fixture that keeps passing after admission
+    /// starts asking the delivery question has not demonstrated the fix.
+    ///
+    /// - The **row at `manifests/sha256:<hex>`** is what admission resolves
+    ///   and what a later child `GET` resolves — the two sides of the one
+    ///   question.
+    /// - The **parseable manifest body** is what the closure walk reads to
+    ///   learn the child's own constituents. Opaque bytes are a legal state
+    ///   (the walk warns and judges the child alone), but a corpus made
+    ///   entirely of them never exercises the transitive step.
+    /// - The **seeded config** makes the child genuinely deliverable rather
+    ///   than deliverable-by-absence.
+    ///
+    /// `label` only has to be unique per child; the stored bytes are derived
+    /// from it.
     fn seed_index_child(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        label: &[u8],
+    ) -> SeededIndexChild {
+        seed_index_child_with_status(artifacts, storage, repo_id, label, QuarantineStatus::None)
+    }
+
+    /// [`seed_index_child`] with an explicit status on the **child's own
+    /// row** — for the admission cases that turn on the child's state
+    /// rather than on its existence.
+    fn seed_index_child_with_status(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        label: &[u8],
+        status: QuarantineStatus,
+    ) -> SeededIndexChild {
+        let config = seed_blob(artifacts, storage, repo_id, &[label, b"-config"].concat());
+        seed_child_manifest(
+            artifacts,
+            storage,
+            repo_id,
+            &build_manifest_json(&config, &[]),
+            status,
+        )
+    }
+
+    /// The one seeding site for a child manifest: a row at the **manifest**
+    /// path carrying `status`, and `body` in CAS under the same hash.
+    fn seed_child_manifest(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        body: &[u8],
+        status: QuarantineStatus,
+    ) -> SeededIndexChild {
+        let hex = hex::encode(Sha256::digest(body));
+        let hash: ContentHash = hex.parse().unwrap();
+        let mut a = sample_artifact(status);
+        a.repository_id = repo_id;
+        a.path = oci_manifest_path(&hash);
+        a.sha256_checksum = hash.clone();
+        a.size_bytes = body.len() as i64;
+        artifacts.insert(a);
+        storage.insert_content(hash.clone(), body.to_vec());
+        SeededIndexChild {
+            hash,
+            size: body.len() as i64,
+        }
+    }
+
+    /// A blob row for `content` at the **blob** path and nothing else — no
+    /// manifest row for those bytes. The shape an index child must not be
+    /// satisfied by: the push route that produces it is the blob upload, so
+    /// a client can leave one under any digest it likes.
+    fn seed_blob_only_child(
         artifacts: &MockArtifactRepository,
         storage: &MockStoragePort,
         repo_id: Uuid,
@@ -5292,16 +5589,18 @@ mod tests {
                 SeededRole::IndexChild => {
                     let present =
                         seed_index_child(&h.artifacts, &h.storage, repo_id, b"present-child");
-                    let seeded = SeededIndexChild {
-                        hash: seed_blob_with_status(
-                            &h.artifacts,
-                            &h.storage,
-                            repo_id,
-                            b"seeded-child",
-                            status,
-                        ),
-                        size: b"seeded-child".len() as i64,
-                    };
+                    // A terminal index child is a terminal **manifest**
+                    // row: that is the row a child `GET` resolves, so it
+                    // is the row admission asks about. A blob row under
+                    // the same digest is a different fixture entirely —
+                    // see `an_index_child_whose_only_row_is_a_blob_is_refused`.
+                    let seeded = seed_index_child_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        b"seeded-child",
+                        status,
+                    );
                     let child = seeded.hash.clone();
                     (
                         build_index_json(
@@ -7868,6 +8167,654 @@ mod tests {
                     "descriptor": "manifests[1]",
                 }),
                 "{declared}"
+            );
+        }
+    }
+
+    // -- admission asks the question delivery answers ---------------------
+    //
+    // Two halves of one property: a successful push must not name a
+    // document this registry will refuse. The first half is about the
+    // DIRECT child — a digest whose only row is a blob row is not a child
+    // manifest, whatever the bytes are. The second is about everything
+    // BELOW it — a deliverable child over a terminal layer is a document
+    // the read path refuses, so the push that mints the index over it is
+    // a success response for an image that can never be pulled.
+
+    /// Build a `PushOutcome`-shaped result for one index body: the
+    /// status, the wire body, and whether the index was minted.
+    struct IndexPush {
+        status: StatusCode,
+        body: Vec<u8>,
+        retry_after: Option<String>,
+    }
+
+    impl IndexPush {
+        fn envelope(&self) -> serde_json::Value {
+            let parsed: serde_json::Value = serde_json::from_slice(&self.body).unwrap();
+            parsed["errors"][0].clone()
+        }
+
+        /// The wire body as text, for an assertion message.
+        ///
+        /// Hoisted into a `let` at every call site rather than written
+        /// inside the `assert!` it reports on: an argument to a panic
+        /// message is only evaluated when the assertion fails, so in a
+        /// green run both this body and the call read as uncovered.
+        fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.body).to_string()
+        }
+    }
+
+    /// PUT `body` as an image index into a fresh `myrepo`, after `seed`
+    /// has populated the harness. The closure hands back the body so each
+    /// case can seed whatever shape it is about and build its index over
+    /// the digests it seeded.
+    fn push_index_with<S>(seed: S) -> IndexPush
+    where
+        S: for<'a> FnOnce(
+            &'a Harness,
+            Uuid,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>>,
+    {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let body = seed(&h, repo_id).await;
+            // The hydrating context, so a `Rejected` constituent's axis is
+            // recovered from its own stream rather than read off a field a
+            // harness stamped.
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let resp = router()
+                .with_state(ctx)
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("Retry-After")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            IndexPush {
+                status,
+                body,
+                retry_after,
+            }
+        })
+    }
+
+    /// **The push this closes.** Arbitrary bytes go up the OCI **blob**
+    /// route, leaving a live `blobs/sha256:<hex>` row and no manifest row.
+    /// An index then names that digest with its true size.
+    ///
+    /// Before, admission resolved the child by checksum, found the blob
+    /// row, was satisfied, and the index committed with a `201`. The
+    /// child `GET` then answered `MANIFEST_UNKNOWN` — hort advertised a
+    /// child it will not serve (ADR 0062), and the push reported success
+    /// for a broken image.
+    ///
+    /// The answer is `MANIFEST_BLOB_UNKNOWN` naming that digest, which is
+    /// the one that was already true for it: this repository does not
+    /// hold that child manifest, the response says which bytes to send,
+    /// and pushing the child as a manifest makes the retry succeed — the
+    /// converse below.
+    #[test]
+    fn an_index_child_whose_only_row_is_a_blob_is_refused() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let blob_only =
+                    seed_blob_only_child(&h.artifacts, &h.storage, repo_id, b"arbitrary-bytes");
+                assert!(
+                    h.artifacts
+                        .find_by_path(repo_id, &oci_manifest_path(&blob_only.hash))
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "the premise: those bytes have a blob row and no manifest row"
+                );
+                build_index_json(
+                    std::slice::from_ref(&blob_only),
+                    "application/vnd.oci.image.index.v1+json",
+                )
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::BAD_REQUEST,
+            "a blob row does not satisfy a child-manifest reference: {rendered}"
+        );
+        assert_eq!(envelope_code(&out.body), "MANIFEST_BLOB_UNKNOWN");
+        let named = out.envelope()["detail"]["blobs"]
+            .as_array()
+            .expect("the unknown-blob envelope names what to send")
+            .len();
+        assert_eq!(named, 1, "the one unsatisfied child: {rendered}");
+    }
+
+    /// The converse, and the test that keeps the one above from passing
+    /// for the wrong reason: the same digest, now carrying a **manifest**
+    /// row, is admitted. Without this, refusing every index child would
+    /// satisfy the refusal test.
+    #[test]
+    fn the_same_child_is_admitted_once_a_manifest_row_exists_for_it() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"real-child");
+                // The same bytes ALSO have a blob row, which is legal —
+                // `(repository_id, path)` is what is unique, not the
+                // checksum. The admission verdict must not depend on
+                // which of the two a checksum lookup happened to return.
+                let mut blob_twin = sample_artifact(QuarantineStatus::None);
+                blob_twin.repository_id = repo_id;
+                blob_twin.path = format!("blobs/sha256:{}", child.hash.as_ref());
+                blob_twin.sha256_checksum = child.hash.clone();
+                blob_twin.size_bytes = child.size;
+                h.artifacts.insert(blob_twin);
+                build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                )
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::CREATED,
+            "a child with a manifest row is admitted, blob twin or not: {rendered}"
+        );
+    }
+
+    /// Seed a child manifest whose own row is `Released` and whose single
+    /// **layer** carries `status`, and return the index naming it plus
+    /// that layer's digest.
+    ///
+    /// Exactly the shape Group B is about: publish and release a child
+    /// manifest over a layer, a later rescan concludes against the layer
+    /// while the child's own row stays `Released`, then an index names
+    /// the child. Admission used to read the child's row, see
+    /// `Released`, and accept.
+    async fn seed_released_child_over_layer(
+        h: &Harness,
+        repo_id: Uuid,
+        status: QuarantineStatus,
+        axis: Option<RejectionReason>,
+    ) -> (Vec<u8>, ContentHash) {
+        let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"child-config");
+        let layer =
+            seed_blob_with_status(&h.artifacts, &h.storage, repo_id, b"child-layer", status);
+        if status == QuarantineStatus::Rejected {
+            seed_rejection_axis(h, repo_id, &layer, axis).await;
+        }
+        let child = seed_child_manifest(
+            &h.artifacts,
+            &h.storage,
+            repo_id,
+            &build_manifest_json(&config, std::slice::from_ref(&layer)),
+            QuarantineStatus::Released,
+        );
+        (
+            build_index_json(
+                std::slice::from_ref(&child),
+                "application/vnd.oci.image.index.v1+json",
+            ),
+            layer,
+        )
+    }
+
+    /// **Group B, the rejected arm.** The child is `Released` and
+    /// resolves; its own layer is `Rejected`. The push is refused with
+    /// the refusal every read of this index would give it — `403 DENIED`
+    /// naming the **layer**, with its axis.
+    ///
+    /// The subject is the constituent and not the index: that document is
+    /// fine, and naming it would state the refusal is about the wrong
+    /// thing. The axis comes from `manifests::terminal_constituent_axis`,
+    /// the one definition the read route's refusal of this same index
+    /// uses, so the disclosure is neither route- nor depth-dependent.
+    #[test]
+    fn an_index_child_released_over_a_rejected_layer_is_refused() {
+        let layer_cell: Arc<std::sync::Mutex<Option<ContentHash>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let sink = layer_cell.clone();
+        let out = push_index_with(move |h, repo_id| {
+            Box::pin(async move {
+                let (body, layer) = seed_released_child_over_layer(
+                    h,
+                    repo_id,
+                    QuarantineStatus::Rejected,
+                    Some(RejectionReason::Scanner),
+                )
+                .await;
+                *sink.lock().unwrap() = Some(layer);
+                body
+            })
+        });
+        let layer = layer_cell.lock().unwrap().clone().expect("layer seeded");
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "one hop is an arbitrary cut — the push is refused for the grandchild layer: \
+             {rendered}"
+        );
+        let envelope = out.envelope();
+        assert_eq!(envelope["code"], "DENIED");
+        assert_eq!(
+            envelope["detail"]["subject"],
+            format!("sha256:{}", layer.as_ref()),
+            "the refusal names the terminal constituent, not the pushed index"
+        );
+        assert_eq!(
+            envelope["detail"]["axis"], "scanner",
+            "the axis is recovered the same way the read route recovers it"
+        );
+    }
+
+    /// **Group B, the indeterminate arm.** Same shape, `ScanIndeterminate`
+    /// on the layer: `503 UNAVAILABLE` and **no** `Retry-After` — that
+    /// hold has no self-resolving deadline, so any number would invite a
+    /// client back forever on a schedule hort invented.
+    #[test]
+    fn an_index_child_released_over_an_indeterminate_layer_is_refused_without_a_deadline() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                seed_released_child_over_layer(
+                    h,
+                    repo_id,
+                    QuarantineStatus::ScanIndeterminate,
+                    None,
+                )
+                .await
+                .0
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(out.status, StatusCode::SERVICE_UNAVAILABLE, "{rendered}");
+        assert_eq!(out.envelope()["code"], "UNAVAILABLE");
+        assert_eq!(
+            out.retry_after, None,
+            "an indeterminate hold advertises no deadline"
+        );
+    }
+
+    /// **A hold below the child is not a refusal.** A `Quarantined` layer
+    /// means "not yet": the client's own blob fetch answers it with the
+    /// deadline, and propagating it here would refuse essentially every
+    /// push — hort quarantines at ingest and the index PUT follows
+    /// seconds later. The arm that would break every multi-arch push if
+    /// the walk treated a hold as terminal.
+    #[test]
+    fn an_index_child_over_a_quarantined_layer_still_commits() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                seed_released_child_over_layer(h, repo_id, QuarantineStatus::Quarantined, None)
+                    .await
+                    .0
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::CREATED,
+            "a hold is `not yet`, not `never`: {rendered}"
+        );
+    }
+
+    /// **Acceptance: the deliverable push is unchanged.** Two children,
+    /// each a real manifest over a `Released` config and layer, every row
+    /// present and non-terminal at every depth. The index commits `201`.
+    #[test]
+    fn an_index_over_genuinely_deliverable_children_still_commits() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let mut children = Vec::new();
+                for label in [b"amd64".as_slice(), b"arm64".as_slice()] {
+                    let config = seed_blob_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        label,
+                        QuarantineStatus::Released,
+                    );
+                    let layer = seed_blob_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        &[label, b"-layer"].concat(),
+                        QuarantineStatus::Released,
+                    );
+                    children.push(seed_child_manifest(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        &build_manifest_json(&config, std::slice::from_ref(&layer)),
+                        QuarantineStatus::Released,
+                    ));
+                }
+                build_index_json(&children, "application/vnd.oci.image.index.v1+json")
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::CREATED,
+            "a genuinely deliverable multi-arch push is untouched: {rendered}"
+        );
+    }
+
+    /// **The walk is transitive past one level, not just one hop below
+    /// the index.** A nested index: the pushed document names a child
+    /// index, which names a manifest, whose layer is rejected. Two hops
+    /// of expansion, which a one-level-deeper check would still miss.
+    ///
+    /// The bound on how deep this goes is not restated here: admission
+    /// inherits `MAX_CHILD_INGEST_DEPTH` and the expansion budget by
+    /// running the read path's own walk, and those bounds are pinned
+    /// where they are implemented
+    /// (`hort_app::use_cases::manifest_deliverability`).
+    #[test]
+    fn the_closure_walk_reaches_a_layer_two_levels_below_the_pushed_index() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"deep-config");
+                let layer = seed_blob_with_status(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    b"deep-layer",
+                    QuarantineStatus::Rejected,
+                );
+                seed_rejection_axis(h, repo_id, &layer, Some(RejectionReason::Scanner)).await;
+                let grandchild = seed_child_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &build_manifest_json(&config, std::slice::from_ref(&layer)),
+                    QuarantineStatus::Released,
+                );
+                let child = seed_child_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &build_index_json(
+                        std::slice::from_ref(&grandchild),
+                        "application/vnd.oci.image.index.v1+json",
+                    ),
+                    QuarantineStatus::Released,
+                );
+                build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                )
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "a terminal layer two levels down still refuses the push: {rendered}"
+        );
+        assert_eq!(out.envelope()["code"], "DENIED");
+    }
+
+    /// **The cost claim.** A single-image manifest push opens **no** CAS
+    /// object for a closure walk: its constituents are blobs, a blob
+    /// binds nothing, so the transitive question has no content beyond
+    /// the direct one the reference resolution already answered. Running
+    /// the walk for it would buy a second catalog round trip per push
+    /// and no additional refusal.
+    ///
+    /// Asserted against the index push, which does read: a regression
+    /// that ran the walk unconditionally fails the first assertion, and
+    /// one that never ran it fails the second.
+    #[test]
+    fn only_an_index_push_pays_for_a_closure_walk() {
+        let (single_image_reads, index_reads) = run(async {
+            let single = {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config");
+                let layer = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer");
+                let body = build_manifest_json(&config, std::slice::from_ref(&layer));
+                let resp = router()
+                    .with_state(h.ctx.clone())
+                    .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+                h.storage.get_call_count()
+            };
+            let index = {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child");
+                let body = build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                );
+                let resp = router()
+                    .with_state(h.ctx.clone())
+                    .oneshot(put_index_request(
+                        "/v2/myrepo/library/nginx/manifests/v1",
+                        body,
+                        "application/vnd.oci.image.index.v1+json",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+                h.storage.get_call_count()
+            };
+            (single, index)
+        });
+        assert_eq!(
+            single_image_reads, 0,
+            "a single-image push must not open a CAS object for a closure it cannot have"
+        );
+        assert!(
+            index_reads > 0,
+            "an index push does walk its closure, which is what it pays for"
+        );
+    }
+
+    /// **The catalog read behind the closure question fails.** Not knowing
+    /// what a document binds is not knowing it is safe (ADR 0007), so the
+    /// push is refused rather than admitted — and the failure is an
+    /// `error!`, because nothing about the index was decided.
+    #[test]
+    fn an_index_push_is_refused_when_the_closure_question_cannot_be_answered() {
+        let (status, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child");
+                h.constituent_status
+                    .fail_next(DomainError::Invariant("catalog unreachable".into()));
+                let body = build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                );
+                router()
+                    .with_state(h.ctx.clone())
+                    .oneshot(put_index_request(
+                        "/v2/myrepo/library/nginx/manifests/v1",
+                        body,
+                        "application/vnd.oci.image.index.v1+json",
+                    ))
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        });
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a closure hort cannot enumerate fails the push closed"
+        );
+        assert!(
+            events.iter().any(|e| e
+                .fields
+                .contains("constituent deliverability could not be resolved")),
+            "and the operator is told what could not be resolved: {events:?}"
+        );
+    }
+
+    /// **The port breaks its own contract.** `ConstituentStatusReader`
+    /// may only name a status `QuarantineStatus::is_terminal` holds for;
+    /// an answer outside that set is one admission cannot map onto a
+    /// refusal, so it fails closed rather than admitting the push.
+    ///
+    /// Driven with a local double because the harness reader cannot
+    /// produce the answer — it filters through `is_terminal` itself,
+    /// which is the property that makes it a faithful stand-in. The
+    /// double is the only way to reach the arm, and the arm is what keeps
+    /// a disagreement between two definitions of "terminal" from serving
+    /// a push.
+    #[test]
+    fn an_index_push_is_refused_when_the_status_reader_names_a_non_terminal_constituent() {
+        struct NamesANonTerminalStatus;
+        impl hort_domain::ports::constituent_status::ConstituentStatusReader for NamesANonTerminalStatus {
+            fn strongest_terminal_constituent<'a>(
+                &'a self,
+                _repository_id: Uuid,
+                constituents: &'a [ContentHash],
+            ) -> hort_domain::ports::BoxFuture<
+                'a,
+                hort_domain::error::DomainResult<
+                    Option<hort_domain::ports::constituent_status::TerminalConstituent>,
+                >,
+            > {
+                let first = constituents.first().cloned();
+                Box::pin(async move {
+                    Ok(first.map(|content_hash| {
+                        hort_domain::ports::constituent_status::TerminalConstituent {
+                            content_hash,
+                            // Not terminal — the contract violation.
+                            status: QuarantineStatus::Released,
+                        }
+                    }))
+                })
+            }
+        }
+
+        let (status, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child");
+                let body = build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                );
+                let ctx = hort_http_core::test_support::with_manifest_deliverability_use_case(
+                    &h.ctx,
+                    Arc::new(
+                        hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase::new(
+                            h.storage.clone(),
+                            Arc::new(NamesANonTerminalStatus),
+                        ),
+                    ),
+                );
+                router()
+                    .with_state(ctx)
+                    .oneshot(put_index_request(
+                        "/v2/myrepo/library/nginx/manifests/v1",
+                        body,
+                        "application/vnd.oci.image.index.v1+json",
+                    ))
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        });
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an unmappable answer is not an admission"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.fields.contains("named a non-terminal status")),
+            "and the disagreement is reported: {events:?}"
+        );
+    }
+
+    /// **The reference resolution's own lookup fails.** A failed catalog
+    /// read must not read as "no such row", which would answer
+    /// `MANIFEST_BLOB_UNKNOWN` and send the publisher to push bytes this
+    /// repository may already hold. Asserted on **both** lookups, because
+    /// a child and a blob now take different ones: a child resolves by
+    /// the manifest path, a config/layer by checksum.
+    #[test]
+    fn a_failed_reference_lookup_refuses_the_push_rather_than_reading_as_absent() {
+        for (label, is_index) in [("index child", true), ("manifest layer", false)] {
+            let (status, events) = capture_tracing(|| {
+                run(async {
+                    let h = harness();
+                    let repo = oci_repo("myrepo");
+                    let repo_id = repo.id;
+                    h.repositories.insert(repo);
+                    let body = if is_index {
+                        let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child");
+                        h.artifacts
+                            .fail_next_find_by_path(DomainError::Invariant("catalog down".into()));
+                        build_index_json(
+                            std::slice::from_ref(&child),
+                            "application/vnd.oci.image.index.v1+json",
+                        )
+                    } else {
+                        let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config");
+                        let layer = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer");
+                        h.artifacts
+                            .fail_next_find_by_repo_and_checksum(DomainError::Invariant(
+                                "catalog down".into(),
+                            ));
+                        build_manifest_json(&config, std::slice::from_ref(&layer))
+                    };
+                    let media = if is_index {
+                        "application/vnd.oci.image.index.v1+json"
+                    } else {
+                        "application/vnd.oci.image.manifest.v1+json"
+                    };
+                    router()
+                        .with_state(h.ctx.clone())
+                        .oneshot(put_index_request(
+                            "/v2/myrepo/library/nginx/manifests/v1",
+                            body,
+                            media,
+                        ))
+                        .await
+                        .unwrap()
+                        .status()
+                })
+            });
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{label}: a failed lookup is not an absent reference"
+            );
+            assert!(
+                events.iter().any(|e| e
+                    .fields
+                    .contains("referenced-constituent resolution failed")),
+                "{label}: the failure is reported: {events:?}"
             );
         }
     }

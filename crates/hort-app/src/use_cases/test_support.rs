@@ -236,6 +236,21 @@ pub struct MockArtifactRepository {
     /// Seeded via
     /// [`set_status_after_next_checksum_read`](Self::set_status_after_next_checksum_read).
     status_after_next_checksum_read: Mutex<HashMap<Uuid, QuarantineStatus>>,
+    /// The same one-shot, hooked to
+    /// [`find_by_path`](ArtifactRepository::find_by_path) instead.
+    ///
+    /// Its own map for the reason the one above has its own: a read
+    /// handler resolves its artifact **by path** and then hands the id to
+    /// a download that re-reads it **by id**, so "the row moved between
+    /// the handler's gate and the download's own gate" is only
+    /// expressible by arming the path read. Armed on
+    /// [`Self::row_after_next_find_by_id`] it would fire one read too
+    /// late — after the download had already decided — and the race
+    /// under test would not happen at all.
+    ///
+    /// Seeded via
+    /// [`set_status_after_next_find_by_path`](Self::set_status_after_next_find_by_path).
+    status_after_next_find_by_path: Mutex<HashMap<Uuid, QuarantineStatus>>,
 }
 
 /// One recorded call to either backfill-candidacy query. See
@@ -266,6 +281,7 @@ impl MockArtifactRepository {
             find_by_path_errors: Mutex::new(std::collections::VecDeque::new()),
             find_by_name_in_repo_errors: Mutex::new(std::collections::VecDeque::new()),
             row_after_next_find_by_id: Mutex::new(HashMap::new()),
+            status_after_next_find_by_path: Mutex::new(HashMap::new()),
             status_after_next_checksum_read: Mutex::new(HashMap::new()),
         }
     }
@@ -302,6 +318,22 @@ impl MockArtifactRepository {
             .lock()
             .unwrap()
             .insert(artifact_id, None);
+    }
+
+    /// After the next `find_by_path` that resolves to `artifact_id`
+    /// serves the current row, rewrite that row's `quarantine_status` to
+    /// `status`.
+    ///
+    /// Models a concurrent rescan landing between a read handler's own
+    /// status gate (which resolves the artifact by path) and the
+    /// download's re-read of the same row: the handler admits the read
+    /// on the row as it was, and the download refuses it on the row as
+    /// it now is.
+    pub fn set_status_after_next_find_by_path(&self, artifact_id: Uuid, status: QuarantineStatus) {
+        self.status_after_next_find_by_path
+            .lock()
+            .unwrap()
+            .insert(artifact_id, status);
     }
 
     /// After the next digest-set read observes `artifact_id`, rewrite
@@ -815,13 +847,26 @@ impl ArtifactRepository for MockArtifactRepository {
         if let Some(err) = self.find_by_path_errors.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
-        let result = self
-            .artifacts
-            .lock()
-            .unwrap()
+        let mut artifacts = self.artifacts.lock().unwrap();
+        let result = artifacts
             .values()
             .find(|a| a.repository_id == repository_id && a.path == path)
             .map(Self::projected);
+        // The current row has been served; apply any armed one-shot so a
+        // later read of the same artifact sees the change.
+        if let Some(id) = result.as_ref().map(|a| a.id) {
+            if let Some(status) = self
+                .status_after_next_find_by_path
+                .lock()
+                .unwrap()
+                .remove(&id)
+            {
+                if let Some(row) = artifacts.get_mut(&id) {
+                    row.quarantine_status = status;
+                }
+            }
+        }
+        drop(artifacts);
         Box::pin(async move { Ok(result) })
     }
 
