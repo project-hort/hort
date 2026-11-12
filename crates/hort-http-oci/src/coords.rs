@@ -79,10 +79,28 @@ pub fn oci_manifest_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
         name: name.to_string(),
         name_as_published: name.to_string(),
         version: None,
-        path: format!("manifests/sha256:{}", digest.as_ref()),
+        path: oci_manifest_path(digest),
         format: RepositoryFormat::Oci,
         metadata: serde_json::Value::Null,
     }
+}
+
+/// The `Artifact.path` an OCI manifest or image index is stored under —
+/// `manifests/sha256:<hex>`, the image name deliberately absent, so
+/// `(repository_id, path)` holds at most one manifest row per digest.
+///
+/// Split out of [`oci_manifest_coords`] because the **path alone** is the
+/// question an admission check has to ask: an image index may only name a
+/// child this registry would serve as a manifest, and what makes a row a
+/// manifest row rather than a blob row is this prefix (the same
+/// discriminator `OciFormatHandler::scan_kind` and
+/// `OciFormatHandler::is_provenance_constituent` read). Resolving a child
+/// by this path is therefore how admission asks the question delivery
+/// answers — a digest-addressed manifest `GET` resolves this exact
+/// string — rather than asking for "some row with these bytes", which a
+/// repository may legitimately hold more than one of.
+pub fn oci_manifest_path(digest: &ContentHash) -> String {
+    format!("manifests/sha256:{}", digest.as_ref())
 }
 
 /// Build `ArtifactCoords` for the OCI manifest-group root addressed by
@@ -160,6 +178,28 @@ mod tests {
     fn manifest_coords_path_is_manifests_sha256_hex() {
         let c = oci_manifest_coords("library/nginx", &sample_hash());
         assert_eq!(c.path, format!("manifests/sha256:{SAMPLE_HEX}"));
+    }
+
+    /// The coords builder and the bare-path builder are one spelling:
+    /// admission resolves a child by the latter and a digest-addressed
+    /// `GET` resolves by the former, so a divergence would let the two
+    /// sides disagree about which row a digest names.
+    #[test]
+    fn manifest_path_is_the_path_manifest_coords_carry() {
+        assert_eq!(
+            oci_manifest_path(&sample_hash()),
+            oci_manifest_coords("library/nginx", &sample_hash()).path
+        );
+    }
+
+    /// And it is not the blob path: the prefix is what keeps a manifest
+    /// row and a blob row for the same bytes apart, which is the whole
+    /// of what the admission check keys on.
+    #[test]
+    fn manifest_path_never_collides_with_the_blob_path() {
+        let m = oci_manifest_path(&sample_hash());
+        assert_ne!(m, oci_blob_coords("x", &sample_hash()).path);
+        assert!(m.starts_with("manifests/"));
     }
 
     #[test]

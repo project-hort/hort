@@ -116,8 +116,6 @@ pub(super) fn check_quarantine(
     repo_key: &str,
     retry_after_floor_secs: NonZeroU32,
 ) -> Response {
-    let retry_after_seconds = quarantine_retry_after_seconds(artifact, retry_after_floor_secs);
-
     // Emit the download-outcome counter from the short-circuit path.
     // `ArtifactUseCase::download` never runs for quarantined pulls (we
     // never opened the CAS stream), so without this counter here the
@@ -133,8 +131,27 @@ pub(super) fn check_quarantine(
     )
     .increment(1);
 
+    quarantined_response(artifact, retry_after_floor_secs)
+}
+
+/// The `Quarantined` 503 envelope **without** the download counter — for
+/// a refusal that is not a short-circuit.
+///
+/// [`check_quarantine`] emits `hort_download_total{result="quarantined"}`
+/// because its caller refuses *before* `ArtifactUseCase::download` runs,
+/// so nothing else would count the pull. A refusal discovered **inside**
+/// the download (the row's status changed between the handler's gate and
+/// the use case's own re-read) is already counted by the use case, which
+/// owns that metric — see
+/// `hort_app::use_cases::artifact_use_case::ArtifactUseCase::download`.
+/// Counting it here too would double-count one pull, so the envelope and
+/// the counter are separate and the caller picks.
+pub(super) fn quarantined_response(
+    artifact: &Artifact,
+    retry_after_floor_secs: NonZeroU32,
+) -> Response {
     OciError::Quarantined {
-        retry_after_seconds,
+        retry_after_seconds: quarantine_retry_after_seconds(artifact, retry_after_floor_secs),
     }
     .into_response()
 }

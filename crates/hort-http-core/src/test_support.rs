@@ -2686,6 +2686,29 @@ pub fn with_ingest_use_case(base: &Arc<AppContext>, new_uc: Arc<IngestUseCase>) 
     rebuild(base, |ctx| ctx.ingest_use_case = new_uc)
 }
 
+/// Swap the wired [`ManifestDeliverabilityUseCase`] on a mock context,
+/// leaving every other field pointer-identical.
+///
+/// The caller composes the use case, for the same reason
+/// [`with_ingest_use_case`] takes one: its `ConstituentStatusReader` is
+/// a constructor argument rather than an [`AppContext`] slot, so no
+/// narrower helper can reach it.
+///
+/// The seam exists for one thing the harness reader deliberately cannot
+/// do. [`MockConstituentStatusReader`] filters its answer through
+/// `QuarantineStatus::is_terminal`, which is what makes it a faithful
+/// stand-in for the Postgres statement — and therefore the one answer it
+/// can never give is a **non-terminal** constituent, which is exactly
+/// the port-contract violation both OCI manifest paths fail closed on.
+/// Reaching that arm needs a double that lies, and this is where a test
+/// hands one in.
+pub fn with_manifest_deliverability_use_case(
+    base: &Arc<AppContext>,
+    new_uc: Arc<ManifestDeliverabilityUseCase>,
+) -> Arc<AppContext> {
+    rebuild(base, |ctx| ctx.manifest_deliverability_use_case = new_uc)
+}
+
 /// Swap the wired
 /// [`EventStore`] handle on a mock context. Used by the `/readyz`
 /// handler test that drives the unhealthy branch by injecting a

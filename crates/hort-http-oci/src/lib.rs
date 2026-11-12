@@ -42,6 +42,11 @@ pub mod catalog;
 pub mod config;
 pub mod coords;
 pub(crate) mod digest;
+// What a pull answers when the download refuses after the handler's own
+// gate admitted it — the mid-read status flip. `pub(crate)`: both pull
+// handlers reach it from their download arms and nothing outside the
+// crate maps an OCI download failure.
+pub(crate) mod download_refusal;
 pub mod error;
 pub mod manifests;
 pub mod manifests_write;

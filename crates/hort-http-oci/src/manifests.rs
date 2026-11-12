@@ -84,6 +84,7 @@ use hort_formats::oci::OciFormatHandler;
 
 use super::coords::oci_manifest_coords;
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
+use super::download_refusal::{self, FailedDownload};
 use super::error::OciError;
 use super::quarantine;
 use super::refusal::{log_refused_read, ReadRoute, RefusalReason, RefusedRead};
@@ -571,15 +572,29 @@ pub(super) async fn serve(
     } else {
         ctx.artifact_use_case.download(artifact.id, actor).await
     };
+    // A refusal from either call is answered in the refused status's own
+    // envelope and recorded, rather than reported as a server fault: the
+    // row can turn terminal between step 4's gate and the download's own
+    // re-read, and that is a withheld read, not a broken registry. Which
+    // failures are refusals, and why the discrimination is on the error,
+    // is `crate::download_refusal`.
     let (_a, stream) = match download_result {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(
-                artifact_id = %artifact.id,
-                error = %e,
-                "OCI manifest download failed after lookup"
-            );
-            return OciError::Internal.into_response();
+            return download_refusal::response_for(
+                &ctx,
+                &FailedDownload {
+                    error: &e,
+                    artifact_id: artifact.id,
+                    operation: if write_authorized_hold_read {
+                        "manifest_download_hold_read"
+                    } else {
+                        "manifest_download"
+                    },
+                    refused: &refused,
+                },
+            )
+            .await;
         }
     };
 
@@ -691,46 +706,8 @@ async fn terminal_constituent_response(
     let subject = format!("sha256:{}", constituent.content_hash);
     match constituent.status {
         QuarantineStatus::Rejected => {
-            let axis = match ctx
-                .artifact_use_case
-                .find_in_repo_by_hash(repo.id, &constituent.content_hash)
-                .await
-            {
-                // An absent axis emits no field and never an `unknown`
-                // token — a token would dress an inconsistency up as a
-                // verdict. The operator is told by the hydration itself,
-                // which distinguishes "no `ArtifactRejected` on the
-                // stream" (the illegal state ADR 0039 D6 names) from
-                // "could not read the stream" in its own log; repeating
-                // that line here would double-count one incident.
-                Ok(Some(artifact)) => artifact
-                    .rejection_reason
-                    .as_ref()
-                    .map(RejectionReason::wire_kind),
-                // The row the resolution just matched is gone or
-                // unreadable. The refusal stands — see the note above on
-                // why this is not a second decision — and the client is
-                // told the subject without an axis.
-                Ok(None) => {
-                    tracing::warn!(
-                        repo_key = %repo.key,
-                        constituent = %constituent.content_hash,
-                        "OCI manifest: the terminal constituent has no row to read its \
-                         rejection axis from; refusing without an axis"
-                    );
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        repo_key = %repo.key,
-                        constituent = %constituent.content_hash,
-                        error = %e,
-                        "OCI manifest: could not load the terminal constituent to recover \
-                         its rejection axis; refusing without an axis"
-                    );
-                    None
-                }
-            };
+            let axis =
+                terminal_constituent_axis(ctx, repo.id, &constituent.content_hash, &repo.key).await;
             let response = OciError::ArtifactRejected { subject, axis }.into_response();
             log_refused_read(&response, refused, &RefusalReason::TerminalConstituent);
             response
@@ -764,6 +741,80 @@ async fn terminal_constituent_response(
                  disagreement about what terminal means"
             );
             OciError::Internal.into_response()
+        }
+    }
+}
+
+/// The rejection axis a **terminal-constituent** refusal reports, for
+/// whichever side is asking.
+///
+/// Both ends of a manifest's life answer about the same constituent and
+/// must answer alike: the read route refuses a stored document whose
+/// closure carries a terminal verdict, and the manifest `PUT` refuses a
+/// document being admitted over the same closure
+/// (`manifests_write::refuse_undeliverable_closure`). One definition, so
+/// the disclosure cannot come out depth-dependent or route-dependent.
+///
+/// The axis is not a column: `ArtifactUseCase` derives it from the
+/// constituent's own `ArtifactRejected` event during the load, at the
+/// one read-path hydration point every format shares (a format crate
+/// must not read a stream, ADR 0008). That costs one bounded stream
+/// read, paid **only** on a path that is already refusing rather than
+/// serving — the same trade a manifest's own `Rejected` arm makes.
+///
+/// An absent axis emits **no** field and never an `unknown` token — a
+/// token would dress an inconsistency up as a verdict. The operator is
+/// told by the hydration itself, which distinguishes "no
+/// `ArtifactRejected` on the stream" (the illegal state ADR 0039 D6
+/// names) from "could not read the stream" in its own log; repeating
+/// that line here would double-count one incident.
+///
+/// **This load is not a second decision.** The refusal was already
+/// decided by the deliverability resolution; this only recovers the
+/// axis, so a constituent re-judged between the two reads does not flip
+/// the answer. Treating it as a re-decision would make the response
+/// depend on which of two reads won a race — hence the two `None` arms
+/// below, which report and carry on rather than reconsidering.
+///
+/// `context` is the caller's own label for the log line (a repository
+/// key on the read route, the pushed document's digest on the write
+/// route), so one grep finds the constituent from either side.
+pub(crate) async fn terminal_constituent_axis(
+    ctx: &AppContext,
+    repo_id: Uuid,
+    constituent: &ContentHash,
+    context: &str,
+) -> Option<&'static str> {
+    match ctx
+        .artifact_use_case
+        .find_in_repo_by_hash(repo_id, constituent)
+        .await
+    {
+        Ok(Some(artifact)) => artifact
+            .rejection_reason
+            .as_ref()
+            .map(RejectionReason::wire_kind),
+        // The row the resolution just matched is gone or unreadable. The
+        // refusal stands and the client is told the subject without an
+        // axis.
+        Ok(None) => {
+            tracing::warn!(
+                context = %context,
+                constituent = %constituent,
+                "OCI: the terminal constituent has no row to read its rejection axis \
+                 from; refusing without an axis"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                context = %context,
+                constituent = %constituent,
+                error = %e,
+                "OCI: could not load the terminal constituent to recover its rejection \
+                 axis; refusing without an axis"
+            );
+            None
         }
     }
 }
@@ -9618,5 +9669,352 @@ mod tests {
             "the premise of this test is an exempted hold-read, not a refusal"
         );
         crate::refusal::assert_no_refusal_line(&events);
+    }
+
+    // -- the status flip inside the read ----------------------------------
+
+    /// Drive one anonymous manifest `GET` **by tag** of a `Released`
+    /// manifest whose row flips to `flip_to` **between** step 4's status
+    /// gate and `ArtifactUseCase::download`'s re-read of the same row —
+    /// the window a concurrent rescan lands in during normal operation.
+    ///
+    /// Every constituent is seeded `Released`, so the ADR 0062 closure
+    /// check passes and the request genuinely reaches the download: a
+    /// refusal from there would otherwise be indistinguishable from the
+    /// constituent arm.
+    ///
+    /// Returns the status, the `Retry-After`, the body and every
+    /// `tracing` event — before this, every error from the download
+    /// mapped to `500` and recorded nothing at all, so a status
+    /// assertion alone cannot settle it.
+    #[allow(clippy::type_complexity)]
+    fn manifest_read_with_status_flip(
+        flip_to: QuarantineStatus,
+        axis: Option<RejectionReason>,
+    ) -> (
+        (StatusCode, Option<String>, Vec<u8>),
+        Vec<CapturedEvent>,
+        String,
+    ) {
+        let body = image_manifest_body(CONFIG_HEX, &[LAYER_HEX]);
+        let hex = sha256_hex(&body);
+        let reported = hex.clone();
+        let (parts, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let (artifact_id, hash) = seed_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    &h.metadata,
+                    repo_id,
+                    &hex,
+                    &body,
+                    None,
+                    QuarantineStatus::Released,
+                );
+                seed_constituent(&h, repo_id, CONFIG_HEX, QuarantineStatus::Released, None);
+                seed_constituent(&h, repo_id, LAYER_HEX, QuarantineStatus::Released, None);
+                seed_tag(&h.refs, repo_id, WITHHELD_NAME, WITHHELD_TAG, &hash);
+                if flip_to == QuarantineStatus::Rejected {
+                    h.events.set_stream(
+                        &hort_domain::events::StreamId::artifact(artifact_id),
+                        axis.map(|reason| {
+                            vec![persisted_artifact_rejected(artifact_id, reason, 1)]
+                        })
+                        .unwrap_or_default(),
+                    );
+                }
+                // The flip lands on the handler's own read: step 3 is
+                // served the `Released` row and step 4 admits it, and
+                // every later read of that row — the download's gate, and
+                // the refusal mapping's re-read — sees the new status.
+                h.artifacts
+                    .set_status_after_next_find_by_path(artifact_id, flip_to);
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+                let response = serve(
+                    ctx,
+                    "myrepo",
+                    WITHHELD_NAME,
+                    WITHHELD_TAG,
+                    &HeaderMap::new(),
+                    /* head = */ false,
+                    /* actor = */ None,
+                )
+                .await;
+                let status = response.status();
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .map(|v| v.to_str().unwrap().to_string());
+                let bytes = to_bytes(response.into_body(), 4 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec();
+                (status, retry_after, bytes)
+            })
+        });
+        (parts, events, reported)
+    }
+
+    /// **Acceptance, manifest route.** The flip to `Rejected` answers
+    /// that status's own `403 DENIED` — naming the client's reference and
+    /// the axis, the same envelope step 4 sends for a row that was
+    /// already `Rejected` when it was read — instead of the `500` that
+    /// told the caller the server broke. And it leaves a `rejected`
+    /// refusal line, which this path used to leave nothing of.
+    #[test]
+    fn a_manifest_read_whose_row_turns_rejected_mid_read_answers_403_and_records_it() {
+        let ((status, _, body), events, hex) = manifest_read_with_status_flip(
+            QuarantineStatus::Rejected,
+            Some(RejectionReason::Scanner),
+        );
+        let rendered = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a withheld read is not a server fault: {rendered}"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["subject"], WITHHELD_TAG,
+            "the manifest route names the client's own reference, as its gate arm does"
+        );
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+        crate::refusal::assert_refusal_line(
+            &events,
+            &crate::refusal::ExpectedRefusal {
+                level: tracing::Level::WARN,
+                route: "manifest",
+                repository: "myrepo",
+                name: WITHHELD_NAME,
+                reference: WITHHELD_TAG,
+                digest: &hex,
+                status: 403,
+                reason: "rejected",
+            },
+        );
+    }
+
+    /// The other terminal state on the same window: `503` with no
+    /// `Retry-After`, recorded as `scan_indeterminate`.
+    #[test]
+    fn a_manifest_read_whose_row_turns_indeterminate_mid_read_answers_503_without_a_deadline() {
+        let ((status, retry_after, body), events, hex) =
+            manifest_read_with_status_flip(QuarantineStatus::ScanIndeterminate, None);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after, None, "no self-resolving deadline");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        crate::refusal::assert_refusal_line(
+            &events,
+            &crate::refusal::ExpectedRefusal {
+                level: tracing::Level::WARN,
+                route: "manifest",
+                repository: "myrepo",
+                name: WITHHELD_NAME,
+                reference: WITHHELD_TAG,
+                digest: &hex,
+                status: 503,
+                reason: "scan_indeterminate",
+            },
+        );
+    }
+
+    /// A flip back into a **hold** is a refusal too, and the one whose
+    /// level differs: `503` with its `Retry-After`, recorded at `info!`
+    /// because waiting does resolve it. The level criterion is
+    /// `crate::refusal`'s and is not re-decided at this exit.
+    #[test]
+    fn a_manifest_read_whose_row_turns_quarantined_mid_read_answers_503_at_info() {
+        let ((status, retry_after, _), events, hex) =
+            manifest_read_with_status_flip(QuarantineStatus::Quarantined, None);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            retry_after.is_some(),
+            "a timed hold advertises its deadline"
+        );
+        crate::refusal::assert_refusal_line(
+            &events,
+            &crate::refusal::ExpectedRefusal {
+                level: tracing::Level::INFO,
+                route: "manifest",
+                repository: "myrepo",
+                name: WITHHELD_NAME,
+                reference: WITHHELD_TAG,
+                digest: &hex,
+                status: 503,
+                reason: "quarantined",
+            },
+        );
+    }
+
+    /// **The hold-read's own download refusal.** A write-granted caller
+    /// is admitted to a `Quarantined` manifest by the ADR 0039 §10
+    /// exemption, and the row turns `Rejected` before
+    /// `download_hold_read` re-reads it — `HeldVisibility::exemption_covers`
+    /// does not cover a verdict already reached, so that call refuses.
+    ///
+    /// The answer is the one this route gives for a `Rejected` manifest
+    /// `GET` for every caller, write grant or not: `403 DENIED` with the
+    /// axis. Before, it was the `500` this route's own comment predicted
+    /// ("an admitted status refused there would arrive here as the
+    /// `OciError::Internal` below — a `500` on a read this route already
+    /// decided was allowed").
+    #[test]
+    fn a_hold_read_whose_row_turns_rejected_mid_read_answers_403_and_records_it() {
+        let (content, hex) = withheld_manifest();
+        let (status, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let (artifact_id, _) = seed_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    &h.metadata,
+                    repo_id,
+                    &hex,
+                    &content,
+                    None,
+                    QuarantineStatus::Quarantined,
+                );
+                h.events.set_stream(
+                    &hort_domain::events::StreamId::artifact(artifact_id),
+                    vec![persisted_artifact_rejected(
+                        artifact_id,
+                        RejectionReason::Scanner,
+                        1,
+                    )],
+                );
+                // The hold-read gate is served the `Quarantined` row and
+                // admits it; the download's own gate sees `Rejected`.
+                h.artifacts
+                    .set_status_after_next_find_by_path(artifact_id, QuarantineStatus::Rejected);
+                let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&ctx);
+                let principal = principal_with_claim("ci-pusher");
+                serve(
+                    ctx,
+                    "myrepo",
+                    WITHHELD_NAME,
+                    &format!("sha256:{hex}"),
+                    &HeaderMap::new(),
+                    /* head = */ false,
+                    Some(&principal),
+                )
+                .await
+                .status()
+            })
+        });
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a verdict reached inside the hold-read is a refusal, not a server fault"
+        );
+        crate::refusal::assert_refusal_line(
+            &events,
+            &crate::refusal::ExpectedRefusal {
+                level: tracing::Level::WARN,
+                route: "manifest",
+                repository: "myrepo",
+                name: WITHHELD_NAME,
+                reference: &format!("sha256:{hex}"),
+                digest: &hex,
+                status: 403,
+                reason: "rejected",
+            },
+        );
+    }
+
+    // -- the shared axis recovery's two fail-safe arms --------------------
+    //
+    // `terminal_constituent_axis` is asked by both ends of a manifest's
+    // life — the read route's refusal of a stored document and the PUT's
+    // refusal of one being admitted. Its two `None` arms report and carry
+    // on rather than reconsidering, because the refusal was decided
+    // before the load and a constituent re-judged between the two reads
+    // must not flip the answer. Driven here directly: the harness's
+    // `ConstituentStatusReader` answers from the same artifact store, so
+    // a constituent it names terminal always has a row to load — which is
+    // the property that makes it faithful, and the reason neither arm is
+    // reachable through a handler.
+
+    /// The row the resolution just matched is **gone**. The refusal
+    /// stands without an axis, and the operator is told.
+    #[test]
+    fn the_axis_recovery_reports_a_constituent_with_no_row_and_returns_none() {
+        let hash: ContentHash = CONFIG_HEX.parse().unwrap();
+        let (axis, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+                terminal_constituent_axis(&ctx, Uuid::new_v4(), &hash, "myrepo").await
+            })
+        });
+        assert_eq!(axis, None, "an absent row yields no axis, never a token");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.fields.contains("has no row to read its rejection axis")),
+            "and the operator is told which arm it was: {events:?}"
+        );
+    }
+
+    /// The load itself **fails**. Same answer, different line: nothing is
+    /// known to be wrong with the constituent, only that the axis could
+    /// not be looked up — collapsing the two would make the first line
+    /// meaningless.
+    #[test]
+    fn the_axis_recovery_reports_a_failed_load_and_returns_none() {
+        let hash: ContentHash = CONFIG_HEX.parse().unwrap();
+        let (axis, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                h.artifacts
+                    .fail_next_find_by_repo_and_checksum(DomainError::Invariant(
+                        "catalog down".into(),
+                    ));
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+                terminal_constituent_axis(&ctx, Uuid::new_v4(), &hash, "myrepo").await
+            })
+        });
+        assert_eq!(axis, None);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.fields.contains("could not load the terminal constituent")),
+            "the failed-load arm is distinguishable from the absent-row one: {events:?}"
+        );
+    }
+
+    /// And the positive arm, so the two above are not satisfied by an
+    /// implementation that always answers `None`: a constituent with a
+    /// row and an `ArtifactRejected` on its stream yields its axis.
+    #[test]
+    fn the_axis_recovery_returns_the_axis_from_the_constituents_own_stream() {
+        let axis = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_constituent(
+                &h,
+                repo_id,
+                CONFIG_HEX,
+                QuarantineStatus::Rejected,
+                Some(RejectionReason::Curator {
+                    curator_id: Uuid::new_v4(),
+                }),
+            );
+            let hash: ContentHash = CONFIG_HEX.parse().unwrap();
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            terminal_constituent_axis(&ctx, repo_id, &hash, "myrepo").await
+        });
+        assert_eq!(axis, Some("curator"));
     }
 }
