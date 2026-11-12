@@ -87,7 +87,9 @@ those, where *why* something is withheld is information rather than access.
   (ADR 0027 / ADR 0039) is a signature over exactly those bytes.
 - Refusal binds both ends of such a document's life: one hort will not deliver
   is also one it does not mint. That is the same rule one step earlier, not a
-  second rule.
+  second rule. *(Amended 2026-11-12: the mint half is withdrawn — a holder of
+  Write may PUT and rely on the artifact existing afterwards; see the amendment
+  below.)*
 
 This ADR decides nothing about a version hort has **never ingested**. That
 tier is neither servable nor non-servable but unknown, it is the ordinary
@@ -216,3 +218,37 @@ decides a different question (the never-ingested tier), and is not extended.
   vocabulary, already in place and unchanged here.
 - [ADR 0043](0043-oci-image-index-support.md) — the narrowed argument, with
   its dated pointer back to here.
+
+## Amendment, 2026-11-12 — refusal binds delivery, not ingest
+
+Decision 2's third bullet said that refusal binds both ends of a document's
+life: *"one hort will not deliver is also one it does not mint."* **That second
+clause is withdrawn.** A manifest hort will not deliver is still refused on
+delivery, and is still omitted from or refused as a resolution document. It is
+nevertheless minted.
+
+**A principal holding Write may execute a PUT and rely on the artifact
+existing afterwards.** That is the guarantee the write right carries, and it
+does not bend to a hold. A refusal grounded in a quarantine status is a
+statement about *this moment*: the hold is provisional by construction, its
+exits are a curator's waive and an arriving verdict, and the ingest it would
+have suppressed is permanent. Conditioning a permanent effect on a provisional
+decision is what this amendment removes — not the refusal itself, which stands
+unchanged on every route that serves bytes or names them.
+
+So hort does store documents whose delivery it refuses at a given time, and
+that is the expected state rather than a defect. The push completes itself: the
+artifact exists, and when the hold is resolved the manifest becomes deliverable
+on the next read, because deliverability is resolved from the manifest's own
+bytes rather than from anything recorded at admission. Nothing has to be pushed
+a second time after a human has already acted.
+
+Decision 1 is untouched, and so are both enforcement shapes in decision 2 — a
+constructed document omits the non-servable entry, content-addressed bytes are
+refused whole.
+
+**Consequence left open:** the mint on a refused path records no membership
+claims, on the grounds that an edge must never name a blob the repository
+cannot deliver, and nothing revisits a refused manifest later to record them.
+A manifest minted this way is therefore a live row whose constituents' bytes
+no claim protects. Closing that is a separate decision, not settled here.
