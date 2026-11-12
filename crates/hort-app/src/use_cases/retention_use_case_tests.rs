@@ -31,8 +31,9 @@ use hort_domain::ports::event_store::{EventStore, ReadFrom};
 use hort_domain::ports::retention_scan_reader::{FirstObservations, RetentionScanReader};
 use hort_domain::ports::BoxFuture;
 use hort_domain::retention::{
-    BooleanOp, ExpirationReason, FindingAgeAnchorSource, PolicyPredicate, RetentionEvaluationMode,
-    RetentionPolicy, RetentionPolicyEvent, RetentionScope,
+    BooleanOp, ExpirationReason, FindingAgeAnchorSource, HeldState, HeldStateEntry,
+    PolicyPredicate, RetentionEvaluationMode, RetentionPolicy, RetentionPolicyEvent,
+    RetentionScope,
 };
 use hort_domain::types::{ComponentRelation, Finding};
 
@@ -162,6 +163,7 @@ fn finding(sev: SeverityThreshold, cvss: Option<f32>, fixed: Vec<&str>) -> Findi
 fn policy(predicate: PolicyPredicate, scope: RetentionScope) -> RetentionPolicy {
     let id = Uuid::new_v4();
     RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+        held_states: Default::default(),
         id,
         name: "test-policy".into(),
         predicate,
@@ -175,6 +177,7 @@ fn archived_policy() -> RetentionPolicy {
     let id = Uuid::new_v4();
     RetentionPolicy::project(&[
         RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id,
             name: "arch".into(),
             predicate: PolicyPredicate::AgeExceeds(1),
@@ -524,6 +527,7 @@ async fn evaluation_refuses_a_stream_already_past_the_event_cap() {
         crate::use_cases::STREAM_EVENT_CAP + 1,
         c.artifact.created_at,
         DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
+            held_state_authority: None,
             artifact_id: c.artifact.id,
             policy_id: p.id,
             policy_name: p.name.clone(),
@@ -1162,6 +1166,7 @@ async fn idempotency_is_scoped_per_policy_id() {
 
     // Genesis + an ArtifactExpired authored by policy A.
     let prior = DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
+        held_state_authority: None,
         artifact_id: c.artifact.id,
         policy_id: pa.id,
         policy_name: pa.name.clone(),
@@ -1896,6 +1901,7 @@ mod metrics {
                 let store = Arc::new(MockEventStore::new());
                 let uc = RetentionUseCase::new(wrap_for_test(store.clone()), Arc::new(reader));
                 let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid,
                     name: "stale-test".into(),
                     predicate: PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High),
@@ -1937,6 +1943,7 @@ mod metrics {
                     Arc::new(MockRetentionScanReader::new()),
                 );
                 let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid,
                     name: "age".into(),
                     predicate: PolicyPredicate::AgeExceeds(1),
@@ -1983,6 +1990,7 @@ mod metrics {
                     Arc::new(MockRetentionScanReader::new()),
                 );
                 let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid,
                     name: "keep-last".into(),
                     predicate: PolicyPredicate::KeepLastN(3),
@@ -2021,6 +2029,7 @@ mod metrics {
                 );
                 // no_match: AgeExceeds(huge) on a young artifact.
                 let p_nm = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid_nm,
                     name: "nm".into(),
                     predicate: PolicyPredicate::AgeExceeds(u64::MAX),
@@ -2031,6 +2040,7 @@ mod metrics {
                 let c_ok = candidate(QuarantineStatus::Released, ts(999_999));
                 // skipped_quarantined.
                 let p_q = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid_q,
                     name: "q".into(),
                     predicate: PolicyPredicate::AgeExceeds(1),
@@ -2082,6 +2092,7 @@ mod metrics {
                     Arc::new(MockRetentionScanReader::new()),
                 );
                 let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid,
                     name: "age".into(),
                     predicate: PolicyPredicate::AgeExceeds(1),
@@ -2135,6 +2146,7 @@ mod metrics {
                     Arc::new(MockRetentionScanReader::new()),
                 );
                 let p_r = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid_r,
                     name: "r".into(),
                     predicate: PolicyPredicate::AgeExceeds(1),
@@ -2143,6 +2155,7 @@ mod metrics {
                 }])
                 .unwrap();
                 let p_i = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid_i,
                     name: "i".into(),
                     predicate: PolicyPredicate::AgeExceeds(1),
@@ -2198,6 +2211,7 @@ mod metrics {
                 let store = Arc::new(MockEventStore::new());
                 let uc = RetentionUseCase::new(wrap_for_test(store.clone()), Arc::new(reader));
                 let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid,
                     name: "err".into(),
                     predicate: PolicyPredicate::AgeExceeds(1),
@@ -2242,6 +2256,7 @@ mod metrics {
                 let store = Arc::new(MockEventStore::new());
                 let uc = RetentionUseCase::new(wrap_for_test(store.clone()), Arc::new(reader));
                 let p = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+                    held_states: Default::default(),
                     id: pid,
                     name: "sec".into(),
                     predicate: PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High),
@@ -2391,4 +2406,652 @@ async fn tag_target_still_expires_under_an_age_policy() {
 
     assert_eq!(s.expired, 1);
     assert_eq!(store.appended_batches().len(), 1);
+}
+
+// ===========================================================================
+// The held-state exception
+//
+// Five artifact-level gates refuse to collect a held artifact, and the
+// evaluator is the second of them. These tests pin what opens it, what
+// does not, and the one anchor that decides whether the exception is
+// safe at all.
+// ===========================================================================
+
+/// A policy opting in to `states`, with the age bound the opt-in
+/// requires. `secs` is the span, measured — for a held artifact — from
+/// its entry into the state.
+fn held_state_policy(states: &[HeldState], secs: u64) -> RetentionPolicy {
+    let id = Uuid::new_v4();
+    RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+        id,
+        name: "collect-held-evidence".into(),
+        predicate: PolicyPredicate::AgeExceeds(secs),
+        scope: RetentionScope::AllRepos,
+        held_states: states.iter().copied().collect(),
+        created_at: ts(0),
+    }])
+    .expect("an age-bounded opt-in is valid")
+}
+
+fn rejected_event(artifact_id: Uuid) -> DomainEvent {
+    DomainEvent::ArtifactRejected(hort_domain::events::ArtifactRejected {
+        artifact_id,
+        rejected_by: hort_domain::events::RejectionReason::Scanner,
+        reason: "blocking findings".into(),
+    })
+}
+
+fn quarantined_event(artifact_id: Uuid, window_start: DateTime<Utc>) -> DomainEvent {
+    DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+        artifact_id,
+        quarantine_window_start: window_start,
+    })
+}
+
+fn scan_indeterminate_event(artifact_id: Uuid) -> DomainEvent {
+    DomainEvent::ScanIndeterminate(hort_domain::events::ScanIndeterminate {
+        artifact_id,
+        scanner: "trivy".into(),
+        reason: "every backend errored".into(),
+        attempts: 3,
+    })
+}
+
+fn released_event(artifact_id: Uuid) -> DomainEvent {
+    DomainEvent::ArtifactReleased(hort_domain::events::ArtifactReleased {
+        artifact_id,
+        released_by: hort_domain::events::ReleaseReason::Curator,
+        released_by_user_id: Some(Uuid::from_u128(0xC0DE)),
+        justification: Some("reviewed and accepted".into()),
+    })
+}
+
+/// Seed a held artifact's stream: genesis, then `extra`, with each
+/// event's `stored_at` given explicitly — the state-entry anchor is
+/// `stored_at`, so a fixture that cannot set it cannot exercise the
+/// anchor at all.
+fn seed_dated_stream(
+    store: &MockEventStore,
+    c: &RetentionCandidate,
+    extra: Vec<(DateTime<Utc>, DomainEvent)>,
+) -> StreamId {
+    let stream_id = StreamId::artifact(c.artifact.id);
+    let mut events = vec![persisted(
+        &stream_id,
+        0,
+        c.artifact.created_at,
+        ingested(c.artifact.id, IngestSource::Proxied),
+    )];
+    for (i, (stored_at, ev)) in extra.into_iter().enumerate() {
+        events.push(persisted(&stream_id, (i + 1) as u64, stored_at, ev));
+    }
+    store.set_stream(&stream_id, events);
+    stream_id
+}
+
+/// The `held_state_authority` on the single `ArtifactExpired` the sweep
+/// appended.
+fn appended_authority(store: &MockEventStore) -> Option<HeldStateEntry> {
+    let batches = store.appended_batches();
+    assert_eq!(batches.len(), 1, "expected exactly one append");
+    match &batches[0].events[0].event {
+        DomainEvent::ArtifactExpired(e) => e.held_state_authority,
+        other => panic!("expected ArtifactExpired, got {}", other.event_type()),
+    }
+}
+
+/// **The most important test in the item.** Without the opt-in, all
+/// three held states stay locked — and they stay locked against a
+/// policy whose age bound is long past, which is the only version of
+/// this test that proves anything.
+#[tokio::test]
+async fn without_the_opt_in_every_held_state_stays_locked() {
+    for status in [
+        QuarantineStatus::Quarantined,
+        QuarantineStatus::Rejected,
+        QuarantineStatus::ScanIndeterminate,
+    ] {
+        let (uc, store) = build(MockRetentionScanReader::new());
+        // No `held_states`: the default, and the state of every policy
+        // that predates the exception.
+        let p = policy(PolicyPredicate::AgeExceeds(1), RetentionScope::AllRepos);
+        let c = candidate(status, ts(0));
+        seed_dated_stream(&store, &c, vec![(ts(1), rejected_event(c.artifact.id))]);
+
+        let s = uc
+            .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+            .await
+            .expect("sweep runs");
+
+        assert_eq!(
+            (
+                s.skipped_protected,
+                s.expired,
+                s.skipped_unanchored_held_state
+            ),
+            (1, 0, 0),
+            "status {status:?} must stay protected with no opt-in"
+        );
+        assert!(
+            store.appended_batches().is_empty(),
+            "status {status:?}: no event may be appended"
+        );
+    }
+}
+
+/// An opt-in is per **state**: a policy naming `Rejected` does not open
+/// `Quarantined` or `ScanIndeterminate`.
+#[tokio::test]
+async fn an_opt_in_opens_only_the_states_it_names() {
+    for status in [
+        QuarantineStatus::Quarantined,
+        QuarantineStatus::ScanIndeterminate,
+    ] {
+        let (uc, store) = build(MockRetentionScanReader::new());
+        let p = held_state_policy(&[HeldState::Rejected], 1);
+        let c = candidate(status, ts(0));
+        seed_dated_stream(
+            &store,
+            &c,
+            vec![
+                (ts(1), quarantined_event(c.artifact.id, ts(0))),
+                (ts(2), scan_indeterminate_event(c.artifact.id)),
+            ],
+        );
+
+        let s = uc
+            .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+            .await
+            .expect("sweep runs");
+
+        assert_eq!(s.skipped_protected, 1, "status {status:?} is not opted in");
+        assert_eq!(s.expired, 0);
+        assert!(store.appended_batches().is_empty());
+    }
+}
+
+/// With the opt-in and an elapsed span, a held artifact expires — and
+/// the event carries the authority the purge will check, naming the
+/// occupancy it was decided about.
+#[tokio::test]
+async fn an_opted_in_held_artifact_with_an_elapsed_span_expires_with_its_authority() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    let c = candidate(QuarantineStatus::Rejected, ts(0));
+    let rejected_at = ts(100_000);
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![(rejected_at, rejected_event(c.artifact.id))],
+    );
+
+    let s = uc
+        .evaluate_policies(
+            rejected_at + Duration::days(31),
+            &[p],
+            std::slice::from_ref(&c),
+        )
+        .await
+        .expect("sweep runs");
+
+    assert_eq!((s.expired, s.skipped_protected), (1, 0));
+    assert_eq!(
+        appended_authority(&store),
+        Some(HeldStateEntry {
+            state: HeldState::Rejected,
+            entered_at: rejected_at,
+            entry_stream_position: 1,
+        })
+    );
+}
+
+/// **The span measures time in the state.** A year-old artifact
+/// rejected yesterday does not expire under a 30-day span.
+///
+/// The same fixture with the content anchor would expire it instantly,
+/// which is the defect that would make the whole exception unsafe —
+/// and it is invisible to any fixture that creates and rejects in the
+/// same second. The gap here is a year.
+#[tokio::test]
+async fn a_year_old_artifact_rejected_yesterday_does_not_expire_under_a_thirty_day_span() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    // Content minted a year before the rejection, and the quarantine
+    // event carries that same year-old instant in its own payload —
+    // both reachable wrong answers are present in the fixture.
+    let created_at = ts(0);
+    let rejected_at = created_at + Duration::days(365);
+    let now = rejected_at + Duration::days(1);
+    let c = candidate(QuarantineStatus::Rejected, created_at);
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![
+            (created_at, quarantined_event(c.artifact.id, created_at)),
+            (rejected_at, rejected_event(c.artifact.id)),
+        ],
+    );
+
+    let s = uc
+        .evaluate_policies(now, &[p], std::slice::from_ref(&c))
+        .await
+        .expect("sweep runs");
+
+    assert_eq!(
+        (
+            s.expired,
+            s.skipped_protected,
+            s.skipped_unanchored_held_state
+        ),
+        (0, 0, 0),
+        "one day in the state is not thirty, whatever the content's age"
+    );
+    assert!(store.appended_batches().is_empty());
+}
+
+/// The same artifact a month later: the span has run **in the state**,
+/// so it expires. Pinned beside the test above so that one is shown to
+/// be about the anchor rather than about the exception never firing.
+#[tokio::test]
+async fn the_same_artifact_expires_once_the_span_has_run_in_the_state() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    let created_at = ts(0);
+    let rejected_at = created_at + Duration::days(365);
+    let c = candidate(QuarantineStatus::Rejected, created_at);
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![
+            (created_at, quarantined_event(c.artifact.id, created_at)),
+            (rejected_at, rejected_event(c.artifact.id)),
+        ],
+    );
+
+    let s = uc
+        .evaluate_policies(
+            rejected_at + Duration::days(31),
+            &[p],
+            std::slice::from_ref(&c),
+        )
+        .await
+        .expect("sweep runs");
+
+    assert_eq!(s.expired, 1);
+}
+
+/// Each of the three held states measures from its own entry event.
+#[tokio::test]
+async fn every_opted_in_held_state_measures_from_its_own_entry() {
+    let entries = [
+        (QuarantineStatus::Quarantined, HeldState::Quarantined),
+        (QuarantineStatus::Rejected, HeldState::Rejected),
+        (
+            QuarantineStatus::ScanIndeterminate,
+            HeldState::ScanIndeterminate,
+        ),
+    ];
+    for (status, state) in entries {
+        let (uc, store) = build(MockRetentionScanReader::new());
+        let p = held_state_policy(&[state], 30 * 86_400);
+        let created_at = ts(0);
+        let entered_at = created_at + Duration::days(365);
+        let c = candidate(status, created_at);
+        let event = match state {
+            HeldState::Quarantined => quarantined_event(c.artifact.id, created_at),
+            HeldState::Rejected => rejected_event(c.artifact.id),
+            HeldState::ScanIndeterminate => scan_indeterminate_event(c.artifact.id),
+        };
+        seed_dated_stream(&store, &c, vec![(entered_at, event)]);
+
+        // One day in: not elapsed.
+        let s = uc
+            .evaluate_policies(
+                entered_at + Duration::days(1),
+                std::slice::from_ref(&p),
+                std::slice::from_ref(&c),
+            )
+            .await
+            .expect("sweep runs");
+        assert_eq!(s.expired, 0, "{state:?} one day in must not expire");
+
+        // Thirty-one days in: elapsed, and dated from the entry.
+        let s = uc
+            .evaluate_policies(
+                entered_at + Duration::days(31),
+                std::slice::from_ref(&p),
+                std::slice::from_ref(&c),
+            )
+            .await
+            .expect("sweep runs");
+        assert_eq!(s.expired, 1, "{state:?} thirty-one days in must expire");
+        assert_eq!(
+            appended_authority(&store),
+            Some(HeldStateEntry {
+                state,
+                entered_at,
+                entry_stream_position: 1,
+            })
+        );
+    }
+}
+
+/// An opted-in held artifact whose stream carries no entry event for
+/// its state has **no span**, so nothing may expire it — and it is
+/// counted apart from the ordinary protection so an operator can tell
+/// the two refusals apart.
+///
+/// The fixture is the real population this protects: a pre-ADR-0039-D6
+/// corruption tombstone, `rejected` with an `ArtifactCorrupted` and no
+/// `ArtifactRejected`. The event store is append-only, so those
+/// streams can never gain the companion event.
+#[tokio::test]
+async fn an_opted_in_held_artifact_with_no_entry_event_has_no_span() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    let created_at = ts(0);
+    let c = candidate(QuarantineStatus::Rejected, created_at);
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![(
+            created_at,
+            DomainEvent::ArtifactCorrupted(hort_domain::events::ArtifactCorrupted {
+                artifact_id: c.artifact.id,
+                computed_hash: "b".repeat(64).parse().unwrap(),
+                expected_hash: "a".repeat(64).parse().unwrap(),
+                detected_at: created_at,
+            }),
+        )],
+    );
+
+    let s = uc
+        .evaluate_policies(
+            created_at + Duration::days(3650),
+            &[p],
+            std::slice::from_ref(&c),
+        )
+        .await
+        .expect("sweep runs");
+
+    assert_eq!(
+        (
+            s.expired,
+            s.skipped_unanchored_held_state,
+            s.skipped_protected
+        ),
+        (0, 1, 0),
+        "no entry event is no span, and it is its own refusal"
+    );
+    assert!(store.appended_batches().is_empty());
+}
+
+/// **A later occupancy records a new authorised expiry despite an older
+/// expiry by the same policy.**
+///
+/// The `(policy_id, artifact_id)` idempotency check is not a status
+/// gate but it vetoes exactly this case: an artifact rejected, expired
+/// by policy P, released by a curator and rejected again would be
+/// stuck — the purge refuses for want of a matching authority, and the
+/// evaluator refuses for having already expired it. Each half of that
+/// deadlock is asserted.
+#[tokio::test]
+async fn a_later_occupancy_records_a_new_authorised_expiry() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    let created_at = ts(0);
+    let first_rejection = created_at + Duration::days(100);
+    let second_rejection = created_at + Duration::days(400);
+    let c = candidate(QuarantineStatus::Rejected, created_at);
+
+    // The stream as it stands after the first occupancy was expired,
+    // the curator released the artifact, and it was rejected again.
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![
+            (first_rejection, rejected_event(c.artifact.id)),
+            (
+                first_rejection + Duration::days(31),
+                DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
+                    artifact_id: c.artifact.id,
+                    policy_id: p.id,
+                    policy_name: p.name.clone(),
+                    reason: ExpirationReason::AgeExceeded {
+                        published_at: first_rejection,
+                        ttl_secs: 30 * 86_400,
+                    },
+                    eligible_at: first_rejection + Duration::days(31),
+                    held_state_authority: Some(HeldStateEntry {
+                        state: HeldState::Rejected,
+                        entered_at: first_rejection,
+                        entry_stream_position: 1,
+                    }),
+                }),
+            ),
+            (
+                first_rejection + Duration::days(60),
+                released_event(c.artifact.id),
+            ),
+            (second_rejection, rejected_event(c.artifact.id)),
+        ],
+    );
+
+    let s = uc
+        .evaluate_policies(
+            second_rejection + Duration::days(31),
+            &[p],
+            std::slice::from_ref(&c),
+        )
+        .await
+        .expect("sweep runs");
+
+    assert_eq!(
+        (s.expired, s.already_expired),
+        (1, 0),
+        "the older expiry must not veto the new occupancy"
+    );
+    assert_eq!(
+        appended_authority(&store),
+        Some(HeldStateEntry {
+            state: HeldState::Rejected,
+            entered_at: second_rejection,
+            // Position 4 — the September rejection, not the one at 1.
+            entry_stream_position: 4,
+        }),
+        "the new authority names the new occupancy"
+    );
+}
+
+/// The idempotency check still holds **within** one occupancy: a second
+/// sweep over a stream already carrying this occupancy's authority is a
+/// no-op.
+#[tokio::test]
+async fn the_same_occupancy_is_idempotent() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    let created_at = ts(0);
+    let rejected_at = created_at + Duration::days(100);
+    let c = candidate(QuarantineStatus::Rejected, created_at);
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![
+            (rejected_at, rejected_event(c.artifact.id)),
+            (
+                rejected_at + Duration::days(31),
+                DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
+                    artifact_id: c.artifact.id,
+                    policy_id: p.id,
+                    policy_name: p.name.clone(),
+                    reason: ExpirationReason::AgeExceeded {
+                        published_at: rejected_at,
+                        ttl_secs: 30 * 86_400,
+                    },
+                    eligible_at: rejected_at + Duration::days(31),
+                    held_state_authority: Some(HeldStateEntry {
+                        state: HeldState::Rejected,
+                        entered_at: rejected_at,
+                        entry_stream_position: 1,
+                    }),
+                }),
+            ),
+        ],
+    );
+
+    let s = uc
+        .evaluate_policies(
+            rejected_at + Duration::days(40),
+            &[p],
+            std::slice::from_ref(&c),
+        )
+        .await
+        .expect("sweep runs");
+
+    assert_eq!((s.expired, s.already_expired), (0, 1));
+    assert!(store.appended_batches().is_empty());
+}
+
+/// An **ordinary** expiry by the same policy — recorded while the
+/// artifact was released — does not authorise a later held occupancy.
+/// Without this the artifact would be refused by the purge (no
+/// matching authority) and refused by the evaluator (already expired).
+#[tokio::test]
+async fn an_ordinary_expiry_does_not_authorise_a_later_held_occupancy() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    let created_at = ts(0);
+    let rejected_at = created_at + Duration::days(400);
+    let c = candidate(QuarantineStatus::Rejected, created_at);
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![
+            (
+                created_at + Duration::days(100),
+                DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
+                    artifact_id: c.artifact.id,
+                    policy_id: p.id,
+                    policy_name: p.name.clone(),
+                    reason: ExpirationReason::AgeExceeded {
+                        published_at: created_at,
+                        ttl_secs: 30 * 86_400,
+                    },
+                    eligible_at: created_at + Duration::days(100),
+                    held_state_authority: None,
+                }),
+            ),
+            (rejected_at, rejected_event(c.artifact.id)),
+        ],
+    );
+
+    let s = uc
+        .evaluate_policies(
+            rejected_at + Duration::days(31),
+            &[p],
+            std::slice::from_ref(&c),
+        )
+        .await
+        .expect("sweep runs");
+
+    assert_eq!((s.expired, s.already_expired), (1, 0));
+    assert!(appended_authority(&store).is_some());
+}
+
+/// A non-held artifact's idempotency is unchanged: an *ordinary* expiry
+/// by this policy is still a no-op, whatever authority anything else
+/// carries. The rule only widens for a held evaluation.
+#[tokio::test]
+async fn a_non_held_artifact_is_still_vetoed_by_an_ordinary_expiry() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 1);
+    let c = candidate(QuarantineStatus::Released, ts(0));
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![(
+            ts(10),
+            DomainEvent::ArtifactExpired(hort_domain::events::ArtifactExpired {
+                artifact_id: c.artifact.id,
+                policy_id: p.id,
+                policy_name: p.name.clone(),
+                reason: ExpirationReason::AgeExceeded {
+                    published_at: ts(0),
+                    ttl_secs: 1,
+                },
+                eligible_at: ts(10),
+                held_state_authority: None,
+            }),
+        )],
+    );
+
+    let s = uc
+        .evaluate_policies(ts(1_000_000), &[p], std::slice::from_ref(&c))
+        .await
+        .expect("sweep runs");
+
+    assert_eq!((s.expired, s.already_expired), (0, 1));
+    assert!(store.appended_batches().is_empty());
+}
+
+/// An opted-in policy evaluating a **non-held** artifact measures from
+/// the content anchor, exactly as it always did: the re-anchor is
+/// scoped to the held evaluation, and the event carries no authority.
+#[tokio::test]
+async fn an_opted_in_policy_still_measures_a_served_artifact_from_its_content_anchor() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let p = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    let created_at = ts(0);
+    let c = candidate(QuarantineStatus::Released, created_at);
+    seed_dated_stream(&store, &c, vec![]);
+
+    let s = uc
+        .evaluate_policies(
+            created_at + Duration::days(31),
+            &[p],
+            std::slice::from_ref(&c),
+        )
+        .await
+        .expect("sweep runs");
+
+    assert_eq!(s.expired, 1);
+    assert_eq!(
+        appended_authority(&store),
+        None,
+        "an ordinary expiry carries no held-state authority"
+    );
+}
+
+/// A mixed run: one policy opts in, another does not, and the
+/// per-policy refusal is retained for the one that does not. The
+/// candidate enumeration is shared, so the evaluator is the only thing
+/// that can make the distinction.
+#[tokio::test]
+async fn a_mixed_run_retains_the_per_policy_refusal() {
+    let (uc, store) = build(MockRetentionScanReader::new());
+    let opted_in = held_state_policy(&[HeldState::Rejected], 30 * 86_400);
+    let not_opted_in = policy(PolicyPredicate::AgeExceeds(1), RetentionScope::AllRepos);
+    let created_at = ts(0);
+    let rejected_at = created_at + Duration::days(100);
+    let c = candidate(QuarantineStatus::Rejected, created_at);
+    seed_dated_stream(
+        &store,
+        &c,
+        vec![(rejected_at, rejected_event(c.artifact.id))],
+    );
+
+    let s = uc
+        .evaluate_policies(
+            rejected_at + Duration::days(31),
+            &[not_opted_in, opted_in],
+            std::slice::from_ref(&c),
+        )
+        .await
+        .expect("sweep runs");
+
+    assert_eq!(
+        (s.evaluated, s.expired, s.skipped_protected),
+        (2, 1, 1),
+        "the policy without the opt-in still refuses the same artifact"
+    );
 }

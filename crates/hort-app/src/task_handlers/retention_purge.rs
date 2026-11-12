@@ -258,6 +258,8 @@ mod tests {
             tag_targeted: false,
             expired_only_by_keep_last_n: true,
             user_deleted: true,
+            held_state_authorised: false,
+            collection_needs_held_state_authority: false,
         };
         let expired = PendingPurge {
             artifact_id: Uuid::new_v4(),
@@ -265,6 +267,8 @@ mod tests {
             tag_targeted: false,
             expired_only_by_keep_last_n: false,
             user_deleted: false,
+            held_state_authorised: false,
+            collection_needs_held_state_authority: false,
         };
         let h = RetentionPurgeHandler::new(purge_uc_with_pending(vec![deleted, expired]));
         match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {

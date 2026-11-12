@@ -29,6 +29,7 @@ use crate::entities::scan_policy::SeverityThreshold;
 use crate::types::Finding;
 
 use super::anchor::FindingAgeAnchor;
+use super::held_state_entry::HeldStateEntry;
 use super::predicate::{BooleanOp, PolicyPredicate};
 use super::reason::ExpirationReason;
 
@@ -119,6 +120,62 @@ pub struct EvaluationInputs<'a> {
     /// (the freshness-gate timestamp). Carried into the
     /// `SecurityFinding` reason snapshot as `latest_scan_at`.
     pub latest_scan_at: DateTime<Utc>,
+    /// When the artifact entered the **held** state the evaluating
+    /// policy opted in to — and `None` for every other evaluation.
+    ///
+    /// This is the field that re-anchors
+    /// [`AgeExceeds`](PolicyPredicate::AgeExceeds). Present, the
+    /// predicate measures its span from
+    /// [`HeldStateEntry::entered_at`]; absent, from [`Self::created_at`].
+    /// One rule, stated once, and [`age_anchor`] is the only reader.
+    ///
+    /// ## Why the two cannot share an anchor
+    ///
+    /// [`Self::created_at`] is the content anchor. A retroactive
+    /// rejection does not move it, so a two-year-old artifact rejected
+    /// five minutes ago is **already past** any span expressed against
+    /// it: under a 30-day span it would be purged the same afternoon it
+    /// was first judged, and the held-state exception would collect
+    /// evidence it was meant to keep. The state entry is the only
+    /// instant that answers "how long has this artifact been held?",
+    /// and it is resolved from the artifact's own stream by
+    /// [`resolve_held_state_entry`](super::resolve_held_state_entry).
+    ///
+    /// ## The app layer's half of the contract
+    ///
+    /// `Some` exactly when the artifact is in a held state **and** the
+    /// evaluating policy's
+    /// [`held_states`](super::RetentionPolicy::held_states) names it.
+    /// A held artifact reaches this evaluator by no other route — the
+    /// evaluator's caller refuses one whose state no policy opted in
+    /// to — so an `AgeExceeds` evaluated against the content anchor is
+    /// always an evaluation of a *non-held* artifact, which is what
+    /// keeps the re-anchoring from changing any existing policy's
+    /// meaning.
+    ///
+    /// A held artifact whose entry event cannot be found has **no
+    /// span**: the caller does not substitute the content anchor and
+    /// does not call this evaluator at all. The fallback that looks
+    /// harmless is the defect — the absent event and the old content
+    /// coincide precisely in the population at risk.
+    pub held_state_entry: Option<HeldStateEntry>,
+}
+
+/// The instant [`PolicyPredicate::AgeExceeds`] measures from: the
+/// held-state entry when this is an opted-in policy's evaluation of a
+/// held artifact, the content anchor otherwise.
+///
+/// One function because two readers ask — the boolean match and the
+/// [`ExpirationReason::AgeExceeded`] snapshot that records what drove
+/// it — and a reason that snapshotted the other anchor would make
+/// `now - published_at >= ttl_secs` false on an event whose decision
+/// was correct, which is the arithmetic every auditor of these events
+/// does.
+fn age_anchor(inputs: &EvaluationInputs) -> DateTime<Utc> {
+    match &inputs.held_state_entry {
+        Some(entry) => entry.entered_at,
+        None => inputs.created_at,
+    }
 }
 
 /// Severity ordering: `Critical` is the strongest. `true` iff `have`
@@ -168,7 +225,9 @@ fn matched_via_security(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> bo
 /// not match when there is none.
 pub fn matches_bool(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> bool {
     match pred {
-        PolicyPredicate::AgeExceeds(secs) => elapsed_at_least(inputs.created_at, inputs.now, *secs),
+        PolicyPredicate::AgeExceeds(secs) => {
+            elapsed_at_least(age_anchor(inputs), inputs.now, *secs)
+        }
         PolicyPredicate::UnusedFor(secs) => match inputs.last_downloaded_at {
             // Never downloaded → "unused since creation": the artifact
             // is unused for at least its full age.
@@ -298,7 +357,7 @@ pub fn evaluate(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> Evaluation
 fn non_security_reason(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> ExpirationReason {
     match pred {
         PolicyPredicate::AgeExceeds(secs) => ExpirationReason::AgeExceeded {
-            published_at: inputs.created_at,
+            published_at: age_anchor(inputs),
             ttl_secs: *secs,
         },
         PolicyPredicate::UnusedFor(secs) => ExpirationReason::UnusedTtl {
@@ -322,7 +381,7 @@ fn non_security_reason(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> Exp
             // tier forbids `unwrap`/`panic` on an unproven branch — a
             // defensive age reason keeps the function total.
             .unwrap_or(ExpirationReason::AgeExceeded {
-                published_at: inputs.created_at,
+                published_at: age_anchor(inputs),
                 ttl_secs: 0,
             }),
         // A security variant never reaches here (the caller routed it
@@ -338,6 +397,7 @@ fn non_security_reason(pred: &PolicyPredicate, inputs: &EvaluationInputs) -> Exp
 mod tests {
     use super::super::anchor::FindingAgeAnchorSource;
     use super::*;
+    use crate::retention::HeldState;
     use crate::types::ComponentRelation;
 
     fn ts(secs: i64) -> DateTime<Utc> {
@@ -386,6 +446,11 @@ mod tests {
                 source: FindingAgeAnchorSource::FirstObservation,
             }),
             latest_scan_at: ts(900_000),
+            // The default is the ordinary (non-held) evaluation: every
+            // test below that is not about the held-state exception
+            // measures `AgeExceeds` from `created_at`, which is what
+            // every policy in the field does.
+            held_state_entry: None,
         }
     }
 
@@ -959,5 +1024,152 @@ mod tests {
         let j = i.clone();
         assert_eq!(j.findings.len(), 0);
         assert!(format!("{i:?}").contains("EvaluationInputs"));
+    }
+
+    // -- the held-state re-anchor ------------------------------------------
+
+    fn held(state: HeldState, entered_at: DateTime<Utc>, position: u64) -> HeldStateEntry {
+        HeldStateEntry {
+            state,
+            entered_at,
+            entry_stream_position: position,
+        }
+    }
+
+    /// **The span measures time in the state.** An artifact whose
+    /// content is a year old, rejected yesterday, does not satisfy a
+    /// 30-day span.
+    ///
+    /// This is the case that decides whether the span exists at all. On
+    /// the content anchor the same predicate matches instantly, which is
+    /// asserted beside it so the two readings are shown to disagree
+    /// rather than taken on faith.
+    #[test]
+    fn a_year_old_artifact_rejected_yesterday_is_not_past_a_thirty_day_span() {
+        let now = ts(366 * 86_400);
+        let thirty_days = PolicyPredicate::AgeExceeds(30 * 86_400);
+
+        let mut i = inputs(&[]);
+        i.now = now;
+        i.created_at = ts(0); // the content is a year old
+        i.held_state_entry = Some(held(HeldState::Rejected, ts(365 * 86_400), 7));
+
+        assert!(
+            !matches_bool(&thirty_days, &i),
+            "one day in the state is not thirty"
+        );
+
+        // The same inputs without the re-anchor: a year of content age
+        // is well past thirty days, which is exactly the expiry the
+        // anchor exists to prevent.
+        i.held_state_entry = None;
+        assert!(matches_bool(&thirty_days, &i));
+    }
+
+    /// Once the span has run **in the state**, the predicate matches.
+    #[test]
+    fn an_elapsed_held_state_span_matches() {
+        let mut i = inputs(&[]);
+        i.now = ts(400 * 86_400);
+        i.created_at = ts(0);
+        i.held_state_entry = Some(held(HeldState::Rejected, ts(365 * 86_400), 7));
+        assert!(matches_bool(&PolicyPredicate::AgeExceeds(30 * 86_400), &i));
+    }
+
+    /// The anchor applies to every held state, not just `Rejected` —
+    /// the quarantine hold and the terminal scan failure measure the
+    /// same way.
+    #[test]
+    fn every_held_state_re_anchors() {
+        for state in HeldState::ALL {
+            let mut i = inputs(&[]);
+            i.now = ts(366 * 86_400);
+            i.created_at = ts(0);
+            i.held_state_entry = Some(held(state, ts(365 * 86_400), 3));
+            assert!(
+                !matches_bool(&PolicyPredicate::AgeExceeds(30 * 86_400), &i),
+                "{state:?} must measure from its own entry"
+            );
+        }
+    }
+
+    /// The reason snapshot records the anchor that **decided**, so
+    /// `now - published_at >= ttl_secs` holds on the event an auditor
+    /// reads. A snapshot of the content anchor would make a correct
+    /// decision look unjustified by a year.
+    #[test]
+    fn the_age_reason_snapshots_the_anchor_that_decided() {
+        let entered_at = ts(365 * 86_400);
+        let mut i = inputs(&[]);
+        i.now = ts(400 * 86_400);
+        i.created_at = ts(0);
+        i.held_state_entry = Some(held(HeldState::Rejected, entered_at, 7));
+
+        match evaluate(&PolicyPredicate::AgeExceeds(30 * 86_400), &i) {
+            EvaluationOutcome::Matched(ExpirationReason::AgeExceeded {
+                published_at,
+                ttl_secs,
+            }) => {
+                assert_eq!(published_at, entered_at);
+                assert_eq!(ttl_secs, 30 * 86_400);
+                assert!(i.now.signed_duration_since(published_at).num_seconds() >= ttl_secs as i64);
+            }
+            other => panic!("expected an AgeExceeded match, got {other:?}"),
+        }
+    }
+
+    /// A future-dated entry (clock skew on `stored_at`) yields a
+    /// negative elapsed span, which `elapsed_at_least` answers as "not
+    /// elapsed" — the safe direction, and the one the resolver's own
+    /// clock-skew note promises.
+    #[test]
+    fn a_future_dated_entry_does_not_match() {
+        let mut i = inputs(&[]);
+        i.now = ts(1_000);
+        i.created_at = ts(0);
+        i.held_state_entry = Some(held(HeldState::Quarantined, ts(100_000), 1));
+        assert!(!matches_bool(&PolicyPredicate::AgeExceeds(1), &i));
+    }
+
+    /// The re-anchor reaches `AgeExceeds` **only**. The three other
+    /// anchored predicates measure their own quantities and a held
+    /// evaluation must not silently move them:
+    /// `HasFindingDetectedFor` dates the vulnerability, `UnusedFor`
+    /// dates a download, `KeepLastN` has no time in it at all.
+    #[test]
+    fn the_re_anchor_reaches_age_exceeds_only() {
+        let finding = vec![finding(SeverityThreshold::High, None, vec![])];
+        let entered_at = ts(900_000);
+
+        // `HasFindingDetectedFor`: the anchor is the advisory/observation
+        // date, which the held entry must not displace. Known since
+        // ts(0), so a 30-day grace period is long past at ts(1_000_000)
+        // whatever the held entry says.
+        let mut i = inputs(&finding);
+        i.held_state_entry = Some(held(HeldState::Rejected, entered_at, 2));
+        assert!(matches_bool(
+            &PolicyPredicate::HasFindingDetectedFor(100),
+            &i
+        ));
+
+        // `UnusedFor` with no download anchor measures from
+        // `created_at` — ts(0) — and stays there.
+        let mut j = inputs(&[]);
+        j.created_at = ts(0);
+        j.held_state_entry = Some(held(HeldState::Rejected, ts(999_999), 2));
+        assert!(matches_bool(&PolicyPredicate::UnusedFor(500_000), &j));
+    }
+
+    /// `created_at` itself is untouched by the re-anchor: it is the
+    /// content anchor and other predicates read it. Pinned because the
+    /// cheap way to implement this would have been to overwrite it.
+    #[test]
+    fn created_at_is_not_overwritten_by_the_held_entry() {
+        let mut i = inputs(&[]);
+        i.created_at = ts(0);
+        i.held_state_entry = Some(held(HeldState::Rejected, ts(900_000), 2));
+        assert_eq!(i.created_at, ts(0));
+        // And `UnusedFor`'s never-downloaded arm still reads it.
+        assert!(matches_bool(&PolicyPredicate::UnusedFor(999_999), &i));
     }
 }

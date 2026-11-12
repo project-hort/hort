@@ -61,6 +61,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinct contents and the weight of those contents:
   `GET /api/v1/admin/inventory`. The byte figure is a catalog weight, not disk
   usage: it is not additive across repositories and not reclaimable space (#280).
+- A `RetentionPolicy` can now collect quarantined, rejected or
+  scan-indeterminate artifacts, with `spec.heldStates` naming the states and
+  a positive `AgeExceeds` on every branch of the predicate measured from the
+  artifact's entry into the state. Omitted or empty — the default for every
+  existing policy — such artifacts stay protected exactly as before (#288).
 
 ### Changed
 

@@ -581,7 +581,7 @@ mod tests {
 
         let reader = PgRetentionCandidateReader::new(pool.clone());
         let candidates = reader
-            .list_candidates(500, None, Utc::now())
+            .list_candidates(500, None, Utc::now(), &[])
             .await
             .expect("candidate listing");
         let ids: Vec<Uuid> = candidates.iter().map(|c| c.artifact.id).collect();

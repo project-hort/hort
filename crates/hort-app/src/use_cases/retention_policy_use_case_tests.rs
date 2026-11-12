@@ -80,6 +80,7 @@ impl MockEventStore {
         extra: Vec<RetentionPolicyEvent>,
     ) -> u64 {
         let created = RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: row.policy_id,
             name: row.name.clone(),
             predicate: row.predicate.clone(),
@@ -276,6 +277,7 @@ fn make_use_case() -> (
 
 fn sample_row(id: Uuid, name: &str, version: u64, archived: bool) -> RetentionPolicyRow {
     RetentionPolicyRow {
+        held_states: Default::default(),
         policy_id: id,
         name: name.into(),
         predicate: PolicyPredicate::AgeExceeds(60),
@@ -298,6 +300,7 @@ fn sample_row(id: Uuid, name: &str, version: u64, archived: bool) -> RetentionPo
 async fn create_appends_created_event_and_upserts_projection() {
     let (uc, events, projections) = make_use_case();
     let cmd = CreateRetentionPolicyCommand {
+        held_states: Default::default(),
         name: "retain-30d".into(),
         predicate: PolicyPredicate::AgeExceeds(2_592_000),
         scope: RetentionScope::AllRepos,
@@ -329,6 +332,7 @@ async fn create_rejects_duplicate_active_name_with_conflict() {
     let (uc, events, projections) = make_use_case();
     projections.insert(sample_row(Uuid::new_v4(), "dup", 0, false));
     let cmd = CreateRetentionPolicyCommand {
+        held_states: Default::default(),
         name: "dup".into(),
         predicate: PolicyPredicate::AgeExceeds(60),
         scope: RetentionScope::AllRepos,
@@ -347,6 +351,7 @@ async fn create_propagates_upsert_failure_after_append() {
     let (uc, _events, projections) = make_use_case();
     projections.fail_next_upsert(DomainError::Invariant("db down".into()));
     let cmd = CreateRetentionPolicyCommand {
+        held_states: Default::default(),
         name: "x".into(),
         predicate: PolicyPredicate::AgeExceeds(60),
         scope: RetentionScope::AllRepos,
@@ -362,6 +367,7 @@ async fn create_propagates_upsert_failure_after_append() {
 async fn create_rejects_malformed_predicate_via_domain_validate() {
     let (uc, events, _projections) = make_use_case();
     let cmd = CreateRetentionPolicyCommand {
+        held_states: Default::default(),
         name: "bad".into(),
         // B1 rejects a 0s TTL.
         predicate: PolicyPredicate::AgeExceeds(0),
@@ -386,6 +392,7 @@ async fn update_appends_updated_event_with_exact_version_and_upserts() {
     let id = Uuid::new_v4();
     projections.insert(sample_row(id, "p", 3, false));
     let cmd = UpdateRetentionPolicyCommand {
+        held_states: Default::default(),
         policy_id: id,
         predicate: PolicyPredicate::AgeExceeds(7_200),
         scope: RetentionScope::IngestSource(hort_domain::events::IngestSource::Proxied),
@@ -412,6 +419,7 @@ async fn update_same_value_is_idempotent_no_append() {
     let id = Uuid::new_v4();
     projections.insert(sample_row(id, "p", 1, false)); // AgeExceeds(60), AllRepos
     let cmd = UpdateRetentionPolicyCommand {
+        held_states: Default::default(),
         policy_id: id,
         predicate: PolicyPredicate::AgeExceeds(60),
         scope: RetentionScope::AllRepos,
@@ -433,6 +441,7 @@ async fn update_unknown_policy_is_not_found() {
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
+                held_states: Default::default(),
                 policy_id: Uuid::new_v4(),
                 predicate: PolicyPredicate::AgeExceeds(60),
                 scope: RetentionScope::AllRepos,
@@ -458,6 +467,7 @@ async fn update_archived_policy_is_rejected() {
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
+                held_states: Default::default(),
                 policy_id: id,
                 predicate: PolicyPredicate::AgeExceeds(99),
                 scope: RetentionScope::AllRepos,
@@ -483,6 +493,7 @@ async fn update_heals_a_stale_row_and_appends_at_the_stream_version() {
     let tail = events.seed_retention_stream(
         &stale,
         vec![RetentionPolicyEvent::Updated {
+            held_states: Default::default(),
             id,
             predicate: PolicyPredicate::AgeExceeds(99),
             scope: RetentionScope::AllRepos,
@@ -499,6 +510,7 @@ async fn update_heals_a_stale_row_and_appends_at_the_stream_version() {
 
     uc.update_policy(
         UpdateRetentionPolicyCommand {
+            held_states: Default::default(),
             policy_id: id,
             predicate: PolicyPredicate::AgeExceeds(123),
             scope: RetentionScope::AllRepos,
@@ -531,6 +543,7 @@ async fn update_whose_stream_already_states_it_succeeds_and_repairs_the_row() {
     let tail = events.seed_retention_stream(
         &stale,
         vec![RetentionPolicyEvent::Updated {
+            held_states: Default::default(),
             id,
             predicate: PolicyPredicate::AgeExceeds(123),
             scope: RetentionScope::AllRepos,
@@ -542,6 +555,7 @@ async fn update_whose_stream_already_states_it_succeeds_and_repairs_the_row() {
 
     uc.update_policy(
         UpdateRetentionPolicyCommand {
+            held_states: Default::default(),
             policy_id: id,
             predicate: PolicyPredicate::AgeExceeds(123),
             scope: RetentionScope::AllRepos,
@@ -577,6 +591,7 @@ async fn update_reports_a_genuine_concurrent_writer_as_contention() {
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
+                held_states: Default::default(),
                 policy_id: id,
                 predicate: PolicyPredicate::AgeExceeds(123),
                 scope: RetentionScope::AllRepos,
@@ -620,6 +635,7 @@ async fn update_refuses_when_the_stream_says_the_policy_was_archived() {
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
+                held_states: Default::default(),
                 policy_id: id,
                 predicate: PolicyPredicate::AgeExceeds(123),
                 scope: RetentionScope::AllRepos,
@@ -652,6 +668,7 @@ async fn update_refuses_and_rewrites_nothing_when_the_stream_cannot_be_read() {
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
+                held_states: Default::default(),
                 policy_id: id,
                 predicate: PolicyPredicate::AgeExceeds(123),
                 scope: RetentionScope::AllRepos,
@@ -677,6 +694,7 @@ async fn update_refuses_and_rewrites_nothing_when_the_stream_cannot_be_replayed(
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
+                held_states: Default::default(),
                 policy_id: id,
                 predicate: PolicyPredicate::AgeExceeds(123),
                 scope: RetentionScope::AllRepos,
@@ -729,6 +747,7 @@ async fn update_refuses_a_stream_carrying_a_foreign_event() {
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
+                held_states: Default::default(),
                 policy_id: id,
                 predicate: PolicyPredicate::AgeExceeds(123),
                 scope: RetentionScope::AllRepos,
@@ -756,6 +775,7 @@ async fn archive_heals_a_stale_row() {
     let tail = events.seed_retention_stream(
         &stale,
         vec![RetentionPolicyEvent::Updated {
+            held_states: Default::default(),
             id,
             predicate: PolicyPredicate::AgeExceeds(99),
             scope: RetentionScope::AllRepos,
@@ -842,6 +862,7 @@ async fn update_propagates_upsert_failure_after_append() {
     let err = uc
         .update_policy(
             UpdateRetentionPolicyCommand {
+                held_states: Default::default(),
                 policy_id: id,
                 predicate: PolicyPredicate::AgeExceeds(456),
                 scope: RetentionScope::AllRepos,

@@ -1677,6 +1677,7 @@ mod tests {
             ),
             (
                 DomainEvent::ArtifactExpired(ArtifactExpired {
+                    held_state_authority: None,
                     artifact_id: Uuid::nil(),
                     policy_id: Uuid::nil(),
                     policy_name: "90-day-age".into(),

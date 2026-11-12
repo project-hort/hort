@@ -5051,10 +5051,23 @@ emit nothing):
   to this label (a security predicate must never expire an artifact
   whose scan freshness cannot be proven).
 - `skipped_quarantined` — the artifact is
-  `quarantined`; GC-protected, not evaluated.
+  `quarantined` and this policy did not evaluate it; GC-protected.
 - `skipped_rejected` — the artifact is `rejected` or
-  `scan_indeterminate` (evidence / terminal-failure); content stays
-  until a curator decision or deletion, not evaluated.
+  `scan_indeterminate` (evidence / terminal-failure) and this policy did
+  not evaluate it.
+
+  Both labels cover two refusals, split by **status** rather than by
+  reason because that is what every dashboard reading them keys on: the
+  policy does not name the state in its `spec.heldStates` (the default,
+  and the only case before the held-state exception existed), or it does
+  and the artifact's stream carries no entry event for that state, so
+  there is no instant a span could be measured from. The task's own
+  `result_summary` separates them — `skipped_protected` versus
+  `skipped_unanchored_held_state` — because an operator who has just
+  written an opt-in needs to tell "the policy does not cover this state"
+  from "it does and these artifacts cannot be dated". A nonzero
+  `skipped_unanchored_held_state` on a configured opt-in is worth
+  looking at; it is not an error and the sweep proceeds.
 - `error` — a port read (`read_stream` / `list_findings` /
   `append_expired`) failed for this pair. The sweep records it and
   continues with the next pair (one bad row never aborts the pass;

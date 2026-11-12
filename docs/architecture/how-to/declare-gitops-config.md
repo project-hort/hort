@@ -1048,7 +1048,7 @@ The other scopes carry no repository reference:
 - New name: one `RetentionPolicyChanged(Created)`; one row inserted into
   `retention_policy_projections`. Counters:
   `hort_gitops_events_emitted_total{kind=retention_policy,event_type=RetentionPolicyCreated}`.
-- Predicate or scope edit: one `RetentionPolicyChanged(Updated)`.
+- Predicate, scope or `heldStates` edit: one `RetentionPolicyChanged(Updated)`.
 - YAML removed: one `RetentionPolicyChanged(Archived)`; the row is
   marked archived, not deleted. Archive is terminal — re-declaring an
   archived name mints a **fresh** policy, it does not reactivate the old
@@ -1067,6 +1067,46 @@ On a hosted repository that inverts the intent — a year-old,
 daily-pulled artifact is the last thing "unused" should reach and the
 first thing "old" does. Write `AgeExceeds` if age is what was meant.
 The rejection is lifted when a real usage signal is wired.
+
+**`spec.heldStates` — collecting retained evidence.** A quarantined,
+rejected or scan-indeterminate artifact is held: retained scan evidence, or
+an artifact awaiting a signature or a curator. Five independent gates refuse
+to collect one, and `heldStates` is the only thing that opens them — per
+policy, per state, and empty unless you say otherwise:
+
+```yaml
+spec:
+  predicate:
+    AgeExceeds: 7776000                   # 90 days IN THE STATE, see below
+  scope: AllRepos
+  heldStates: [Rejected, ScanIndeterminate]
+```
+
+Three things to know before writing one:
+
+- **The span is measured from the artifact's entry into the state**, not from
+  its creation. A two-year-old artifact rejected five minutes ago has
+  **five minutes** of held time, so a 90-day bound keeps it for 90 more days.
+  `AgeExceeds` is re-anchored for exactly this evaluation, and for no other.
+- **Every branch of the predicate that can match must carry a positive
+  `AgeExceeds`**, or the apply is rejected. An `And` needs it on only one
+  child (every child has to hold anyway); an `Or` needs it on **every** arm,
+  because one arm matching skips the others —
+  `Or([AgeExceeds: 7776000, HasFindingAboveSeverity: High])` is rejected, and
+  would otherwise delete a rejected artifact the moment a severe finding is
+  reported against it. `HasFindingDetectedFor` does **not** count: it dates
+  the vulnerability, which can be years older than the artifact.
+- **Omitting the field, or `heldStates: []`, keeps every gate shut.** An
+  update that drops the field clears the opt-in. Nothing about the hold
+  itself changes either way: a held artifact is never served, and no span
+  releases it or rejects it — the only new outcome is disposal (`ArtifactExpired`
+  then `ArtifactPurged`, the same two-stage path every other expiry takes).
+
+Releasing the artifact before the purge runs cancels the disposal: the
+decision names the occupancy it was taken about, so a curator's release — or
+a re-rejection — leaves it standing until a policy decides again. See
+[ADR 0007](../../adr/0007-fail-closed-quarantine-release-predicate.md) and
+[ADR 0039](../../adr/0039-keyed-provenance-verification.md) D4.
 
 **Direct-upload advisory.** A security-driven predicate
 (`HasFixAvailable`, `HasFindingAboveSeverity`, …) under a scope that does
