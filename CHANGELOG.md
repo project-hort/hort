@@ -97,6 +97,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once the policy's rescan interval has elapsed — list it with
   `GET /api/v1/admin/curation/queue?status=scan_indeterminate` and recover it
   by fixing the policy's `scanBackends` and rescanning (#427).
+- **Breaking:** invoking a destructive admin task now requires an explicit
+  permission that being an administrator does **not** confer —
+  `destroy_content` for `retention-purge` and an executing
+  `retention-evaluate`, `destroy_record` for `eventstore-archive`. The
+  `task:destructive` claim is gone. Apply a global grant bound to the
+  invoking identity (`kind: user` / `kind: serviceAccount`) before running
+  one; a dry-run `retention-evaluate` still needs neither (#285).
+- A service account may now hold `destroy_content`, so the retention CronJobs
+  can run unattended on the job's own identity instead of by hand: declare a
+  `serviceAccount`-subject grant, add the permission to the token's mint, and
+  rotate the token — a token's capability is frozen at mint, so the grant alone
+  does not reach an existing one. `destroy_record` is refused to a service
+  account outright, so `eventstore-archive` keeps only the manual path (#285).
 - `hort-cli curation waive <artifact_id>` is now `curation waive artifact
   <artifact_id>`; `waive versions`, `waive digests` and `block digests`
   address a decision in bulk (#176).

@@ -10,7 +10,7 @@
 //! than over the kind:
 //!
 //! ```text
-//! task_invocation_is_destructive(P::KIND, params) == true
+//! task_invocation_destructive_authority(P::KIND, params) == true
 //!     <=> db_idempotency_key.is_some()
 //! ```
 //!
@@ -100,36 +100,41 @@ fn build_test_router(ctx: Arc<AppContext>) -> axum::Router {
         .with_state(ctx)
 }
 
-/// Permit grant that AUTHORISES the destructive kinds — `Permission::AdminTaskInvoke`
-/// for callers carrying `task-admin`, exercised through a principal whose
-/// claim set also includes `task:destructive` (see ADR 0012 / ADR 0028).
+/// Permit grants that AUTHORISE the destructive kinds —
+/// `Permission::AdminTaskInvoke` for callers carrying `task-admin`, plus
+/// both destructive permissions for callers carrying `destructive` (see
+/// ADR 0012 / ADR 0028).
 fn task_use_case_permit_destructive(
     mocks: &MockPorts,
     events: Arc<hort_app::event_store_publisher::EventStorePublisher>,
 ) -> Arc<TaskUseCase> {
-    let grant = PermissionGrant {
+    let grant = |required: &[&str], permission| PermissionGrant {
         id: Uuid::new_v4(),
-        subject: GrantSubject::Claims(vec!["task-admin".into()]),
+        subject: GrantSubject::Claims(required.iter().map(|c| (*c).to_string()).collect()),
         repository_id: None,
-        permission: Permission::AdminTaskInvoke,
+        permission,
         created_at: Utc::now(),
         managed_by: ManagedBy::Local,
         managed_by_digest: None,
     };
-    let evaluator = RbacEvaluator::new(vec![grant]);
+    let evaluator = RbacEvaluator::new(vec![
+        grant(&["task-admin"], Permission::AdminTaskInvoke),
+        grant(&["destructive"], Permission::DestroyContent),
+        grant(&["destructive"], Permission::DestroyRecord),
+    ]);
     let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(evaluator));
     Arc::new(TaskUseCase::new(mocks.jobs.clone(), events, rbac))
 }
 
-/// Caller authorised for destructive kinds (both `task-admin` and
-/// `task:destructive` claims).
+/// Caller authorised for destructive kinds — carries the claims both
+/// factors' grants are bound to.
 fn destructive_principal() -> CallerPrincipal {
     CallerPrincipal {
         user_id: Uuid::new_v4(),
         external_id: "destructive-admin".into(),
         username: "destructive-admin".into(),
         email: "destructive@example.com".into(),
-        claims: vec!["task-admin".into(), "task:destructive".into()],
+        claims: vec!["task-admin".into(), "destructive".into()],
         token_kind: None,
         issued_at: Utc::now(),
         token_cap: None,
@@ -137,8 +142,9 @@ fn destructive_principal() -> CallerPrincipal {
 }
 
 /// Caller authorised only for ordinary (non-destructive) kinds — holds
-/// `task-admin` but NOT `task:destructive`. Used by the spot test on a
-/// non-destructive kind (which doesn't need the destructive claim).
+/// `task-admin` but not the claim the destructive grants are bound to.
+/// Used by the spot test on a non-destructive kind (which needs no
+/// destructive permission).
 fn ordinary_principal() -> CallerPrincipal {
     CallerPrincipal {
         user_id: Uuid::new_v4(),
@@ -170,7 +176,7 @@ fn ordinary_principal() -> CallerPrincipal {
 ///
 /// Closed-set semantics: adding a fourth destructive kind to
 /// `DESTRUCTIVE_TASK_KINDS` without routing the new kind through the
-/// `task_invocation_is_destructive` branch in `invoke.rs` fails this test
+/// `task_invocation_destructive_authority` branch in `invoke.rs` fails this test
 /// on the new iteration.
 #[tokio::test]
 async fn destructive_kinds_carry_db_idempotency() {
@@ -207,7 +213,7 @@ async fn destructive_kinds_carry_db_idempotency() {
             StatusCode::ACCEPTED,
             "destructive kind {kind:?} must enqueue successfully when the caller is authorised; \
              status={status} (RBAC denial here usually means the test fixture forgot the \
-             task:destructive claim)",
+             destructive permission grant)",
             status = resp.status(),
         );
 
@@ -340,7 +346,7 @@ async fn retention_preview_takes_no_durable_key_and_execute_keeps_its_own() {
 
 /// Acceptance (7b): for at least one non-destructive kind (`noop`), the
 /// handler passes `idempotency_key = None`. Pins the negative side of
-/// the `task_invocation_is_destructive` branch for a kind that has no
+/// the `task_invocation_destructive_authority` branch for a kind that has no
 /// mode at all — without it, a future change that always passes
 /// `Some(...)` would still pass the closed-set walker above.
 #[tokio::test]

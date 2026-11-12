@@ -1908,11 +1908,12 @@ mod tests {
     /// its requester still holds the authority.
     const FIXTURE_REQUESTER: Uuid = Uuid::from_u128(0x3671);
 
-    /// A still-authorized requester for [`FIXTURE_REQUESTER`].
+    /// A still-active requester for [`FIXTURE_REQUESTER`].
     ///
-    /// Admin, because `users.is_admin` is the only destructive authority
-    /// the registry persists — see
-    /// [`crate::destructive_task_reauthorization`].
+    /// Admin only because the coarse `AdminTaskInvoke` factor rides the
+    /// admin short-circuit; the destructive factor is a grant and arrives
+    /// through [`fixture_destructive_grants`] — an admin does not hold it
+    /// implicitly (see [`crate::destructive_task_reauthorization`]).
     fn fixture_admin() -> hort_domain::entities::user::User {
         hort_domain::entities::user::User {
             id: FIXTURE_REQUESTER,
@@ -1930,15 +1931,35 @@ mod tests {
         }
     }
 
+    /// The identity-bound destructive grants [`FIXTURE_REQUESTER`] holds
+    /// — both halves, so a fixture row of any destructive kind
+    /// re-authorizes. `GrantSubject::User` because the execution-time
+    /// principal carries no IdP-resolved claims to match a claims grant
+    /// against.
+    fn fixture_destructive_grants() -> Vec<hort_domain::entities::rbac::PermissionGrant> {
+        use hort_domain::entities::rbac::{GrantSubject, Permission, PermissionGrant};
+        [Permission::DestroyContent, Permission::DestroyRecord]
+            .into_iter()
+            .map(|permission| PermissionGrant {
+                id: Uuid::new_v4(),
+                subject: GrantSubject::User(FIXTURE_REQUESTER),
+                repository_id: None,
+                permission,
+                managed_by: hort_domain::entities::managed_by::ManagedBy::Local,
+                managed_by_digest: None,
+                created_at: Utc::now(),
+            })
+            .collect()
+    }
+
     /// A reauthorizer that authorizes [`FIXTURE_REQUESTER`] — the
     /// default for every test that is not about the re-check itself.
     fn authorizing_reauthorizer() -> Arc<DestructiveTaskReauthorizer> {
         let users = Arc::new(MockUserRepository::new());
         users.insert(fixture_admin());
-        Arc::new(DestructiveTaskReauthorizer::new(
-            users,
-            Arc::new(MockPermissionGrantRepository::new()),
-        ))
+        let grants = Arc::new(MockPermissionGrantRepository::new());
+        grants.seed(fixture_destructive_grants());
+        Arc::new(DestructiveTaskReauthorizer::new(users, grants))
     }
 
     /// A reauthorizer that knows no users, so a destructive row's

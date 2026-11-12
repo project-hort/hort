@@ -1588,6 +1588,20 @@ scheduledTasks:
   #                 Default false. OR'd with the global
   #                 `rotateSvcToken` switch above.
   #
+  # CHANGING `permissions` ON AN EXISTING ENTRY NEEDS `rotate: true`.
+  # A token's capability is frozen at mint (ADR 0012), and the state
+  # machine below skips an entry whose row and Secret both exist — so
+  # editing this list alone leaves the live token at its old cap. Nothing
+  # re-snapshots it on an interval either: a PAT-only ServiceAccount (no
+  # `fallbackRotation` in its gitops envelope, which `cronjob-tasks` is)
+  # is never visited by the rotation reconciler. The failure mode is
+  # quiet and has cost a diagnosis round before: the PermissionGrant is
+  # applied, the evaluator sees it, and the endpoint still answers 403,
+  # which reads as an authorization defect. `hort-cli auth status --output
+  # json` prints the FROZEN CAP as `permissions` — that is the field to
+  # compare against this list, never the grant set. Set `rotate: true` for
+  # one upgrade, then back to false.
+  #
   # Per-identity bootstrap state machine, evaluated at every upgrade:
   #   token row exists AND Secret exists     -> skip, no rotation
   #                                              (today's idempotent
@@ -1631,6 +1645,14 @@ scheduledTasks:
   #     --output=file:/tmp/discard
   #   kubectl delete secret <its secretName>   # cluster-side, manual
   svcTokens:
+    # `admin_task_invoke` alone is the shipped default, deliberately: the
+    # always-on `--require-authority` preflight resolves every entry here
+    # against the live grant set, so a default carrying `destroy_content`
+    # would fail the bootstrap Job on every install that has not declared
+    # the matching grant. Add it (plus `rotate: true` for one upgrade)
+    # when you want the retention CronJobs to run unattended — see their
+    # `DESTRUCTIVE_TASK_KINDS caveat` below. `destroy_record` is not
+    # grantable to a service account and is refused here outright.
     - name: cronjob-tasks
       permissions:
         - admin_task_invoke
@@ -2079,14 +2101,21 @@ scheduledTasks:
   # keyset-paginated non-protected artifacts → append ArtifactExpired
   # per fresh match (deletes nothing). Daily.
   #
-  # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
-  # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
-  # svc-token is claimless and cannot run it, and no token can be made to
-  # carry the claim. Run by hand with
-  # `hort-cli admin task invoke retention-evaluate`. The admin's authority is
-  # re-checked again when the worker runs the job, so revoking it stops
-  # jobs already queued; see the CronJob template's docstring. Leaving
-  # `enabled: false` (default) is safe.
+  # DESTRUCTIVE_TASK_KINDS caveat: this task needs the `destroy_content`
+  # permission in addition to `admin_task_invoke`, and being an admin does
+  # not confer it — it is held only through an explicit PermissionGrant.
+  # A machine identity MAY hold it, so this CronJob can run unattended, but
+  # the default `cronjob-tasks` svc-token entry under `svcTokens` above
+  # declares `admin_task_invoke` only. Three steps, all required: declare a
+  # `serviceAccount`-subject `destroy_content` PermissionGrant in your
+  # gitops tree, add `destroy_content` to that entry's `permissions`, and
+  # set its `rotate: true` for one upgrade — a token's cap is frozen at
+  # mint (ADR 0012) and this SA is PAT-only, so an existing token keeps the
+  # old cap and 403s with the grant live. To run by hand instead:
+  # `hort-cli admin task invoke retention-evaluate` as an identity holding the
+  # grant. That authority is re-checked again when the worker runs the job,
+  # so revoking it stops jobs already queued; see the CronJob template's
+  # docstring. Leaving `enabled: false` (default) is safe.
   retentionEvaluate:
     executionPath: admin-task
     enabled: false
@@ -2097,14 +2126,21 @@ scheduledTasks:
   # jobs.last_error, and the worker restates a closed gate on its
   # 60-second heartbeat. Daily, after retention-evaluate.
   #
-  # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
-  # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
-  # svc-token is claimless and cannot run it, and no token can be made to
-  # carry the claim. Run by hand with
-  # `hort-cli admin task invoke retention-purge`. The admin's authority is
-  # re-checked again when the worker runs the job, so revoking it stops
-  # jobs already queued; see the CronJob template's docstring. Leaving
-  # `enabled: false` (default) is safe.
+  # DESTRUCTIVE_TASK_KINDS caveat: this task needs the `destroy_content`
+  # permission in addition to `admin_task_invoke`, and being an admin does
+  # not confer it — it is held only through an explicit PermissionGrant.
+  # A machine identity MAY hold it, so this CronJob can run unattended, but
+  # the default `cronjob-tasks` svc-token entry under `svcTokens` above
+  # declares `admin_task_invoke` only. Three steps, all required: declare a
+  # `serviceAccount`-subject `destroy_content` PermissionGrant in your
+  # gitops tree, add `destroy_content` to that entry's `permissions`, and
+  # set its `rotate: true` for one upgrade — a token's cap is frozen at
+  # mint (ADR 0012) and this SA is PAT-only, so an existing token keeps the
+  # old cap and 403s with the grant live. To run by hand instead:
+  # `hort-cli admin task invoke retention-purge` as an identity holding the
+  # grant. That authority is re-checked again when the worker runs the job,
+  # so revoking it stops jobs already queued; see the CronJob template's
+  # docstring. Leaving `enabled: false` (default) is safe.
   retentionPurge:
     executionPath: admin-task
     enabled: false
@@ -2113,14 +2149,19 @@ scheduledTasks:
   # / age-gated streams past the configured retention floor, via the
   # StreamSealed tombstone chokepoint). Weekly (Sunday) — lowest frequency.
   #
-  # DESTRUCTIVE_TASK_KINDS caveat: this task needs a fresh IdP-backed admin
-  # session (the `task:destructive` claim) — the bootstrap `cronjob-tasks`
-  # svc-token is claimless and cannot run it, and no token can be made to
-  # carry the claim. Run by hand with
-  # `hort-cli admin task invoke eventstore-archive`. The admin's authority is
-  # re-checked again when the worker runs the job, so revoking it stops
-  # jobs already queued; see the CronJob template's docstring. Leaving
-  # `enabled: false` (default) is safe.
+  # DESTRUCTIVE_TASK_KINDS caveat: this task needs the `destroy_record`
+  # permission in addition to `admin_task_invoke`, and being an admin does
+  # not confer it — it is held only through an explicit PermissionGrant.
+  # Unlike the retention pair above, `destroy_record` is NOT grantable to a
+  # service account: the archive seals audit streams and nothing
+  # reconstructs a sealed one, so no unattended identity holds standing
+  # authority over it. Adding it to an `svcTokens` entry's `permissions`
+  # fails the bootstrap Job; declaring the grant fails the gitops apply.
+  # This kind has only the manual path: run
+  # `hort-cli admin task invoke eventstore-archive` as a human identity
+  # holding the grant. That authority is re-checked again when the worker
+  # runs the job, so revoking it stops jobs already queued; see the CronJob
+  # template's docstring. Leaving `enabled: false` (default) is correct.
   eventstoreArchive:
     executionPath: admin-task
     enabled: false

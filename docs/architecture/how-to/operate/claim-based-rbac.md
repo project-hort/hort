@@ -320,7 +320,7 @@ visibly opted out in audited gitops config. CI fails on `reject`.
 |---|---|---|
 | `single-claim-grant` | A `Claims(_)` grant whose `required_claims` has exactly one element, and that claim is **not** in `single_claim_allowlist`. | **`reject`** — the allowlist is the opt-out |
 | `wildcard-repo-non-admin` | A `Claims(_)` grant with no `repository` (global) and `permission != admin`. | **`reject`** |
-| `direct-user-grant-without-justification` | A `User(_)` grant with no justification annotation. | **`reject`** when `permission == admin` OR (global AND `permission ∈ {write, delete, admin_task_invoke, curate, prefetch}`); else **`warn`** |
+| `direct-user-grant-without-justification` | A `User(_)` grant with no justification annotation. | **`reject`** when `permission == admin` OR (global AND `permission ∈ {write, delete, admin_task_invoke, curate, prefetch, destroy_content, destroy_record}`); else **`warn`** |
 | `claim-name-collision` | A `ClaimMapping` whose `claim` collides with a reserved name. | **`reject`** |
 
 > **Reserved-name note (as-built).** The reserved set the
@@ -343,6 +343,16 @@ visibly opted out in audited gitops config. CI fails on `reject`.
 > gitops-applied grant carries one, so that reading would make the
 > rule dead. The faithful reading exempts SA-owned grants and flags
 > hand-authored privileged `User` grants.
+
+> **The exemption stops at the two permissions no machine identity may
+> hold** — `admin` and `destroy_record`. An SA-owned `User`-subject
+> grant of either is denied the provenance exemption and rejects
+> exactly like the hand-authored form, which is what reaches the one
+> shape the `serviceAccount`-subject parse gate cannot see: a
+> hand-written `subject: { kind: user }` naming a service account's
+> *backing user* never passes through the `serviceAccount` arm at all.
+> `destroy_content` is **not** in that set — a machine identity may
+> hold it, and the shipped `cronjob-tasks` SA does.
 
 **Tuning strictness.** Operators tune the linter **only** through
 explicit, audited gitops config — there is no env var and no global

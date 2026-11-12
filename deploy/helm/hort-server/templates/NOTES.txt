@@ -154,11 +154,23 @@ have not already:
     subject: { kind: serviceAccount, name: cronjob-tasks }
     permission: admin_task_invoke        # global (no repository:)
 
-DESTRUCTIVE_TASK_KINDS caveat: `retentionEvaluate`, `retentionPurge`, and
-`eventstoreArchive` additionally require the `task:destructive` claim, which
-the `cronjob-tasks` svc-token can never carry (svc-tokens are claimless).
-They ship `enabled: false` and stay so; run them by hand with a fresh
-IdP-backed admin session (`hort-cli admin task invoke <kind>`).
+DESTRUCTIVE_TASK_KINDS caveat: `retentionEvaluate` and `retentionPurge`
+additionally require the `destroy_content` permission, and
+`eventstoreArchive` requires `destroy_record`. Neither is implied by being
+an admin — each is held only through an explicit PermissionGrant. All three
+ship `enabled: false`.
+
+  destroy_content  MAY be held by the job's own identity. To run the two
+                   retention kinds unattended: declare a
+                   serviceAccount-subject grant, add `destroy_content` to
+                   this release's scheduledTasks.svcTokens[].permissions,
+                   and set that entry's `rotate: true` for one upgrade —
+                   a token's cap is frozen at mint, so the grant alone
+                   does not reach an already-issued token.
+  destroy_record   is NOT grantable to a service account. eventstoreArchive
+                   has only the manual path: run it as a human identity
+                   holding the grant (`hort-cli admin task invoke
+                   eventstore-archive`).
 
 See: docs/architecture/how-to/deploy/enable-admin-task-cronjobs.md
 ==============================================================================

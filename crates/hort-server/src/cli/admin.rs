@@ -466,11 +466,12 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
         })
         .collect::<anyhow::Result<_>>()?;
 
-    // Service accounts are strictly non-admin (Entry 4 / ADR 0012):
-    // `issue-svc-token` must never mint an admin-cap token. Reject
-    // `--permission=admin` here, before any DB work — there is no
-    // operator opt-in for it.
-    reject_admin_permission(&permissions)?;
+    // A machine identity may not hold every permission (Entry 4):
+    // `issue-svc-token` must never mint a cap carrying one it may not.
+    // Rejected here, before any DB work — there is no operator opt-in
+    // for any of them, and the set is the domain's one declaration
+    // rather than a list re-typed per mint path.
+    reject_service_account_forbidden_permissions(&permissions)?;
 
     // Parse output mode.
     let output_path = parse_output_mode(&args.output)?;
@@ -680,20 +681,28 @@ async fn issue_svc_token_async(args: IssueSvcTokenArgs) -> anyhow::Result<()> {
 // Shared output helpers
 // ---------------------------------------------------------------------------
 
-/// Reject `Permission::Admin` in an `issue-svc-token` permission set.
+/// Reject any permission no service account may hold in an
+/// `issue-svc-token` permission set.
 ///
-/// Service accounts are strictly non-admin (Entry 4 / ADR 0012) and
-/// there is no operator opt-in for an admin-cap svc token — the only
-/// admin mint path is `bootstrap-session`. Pure so the rejection is
-/// unit-testable without a database.
-fn reject_admin_permission(permissions: &[Permission]) -> anyhow::Result<()> {
-    if permissions.contains(&Permission::Admin) {
-        anyhow::bail!(
-            "--permission=admin is not permitted for service-account tokens — \
-             service accounts are strictly non-admin (Entry 4 / ADR 0012). \
-             Human admin uses OIDC → CliSession; first-admin bootstrap uses \
-             `hort-server admin bootstrap-session`."
-        );
+/// Membership and the reason both come from the one declaration,
+/// `Permission::service_account_refusal`
+/// (`hort_domain::entities::rbac::SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS`),
+/// which the gitops apply-parse gate (`hort-config`'s
+/// `validate_permission_grant`) and the apply linter's SA-provenance
+/// exemption read too — so the three declaration/mint points cannot
+/// come to refuse different sets. There is no operator opt-in for any
+/// of them on this path.
+///
+/// Pure so the rejection is unit-testable without a database, and it
+/// runs before any DB work so the refusal costs no connection.
+fn reject_service_account_forbidden_permissions(permissions: &[Permission]) -> anyhow::Result<()> {
+    for permission in permissions {
+        if let Some(reason) = permission.service_account_refusal() {
+            anyhow::bail!(
+                "--permission={permission} is not permitted for service-account tokens \
+                 (Entry 4): {reason}."
+            );
+        }
     }
     Ok(())
 }
@@ -1395,13 +1404,15 @@ mod tests {
         assert_ne!(output, "kube-secret");
     }
 
-    // -- issue-svc-token: --permission=admin rejection ----------------------
+    // -- issue-svc-token: forbidden-permission rejection --------------------
 
     #[test]
     fn issue_svc_token_rejects_admin_permission() {
         // `--permission=admin` must be rejected before any DB work —
         // service accounts are strictly non-admin (Entry 4 / ADR 0012).
-        let err = reject_admin_permission(&[Permission::Read, Permission::Admin]).unwrap_err();
+        let err =
+            reject_service_account_forbidden_permissions(&[Permission::Read, Permission::Admin])
+                .unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("not permitted for service-account tokens"),
@@ -1413,12 +1424,59 @@ mod tests {
         );
     }
 
+    /// The third of the three declaration/mint points that refuse
+    /// `destroy_record` to a machine identity (the other two are
+    /// `hort-config`'s apply-parse validator and the apply linter's
+    /// SA-provenance exemption). Asserted here on its own, not only
+    /// end-to-end: a point that silently stopped refusing would leave
+    /// the other two still green.
+    #[test]
+    fn issue_svc_token_rejects_destroy_record_permission() {
+        let err = reject_service_account_forbidden_permissions(&[
+            Permission::AdminTaskInvoke,
+            Permission::DestroyRecord,
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--permission=destroy_record is not permitted"),
+            "the refusal must name the permission it refused: {msg}"
+        );
+        // The message says *why* and what to automate instead — an
+        // operator reaching for it is automating something, and "no"
+        // alone sends them looking for a wider credential.
+        assert!(
+            msg.contains("nothing reconstructs a sealed stream"),
+            "the refusal must name why: {msg}"
+        );
+        assert!(
+            msg.contains("Grant `destroy_content`"),
+            "the refusal must name what to automate instead: {msg}"
+        );
+    }
+
     #[test]
     fn issue_svc_token_accepts_non_admin_permissions() {
         // The common non-admin caps pass the gate.
-        reject_admin_permission(&[Permission::AdminTaskInvoke]).expect("admin_task_invoke ok");
-        reject_admin_permission(&[Permission::Read, Permission::Write]).expect("read+write ok");
-        reject_admin_permission(&[Permission::Curate, Permission::Prefetch]).expect("curate ok");
+        reject_service_account_forbidden_permissions(&[Permission::AdminTaskInvoke])
+            .expect("admin_task_invoke ok");
+        reject_service_account_forbidden_permissions(&[Permission::Read, Permission::Write])
+            .expect("read+write ok");
+        reject_service_account_forbidden_permissions(&[Permission::Curate, Permission::Prefetch])
+            .expect("curate ok");
+    }
+
+    /// The content-destructive authority is **mintable** for a machine
+    /// identity — the whole point of the split. A mint path that
+    /// refused both would make the shipped `cronjob-tasks` cap
+    /// unprovisionable, and the refusal above vacuous.
+    #[test]
+    fn issue_svc_token_accepts_destroy_content_permission() {
+        reject_service_account_forbidden_permissions(&[
+            Permission::AdminTaskInvoke,
+            Permission::DestroyContent,
+        ])
+        .expect("the cronjob-tasks cap must be mintable");
     }
 
     // -- issue-svc-token: SA resolution (no user fabrication) ----------------

@@ -53,10 +53,10 @@ idempotency key itself and the database enforces its uniqueness durably:
   a destructive invocation reaches `enqueue` with no key — the invariant
   "destructive ⇒ key present" is structural, not operator discipline.
 - **Per invocation, not per kind.** The gate is
-  `hort_domain::events::task_invocation_is_destructive(kind, params)` — the
-  same domain answer that decides whether the caller needs the
-  `DESTRUCTIVE_TASK_CLAIM` (`TaskUseCase::authorize_kind`), so the authority
-  an invocation needs and the single-flight claim it takes cannot come apart.
+  `hort_domain::events::task_invocation_destructive_authority(kind, params)` — the
+  same domain answer that decides which destructive `Permission` the caller
+  needs (`TaskUseCase::authorize_kind`), so the authority an invocation needs
+  and the single-flight claim it takes cannot come apart.
   The coarser `task_kind_is_destructive(kind)` remains correct for audit
   routing (`TaskUseCase::task_audit_stream`: a dry run's `TaskInvoked` still
   belongs on the never-deleted destructive-kind stream) and is deliberately
@@ -138,10 +138,10 @@ block per ADR 0020.
   `Option<&IdempotencyKey>` decision; the compiler forces new enqueuers to
   consider idempotency.
 - Adding a kind to `DESTRUCTIVE_TASK_KINDS` automatically extends both the
-  server-side derivation (via `task_invocation_is_destructive`, which is built
+  server-side derivation (via `task_invocation_destructive_authority`, which is built
   on `task_kind_is_destructive`) and the closed-set guard test — no second list
   to update. A kind that needs a *mode* dimension extends
-  `task_invocation_is_destructive`, and the claim gate and the key follow
+  `task_invocation_destructive_authority`, and the claim gate and the key follow
   together because both read it.
 
 ## Alternatives considered
@@ -190,7 +190,7 @@ block per ADR 0020.
   (column, CHECKs, partial unique index);
   `crates/hort-domain/src/events/authorization_events.rs`
   (`DESTRUCTIVE_TASK_KINDS`, `task_kind_is_destructive`,
-  `task_invocation_is_destructive`, `retention_evaluate_mode`);
+  `task_invocation_destructive_authority`, `retention_evaluate_mode`);
   `crates/hort-domain/src/retention/mode.rs` (`RetentionEvaluationMode`).
 - Tests: `crates/hort-adapters-postgres/tests/idempotency_key.rs`;
   `crates/hort-http-admin-tasks/tests/destructive_kinds_carry_db_idempotency.rs`;

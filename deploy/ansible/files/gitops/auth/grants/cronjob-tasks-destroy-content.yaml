@@ -1,0 +1,52 @@
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: cronjob-tasks-destroy-content
+spec:
+  # Standalone serviceAccount-subject grant, the sibling of
+  # cronjob-tasks-task-invoke.yaml. Resolves at apply to
+  # GrantSubject::User(<cronjob-tasks backing user>), so the authority is
+  # bound to the identity and survives the worker's execution-time
+  # re-check (which rebuilds the requester from the `users` row and can
+  # re-derive no IdP claim).
+  #
+  # `destroy_content` is the authority over artifact content:
+  # retention-evaluate in execute mode (which appends the ArtifactExpired
+  # the purge acts on) and retention-purge (which deletes the CAS bytes).
+  # Removal leaves a record behind by design — ArtifactPurged stays on the
+  # stream — which is what makes scheduled storage reclamation something a
+  # machine identity may be trusted with. Both factors are required: this
+  # grant AND the global admin_task_invoke beside it.
+  #
+  # `destroy_record` (eventstore-archive) is deliberately NOT here and
+  # cannot be: nothing reconstructs a sealed audit stream, so no
+  # unattended identity is given standing authority over one. A
+  # serviceAccount-subject grant of it is rejected at apply-parse, the
+  # apply linter denies it the SA-provenance exemption, issue-svc-token
+  # refuses to mint it, and both runtime authority checks refuse a
+  # service-account caller regardless of the grant set. Run
+  # eventstore-archive by hand as a human identity that holds it.
+  #
+  # THE GRANT IS HALF OF IT. A service-account token's capability is
+  # frozen at mint (ADR 0012), and `cronjob-tasks` is PAT-only — no
+  # `fallbackRotation`, so no reconciler interval re-snapshots it. A token
+  # minted before this grant existed carries `admin_task_invoke` alone and
+  # is answered 403 on every retention invocation. Confirm with
+  # `hort-cli auth status --output json` (its `permissions` is the frozen
+  # cap, not the grant set) and rotate via the hort_timers role's
+  # `hort_timers_token_rotate: true`, or directly:
+  #
+  #   hort-server admin issue-svc-token --name cronjob-tasks \
+  #     --permission admin_task_invoke --permission destroy_content \
+  #     --rotate --output file:/etc/hort/tasks-token
+  #
+  # Re-running that command converges to the same state, so it is safe to
+  # repeat; without `--rotate` the mint is a no-op on an existing token and
+  # the cap stays stale.
+  subject:
+    kind: serviceAccount
+    name: cronjob-tasks
+  permission: destroy_content
+  # No `repository:` -> global. Admin-task invocation is a global
+  # capability and the destructive gate asks at `repository = None`, so a
+  # repo-scoped destructive grant would authorise nothing.

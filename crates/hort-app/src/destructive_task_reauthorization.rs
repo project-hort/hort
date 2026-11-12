@@ -1,9 +1,10 @@
 //! Execution-time re-authorization of a destructive admin task.
 //!
 //! Acceptance does not confer authority. The enqueue path checks
-//! `Permission::AdminTaskInvoke` **plus** the
-//! [`DESTRUCTIVE_TASK_CLAIM`] once, against the principal that made the
-//! request ([`TaskUseCase::authorize_kind`](crate::use_cases::TaskUseCase::authorize_kind)).
+//! `Permission::AdminTaskInvoke` **plus** the destructive permission the
+//! invocation needs ([`Permission::DestroyContent`] or
+//! [`Permission::DestroyRecord`]) once, against the principal that made
+//! the request ([`TaskUseCase::authorize_kind`](crate::use_cases::TaskUseCase::authorize_kind)).
 //! A `jobs` row then sits in the queue for however long the backlog,
 //! the poll interval and the per-kind semaphore take, and the handler
 //! that eventually runs it carries no principal at all — the dispatcher
@@ -19,22 +20,40 @@
 //! never called — nothing is destroyed, and the row lands terminal with
 //! a reason an operator can read.
 //!
-//! # What "the same claim the enqueue required" means here
+//! # What "the same authority the enqueue required" means here
 //!
 //! The decision reuses the enqueue's own primitives, in the enqueue's
 //! own order, so the two cannot drift:
 //!
-//! - [`task_invocation_is_destructive`] decides whether the check
+//! - [`task_invocation_destructive_authority`] decides whether the check
 //!   applies at all — the same per-invocation classifier the enqueue
 //!   gate and the ADR 0028 idempotency key read, not a parallel list.
 //!   A `retention-evaluate` dry run destroys nothing and is therefore
 //!   not re-checked.
 //! - [`RbacEvaluator::authorize`] for `Permission::AdminTaskInvoke` and
-//!   [`RbacEvaluator::claims_satisfy`] for the claim, over an evaluator
+//!   again for the invocation's destructive permission, over an evaluator
 //!   built from a **live** `PermissionGrantRepository::list_all` read —
 //!   the same per-tick-evaluator pattern `ServiceAccountRotationHandler`
 //!   uses, because the worker's composition-root evaluator is
-//!   deliberately empty.
+//!   deliberately empty. Both factors are now one grant model, so the
+//!   live read is the whole of the re-check.
+//!
+//! # One authority is refused to a machine identity outright
+//!
+//! `Permission::DestroyRecord` is not grantable to a service account
+//! (`hort_domain::entities::rbac::SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS`
+//! — nothing reconstructs a sealed audit stream, so no unattended
+//! identity gets standing authority over one). The enqueue gate refuses
+//! it on the caller's `TokenKind::ServiceAccount` credential; this check
+//! refuses it on the requester's persisted `users.is_service_account`
+//! row, because a `jobs` row carries no credential. The two
+//! discriminators are the only ones their respective layers have, and
+//! the persisted one is the identity the decision was about.
+//!
+//! `Permission::DestroyContent` is deliberately not refused here —
+//! reclaiming artifact storage is the scheduled housekeeping a machine
+//! identity exists for, and the shipped `cronjob-tasks` SA holds it, so
+//! its queued `retention-purge` must still reach its handler.
 //!
 //! # The execution-time principal, and why it can only subtract
 //!
@@ -57,14 +76,24 @@
 //! can only *widen* — but every row that exists already passed the
 //! enqueue with its cap applied, so widening here cannot admit an
 //! invocation the enqueue refused. The claim set, conversely, only ever
-//! *narrows*: a requester who held the claim through an IdP group is
-//! refused here. That is the fail-closed direction, and it is the one
-//! this check exists to take — an execution carrying authority the
-//! registry can no longer see is precisely what "acceptance does not
-//! confer authority" forbids. The practical consequence, which belongs
-//! in operator docs rather than only here: destructive tasks must be
-//! invoked by a principal whose destructive authority is persisted,
-//! i.e. an `admin` user.
+//! *narrows*: a requester who held the authority through a
+//! `GrantSubject::Claims` grant on an IdP-resolved claim is refused
+//! here. That is the fail-closed direction, and it is the one this check
+//! exists to take — an execution carrying authority the registry can no
+//! longer see is precisely what "acceptance does not confer authority"
+//! forbids.
+//!
+//! **The practical consequence, which belongs in operator docs rather
+//! than only here: a destructive grant must be reachable from the
+//! persisted identity.** A `GrantSubject::User` grant (including the
+//! `serviceAccount`-subject form, which resolves to one at apply) is
+//! re-derivable here and survives; so does a `Claims(["admin"])` grant
+//! held by a still-`is_admin` user, because that one claim is
+//! synthesised from the user row. A destructive grant bound to any
+//! *other* claim passes the enqueue and is then refused at execution,
+//! every time — the row lands terminal with a reason naming the
+//! permission, and the fix is to bind the grant to the identity rather
+//! than to a claim nothing persists.
 //!
 //! # Refusal versus unavailability
 //!
@@ -94,7 +123,6 @@
 //! sweep cannot re-fire within a day, and a refusal is not evidence
 //! that it did not.
 
-use std::slice;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -103,7 +131,7 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::entities::user::User;
 use hort_domain::error::DomainError;
-use hort_domain::events::{task_invocation_is_destructive, DESTRUCTIVE_TASK_CLAIM};
+use hort_domain::events::task_invocation_destructive_authority;
 use hort_domain::ports::jobs_repository::JobRow;
 use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
 use hort_domain::ports::user_repository::UserRepository;
@@ -173,7 +201,8 @@ impl DestructiveTaskReauthorizer {
         job: &JobRow,
         params: &serde_json::Value,
     ) -> ReauthorizationVerdict {
-        // 1. Does this invocation destroy anything? Same per-invocation
+        // 1. Does this invocation destroy anything, and under whose
+        //    authority? Same per-invocation
         //    classifier as the enqueue gate. An unclassifiable row (a
         //    `mode` string outside the closed vocabulary, which the
         //    enqueue's param validation rejects and only an out-of-band
@@ -181,8 +210,8 @@ impl DestructiveTaskReauthorizer {
         //    cannot say what authority it needs, so we cannot say it
         //    holds it. The params are fixed on the row, so a retry
         //    would reach the same dead end.
-        let destructive = match task_invocation_is_destructive(&job.kind, params) {
-            Ok(destructive) => destructive,
+        let required_authority = match task_invocation_destructive_authority(&job.kind, params) {
+            Ok(authority) => authority,
             Err(err) => {
                 return refuse(format!(
                     "{REFUSAL_PREFIX}: the invocation could not be classified as destructive or \
@@ -190,9 +219,9 @@ impl DestructiveTaskReauthorizer {
                 ));
             }
         };
-        if !destructive {
+        let Some(required_authority) = required_authority else {
             return ReauthorizationVerdict::Authorized;
-        }
+        };
 
         // 2. An unnamed requester has no authority to re-check. Only
         //    `TaskUseCase::enqueue` produces rows of these kinds and it
@@ -255,18 +284,39 @@ impl DestructiveTaskReauthorizer {
         let rbac = RbacEvaluator::new(grants);
         let principal = execution_time_principal(&user);
 
-        // 5. The enqueue's two factors, in the enqueue's order, through
-        //    the enqueue's evaluator methods.
+        // 5. The enqueue's identity refusal, over the one discriminator
+        //    this layer has. The enqueue gate reads the caller's
+        //    `TokenKind::ServiceAccount` credential; no credential is
+        //    persisted on a `jobs` row, so here the identity is
+        //    `users.is_service_account` — the persisted fact, and the
+        //    one the decision was actually about. Membership comes from
+        //    the same domain declaration both layers read. Reached only
+        //    by a row the enqueue gate did not mint (an out-of-band
+        //    INSERT, or a grant/identity that changed under a row that
+        //    was already queued), which is exactly why it is here and
+        //    not assumed away.
+        if user.is_service_account {
+            if let Some(reason) = required_authority.service_account_refusal() {
+                return refuse(format!(
+                    "{REFUSAL_PREFIX}: the requester is a service account, which may not hold \
+                     Permission::{required_authority}: {reason}"
+                ));
+            }
+        }
+
+        // 6. The enqueue's two authority factors, in the enqueue's
+        //    order, through the enqueue's evaluator methods.
         if !rbac.authorize(&principal, Permission::AdminTaskInvoke, None) {
             return refuse(format!(
                 "{REFUSAL_PREFIX}: the requester no longer holds Permission::AdminTaskInvoke — it \
                  was revoked before execution"
             ));
         }
-        if !rbac.claims_satisfy(&principal, slice::from_ref(&DESTRUCTIVE_TASK_CLAIM)) {
+        if !rbac.authorize(&principal, required_authority, None) {
             return refuse(format!(
-                "{REFUSAL_PREFIX}: the requester's {DESTRUCTIVE_TASK_CLAIM:?} claim was revoked \
-                 before execution"
+                "{REFUSAL_PREFIX}: the requester does not hold \
+                 Permission::{required_authority} — the grant was revoked before execution, or \
+                 it is bound to a claim this execution cannot re-derive"
             ));
         }
 
@@ -347,15 +397,30 @@ mod tests {
     }
 
     fn invoke_grant(subject: GrantSubject) -> PermissionGrant {
+        grant(subject, Permission::AdminTaskInvoke)
+    }
+
+    fn grant(subject: GrantSubject, permission: Permission) -> PermissionGrant {
         PermissionGrant {
             id: Uuid::new_v4(),
             subject,
             repository_id: None,
-            permission: Permission::AdminTaskInvoke,
+            permission,
             managed_by: ManagedBy::Local,
             managed_by_digest: None,
             created_at: DateTime::<Utc>::UNIX_EPOCH,
         }
+    }
+
+    /// The grant set a destructive requester needs to survive the
+    /// re-check: both factors, bound to the **identity** so the
+    /// execution-time principal can re-derive them (see the module docs
+    /// on why a claim-bound grant cannot be).
+    fn destructive_grants(actor: Uuid, authority: Permission) -> Vec<PermissionGrant> {
+        vec![
+            invoke_grant(GrantSubject::User(actor)),
+            grant(GrantSubject::User(actor), authority),
+        ]
     }
 
     fn row(kind: &str, actor_id: Option<Uuid>, params: serde_json::Value) -> JobRow {
@@ -470,12 +535,40 @@ mod tests {
     // The normal case
     // -----------------------------------------------------------------
 
-    /// An admin requester whose authority is unchanged still runs. The
-    /// `admin` claim short-circuits the claim requirement exactly as it
-    /// does at enqueue, so no separate `task:destructive` grant is
-    /// needed for this path.
+    /// A requester whose authority is unchanged still runs — and
+    /// "unchanged" now means both grants are live, for a non-admin and an
+    /// admin alike.
     #[tokio::test]
-    async fn an_admin_requester_whose_authority_still_holds_is_authorized() {
+    async fn a_requester_whose_authority_still_holds_is_authorized() {
+        for is_admin in [false, true] {
+            let actor = Uuid::new_v4();
+            let reauth = reauthorizer(
+                Some(user(actor, is_admin, true)),
+                destructive_grants(actor, Permission::DestroyContent),
+            );
+
+            let verdict = reauth
+                .authorize_execution(
+                    &row("retention-purge", Some(actor), serde_json::json!({})),
+                    &serde_json::json!({}),
+                )
+                .await;
+
+            assert_eq!(
+                verdict,
+                ReauthorizationVerdict::Authorized,
+                "is_admin={is_admin}: a live grant pair must authorize"
+            );
+        }
+    }
+
+    /// **An admin is not implicitly authorised here either.** The
+    /// execution re-check reads the same orthogonality the enqueue gate
+    /// does, so an admin requester with no destructive grant is refused
+    /// at execution — the surfaces cannot disagree about whether the
+    /// admin bit confers destructive authority.
+    #[tokio::test]
+    async fn an_admin_requester_without_the_destructive_grant_is_refused() {
         let actor = Uuid::new_v4();
         let reauth = reauthorizer(Some(user(actor, true, true)), Vec::new());
 
@@ -486,19 +579,19 @@ mod tests {
             )
             .await;
 
-        assert_eq!(verdict, ReauthorizationVerdict::Authorized);
+        let reason = refusal_reason(&verdict);
+        assert!(
+            reason.contains("destroy_content"),
+            "the refusal must name the destructive permission: {reason}"
+        );
     }
 
-    /// The two legs are independent, and a grant satisfies only one of
-    /// them. A non-admin requester holding `AdminTaskInvoke` through a
-    /// live `User`-subject grant — the shape a gitops-granted service
-    /// account or operator has — passes the permission leg and is still
-    /// refused on the claim, because no grant confers a claim (ADR 0012
-    /// keeps the two taxonomies apart). Pinned by asserting *which* leg
-    /// the refusal names: a future change that collapsed the claim leg
-    /// into the permission leg would otherwise pass unnoticed.
+    /// The two factors are independent, and the `AdminTaskInvoke` grant
+    /// satisfies only one of them. Pinned by asserting *which* factor the
+    /// refusal names: a change that collapsed the destructive factor into
+    /// the coarse one would otherwise pass unnoticed.
     #[tokio::test]
-    async fn a_user_subject_grant_satisfies_the_permission_leg_but_not_the_claim_leg() {
+    async fn an_invoke_grant_alone_satisfies_only_the_coarse_factor() {
         let actor = Uuid::new_v4();
         let reauth = reauthorizer(
             Some(user(actor, false, true)),
@@ -514,8 +607,78 @@ mod tests {
 
         let reason = refusal_reason(&verdict);
         assert!(
-            reason.contains("task:destructive") && reason.contains("revoked before execution"),
-            "the refusal must name the claim leg, not the permission leg: {reason}"
+            reason.contains("destroy_record"),
+            "the refusal must name the destructive factor, not the coarse one: {reason}"
+        );
+    }
+
+    /// The confusion case at the execution site: the requester holds the
+    /// *other* destructive authority. Content and record are not
+    /// interchangeable here any more than at enqueue.
+    #[tokio::test]
+    async fn the_wrong_destructive_grant_does_not_authorise_execution() {
+        let actor = Uuid::new_v4();
+        let reauth = reauthorizer(
+            Some(user(actor, false, true)),
+            destructive_grants(actor, Permission::DestroyRecord),
+        );
+
+        let verdict = reauth
+            .authorize_execution(
+                &row("retention-purge", Some(actor), serde_json::json!({})),
+                &serde_json::json!({}),
+            )
+            .await;
+
+        assert!(
+            refusal_reason(&verdict).contains("destroy_content"),
+            "a record grant must not run a content purge"
+        );
+    }
+
+    /// The narrowing the module docs own: a destructive grant bound to a
+    /// claim nothing persists passes the enqueue (where the session
+    /// carries the claim) and is refused here, every time. The fix is to
+    /// bind the grant to the identity — asserted beside the refusal so
+    /// the operator-facing remedy is pinned, not just the hazard.
+    #[tokio::test]
+    async fn a_claim_bound_destructive_grant_cannot_be_re_derived_at_execution() {
+        let actor = Uuid::new_v4();
+        let claim_bound = vec![
+            invoke_grant(GrantSubject::User(actor)),
+            grant(
+                GrantSubject::Claims(vec!["retention-operator".into()]),
+                Permission::DestroyContent,
+            ),
+        ];
+        let reauth = reauthorizer(Some(user(actor, false, true)), claim_bound);
+
+        let verdict = reauth
+            .authorize_execution(
+                &row("retention-purge", Some(actor), serde_json::json!({})),
+                &serde_json::json!({}),
+            )
+            .await;
+
+        let reason = refusal_reason(&verdict);
+        assert!(
+            reason.contains("cannot re-derive"),
+            "the refusal must say the authority was unreachable, not merely absent: {reason}"
+        );
+
+        // The same identity, same authority, bound to the identity: runs.
+        let reauth = reauthorizer(
+            Some(user(actor, false, true)),
+            destructive_grants(actor, Permission::DestroyContent),
+        );
+        assert_eq!(
+            reauth
+                .authorize_execution(
+                    &row("retention-purge", Some(actor), serde_json::json!({})),
+                    &serde_json::json!({}),
+                )
+                .await,
+            ReauthorizationVerdict::Authorized,
         );
     }
 
@@ -523,14 +686,13 @@ mod tests {
     // The gap itself
     // -----------------------------------------------------------------
 
-    /// The defect this module exists for: the requester held the claim
-    /// when the row was enqueued and does not hold it now. Nothing runs.
+    /// The defect this module exists for: the requester held the
+    /// authority when the row was enqueued and does not hold it now.
+    /// Nothing runs.
     #[tokio::test]
-    async fn a_requester_demoted_after_enqueue_is_refused() {
+    async fn a_requester_whose_grant_was_revoked_after_enqueue_is_refused() {
         let actor = Uuid::new_v4();
-        // Demotion is `is_admin = false`: the synthetic `admin` claim is
-        // the only destructive authority the registry persists, so
-        // losing it is losing the claim.
+        // The grant set is empty now, whatever it was at enqueue.
         let reauth = reauthorizer(Some(user(actor, false, true)), Vec::new());
 
         let verdict = reauth
@@ -664,6 +826,106 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // One authority is refused to a machine identity outright
+    // -----------------------------------------------------------------
+
+    /// A service-account requester, with its persisted identity set —
+    /// the discriminator this layer has, because a `jobs` row carries
+    /// no credential to read a `TokenKind` off.
+    fn service_account_user(id: Uuid) -> User {
+        User {
+            username: "sa:cronjob-tasks".into(),
+            email: "sa+cronjob-tasks@example.invalid".into(),
+            auth_provider: AuthProvider::Local,
+            external_id: None,
+            is_service_account: true,
+            ..user(id, false, true)
+        }
+    }
+
+    /// The execution-time half of the identity refusal, reached by the
+    /// one row the enqueue gate cannot have minted: a queued
+    /// `eventstore-archive` whose requester is a service account. The
+    /// grants are present and bound to the identity, so the refusal is
+    /// the identity and nothing else.
+    #[tokio::test]
+    async fn a_service_account_requester_is_refused_the_record_authority() {
+        let actor = Uuid::new_v4();
+        let reauth = reauthorizer(
+            Some(service_account_user(actor)),
+            destructive_grants(actor, Permission::DestroyRecord),
+        );
+
+        let verdict = reauth
+            .authorize_execution(
+                &row("eventstore-archive", Some(actor), serde_json::json!({})),
+                &serde_json::json!({}),
+            )
+            .await;
+
+        let reason = refusal_reason(&verdict);
+        assert!(
+            reason.contains("the requester is a service account, which may not hold"),
+            "the refusal must name the identity, not a missing grant: {reason}"
+        );
+        assert!(
+            reason.contains("nothing reconstructs a sealed stream"),
+            "the refusal must name why: {reason}"
+        );
+    }
+
+    /// The counter-assertion that keeps the refusal above from being
+    /// read as "a service account may not run a destructive job". The
+    /// shipped `cronjob-tasks` SA holds `destroy_content` precisely so
+    /// its queued `retention-purge` reaches its handler; a refusal
+    /// widened to both authorities would strand exactly that row.
+    #[tokio::test]
+    async fn a_service_account_requester_keeps_the_content_authority() {
+        let actor = Uuid::new_v4();
+        let reauth = reauthorizer(
+            Some(service_account_user(actor)),
+            destructive_grants(actor, Permission::DestroyContent),
+        );
+
+        for kind in ["retention-purge", "retention-evaluate"] {
+            assert_eq!(
+                reauth
+                    .authorize_execution(
+                        &row(kind, Some(actor), serde_json::json!({})),
+                        &serde_json::json!({})
+                    )
+                    .await,
+                ReauthorizationVerdict::Authorized,
+                "a machine identity holding destroy_content must still execute {kind:?}"
+            );
+        }
+    }
+
+    /// And the symmetric counter-assertion: the record authority stays
+    /// executable for a non-service-account requester holding it, so
+    /// the refusal is scoped to the identity rather than to the
+    /// authority.
+    #[tokio::test]
+    async fn a_human_requester_keeps_the_record_authority() {
+        let actor = Uuid::new_v4();
+        let reauth = reauthorizer(
+            Some(user(actor, false, true)),
+            destructive_grants(actor, Permission::DestroyRecord),
+        );
+
+        assert_eq!(
+            reauth
+                .authorize_execution(
+                    &row("eventstore-archive", Some(actor), serde_json::json!({})),
+                    &serde_json::json!({})
+                )
+                .await,
+            ReauthorizationVerdict::Authorized,
+            "a human identity that holds destroy_record must still execute the archive"
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Only the destructive invocations pay
     // -----------------------------------------------------------------
 
@@ -692,7 +954,7 @@ mod tests {
     }
 
     /// A `retention-evaluate` **dry run** destroys nothing, so it is not
-    /// re-checked — the same split `task_invocation_is_destructive`
+    /// re-checked — the same split `task_invocation_destructive_authority`
     /// draws for the enqueue gate and the idempotency key. Its execute
     /// counterpart, including the defaulted mode, is.
     #[tokio::test]

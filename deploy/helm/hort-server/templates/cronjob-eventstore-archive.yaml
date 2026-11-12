@@ -22,21 +22,37 @@ Gated by `scheduledTasks.eventstoreArchive.enabled` (default false).
 The parent `scheduledTasks.adminTasksEnabled` must also be true.
 
 DESTRUCTIVE TASK: `eventstore-archive` is in DESTRUCTIVE_TASK_KINDS, so
-invoking it requires the caller carry the `task:destructive` claim in
-addition to `AdminTaskInvoke`. The bootstrap `{{ release }}-svc-token` is a
-non-admin `cronjob-tasks` svc-token (AdminTaskInvoke only — svc-tokens are
-claimless), so it cannot satisfy `task:destructive` and this CronJob fails
-if run with it. No token can be made to carry the claim: a native token
-resolves no IdP claims at all, so the only token that passes the gate is an
-admin user's, which passes it by the admin short-circuit. Run this kind by
-hand with a Dex-backed admin CliSession instead:
+invoking it requires `destroy_record` — the authority over the audit record
+itself — in addition to `AdminTaskInvoke`.
+
+THIS KIND HAS ONLY THE MANUAL PATH, AND NO GRANT CHANGES THAT. Unlike the
+retention pair, `destroy_record` is **not grantable to a service account**:
+the archive seals audit streams — authentication audit, download audit, token
+use — and nothing reconstructs a sealed stream, so no unattended identity is
+given standing authority over one. The refusal is fail-closed at five
+independent points (the apply-parse validator rejects a
+`serviceAccount`-subject grant of it, the apply linter denies it the
+SA-provenance exemption so the hand-written `kind: user` form naming the SA's
+backing user rejects too, `issue-svc-token` refuses to mint it, and both
+runtime authority checks refuse a service-account caller whatever the grant
+set says). Adding it to `scheduledTasks.svcTokens[].permissions` fails the
+bootstrap Job; declaring the grant fails the apply. So leaving this CronJob
+disabled is the design, not a gap to provision around.
+
+**Being an admin does not confer `destroy_record` either**: it is held only
+through an explicit PermissionGrant, so an interactive admin is answered
+`403` until one exists for their identity. Run this kind by hand with an
+admin CliSession whose identity holds that grant:
 `hort-cli admin task invoke eventstore-archive`.
 
 The authority is re-checked a second time when the worker runs the job,
-against the live state of the user it was enqueued under: revoking that
-identity's authority (demote, deactivate, or remove its
-`admin_task_invoke` grant) stops the jobs it has already queued, which
-land as terminal `failed` rows naming the cause. See
+against the live state of the user it was enqueued under: revoking either
+grant (or deactivating the account) stops the jobs it has already queued,
+which land as terminal `failed` rows naming the cause. The grant must be
+reachable from the persisted identity — a `serviceAccount`- or
+`User`-subject grant, or a claims grant on `admin` for an admin user;
+a grant bound to any other claim passes the enqueue and is refused at
+execution, because nothing persists an IdP-resolved claim set. See
 docs/architecture/how-to/deploy/enable-admin-task-cronjobs.md section 5.
 */}}
 {{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.eventstoreArchive.enabled }}

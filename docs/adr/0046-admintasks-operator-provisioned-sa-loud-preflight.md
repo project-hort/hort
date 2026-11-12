@@ -81,15 +81,16 @@ gitops.
 
 ### D3 — Destructive CronJobs stay disabled-by-default, docs-only
 
-`retention-evaluate`, `retention-purge`, `eventstore-archive` require the
-`task:destructive` claim, satisfiable only by a fresh IdP-backed admin session
-and never by the claimless bootstrap svc-token (ADR 0038 §4). They ship
-`enabled: false` and stay so; this decision only improves their warnings
-(`values.yaml`, `NOTES.txt`, the how-to). The hardcoded destructive-CronJob
-`HORT_TOKEN` secretKeyRef (no values knob for an operator-supplied
-`task:destructive` Secret) and the cron-proposes/admin-confirms approval workflow
-are **deferred** to the ADR 0038 follow-on 1 (which needs its own security
-co-review) — not introduced here.
+`retention-evaluate` and `retention-purge` require `destroy_content`,
+`eventstore-archive` requires `destroy_record`, and neither permission is
+implied by being an admin or held by the bootstrap svc-token (ADR 0038 §4 and
+the destructive-authority capability's own ADR). They ship `enabled: false` and
+stay so; this decision only improves their warnings (`values.yaml`,
+`NOTES.txt`, the how-to). The hardcoded destructive-CronJob `HORT_TOKEN`
+secretKeyRef (no values knob for an operator-supplied destructive-authority
+Secret) and the cron-proposes/admin-confirms approval workflow are **deferred**
+to the ADR 0038 follow-on 1 (which needs its own security co-review) — not
+introduced here.
 
 ## Consequences
 
@@ -107,9 +108,12 @@ co-review) — not introduced here.
   permission-grant write; it is a strict sub-window of the pre-existing
   SA-absent race, is only reachable during the server's one-shot boot apply, and
   self-heals via the Job's in-retry plus the documented "re-run `helm upgrade`".
-- The authority model is untouched: no SA gains admin, no static token carries
-  `task:destructive`, and the preflight only *reads* grants using the runtime's
-  own evaluator.
+- The authority model is untouched by *this* decision: no SA gains admin, no
+  credential gains a destructive permission here, and the preflight only *reads*
+  grants using the runtime's own evaluator. (The preflight's subject is the
+  `admin_task_invoke` grant; the destructive permissions are a separate grant it
+  does not check, because the destructive CronJobs it warns about ship
+  disabled.)
 
 ## Alternatives considered
 
@@ -123,11 +127,17 @@ co-review) — not introduced here.
   ConfigMap — writing into the operator's declarative surface either way. The
   operator decided their gitops stays operator-owned; the loud preflight + docs
   meet the acceptance without the chart touching gitops.
-- **Auto-provision a destructive-authority SA behind an opt-in.** Rejected as
-  both impossible and forbidden: a native SA token is claimless
-  (`authenticate_pat`), so it can never carry `task:destructive`; and an admin/
-  destructive SA is rejected three ways (ADR 0038 §4). Destructive housekeeping's
-  durable answer is the cron-proposes/admin-confirms approval workflow follow-on.
+- **Auto-provision a destructive-authority SA behind an opt-in.** Rejected at
+  the time as both impossible and forbidden: a native SA token was claimless
+  (`authenticate_pat`), so it could never carry the destructive *claim* the gate
+  then required; and an admin SA is rejected three ways (ADR 0038 §4). The
+  "impossible" half no longer holds — a destructive authority is now a
+  `Permission` a grant can bind to any identity — but the rejection of *this
+  chart* auto-provisioning one stands on its own ground, which is the headline
+  rejection above: SA authority is operator-declared through the audited apply
+  path, and the chart writes no gitops. Destructive housekeeping's durable
+  answer for unattended execution is still the cron-proposes/admin-confirms
+  approval workflow follow-on.
 - **A verification endpoint / dry-run invoke over HTTP instead of a CLI flag.**
   Rejected: the bootstrap Job already runs `issue-svc-token` against the DB with
   the SA resolved in hand; reusing the runtime `RbacEvaluator` there is one grant

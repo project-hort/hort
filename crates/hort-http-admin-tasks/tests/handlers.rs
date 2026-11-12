@@ -82,29 +82,42 @@ fn task_admin_principal() -> CallerPrincipal {
     }
 }
 
+/// A caller who additionally holds both destructive permissions, through
+/// the `destructive` claim the permit grants them to.
 fn destructive_task_admin_principal() -> CallerPrincipal {
     let mut principal = task_admin_principal();
-    principal.claims.push("task:destructive".into());
+    principal.claims.push("destructive".into());
     principal
 }
 
+/// A global claims-subject grant.
+fn claim_grant(required: &[&str], permission: Permission) -> PermissionGrant {
+    PermissionGrant {
+        id: Uuid::new_v4(),
+        subject: GrantSubject::Claims(required.iter().map(|c| (*c).to_string()).collect()),
+        repository_id: None,
+        permission,
+        created_at: Utc::now(),
+        managed_by: ManagedBy::Local,
+        managed_by_digest: None,
+    }
+}
+
 /// Build a `TaskUseCase` that grants `Permission::AdminTaskInvoke` to any
-/// caller whose resolved claims contain `task-admin` (flat
-/// `GrantSubject::Claims` grant set, no role row — see ADR 0012).
+/// caller whose resolved claims contain `task-admin`, and both
+/// destructive permissions to a caller carrying `destructive` (flat
+/// `GrantSubject::Claims` grant set, no role row — see ADR 0012). The
+/// destructive factor is a *grant* now, so a test caller needs the
+/// matching claim on a grant rather than a claim of its own.
 fn task_use_case_with_permit(
     mocks: &MockPorts,
     events: Arc<hort_app::event_store_publisher::EventStorePublisher>,
 ) -> Arc<TaskUseCase> {
-    let grant = PermissionGrant {
-        id: Uuid::new_v4(),
-        subject: GrantSubject::Claims(vec!["task-admin".into()]),
-        repository_id: None,
-        permission: Permission::AdminTaskInvoke,
-        created_at: Utc::now(),
-        managed_by: ManagedBy::Local,
-        managed_by_digest: None,
-    };
-    let evaluator = RbacEvaluator::new(vec![grant]);
+    let evaluator = RbacEvaluator::new(vec![
+        claim_grant(&["task-admin"], Permission::AdminTaskInvoke),
+        claim_grant(&["destructive"], Permission::DestroyContent),
+        claim_grant(&["destructive"], Permission::DestroyRecord),
+    ]);
     let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(evaluator));
     Arc::new(TaskUseCase::new(mocks.jobs.clone(), events, rbac))
 }
@@ -998,14 +1011,14 @@ async fn invoke_unauthorized_does_not_probe_idempotency_store() {
 }
 
 /// A destructive kind (`retention-purge`) invoked by a caller holding
-/// `AdminTaskInvoke` but NOT the `task:destructive` claim is rejected
-/// `403` at the handler boundary (per-kind destructive-claim tier).
+/// `AdminTaskInvoke` but neither destructive permission is rejected
+/// `403` at the handler boundary (per-kind destructive tier).
 #[tokio::test]
-async fn invoke_destructive_kind_without_destructive_claim_returns_403() {
+async fn invoke_destructive_kind_without_destructive_permission_returns_403() {
     let (ctx, mocks) = new_ctx();
     let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
-    // Permit grants AdminTaskInvoke to `task-admin` callers only — no
-    // `task:destructive` claim is carried by `task_admin_principal()`.
+    // The permit binds the destructive grants to the `destructive` claim,
+    // which `task_admin_principal()` does not carry.
     let uc = task_use_case_with_permit(&mocks, events);
     let ctx = with_task_use_case(&ctx, uc);
     let router = build_test_router(ctx);
@@ -1021,16 +1034,16 @@ async fn invoke_destructive_kind_without_destructive_claim_returns_403() {
     assert_eq!(
         resp.status(),
         StatusCode::FORBIDDEN,
-        "destructive kind without task:destructive claim must be 403"
+        "destructive kind without its destructive permission must be 403"
     );
     assert!(
         mocks.jobs.enqueue_calls().is_empty(),
-        "destructive enqueue must not run without the claim"
+        "destructive enqueue must not run without the permission"
     );
 }
 
 #[tokio::test]
-async fn retention_dry_run_is_authorized_without_destructive_claim_but_execute_is_not() {
+async fn retention_dry_run_is_authorized_without_destructive_permission_but_execute_is_not() {
     let (ctx, mocks) = new_ctx();
     let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
     let uc = task_use_case_with_permit(&mocks, events);

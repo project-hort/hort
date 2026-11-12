@@ -9,10 +9,13 @@ spec:
   # `admin_task_invoke` is the narrow "may enqueue an admin task" cap, not
   # the `admin` bit — this standalone grant is the sole carrier.
   #
-  # This does not confer the `task:destructive` claim, so the cronjob-tasks
-  # token cannot run retention-evaluate / retention-purge / eventstore-archive
-  # (those need admin_task_invoke AND task:destructive). Destructive
-  # housekeeping requires a fresh admin session instead.
+  # This confers no destructive authority by itself. The destructive
+  # factor is a separate grant per authority, and neither is implied by
+  # `admin`: `destroy_content` for retention-evaluate / retention-purge
+  # ships beside this file as cronjob-tasks-destroy-content.yaml, and
+  # `destroy_record` for eventstore-archive is not grantable to a service
+  # account at all (nothing reconstructs a sealed audit stream — see the
+  # ServiceAccount declaration for the five points that refuse it).
   subject:
     kind: serviceAccount
     name: cronjob-tasks

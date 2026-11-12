@@ -747,11 +747,18 @@ pub const EVENT_TASK_KINDS: &[&str] = &[
 /// exactly these three**; adding a fourth is a scope-creep regression
 /// and must be treated as re-opening the audit finding.
 ///
+/// **The three do not share one authority**, so the set is declared as
+/// the two authority groups below and this const is their union — the
+/// shape every existing consumer of "is this kind in the destructive
+/// tier?" already reads. `destructive_kinds_are_exactly_the_two_authority_groups`
+/// pins the union against them, so a kind cannot join the tier without
+/// being given an authority.
+///
 /// Membership is per **kind** and is the coarse tier: it says a kind can
 /// destroy, not that a given call will. Whether a particular invocation
-/// needs the [`DESTRUCTIVE_TASK_CLAIM`] and takes the durable
+/// needs a destructive authority at all and takes the durable
 /// per-UTC-day idempotency layer (ADR 0028) is
-/// [`task_invocation_is_destructive`], which refines this set by the
+/// [`task_invocation_destructive_authority`], which refines this set by the
 /// call's own params — `retention-evaluate` in `dry_run` mode is a
 /// member here and does neither.
 pub const DESTRUCTIVE_TASK_KINDS: &[&str] = &[
@@ -760,26 +767,45 @@ pub const DESTRUCTIVE_TASK_KINDS: &[&str] = &[
     "eventstore-archive",
 ];
 
-/// The single registry **claim** a caller must additionally carry to
-/// invoke a [`DESTRUCTIVE_TASK_KINDS`] kind (expressed via the
-/// additive-claims model — ADR 0012).
+/// The [`DESTRUCTIVE_TASK_KINDS`] members that destroy **artifact
+/// content** — the bytes and the registry's record of the version.
 ///
-/// **Why a claim, not a new `Permission` enum variant.** The
-/// claim-based-RBAC model (ADR 0012) keeps the `Permission` /
-/// `GrantSubject` taxonomies closed — a third `GrantSubject`
-/// variant is forbidden. A single well-named claim
-/// (`task:destructive`) is the simplest expression that lets operators
-/// grant destructive-task authority **distinctly** from ordinary
-/// admin-task authority (`Permission::AdminTaskInvoke`) without touching
-/// the closed `Permission`/`GrantSubject` taxonomies: an operator maps an
-/// IdP group → the `task:destructive` claim (or binds it on a
-/// `User`-subject service-account grant) exactly as any other claim. The
-/// gate is `AdminTaskInvoke` **AND** this claim — the destructive caller
-/// needs strictly more authority than a `noop` caller, by construction.
-pub const DESTRUCTIVE_TASK_CLAIM: &str = "task:destructive";
+/// Their removal leaves a record behind by design: `ArtifactPurged`
+/// stays on the stream. `retention-evaluate` is here because its execute
+/// mode appends the `ArtifactExpired` the purge then acts on.
+/// Authority: [`Permission::DestroyContent`].
+pub const DESTROY_CONTENT_TASK_KINDS: &[&str] = &["retention-evaluate", "retention-purge"];
 
-/// Classify a task `kind` string as destructive (irreversible — requires
-/// the [`DESTRUCTIVE_TASK_CLAIM`] in addition to
+/// The [`DESTRUCTIVE_TASK_KINDS`] members that destroy **the record of
+/// what happened** — authentication audit, download audit, token use.
+///
+/// Nothing reconstructs a sealed and archived audit stream, which is why
+/// this is a separate authority: an identity trusted to reclaim storage
+/// is not thereby trusted to cut audit history.
+/// Authority: [`Permission::DestroyRecord`].
+pub const DESTROY_RECORD_TASK_KINDS: &[&str] = &["eventstore-archive"];
+
+/// The destructive authority a task `kind` needs — the object it
+/// destroys, not the purpose it serves — or `None` when the kind
+/// destroys nothing.
+///
+/// This is the single definition of both halves of the coarse tier:
+/// [`task_kind_is_destructive`] is "this returned `Some`", so a kind
+/// cannot be in the tier without naming an authority and cannot name one
+/// without being in the tier. Pure, zero-I/O, total over every `&str`.
+#[must_use]
+pub fn destructive_task_kind_authority(kind: &str) -> Option<Permission> {
+    if DESTROY_CONTENT_TASK_KINDS.contains(&kind) {
+        Some(Permission::DestroyContent)
+    } else if DESTROY_RECORD_TASK_KINDS.contains(&kind) {
+        Some(Permission::DestroyRecord)
+    } else {
+        None
+    }
+}
+
+/// Classify a task `kind` string as destructive (irreversible —
+/// requires one of the two destructive `Permission`s in addition to
 /// `Permission::AdminTaskInvoke`) versus ordinary (the existing
 /// `AdminTaskInvoke`-only gate, zero behaviour change).
 ///
@@ -789,7 +815,7 @@ pub const DESTRUCTIVE_TASK_CLAIM: &str = "task:destructive";
 /// input it does not recognise — fail-safe-by-construction).
 #[must_use]
 pub fn task_kind_is_destructive(kind: &str) -> bool {
-    DESTRUCTIVE_TASK_KINDS.contains(&kind)
+    destructive_task_kind_authority(kind).is_some()
 }
 
 /// The one [`DESTRUCTIVE_TASK_KINDS`] kind whose params carry an
@@ -821,8 +847,17 @@ pub fn retention_evaluate_mode(
         .map_err(|message| DomainError::Validation(message.to_owned()))
 }
 
-/// Classify a single **invocation** — a `kind` together with the params it
-/// was invoked with — as destructive.
+/// Classify a single **invocation** — a `kind` together with the params
+/// it was invoked with — as destructive, and name the authority it needs.
+///
+/// `Ok(None)` is "this call destroys nothing"; `Ok(Some(permission))` is
+/// "this call destroys, and that is the authority it needs in addition
+/// to `Permission::AdminTaskInvoke`" —
+/// [`Permission::DestroyContent`] for the artifact-content kinds
+/// (`retention-purge`, `retention-evaluate` in execute mode) and
+/// [`Permission::DestroyRecord`] for `eventstore-archive`, which removes
+/// the record of what happened rather than the thing itself (see
+/// [`DESTRUCTIVE_TASK_KINDS`]).
 ///
 /// This is the finer of the two destructive classifiers, and the two are
 /// not interchangeable:
@@ -832,19 +867,23 @@ pub fn retention_evaluate_mode(
 ///   run's `TaskInvoked` still belongs on the never-deleted
 ///   destructive-kind audit stream — and the wrong question for anything
 ///   that must act on what *this* call will actually do.
-/// - This function answers "will this call destroy anything?".
-///   [`RETENTION_EVALUATE_TASK_KIND`] is where the two diverge: its
-///   `dry_run` mode runs the same selection and predicates and appends
-///   nothing.
+/// - This function answers "will this call destroy anything, and under
+///   whose authority?". [`RETENTION_EVALUATE_TASK_KIND`] is where the two
+///   diverge: its `dry_run` mode runs the same selection and predicates
+///   and appends nothing.
 ///
-/// **Exactly two consumers, and they must never disagree**, because
-/// together they decide the authority an invocation needs and the
-/// single-flight claim it takes:
+/// **Whether and which are one answer, deliberately.** Three consumers
+/// read it, and they must never disagree, because together they decide
+/// the authority an invocation needs and the single-flight claim it
+/// takes:
 ///
-/// 1. The [`DESTRUCTIVE_TASK_CLAIM`] gate in the admin-task authorization
+/// 1. The destructive-authority gate in the admin-task authorization
 ///    path — a destructive invocation needs strictly more authority than
-///    an ordinary one.
-/// 2. The durable per-UTC-day idempotency key (ADR 0028) the invoke
+///    an ordinary one, and *which* more depends on what it destroys.
+/// 2. The execution-time re-authorization of a queued row, which
+///    re-checks that same authority against the live grant set before a
+///    handler runs.
+/// 3. The durable per-UTC-day idempotency key (ADR 0028) the invoke
 ///    handler derives — a *destructive* sweep must not re-fire after a
 ///    controller restart. An observation has no such hazard, and denying
 ///    a repeat of one would make "look again" impossible, which is the
@@ -853,22 +892,34 @@ pub fn retention_evaluate_mode(
 /// A consumer that asks the per-kind question instead grants a dry run a
 /// single-flight claim it has no reason to hold, so the second dry run of
 /// a UTC day is deduplicated back to the first and silently reports a
-/// stale observation as a fresh one.
+/// stale observation as a fresh one. A *second function* answering "which
+/// authority" beside this one answering "whether" re-opens the same gap
+/// one level up, which is why both answers are this return value.
 ///
 /// Pure, zero-I/O, total for every `kind`: an unrecognised kind is not
 /// destructive (fail-safe, matching [`task_kind_is_destructive`] — the
-/// `ADMIN_INVOKABLE_TASK_KINDS` allowlist rejects it upstream).
-pub fn task_invocation_is_destructive(
+/// `ADMIN_INVOKABLE_TASK_KINDS` allowlist rejects it upstream). A kind
+/// that *is* in [`DESTRUCTIVE_TASK_KINDS`] with no authority arm below is
+/// an [`DomainError::Invariant`] rather than `Ok(None)`: both call sites
+/// treat the error as a refusal, so a fourth kind added to the set
+/// without deciding what it destroys cannot run unauthorized.
+pub fn task_invocation_destructive_authority(
     kind: &str,
     params: &serde_json::Value,
-) -> DomainResult<bool> {
-    if !task_kind_is_destructive(kind) {
-        return Ok(false);
-    }
+) -> DomainResult<Option<Permission>> {
+    // Which authority — the object destroyed, read from the one place
+    // that pairs a kind with it. A kind outside both groups destroys
+    // nothing, which is the same fail-safe answer
+    // `task_kind_is_destructive` gives for an unrecognised input.
+    let Some(authority) = destructive_task_kind_authority(kind) else {
+        return Ok(None);
+    };
     if kind != RETENTION_EVALUATE_TASK_KIND {
-        return Ok(true);
+        return Ok(Some(authority));
     }
-    Ok(retention_evaluate_mode(params)?.is_destructive())
+    Ok(retention_evaluate_mode(params)?
+        .is_destructive()
+        .then_some(authority))
 }
 
 // ---------------------------------------------------------------------------
@@ -1763,8 +1814,8 @@ mod tests {
         );
     }
 
-    /// The release-sweep kind is **not** destructive (no extra
-    /// `task:destructive` claim required). The release sweep delegates
+    /// The release-sweep kind is **not** destructive (no destructive
+    /// permission required). The release sweep delegates
     /// release authority to `QuarantineUseCase::release_expired`, which
     /// enforces the fail-closed release predicate (ADR 0007) per
     /// artifact (`ScanSucceeded`/`ScanWaived`
@@ -1962,9 +2013,136 @@ mod tests {
         assert!(!task_kind_is_destructive(""));
     }
 
+    /// The union const is exactly the two authority groups, so a kind
+    /// cannot join the destructive tier without being given an authority
+    /// and cannot be given one without joining the tier. This is the
+    /// guard that makes the two groups the single declaration rather
+    /// than a second list beside `DESTRUCTIVE_TASK_KINDS`.
     #[test]
-    fn destructive_task_claim_is_the_documented_literal() {
-        assert_eq!(DESTRUCTIVE_TASK_CLAIM, "task:destructive");
+    fn destructive_kinds_are_exactly_the_two_authority_groups() {
+        assert!(
+            !DESTROY_CONTENT_TASK_KINDS.is_empty() && !DESTROY_RECORD_TASK_KINDS.is_empty(),
+            "an empty authority group would make the loops below vacuous"
+        );
+        let mut union: Vec<&str> = DESTROY_CONTENT_TASK_KINDS
+            .iter()
+            .chain(DESTROY_RECORD_TASK_KINDS.iter())
+            .copied()
+            .collect();
+        union.sort_unstable();
+        let mut declared: Vec<&str> = DESTRUCTIVE_TASK_KINDS.to_vec();
+        declared.sort_unstable();
+        assert_eq!(
+            declared, union,
+            "DESTRUCTIVE_TASK_KINDS must be the union of the two authority groups — a kind in \
+             one and not the other either runs without the authority it needs, or carries an \
+             authority nothing asks for"
+        );
+        for kind in DESTROY_CONTENT_TASK_KINDS {
+            assert!(
+                !DESTROY_RECORD_TASK_KINDS.contains(kind),
+                "{kind:?} is in both authority groups, which would make the split decorative"
+            );
+        }
+    }
+
+    /// Every member of the closed kind set maps to exactly one
+    /// destructive authority, and the split is the decided one: content
+    /// for the two artifact kinds, record for the audit-stream kind.
+    #[test]
+    fn every_destructive_kind_maps_to_its_decided_authority() {
+        let expected = [
+            ("retention-evaluate", Permission::DestroyContent),
+            ("retention-purge", Permission::DestroyContent),
+            ("eventstore-archive", Permission::DestroyRecord),
+        ];
+        assert_eq!(
+            DESTRUCTIVE_TASK_KINDS.len(),
+            expected.len(),
+            "the kind set is closed at three; a fourth member needs a decided authority,              not an inherited one"
+        );
+        for (kind, authority) in expected {
+            assert!(
+                DESTRUCTIVE_TASK_KINDS.contains(&kind),
+                "{kind:?} left the closed set"
+            );
+            // Execute mode (the default) for every kind, so the mode-carrying
+            // kind is read in the mode that destroys.
+            assert_eq!(
+                task_invocation_destructive_authority(kind, &serde_json::json!({}))
+                    .expect("classified"),
+                Some(authority),
+                "{kind:?} must require {authority}"
+            );
+        }
+    }
+
+    /// The two authorities are not interchangeable: no destructive kind
+    /// answers both, so holding one never authorises the other's kind.
+    #[test]
+    fn no_destructive_kind_requires_both_authorities() {
+        let content: Vec<&str> = DESTRUCTIVE_TASK_KINDS
+            .iter()
+            .copied()
+            .filter(|kind| {
+                task_invocation_destructive_authority(kind, &serde_json::json!({}))
+                    .expect("classified")
+                    == Some(Permission::DestroyContent)
+            })
+            .collect();
+        let record: Vec<&str> = DESTRUCTIVE_TASK_KINDS
+            .iter()
+            .copied()
+            .filter(|kind| {
+                task_invocation_destructive_authority(kind, &serde_json::json!({}))
+                    .expect("classified")
+                    == Some(Permission::DestroyRecord)
+            })
+            .collect();
+        assert_eq!(content, DESTROY_CONTENT_TASK_KINDS);
+        assert_eq!(record, DESTROY_RECORD_TASK_KINDS);
+        assert!(
+            content.iter().all(|kind| !record.contains(kind)),
+            "a kind in both halves would make the split decorative"
+        );
+    }
+
+    /// The authority lookup is total: a kind in neither group — including
+    /// every ordinary invokable kind and an unrecognised string — names
+    /// no destructive authority, which is the same fail-safe answer
+    /// `task_kind_is_destructive` gives.
+    #[test]
+    fn a_kind_in_neither_group_names_no_destructive_authority() {
+        for kind in ADMIN_INVOKABLE_TASK_KINDS
+            .iter()
+            .copied()
+            .chain(["bogus-kind", ""])
+        {
+            let authority = destructive_task_kind_authority(kind);
+            assert_eq!(
+                authority.is_some(),
+                task_kind_is_destructive(kind),
+                "kind {kind:?}: the tier membership and the authority lookup are one answer"
+            );
+            if !DESTRUCTIVE_TASK_KINDS.contains(&kind) {
+                assert_eq!(authority, None, "kind {kind:?} must name no authority");
+            }
+        }
+    }
+
+    /// Both destructive authorities are declared orthogonal to `Admin`:
+    /// the whole point of the gate is that nobody holds it implicitly.
+    #[test]
+    fn both_destructive_authorities_are_admin_orthogonal() {
+        for kind in DESTRUCTIVE_TASK_KINDS {
+            let authority = task_invocation_destructive_authority(kind, &serde_json::json!({}))
+                .expect("classified")
+                .expect("a destructive kind in execute mode names an authority");
+            assert!(
+                authority.is_admin_orthogonal(),
+                "{kind:?} requires {authority}, which an admin would hold implicitly"
+            );
+        }
     }
 
     // -----------------------------------------------------------------
@@ -1974,8 +2152,8 @@ mod tests {
     #[test]
     fn retention_evaluate_task_kind_is_one_of_the_destructive_kinds() {
         // The mode-carrying kind must stay a member of the closed set, or
-        // `task_invocation_is_destructive` would short-circuit to `false`
-        // before it ever read the mode.
+        // `task_invocation_destructive_authority` would short-circuit to
+        // `None` before it ever read the mode.
         assert!(DESTRUCTIVE_TASK_KINDS.contains(&RETENTION_EVALUATE_TASK_KIND));
         assert!(ADMIN_INVOKABLE_TASK_KINDS.contains(&RETENTION_EVALUATE_TASK_KIND));
     }
@@ -2022,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn task_invocation_is_destructive_matches_the_kind_classifier_where_there_is_no_mode() {
+    fn task_invocation_destructive_authority_matches_the_kind_classifier_where_there_is_no_mode() {
         // For every kind except the mode-carrying one, the per-invocation
         // answer is exactly the per-kind answer, whatever the params say.
         for kind in ADMIN_INVOKABLE_TASK_KINDS
@@ -2035,7 +2213,9 @@ mod tests {
                 serde_json::json!({ "mode": "nonsense" }),
             ] {
                 assert_eq!(
-                    task_invocation_is_destructive(kind, &params).expect("total for these kinds"),
+                    task_invocation_destructive_authority(kind, &params)
+                        .expect("total for these kinds")
+                        .is_some(),
                     task_kind_is_destructive(kind),
                     "kind {kind:?} with params {params} diverged from the per-kind answer"
                 );
@@ -2044,34 +2224,38 @@ mod tests {
     }
 
     #[test]
-    fn task_invocation_is_destructive_splits_the_retention_evaluate_modes() {
+    fn task_invocation_destructive_authority_splits_the_retention_evaluate_modes() {
         let execute = serde_json::json!({ "mode": "execute" });
         let dry_run = serde_json::json!({ "mode": "dry_run" });
         let defaulted = serde_json::json!({});
 
-        assert!(
-            task_invocation_is_destructive(RETENTION_EVALUATE_TASK_KIND, &execute).expect("parses"),
-        );
-        assert!(
-            task_invocation_is_destructive(RETENTION_EVALUATE_TASK_KIND, &defaulted)
+        assert_eq!(
+            task_invocation_destructive_authority(RETENTION_EVALUATE_TASK_KIND, &execute)
                 .expect("parses"),
+            Some(Permission::DestroyContent),
+        );
+        assert_eq!(
+            task_invocation_destructive_authority(RETENTION_EVALUATE_TASK_KIND, &defaulted)
+                .expect("parses"),
+            Some(Permission::DestroyContent),
             "an absent mode is the shipped CronJob's execute",
         );
-        assert!(
-            !task_invocation_is_destructive(RETENTION_EVALUATE_TASK_KIND, &dry_run)
+        assert_eq!(
+            task_invocation_destructive_authority(RETENTION_EVALUATE_TASK_KIND, &dry_run)
                 .expect("parses"),
-            "a dry run appends nothing and is not destructive",
+            None,
+            "a dry run appends nothing, is not destructive, and needs no destructive authority",
         );
 
         // The finer classifier disagrees with the coarser one exactly here,
         // and that divergence is the point: audit routing wants the kind,
-        // the claim gate and the idempotency key want the invocation.
+        // the authority gate and the idempotency key want the invocation.
         assert!(task_kind_is_destructive(RETENTION_EVALUATE_TASK_KIND));
     }
 
     #[test]
-    fn task_invocation_is_destructive_propagates_an_unreadable_mode() {
-        let err = task_invocation_is_destructive(
+    fn task_invocation_destructive_authority_propagates_an_unreadable_mode() {
+        let err = task_invocation_destructive_authority(
             RETENTION_EVALUATE_TASK_KIND,
             &serde_json::json!({ "mode": "preview" }),
         )
@@ -2080,11 +2264,15 @@ mod tests {
     }
 
     #[test]
-    fn task_invocation_is_destructive_never_over_claims_an_unknown_kind() {
+    fn task_invocation_destructive_authority_never_over_claims_an_unknown_kind() {
         for kind in ["bogus-kind", ""] {
-            assert!(
-                !task_invocation_is_destructive(kind, &serde_json::json!({ "mode": "execute" }))
-                    .expect("total"),
+            assert_eq!(
+                task_invocation_destructive_authority(
+                    kind,
+                    &serde_json::json!({ "mode": "execute" })
+                )
+                .expect("total"),
+                None,
                 "kind {kind:?} must not be classified destructive"
             );
         }

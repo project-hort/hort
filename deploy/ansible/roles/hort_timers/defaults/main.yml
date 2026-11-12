@@ -19,6 +19,37 @@ hort_timers_server_bin: /usr/local/bin/hort-server
 hort_timers_cli_bin: /usr/local/bin/hort-cli
 hort_timers_server_env_file: /etc/hort/hort-server.env
 hort_timers_token_file: /etc/hort/tasks-token
+
+# The capability the cronjob-tasks svc-token is minted with. Every entry
+# must be backed by a live PermissionGrant for the cronjob-tasks SA in the
+# gitops tree (`auth/grants/cronjob-tasks-*.yaml`) — effective authority is
+# grants AND cap, so an unbacked entry here is dead weight and a granted
+# permission missing here authorises nothing.
+#
+# `destroy_content` is what lets the retention timers below run as this
+# identity instead of by hand. `destroy_record` (eventstore-archive) MUST
+# NOT be added: it is not grantable to a service account at any of the five
+# points that enforce it, so a mint carrying it is refused outright.
+hort_timers_token_permissions:
+  - admin_task_invoke
+  - destroy_content
+
+# Force one rotation of the cronjob-tasks token on the next deploy.
+#
+# The token's capability is frozen at mint (ADR 0012) and this SA is
+# PAT-only — no `fallbackRotation`, so nothing re-snapshots it on an
+# interval. Editing `hort_timers_token_permissions` above therefore does
+# NOT reach an already-minted token: the idempotent mint reports "already
+# exists" and the stale cap stays, which is the frozen-cap trap (the grant
+# is live in the database, the evaluator sees it, and the mounted token
+# still 403s). Read the live cap with
+# `hort-cli auth status --output json` — its `permissions` field is the
+# frozen cap, never the grant set.
+#
+# Set true for one deploy to converge, then back to false. Mirrors the Helm
+# chart's `scheduledTasks.svcTokens[].rotate`. Rotation invalidates the
+# previous token, which is why it is opt-in.
+hort_timers_token_rotate: false
 hort_timers_server_url: "https://{{ registry_fqdn }}"
 hort_timers_run_user: "{{ hort_user }}"
 
@@ -125,9 +156,21 @@ hort_timers_tasks:
     enabled: false
     description: "Rotate service-account tokens (needs the k8s svc-token rotation surface; off on the native flavor)."
   # ── disabled — destructive retention/archive tasks ──────────────────────────
-  # Require the task:destructive claim (ADR 0038), which the non-admin
-  # cronjob-tasks SA cannot hold, plus HORT_RETENTION_DATABASE_URL — so they
-  # cannot run unattended.
+  # Each requires `admin_task_invoke` AND a destructive permission.
+  #
+  # The retention pair needs `destroy_content`, which the cronjob-tasks SA
+  # DOES hold (`auth/grants/cronjob-tasks-destroy-content.yaml`), so these
+  # two are runnable unattended once their remaining prerequisite —
+  # HORT_RETENTION_DATABASE_URL — is wired and the token carries the cap
+  # (see `hort_timers_token_rotate`). They stay disabled here because
+  # turning them on is a capacity-and-retention decision, not a
+  # capability gap.
+  #
+  # eventstore-archive needs `destroy_record`, which is NOT grantable to a
+  # service account — nothing reconstructs a sealed audit stream, so no
+  # unattended identity holds standing authority over one. This timer
+  # cannot be made to work by granting anything; run the kind by hand as a
+  # human identity that holds `destroy_record`.
   - kind: retention-evaluate
     path: admin-task
     idempotency_window: hour
@@ -145,4 +188,4 @@ hort_timers_tasks:
     idempotency_window: day
     on_calendar: "Sun *-*-* 05:00:00"
     enabled: false
-    description: "Event-store archive — needs HORT_RETENTION_DATABASE_URL + the seal-pool single-flight backstop (ADR 0020)."
+    description: "Event-store archive — NOT runnable as the cronjob-tasks SA: `destroy_record` is not grantable to a machine identity. Run by hand as a human identity that holds it. Also needs HORT_RETENTION_DATABASE_URL + the seal-pool single-flight backstop (ADR 0020)."
