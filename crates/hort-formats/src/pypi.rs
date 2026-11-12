@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::{Cursor, Read, Seek};
 
 use bytes::Bytes;
@@ -1280,8 +1281,10 @@ enum PypiDeclaration {
     /// statement**, not an absence — this distribution declares none.
     Stated(Vec<String>),
     /// The document was read and does not state them: it marks
-    /// `Requires-Dist` dynamic (PEP 643), or it is an sdist whose
-    /// metadata version makes silence about the field meaningless.
+    /// `Requires-Dist` dynamic (PEP 643), it is an sdist whose metadata
+    /// version makes silence about the field meaningless, or its RFC
+    /// 5322 header block folds an authority-bearing field into
+    /// something that cannot be read as that field's value.
     NotCanonical(String),
     /// No metadata document could be read out of the payload: the bytes
     /// are not one of the two containers, the archive is unreadable, the
@@ -1524,28 +1527,72 @@ fn is_sdist_pkg_info_path(name: &str) -> bool {
 /// That is not tidiness: a case-sensitive match that missed a `dynamic:`
 /// spelling would read a non-canonical declaration as a canonical one,
 /// and the fail-open direction is the one that matters here.
+///
+/// For the same reason the document is **unfolded** before it is read
+/// (see [`unfold_rfc5322_block`]): a value folded onto a continuation
+/// line is part of its header's value, so `Dynamic:` followed by
+/// ` Requires-Dist` declares the field dynamic just as a single-line
+/// `Dynamic: Requires-Dist` does. Reading per physical line dropped the
+/// continuation and read that document as declaring nothing dynamic —
+/// a static empty declaration over a distribution that explicitly
+/// withheld its requirement list.
+///
+/// A reassembly this reader cannot make sense of is reported
+/// [`PypiDeclaration::NotCanonical`] — an **unreadable** declaration,
+/// never an empty one. The empty arm grants release authority under a
+/// policy whose backend adjudicates the component list (ADR 0007), so
+/// it is reserved for a document that says there are no requirements.
 fn classify_requires_dist(text: &str, container: PypiContainer) -> PypiDeclaration {
     let mut requires: Vec<String> = Vec::new();
     let mut requires_dist_is_dynamic = false;
     let mut metadata_version: Option<(u32, u32)> = None;
 
-    for line in text.lines() {
-        // RFC 5322 headers end at the first blank line — everything
-        // after it is the long description, which commonly contains
-        // text that looks like a header.
-        if line.is_empty() {
-            break;
-        }
-        let Some((name, value)) = rfc5322_header(line) else {
+    // Classified per *field*, not per physical line: a folded value is
+    // part of its header's value, so the continuation has to be joined
+    // back on before any of this is read. `unfold_rfc5322_block` stops
+    // at the blank line, so the long description below it stays out.
+    let headers = match unfold_rfc5322_block(text) {
+        Ok(headers) => headers,
+        Err(why) => return PypiDeclaration::NotCanonical(why),
+    };
+
+    for header in &headers {
+        let Some((name, value)) = rfc5322_header(&header.line) else {
             continue;
         };
         match name.as_str() {
             "requires-dist" => {
+                // A field folded onto a continuation that carries
+                // nothing is a requirement this reader cannot recover,
+                // not one the distribution declined to state — and the
+                // difference is release authority, so say unreadable.
+                if header.folded && value.is_empty() {
+                    return PypiDeclaration::NotCanonical(
+                        "the distribution's `Requires-Dist` field is folded onto a continuation \
+                         line that carries no value, so the requirement it states cannot be read"
+                            .to_string(),
+                    );
+                }
                 if !value.is_empty() {
                     requires.push(value.to_string());
                 }
             }
             "dynamic" => {
+                // Only a reassembled value is held to this: what the
+                // document states on one line is read as it stands, and
+                // what this reader joined back together must come out
+                // legible. A fold that splits the field name yields
+                // text no field is called, and reading that as "not
+                // dynamic" would withhold the declaration exactly as
+                // dropping the continuation did.
+                if header.folded && !is_core_metadata_field_name(value) {
+                    return PypiDeclaration::NotCanonical(
+                        "the distribution's `Dynamic` field is folded across lines into text \
+                         that is not a single Core Metadata field name (PEP 643), so whether it \
+                         marks `Requires-Dist` dynamic cannot be read"
+                            .to_string(),
+                    );
+                }
                 if value.eq_ignore_ascii_case("Requires-Dist") {
                     requires_dist_is_dynamic = true;
                 }
@@ -1607,12 +1654,96 @@ fn classify_requires_dist(text: &str, container: PypiContainer) -> PypiDeclarati
     }
 }
 
+/// One field of an RFC 5322 header block, with any folded continuation
+/// lines joined back onto it.
+struct UnfoldedHeader<'a> {
+    /// The field's whole logical line — its first physical line with
+    /// every continuation appended and the line breaks removed. Borrowed
+    /// when the field occupied one line, which is the overwhelming
+    /// majority of them.
+    line: Cow<'a, str>,
+    /// Whether the value arrived across more than one physical line, so
+    /// `line` is a reassembly this reader performed rather than text the
+    /// document states as it stands. The two authority-bearing fields
+    /// insist their reassembly is legible; see
+    /// [`classify_requires_dist`].
+    folded: bool,
+}
+
+/// Unfold a Core Metadata document's RFC 5322 header block into one
+/// entry per field.
+///
+/// A Core Metadata document (PEP 566) **is** an RFC 5322 header block,
+/// and RFC 5322 §2.2.3 lets a long value be *folded*: a line beginning
+/// with SP or HTAB continues the preceding line's value, and unfolding
+/// is removing the line break in front of it. So a folded value is part
+/// of its header's value, and a reader that classifies per *physical*
+/// line drops the continuation — which for `Dynamic` and
+/// `Requires-Dist` turns a declaration the document makes into one it
+/// appears to withhold.
+///
+/// **The blank line still ends the block.** What follows it is the long
+/// description, where indented prose is ordinary, so unfolding stops at
+/// the break: an indented description line must never become a
+/// continuation of the last header.
+///
+/// `Err` is the one block that cannot be unfolded at all: one whose
+/// first line is already a continuation, leaving text with no field to
+/// belong to. No conforming document has that shape — PEP 566 §3 puts
+/// `Metadata-Version` first — and guessing which field such text
+/// continues is precisely the guess that decides whether a dependency
+/// declaration was withheld, so the document is reported unreadable
+/// instead.
+fn unfold_rfc5322_block(text: &str) -> Result<Vec<UnfoldedHeader<'_>>, String> {
+    let mut headers: Vec<UnfoldedHeader<'_>> = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            let Some(last) = headers.last_mut() else {
+                let why = "the metadata document's RFC 5322 header block opens with a folded \
+                           continuation line, so that text belongs to no field and the \
+                           declaration cannot be read";
+                return Err(why.to_string());
+            };
+            // RFC 5322 §2.2.3: unfolding removes the line break and
+            // keeps the whitespace that marked the line a continuation.
+            last.line.to_mut().push_str(line);
+            last.folded = true;
+            continue;
+        }
+        headers.push(UnfoldedHeader {
+            line: Cow::Borrowed(line),
+            folded: false,
+        });
+    }
+    Ok(headers)
+}
+
+/// Whether a value is a single Core Metadata field name — the only
+/// thing PEP 643's `Dynamic` admits as its value.
+///
+/// A field name is a token of letters, digits and hyphens, so it cannot
+/// span a fold's whitespace: `Dynamic:` + ` Requires` + ` -Dist`
+/// reassembles into something no field is called, and which conforming
+/// readers reject rather than resolve.
+fn is_core_metadata_field_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
 /// Split an RFC 5322 header line into a lowercased field name and its
 /// trimmed value.
 ///
 /// Returns `None` for anything that is not a header line: a folded
 /// continuation (which begins with whitespace, so the name would carry
 /// it) and a line with no colon.
+///
+/// **Joining a continuation is not this function's job** — the block is
+/// unfolded by [`unfold_rfc5322_block`] before anything reaches here.
+/// Answering `Some` for a continuation line would make a wrapped value
+/// look like a field of its own, so `  Dynamic: Requires-Dist` inside a
+/// wrapped `Description` would read as a PEP 643 marker.
 fn rfc5322_header(line: &str) -> Option<(String, &str)> {
     let (name, value) = line.split_once(':')?;
     if name.is_empty() || name.contains(char::is_whitespace) {
@@ -1867,6 +1998,9 @@ impl VersionDiscovery for PyPiFormatHandler {
     /// - Wheel zip is malformed / unreadable → `Validation`.
     /// - `*.dist-info/METADATA` absent from a wheel zip → `Validation`.
     /// - METADATA present but not valid UTF-8 → `Validation` (non-retry).
+    /// - METADATA whose RFC 5322 header block opens with a folded
+    ///   continuation line, so the text belongs to no field → `Validation`
+    ///   (an unparseable manifest, not a wheel declaring nothing).
     /// - A well-formed wheel with zero declared runtime deps → `Ok(vec![])`.
     /// - sdist gzip → `Ok(vec![])` (best-effort skip).
     ///
@@ -2084,15 +2218,25 @@ struct WheelMetadataScan {
 /// `pip install pkg` never activates. Plain markers without an `extra ==`
 /// clause (`; python_version >= '3.8'`) ARE kept.
 ///
-/// Each surviving line is parsed via [`parse_requires_dist_into_spec`] — name +
+/// Each surviving field is parsed via [`parse_requires_dist_into_spec`] — name +
 /// parenthesised-or-inline version specifier. The specifier (e.g. `(>=1.0,<2)`)
-/// becomes the `range` field verbatim (no specifier → empty `range`). Lines
+/// becomes the `range` field verbatim (no specifier → empty `range`). Fields
 /// that don't parse as `Requires-Dist:` (other headers, the description body
-/// after the first blank line, malformed continuations) are silently skipped.
+/// after the first blank line) are silently skipped.
 ///
-/// Input must be valid UTF-8 (PEP 566 §3) — otherwise `Validation`. Bounded by
-/// [`PYPI_WHEEL_METADATA_MAX_BYTES`] (1 MiB) as a parser-input sanity cap on
-/// this identical content (the same canonical cap
+/// **Fields, not physical lines.** METADATA is an RFC 5322 header block, so a
+/// requirement may be folded across lines; the block is unfolded by
+/// [`unfold_rfc5322_block`] first and the extras-marker filter and the spec
+/// parser both see the whole value. Reading per physical line truncated a
+/// folded requirement to its first line and dropped the rest with no error,
+/// so the dependency simply was not in the cascade and advisory matching
+/// never asked about it.
+///
+/// Input must be valid UTF-8 (PEP 566 §3) — otherwise `Validation`. A header
+/// block that cannot be unfolded at all (its first line is a continuation) is
+/// an unparseable manifest, which the port contract puts on `Validation` too.
+/// Bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`] (1 MiB) as a parser-input
+/// sanity cap on this identical content (the same canonical cap
 /// [`extract_wheel_metadata_bytes`](PyPiFormatHandler::extract_wheel_metadata_bytes)
 /// uses), decoupled from `metadata_expected_max_bytes`.
 fn parse_wheel_metadata_into_specs(metadata: &[u8]) -> DomainResult<Vec<DependencySpec>> {
@@ -2107,14 +2251,13 @@ fn parse_wheel_metadata_into_specs(metadata: &[u8]) -> DomainResult<Vec<Dependen
     })?;
 
     let mut out = Vec::new();
-    for line in text.lines() {
-        // RFC 5322 headers end at the first blank line — everything after is
-        // the description body, which the wheel METADATA spec calls out
-        // explicitly.
-        if line.is_empty() {
-            break;
-        }
-        let Some(value) = line.strip_prefix("Requires-Dist:") else {
+    // Walked per *field*, not per physical line: a `Requires-Dist` value
+    // folded onto a continuation is still that field's value, and reading
+    // only the first line drops the rest of the requirement silently.
+    // `unfold_rfc5322_block` stops at the blank line, so the description
+    // body below it — indented prose included — stays out.
+    for header in unfold_rfc5322_block(text).map_err(DomainError::Validation)? {
+        let Some(value) = header.line.strip_prefix("Requires-Dist:") else {
             continue;
         };
         let value = value.trim();
@@ -4988,17 +5131,19 @@ mod tests {
         );
     }
 
-    /// A folded continuation line inside the header block is skipped
-    /// rather than read as a field, so a wrapped value cannot be
-    /// mistaken for a `Dynamic` or `Requires-Dist` declaration of its
-    /// own. The declaration around it is still read.
+    /// A continuation line belongs to the field it continues, never to a
+    /// field of its own — so a `Description` that wraps onto a line
+    /// reading `Dynamic: Requires-Dist` is a wrapped description, not a
+    /// PEP 643 marker. The declaration around it is still read.
     #[test]
-    fn a_continuation_line_inside_the_header_block_is_skipped() {
-        let wheel = wheel_with_metadata(
-            "Metadata-Version: 2.3\nName: myapp\n\
-             Description: a summary that wraps\n  Dynamic: Requires-Dist\n\
-             Requires-Dist: urllib3 (==1.26.0)\n",
-        );
+    fn a_continuation_line_belongs_to_the_field_it_continues() {
+        let wheel = wheel_with_metadata(concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Description: a summary that wraps\n",
+            "  Dynamic: Requires-Dist\n",
+            "Requires-Dist: urllib3 (==1.26.0)\n",
+        ));
         let extraction = extract_payload(&wheel, &proxied_metadata());
 
         assert_eq!(
@@ -5007,6 +5152,407 @@ mod tests {
             "a wrapped line is not a `Dynamic` field"
         );
         assert_eq!(purls(&extraction), vec!["pkg:pypi/urllib3@1.26.0"]);
+    }
+
+    // ----- RFC 5322 folding ------------------------------------------------
+    //
+    // Core Metadata is an RFC 5322 header block, so a value may be folded
+    // onto a continuation line. Both readers below used to classify per
+    // *physical* line, which dropped the continuation: a folded `Dynamic`
+    // read as "nothing is dynamic" (a static empty declaration over a
+    // distribution that withheld its requirement list) and a folded
+    // `Requires-Dist` lost the rest of the requirement with no error.
+
+    /// **The fail-open, as the disposition that carries it.** A metadata
+    /// 2.2 sdist whose `Dynamic:` value is folded onto a continuation
+    /// line marks `Requires-Dist` dynamic — `email.parser` with
+    /// `compat32`, the parser the Core Metadata specification names,
+    /// unfolds it to `Requires-Dist`. Read per physical line it was a
+    /// static empty declaration, which becomes `NoLockfile` and a
+    /// subject-only BOM an SBOM-only policy's backend answers
+    /// `Analysed([])` over: a clean scan recorded over a distribution
+    /// that explicitly said its requirement list is not canonical.
+    ///
+    /// The resolution — not the handler's `Option<Sbom>` — is what the
+    /// scan orchestrator spends, so the resolution is what is asserted
+    /// here. `UnusableLockfile` holds the artifact with no verdict;
+    /// `NoLockfile` completes the run as not-applicable and releases on
+    /// it. That the two dispose differently is pinned where the
+    /// disposition is made, in `hort-app`'s `scan_orchestration_tests`
+    /// (`a_subject_only_bom_from_an_unread_declaration_does_not_authorize_release`
+    /// against `a_declared_empty_declaration_still_completes`); what is
+    /// pinned here is which of the two this document lands on.
+    #[test]
+    fn a_folded_dynamic_marker_is_read_and_the_declaration_gates() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Version: 1.0.0\n",
+            "Dynamic:\n",
+            " Requires-Dist\n",
+        );
+        assert!(
+            matches!(
+                classify_requires_dist(body, PypiContainer::Sdist),
+                PypiDeclaration::NotCanonical(_)
+            ),
+            "a folded `Dynamic` value is still a `Dynamic` declaration"
+        );
+
+        let extraction = extract_payload(&sdist_with_pkg_info(body), &proxied_metadata());
+        assert_eq!(
+            extraction.resolution,
+            SbomResolution::UnusableLockfile,
+            "a withheld declaration is unread, not empty — `NoLockfile` is the non-gating arm \
+             and would have released this artifact"
+        );
+        assert!(
+            extraction
+                .sbom
+                .expect("the subject-only shape")
+                .components
+                .is_empty(),
+            "nothing was declared readable, so no component may be claimed"
+        );
+    }
+
+    /// RFC 5322 §2.2.3 admits SP **or** HTAB as the fold's leading
+    /// whitespace, and a producer that indents with a tab is making the
+    /// same declaration.
+    #[test]
+    fn a_tab_folded_dynamic_marker_is_read_the_same_way() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Dynamic:\n",
+            "\tRequires-Dist\n",
+        );
+        assert!(matches!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::NotCanonical(_)
+        ));
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A folded `Requires-Dist` is read whole by the declaration
+    /// reader, so the BOM carries the requirement the document states
+    /// rather than the truncated head of it.
+    #[test]
+    fn a_folded_requires_dist_value_is_read_whole_by_the_declaration_reader() {
+        let body = concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Requires-Dist: requests\n",
+            " (==2.31.0)\n",
+        );
+        assert_eq!(
+            classify_requires_dist(body, PypiContainer::Wheel),
+            PypiDeclaration::Stated(vec!["requests (==2.31.0)".to_string()])
+        );
+        assert_eq!(
+            purls(&extract_payload(
+                &wheel_with_metadata(body),
+                &proxied_metadata()
+            )),
+            vec!["pkg:pypi/requests@2.31.0"],
+            "read per physical line this was `requests` with no version"
+        );
+    }
+
+    /// And read whole by the cascade reader, which is the half that lost
+    /// a dependency in silence: nothing was withheld and nothing errored,
+    /// the requirement simply was not in the list advisory matching sees.
+    ///
+    /// The extras marker on the continuation is the point of the second
+    /// case: `is_extras_gated_requirement` runs on the **unfolded**
+    /// value, so a line whose `; extra == 'test'` arrived on a
+    /// continuation is filtered exactly as an inline one is. Per physical
+    /// line the marker was invisible and the dev-only dependency entered
+    /// the prefetch cascade as a runtime one.
+    #[test]
+    fn a_folded_requires_dist_value_is_read_whole_by_the_cascade_reader() {
+        let specs = parse_wheel_metadata_into_specs(
+            concat!(
+                "Metadata-Version: 2.3\n",
+                "Name: myapp\n",
+                "Requires-Dist: requests\n",
+                " (==2.31.0)\n",
+            )
+            .as_bytes(),
+        )
+        .expect("specs");
+        assert_eq!(
+            specs
+                .iter()
+                .map(|s| (s.name.as_str(), s.range.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("requests", "==2.31.0")]
+        );
+
+        let gated = parse_wheel_metadata_into_specs(
+            concat!(
+                "Metadata-Version: 2.3\n",
+                "Name: myapp\n",
+                "Requires-Dist: pytest (==7.0.0)\n",
+                " ; extra == 'test'\n",
+            )
+            .as_bytes(),
+        )
+        .expect("specs");
+        assert!(
+            gated.is_empty(),
+            "the extras filter reads the unfolded value: {gated:?}"
+        );
+    }
+
+    /// The two readers diverge on an extras-gated requirement **on
+    /// purpose**, and that divergence has to survive unfolding in both
+    /// directions. The cascade reader drops one (above); the declaration
+    /// reader keeps it, because in the BOM it is one advisory lookup over
+    /// a component whose artifact `payload_contains_components() == false`
+    /// already denies authority over, while in the cascade it is a
+    /// dev/test download fan-out that inflates the closure 10-100x.
+    ///
+    /// Unfolding hands both readers the same whole value, so this is the
+    /// half that goes wrong by making the extras filter the *unfolder's*
+    /// business rather than each reader's: a filter applied during
+    /// reassembly would silently take the requirement out of the BOM too,
+    /// and nothing else in this file would notice.
+    #[test]
+    fn a_folded_extras_gated_requirement_is_still_kept_in_the_bom() {
+        let body = concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Requires-Dist: requests (==2.31.0)\n",
+            "Requires-Dist: pytest (==7.0.0)\n",
+            " ; extra == 'test'\n",
+        );
+        assert_eq!(
+            purls(&extract_payload(
+                &wheel_with_metadata(body),
+                &proxied_metadata()
+            )),
+            vec!["pkg:pypi/requests@2.31.0", "pkg:pypi/pytest@7.0.0"],
+            "the BOM keeps an extras-gated requirement whether or not it was folded"
+        );
+        let specs = parse_wheel_metadata_into_specs(body.as_bytes()).expect("specs");
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["requests"],
+            "and the cascade still drops it, read whole"
+        );
+    }
+
+    /// Two or more continuation lines are one value. RFC 5322 unfolding
+    /// removes every line break that precedes whitespace, not just the
+    /// first.
+    #[test]
+    fn a_multi_line_continuation_is_read_whole_by_both_readers() {
+        let body = concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Requires-Dist: requests\n",
+            " (>=2.25,\n",
+            " <3)\n",
+        );
+        assert_eq!(
+            classify_requires_dist(body, PypiContainer::Wheel),
+            PypiDeclaration::Stated(vec!["requests (>=2.25, <3)".to_string()])
+        );
+        let specs = parse_wheel_metadata_into_specs(body.as_bytes()).expect("specs");
+        assert_eq!(
+            specs
+                .iter()
+                .map(|s| (s.name.as_str(), s.range.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("requests", ">=2.25, <3")]
+        );
+    }
+
+    /// **The regression unfolding could introduce.** The header block
+    /// ends at the first blank line and the long description follows,
+    /// where indented prose is entirely ordinary. Neither half of the
+    /// description may reach the declaration: an indented line must not
+    /// become a continuation of the last header, and an un-indented one
+    /// must not become a header. Both would replace a fail-open with a
+    /// corrupted component list assembled out of publisher-controlled
+    /// prose, which is the worse of the two failures: the first holds an
+    /// artifact that should have been held, the second puts components
+    /// in a BOM that the distribution never declared.
+    ///
+    /// The fixture carries both shapes — a description opening with a
+    /// line that reads exactly like a PEP 643 marker, then indented
+    /// continuation prose under it — so the test is red for a blank line
+    /// that is skipped *and* for one that is merely not special-cased.
+    #[test]
+    fn an_indented_description_line_is_not_a_continuation_of_the_last_header() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Requires-Dist: urllib3 (==1.26.0)\n",
+            "\n",
+            "Dynamic: Requires-Dist\n",
+            "  continued prose under it\n",
+            "  Requires-Dist: evil (==9.9)\n",
+            "    indented example code\n",
+        );
+        assert_eq!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::Stated(vec!["urllib3 (==1.26.0)".to_string()]),
+            "the description is not part of the header block"
+        );
+        let specs = parse_wheel_metadata_into_specs(body.as_bytes()).expect("specs");
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["urllib3"]
+        );
+    }
+
+    /// A fold that splits the field name reassembles into text no field
+    /// is called, and `packaging` rejects such a document outright. This
+    /// reader cannot tell whether it meant `Requires-Dist`, so it
+    /// reports the declaration **unreadable** — reaching for the empty
+    /// arm here would reproduce the fail-open through a different door.
+    #[test]
+    fn a_dynamic_folded_into_a_name_no_field_has_is_unreadable_not_empty() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Dynamic:\n",
+            " Requires\n",
+            " -Dist\n",
+        );
+        assert!(
+            matches!(
+                classify_requires_dist(body, PypiContainer::Sdist),
+                PypiDeclaration::NotCanonical(_)
+            ),
+            "an illegible reassembly of `Dynamic` is not a statement that nothing is dynamic"
+        );
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// `Dynamic` naming some *other* field is a legible declaration that
+    /// says nothing about `Requires-Dist`, folded or not — so the
+    /// refusal above must not fire on it. Without this the fail-closed
+    /// arm would hold every sdist that marks an unrelated field dynamic.
+    #[test]
+    fn a_folded_dynamic_naming_another_field_does_not_gate() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Dynamic:\n",
+            " Provides-Extra\n",
+            "Requires-Dist: urllib3 (==1.26.0)\n",
+        );
+        assert_eq!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::Stated(vec!["urllib3 (==1.26.0)".to_string()])
+        );
+    }
+
+    /// A `Requires-Dist` whose continuation carries nothing is a
+    /// requirement this reader cannot recover, not one the distribution
+    /// declined to state. The empty arm is for a document that says
+    /// there are none.
+    #[test]
+    fn a_requires_dist_folded_onto_an_empty_continuation_is_unreadable_not_empty() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Requires-Dist:\n",
+            "  \n",
+        );
+        assert!(matches!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::NotCanonical(_)
+        ));
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A header block whose **first** line is a continuation leaves text
+    /// belonging to no field, and guessing which field it continues is
+    /// the guess that decides whether a declaration was withheld. No
+    /// conforming document has that shape (PEP 566 §3 puts
+    /// `Metadata-Version` first), so both readers refuse it: the
+    /// declaration reader as unreadable, the cascade reader as the
+    /// unparseable manifest its port contract puts on `Validation`.
+    #[test]
+    fn a_header_block_opening_with_a_continuation_is_refused_by_both_readers() {
+        let body = concat!(
+            " Requires-Dist\n",
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+        );
+        assert!(matches!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::NotCanonical(_)
+        ));
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+        assert!(matches!(
+            parse_wheel_metadata_into_specs(body.as_bytes()),
+            Err(DomainError::Validation(_))
+        ));
+    }
+
+    /// The unfolder's own contract, stated where it is cheap to read:
+    /// one entry per field, continuations joined on with their
+    /// whitespace and the line break removed (RFC 5322 §2.2.3), the
+    /// block ended by the first blank line, and a leading continuation
+    /// refused.
+    #[test]
+    fn unfold_rfc5322_block_joins_continuations_and_stops_at_the_blank_line() {
+        let headers = unfold_rfc5322_block(concat!(
+            "Name: myapp\n",
+            "Requires-Dist: requests\n",
+            " (==2.31.0)\n",
+            "\tand more\n",
+            "\n",
+            " an indented description line\n",
+        ))
+        .expect("a readable block");
+
+        let lines: Vec<(&str, bool)> = headers
+            .iter()
+            .map(|h| (h.line.as_ref(), h.folded))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("Name: myapp", false),
+                ("Requires-Dist: requests (==2.31.0)\tand more", true),
+            ],
+            "the description below the blank line is not part of the block"
+        );
+
+        assert!(unfold_rfc5322_block(" continues nothing\nName: myapp\n").is_err());
+        assert!(unfold_rfc5322_block("").expect("an empty block").is_empty());
+    }
+
+    /// PEP 643's `Dynamic` admits exactly one Core Metadata field name,
+    /// which is a token of letters, digits and hyphens — so it cannot
+    /// span a fold's whitespace, and cannot be empty.
+    #[test]
+    fn a_core_metadata_field_name_is_a_single_token() {
+        assert!(is_core_metadata_field_name("Requires-Dist"));
+        assert!(is_core_metadata_field_name("requires-dist"));
+        assert!(!is_core_metadata_field_name(""));
+        assert!(!is_core_metadata_field_name("Requires -Dist"));
+        assert!(!is_core_metadata_field_name(
+            "Requires-Dist, Provides-Extra"
+        ));
     }
 
     /// An `extra ==`-gated requirement stays **in the BOM**, which is
@@ -5794,10 +6340,16 @@ Version: 1.0.0\n\
     #[test]
     fn parse_wheel_metadata_at_cap_boundary_is_accepted() {
         // A body sized exactly at the wheel-METADATA cap parses (gate is
-        // `>`, not `>=`). An all-space body has no blank line and no
-        // `Requires-Dist:` header, so it yields zero deps.
+        // `>`, not `>=`). The padding follows a real header line so the
+        // block is a readable RFC 5322 one — a body that opens with
+        // whitespace is a continuation belonging to no field and is
+        // refused on its own terms, which is not what this asserts. It
+        // carries no blank line and no `Requires-Dist:` header, so it
+        // yields zero deps.
         let max = PYPI_WHEEL_METADATA_MAX_BYTES as usize;
-        let body = vec![b' '; max];
+        let mut body = b"Metadata-Version: 2.1\n".to_vec();
+        body.resize(max, b'X');
+        assert_eq!(body.len(), max);
         let out = parse_wheel_metadata_into_specs(&body).expect("at-cap body must parse");
         assert!(out.is_empty());
     }

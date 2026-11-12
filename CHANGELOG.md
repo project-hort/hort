@@ -117,6 +117,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`==1.*`, `==1.0,!=1.0`, `===1.0`) no longer reaches the SBOM as a versioned
   component, so advisory matching is not keyed on a version nothing resolves
   to (#424).
+- A PyPI metadata field folded across lines is now read whole: a distribution
+  that marks `Requires-Dist` dynamic on a continuation line is held rather than
+  recorded clean, and a folded requirement no longer drops out of the component
+  list and the prefetch cascade (#424).
 - A write-granted publisher can now resolve its own artifact held
   `scan_indeterminate` — OCI manifest and cargo index entry — so an upload held
   for want of a scan verdict can still be signed.
