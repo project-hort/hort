@@ -30,6 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per population. Without it, layers held under the old rule stay held and
   images with no composite assessment keep serving. See
   `docs/architecture/how-to/recover-stranded-artifacts.md`.
+- **The Ansible Podman flavour now deploys `postgres:15-alpine` instead of
+  `postgres:15`.** The base moves from glibc to musl, which changes the C
+  library behind PostgreSQL's collations, so an existing
+  `/var/lib/hort/postgres-data` first initdb'd under the Debian image needs its
+  collation-dependent indexes rebuilt (`REINDEX DATABASE`) after the switch;
+  nothing in the deploy path does it for you. Set `postgres_image` back to the
+  Debian tag to defer. File ownership needs no action: the `postgres` uid
+  differs between the bases (999 on Debian, 70 on Alpine) and the quadlet
+  bind-mounts with `:U`, so Podman re-chowns the directory on first start —
+  which takes time proportional to its size. The native flavour is unaffected;
+  it installs PostgreSQL from Debian apt and pulls no image.
 - **The database column is not dropped in this release.**
   `policy_projections.composite_verdict_mode` and its CHECK constraint still
   exist and are no longer read. The migration that removes them ships in a
