@@ -59,10 +59,11 @@ chart wires `HORT_DATABASE_URL`.
 ## Local-dev quickstart
 
 ```bash
-# 1. Postgres
+# 1. Postgres (`-alpine` is musl-based — fine for this throwaway container,
+#    but a data directory carried across a glibc/musl switch needs a REINDEX)
 docker run --rm -d --name hort-pg -p 5432:5432 \
   -e POSTGRES_USER=registry -e POSTGRES_PASSWORD=registry \
-  -e POSTGRES_DB=artifact_registry postgres:15
+  -e POSTGRES_DB=artifact_registry postgres:15-alpine
 
 # 2. Server (HORT_DATABASE_URL is canonical; bare DATABASE_URL also works)
 HORT_DATABASE_URL='postgres://registry:registry@localhost:5432/artifact_registry' \

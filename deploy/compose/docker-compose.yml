@@ -24,7 +24,14 @@ name: hort
 
 services:
   postgres:
-    image: postgres:17
+    # Alpine (musl), not the Debian (glibc) tag: the glibc images add an
+    # unfixable libxml2 CRITICAL and a much larger HIGH surface. The base
+    # supplies the C library behind PostgreSQL's collations, so an existing
+    # data directory carried across a glibc/musl switch needs its
+    # collation-dependent indexes rebuilt (`REINDEX`) by whoever carries it —
+    # moot for this stack, whose PGDATA is the tmpfs below and is re-initdb'd
+    # on every `up`, but not for anything that copies this line.
+    image: postgres:17-alpine
     # Resource cap (B7/INFRA-6): bound postgres memory so the dev/CI host is
     # protected. Smoke data is tens-of-MB; 512m is comfortable.
     mem_limit: 512m
