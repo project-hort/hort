@@ -2340,9 +2340,11 @@ event, one per `PomSkipReason` that occurred, emitted by
 (`crates/hort-formats/src/maven/mod.rs`) once per stored POM it reads.
 Each event carries `reason` (the label below), `count` (how many
 declared edges fell to that reason on this POM), and `resolved` (how
-many edges this POM yielded). An "edge" is a `<dependencies>` entry or
-the POM's `<parent>` coordinate, which the reader emits first and counts
-under the same reasons. It is documented here per the
+many edges this POM yielded). An "edge" is a `<dependencies>` entry,
+the POM's `<parent>` coordinate, or a `<dependencyManagement>` BOM
+import (`type=pom, scope=import`) — the reader emits the latter two
+first, as the resolution inputs the dependency list is written against,
+and counts them under the same reasons. It is documented here per the
 catalog's convention for labelling skip/failure reasons even though
 Maven's dependency-extraction ceiling (below) is architectural, not a
 gap this catalog entry can close by itself — see
@@ -2355,11 +2357,11 @@ read differently**:
 
 | Reason | Class | Meaning |
 |---|---|---|
-| `scope_excluded` | deliberate class boundary | Effective scope is `provided` / `test` / `system` / `import`; declined on purpose (ADR 0053 D4/D5). Normal, and expected to be the largest count on a well-formed POM. |
-| `version_from_parent_or_bom` | reader limit | No `<version>` in this POM or its own `<dependencyManagement>` — the version lives in a parent POM or an imported BOM, neither reachable from here. Dominant reason on a managed tree (Spring Boot, Quarkus); the one that most understates real coverage. |
+| `scope_excluded` | deliberate class boundary | A `<dependencies>` entry whose effective scope is `provided` / `test` / `system`; declined on purpose (ADR 0053 D4/D5). Normal, and expected to be the largest count on a well-formed POM. Never reported for a `<parent>` or a BOM import, neither of which reaches the scope filter. |
+| `version_from_parent_or_bom` | reader limit | No `<version>` in this POM or its own `<dependencyManagement>` — the version lives in a parent POM or an imported BOM, neither reachable from here. Dominant reason on a managed tree (Spring Boot, Quarkus); the one that most understates real coverage. A BOM import whose version a parent supplies lands here too. |
 | `unresolved_property` | reader limit | A `${...}` placeholder did not resolve from this POM's own `<properties>` or the model built-ins. |
 | `unsupported_range` | reader limit | The version is a Maven range; per ADR 0053 D2 a range upstream cannot satisfy is skipped, never guessed at. |
-| `incomplete_coordinate` | reader limit | The `<dependency>` declares no `<groupId>` or `<artifactId>`, or the `<parent>` block is missing any of its three parts — no identity to enqueue even in principle, and no `<dependencyManagement>` entry can complete a `<parent>`. |
+| `incomplete_coordinate` | reader limit | A `<dependency>` or BOM-import entry declares no `<groupId>` or `<artifactId>`, or the `<parent>` block is missing any of its three parts — no identity to enqueue even in principle, and no `<dependencyManagement>` entry can complete a `<parent>`. |
 
 **Operator reading.** A `scope_excluded`-dominated skip set is a
 healthy cascade — it explains why the warmed set is smaller than the
@@ -2372,6 +2374,24 @@ one number would make a healthy cascade look broken and a half-blind
 one look fine — which is exactly why they stay distinguishable
 per-reason rather than folded into a single `deps_extracted` /
 `deps_skipped` pair.
+
+**The one case no skip reason reports — a structured `tracing::info!`
+beside the `debug!` above.** A `<dependencyManagement>` entry that is
+not a BOM import is a version-table row for the `<dependencies>` block,
+not an edge the reader declined, so nothing is counted for it. A POM
+that yields no edge at all while declaring such entries — a pure BOM is
+the canonical shape — therefore emits no skip and no spec, which is
+indistinguishable from a leaf artifact in the walk's own
+`deps_extracted=0`. `MavenFormatHandler::extract_dependency_specs`
+emits one `info!` for exactly that case, carrying
+`managed_coordinates`: how many `<dependencyManagement>` entries the POM
+declared, whether or not any resolved. At `info` rather than `debug`
+because reading `deps_extracted=0` as "this artifact has no
+dependencies" is an operator's natural conclusion and, for a BOM, the
+wrong one. The figure is what the POM *declared* rather than a sixth
+`PomSkipReason`, because a version-table row is not a skipped edge —
+and warming every coordinate a BOM manages is a different question than
+the one this reader answers.
 
 ### Discovery + self-service prefetch endpoints
 

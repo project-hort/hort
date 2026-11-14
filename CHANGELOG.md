@@ -138,6 +138,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The Maven transitive-prefetch cascade now warms a BOM a POM imports through
+  `<dependencyManagement>` (`type=pom, scope=import`), so a BOM-managed tree
+  cascades instead of stopping at `deps_extracted=0` (#439).
 - A retention dry run's `freed_bytes` estimate no longer vanishes because one
   reclaimable target is missing from storage: it reports the sum over the
   targets it could size as `at_least`, with a count of the ones it could not,
