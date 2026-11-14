@@ -506,7 +506,7 @@ jobs:
         run: cargo test --workspace --test '*' --verbose
 
   # ════════════════════════════════════════════════════════════════════════════
-  # QUALITY — SonarQube Cloud (trunk pushes only)
+  # QUALITY — SonarQube Cloud (`main` pushes only)
   # ════════════════════════════════════════════════════════════════════════════
 
   # Drives the analysis of the SonarQube Cloud project from this pipeline.
@@ -529,23 +529,40 @@ jobs:
     needs: [coverage]
     permissions:
       contents: read
-    # Pushes to the two integration refs only — no pull-request mode. This
-    # matches the GitLab twin (`quality:sonar` skips merge-request pipelines)
-    # and for the same reason: the gate scores coverage and duplication on NEW
-    # CODE, which is meaningless for the many changes that touch no Rust —
-    # those score 0% and would block. It is also the posture with no gap,
-    # because the `coverage` job only builds lcov.info when Rust actually
-    # changed, and that detection is unconditionally true for a push. Adding
+    # Pushes to `main` only — no pull-request mode and, deliberately, not
+    # `develop` either.
+    #
+    # No pull-request mode, matching the GitLab twin (`quality:sonar` skips
+    # merge-request pipelines) and for the same reason: the gate scores
+    # coverage and duplication on NEW CODE, which is meaningless for the many
+    # changes that touch no Rust — those score 0% and would block. Adding
     # pull-request decoration later means consuming the SAME `rust_changed`
-    # signal the `coverage` job already computes — a second derivation of
-    # "did Rust change" would drift from the first.
+    # signal the `coverage` job already computes; a second derivation of "did
+    # Rust change" would drift from the first.
+    #
+    # And not `develop`, because this organization cannot read quality-gate
+    # data for a branch that is not the project's main branch. The scan itself
+    # uploads, and then the gate read fails the job:
+    #
+    #   ERROR Failed to get Quality Gate status - Organization is not allowed
+    #         to access data from non main branches.
+    #
+    # `sonar.qualitygate.wait=true` lives in the shared
+    # `sonar-project.properties`, so it is not a per-target knob to turn off
+    # here — and turning it off would buy nothing: the cloud project holds no
+    # analysis for `develop` at all (its branch record carries no analysis
+    # date), so the upload never became an analysis either. `develop`'s Sonar
+    # verdict comes from the in-cluster instance via the GitLab twin, which
+    # runs on exactly this ref, so narrowing here removes a job that cannot
+    # succeed rather than a gate. Re-adding the ref is one line if the
+    # entitlement changes.
     #
     # The ref test also excludes `v*` tags, which reach this file as a
     # `workflow_call` gate for the publish workflows: in a called workflow the
     # context is the caller's, so `event_name` is `push` there too, and only
     # the ref distinguishes them. A release must not wait on a third-party
     # gate verdict.
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop')
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     env:
       # Gates the scan step below. A job-level `if:` cannot read `secrets`, so
       # the "is Sonar configured here at all" check has to sit on the step —
