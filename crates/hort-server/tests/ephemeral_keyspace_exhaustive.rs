@@ -393,10 +393,7 @@ fn is_in_comment_or_string(source: &str, idx: usize) -> bool {
     //    recent line break (string literals usually don't span
     //    lines in Rust outside of raw strings; treating the start
     //    of the line as the boundary is conservative enough).
-    if is_inside_string(line_prefix) {
-        return true;
-    }
-    false
+    is_inside_string(line_prefix)
 }
 
 /// Returns true when `prefix` ends inside an open `"..."` string

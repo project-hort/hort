@@ -198,11 +198,15 @@ pub fn auth_routes() -> Router<Arc<AppContext>> {
 /// No permission check beyond "authenticated": the route is mounted
 /// inside the normal auth dispatch (`extract_optional_principal` on
 /// GET), but `AuthenticatedCallerExt` rejects with 401 when the
-/// extension is absent or `None`.
+/// extension is absent or `None`. That rejection is the extractor's,
+/// which is why this handler is infallible and returns the body
+/// directly: once a principal is in hand every field below is derived
+/// from it, and `resolve_effective_grants` answers with an empty set
+/// rather than an error.
 pub async fn whoami_handler(
     State(ctx): State<Arc<AppContext>>,
     principal: AuthenticatedPrincipalExtractor,
-) -> Result<Json<WhoamiResponse>, Response> {
+) -> Json<WhoamiResponse> {
     let caller = principal.0.as_caller();
 
     // `token_kind` comes from the typed `CallerPrincipal.token_kind`
@@ -246,13 +250,13 @@ pub async fn whoami_handler(
 
     let effective_grants = resolve_effective_grants(&ctx, caller).await;
 
-    Ok(Json(WhoamiResponse {
+    Json(WhoamiResponse {
         user_id,
         username,
         token_kind,
         permissions,
         effective_grants,
-    }))
+    })
 }
 
 /// Resolve the present token's `(repository, permission)`

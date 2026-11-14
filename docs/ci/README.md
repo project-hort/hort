@@ -144,6 +144,29 @@ third-party SaaS verdict must not stand between a tag and its release.
   `github.com/sigstore/cosign/releases`; several jobs `cargo install` and
   install OS packages. `SIGNING_MODE=keyless` additionally needs reach to public
   Sigstore (Fulcio + Rekor). Air-gapped installs must mirror these.
+- **The image CVE gates need two more things.** `build-images:*` (which scan
+  the image they built before pushing it, and block on a finding) and
+  `security:base-image-scan` (which scans the digest-pinned base images, and
+  only warns on a finding — a base image's `CRITICAL` is cleared by an
+  upstream rebuild, which no change in this repository can produce) both run
+  `scripts/ci/trivy-image-gate.sh`, which needs:
+  - the Trivy tarball from `github.com/aquasecurity/trivy/releases` — the same
+    reach cosign already uses, at the version and checksum
+    `docker/Dockerfile.worker` pins for the shipped worker image, so the gate
+    and the product never run different scanners;
+  - the vulnerability database, which Trivy fetches from
+    `mirror.gcr.io/aquasec/trivy-db:2` (falling back to
+    `ghcr.io/aquasecurity/trivy-db:2`). **This fetch does not go through the
+    runner's `registries.conf`** — Trivy talks to that registry itself — so an
+    installation whose runners reach registries only through a mirror has to
+    point `TRIVY_DB_REPOSITORY` at a local copy. A database that cannot be
+    fetched reports `INDETERMINATE` and fails the job — both of these, the
+    warning-only one included, deliberately: an image nobody scanned must not
+    read as an image with no findings.
+
+  The image bytes themselves do go through `registries.conf`: buildah pulls or
+  builds them into the runner's local container store and Trivy reads an
+  export of that, so the gate scans exactly the bytes the build consumed.
 
 ## Quick recipes
 

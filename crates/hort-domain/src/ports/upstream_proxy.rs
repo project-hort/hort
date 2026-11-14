@@ -943,6 +943,10 @@ mod tests {
         // Spelled through `Clone` explicitly: the derive is part of the
         // public shape (a consumer may hold the verdict in a cloneable
         // struct), and `.clone()` on a `Copy` value reads as an accident.
+        // `clone_on_copy` is about an accidental clone; cloning a `Copy`
+        // value is this statement's entire assertion, so the lint does not
+        // apply to it.
+        #[allow(clippy::clone_on_copy)]
         let cloned: UpstreamExistence = Clone::clone(&present);
         assert_eq!(cloned, UpstreamExistence::Present);
         assert_eq!(format!("{:?}", UpstreamExistence::Absent), "Absent");

@@ -9,11 +9,11 @@
 # The quarantine + scanning scenarios drive `hort-cli admin ...`. It is a
 # pure-HTTP client crate (no DSN / hort-app / sqlx deps — see crates/hort-cli),
 # so this compiles only its own subgraph, not the whole workspace. Built on
-# rust:1.97-slim-trixie (workspace MSRV) so the binary's glibc matches the trixie
+# rust:1.100-slim-trixie (workspace MSRV) so the binary's glibc matches the trixie
 # final stage — the same builder image the server/worker images pin. cargo needs
 # every member's Cargo.toml for workspace resolution, hence `COPY crates`, but
 # only hort-cli's subgraph is compiled.
-FROM rust:1.97-slim-trixie AS cli-builder
+FROM rust:1.100-slim-trixie AS cli-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 # `.cargo/config.toml` declares the `hort-crates` registry that every
@@ -111,7 +111,7 @@ RUN curl -fsSL -o /usr/local/bin/cosign \
 # so the .gitlab/ path resolves.
 COPY .gitlab/ci/cosign-sign.sh /usr/local/bin/hort-cosign-sign.sh
 RUN chmod +x /usr/local/bin/hort-cosign-sign.sh
-# Rust/cargo — copied from the cli-builder stage (rust:1.97-slim-trixie, the
+# Rust/cargo — copied from the cli-builder stage (rust:1.100-slim-trixie, the
 # workspace's pinned MSRV) instead of a curl-piped rustup install. Docker's
 # default RUN shell has no `pipefail`, so `curl ... | sh ...` reports success
 # even when the curl leg fails outright (empty stdin, `sh` exits 0) — the

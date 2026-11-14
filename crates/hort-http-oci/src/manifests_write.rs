@@ -407,17 +407,19 @@ fn parse_and_validate_manifest_tail(
 /// MiB cap applies here; axum's `to_bytes` returns an `Err` if the body
 /// exceeds the limit — classified as `MANIFEST_INVALID` (not `SIZE_INVALID`,
 /// which is reserved for blob-upload limits).
-async fn read_manifest_body(request: Request<Body>) -> Result<(HeaderMap, Vec<u8>), Response> {
+async fn read_manifest_body(request: Request<Body>) -> Result<(HeaderMap, Vec<u8>), Box<Response>> {
     let headers = request.headers().clone();
     match to_bytes(request.into_body(), MANIFEST_BODY_MAX_BYTES).await {
         Ok(b) => Ok((headers, b.to_vec())),
-        Err(_) => Err(OciError::ManifestInvalid {
-            detail: Some(serde_json::json!({
-                "reason": "manifest body too large or unreadable",
-                "max_bytes": MANIFEST_BODY_MAX_BYTES,
-            })),
-        }
-        .into_response()),
+        Err(_) => Err(Box::new(
+            OciError::ManifestInvalid {
+                detail: Some(serde_json::json!({
+                    "reason": "manifest body too large or unreadable",
+                    "max_bytes": MANIFEST_BODY_MAX_BYTES,
+                })),
+            }
+            .into_response(),
+        )),
     }
 }
 
@@ -847,7 +849,7 @@ async fn run_manifest_ingest(
     claimed_edges: &[ContentReferenceClaim],
     hashes: &ManifestHashDecision,
     body_bytes: &[u8],
-) -> Result<IngestOutcome, Response> {
+) -> Result<IngestOutcome, Box<Response>> {
     // Build the ingest request + stream. The body is an in-memory `Vec<u8>`
     // by the time we're here (the 1 MiB cap keeps this cheap); wrap in a
     // `Cursor` to get an `AsyncRead`.
@@ -907,18 +909,20 @@ async fn run_manifest_ingest(
 
     match ingest_result {
         Ok(o) => Ok(o),
-        Err(AppError::Domain(DomainError::Conflict(_))) => Err(OciError::ManifestInvalid {
-            detail: Some(serde_json::json!({
-                "reason": "manifest ingest rejected declared digest",
-            })),
-        }
-        .into_response()),
+        Err(AppError::Domain(DomainError::Conflict(_))) => Err(Box::new(
+            OciError::ManifestInvalid {
+                detail: Some(serde_json::json!({
+                    "reason": "manifest ingest rejected declared digest",
+                })),
+            }
+            .into_response(),
+        )),
         Err(err) => {
             if let Some(busy) = manifest_write_contention(&err, "manifest_ingest") {
-                return Err(busy.into_response());
+                return Err(Box::new(busy.into_response()));
             }
             tracing::error!(error = %err, "OCI manifest ingest failed");
-            Err(OciError::Internal.into_response())
+            Err(Box::new(OciError::Internal.into_response()))
         }
     }
 }
@@ -1173,7 +1177,7 @@ async fn resolve_and_check_referenced_blobs(
     media_type_is_index: bool,
     manifest_digest: &ContentHash,
     body_bytes: &[u8],
-) -> Result<ResolvedReferences, Response> {
+) -> Result<ResolvedReferences, Box<Response>> {
     let resolution = resolve_referenced_blobs(ctx, repo_id, referenced)
         .await
         .inspect_err(|_| {
@@ -1250,7 +1254,7 @@ async fn resolve_and_check_referenced_blobs(
             manifest_digest = %manifest_digest,
             "resolve_referenced_blobs returned None config with every reference resolved"
         );
-        return Err(OciError::Internal.into_response());
+        return Err(Box::new(OciError::Internal.into_response()));
     }
 
     if media_type_is_index {
@@ -1333,7 +1337,7 @@ async fn refuse_undeliverable_closure(
     repo_id: Uuid,
     manifest_digest: &ContentHash,
     body_bytes: &[u8],
-) -> Result<Option<TerminalReference>, Response> {
+) -> Result<Option<TerminalReference>, Box<Response>> {
     let resolved = ctx
         .manifest_deliverability_use_case
         .resolve_pending(repo_id, manifest_digest, body_bytes.to_vec())
@@ -1391,7 +1395,7 @@ async fn refuse_undeliverable_closure(
                             "constituent-status reader named a non-terminal status as the \
                              strongest terminal constituent; refusing the push"
                         );
-                        return Err(OciError::Internal.into_response());
+                        return Err(Box::new(OciError::Internal.into_response()));
                     }
                 },
             }))
@@ -1403,7 +1407,7 @@ async fn refuse_undeliverable_closure(
                 "image index admission: constituent deliverability could not be resolved, so \
                  what the index binds is unknown; refusing the push"
             );
-            Err(OciError::Internal.into_response())
+            Err(Box::new(OciError::Internal.into_response()))
         }
     }
 }
@@ -1450,7 +1454,7 @@ async fn attach_group_members(
     m: &ManifestPostIngest<'_>,
     config_artifact: &Option<Artifact>,
     layer_artifacts: &[Artifact],
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     if let Err(e) = ctx
         .artifact_group_use_case
         .add_member(
@@ -1468,7 +1472,7 @@ async fn attach_group_members(
         .await
     {
         if let Some(busy) = manifest_write_contention(&e, "group_attach_manifest") {
-            return Err(busy.into_response());
+            return Err(Box::new(busy.into_response()));
         }
         tracing::error!(
             manifest_artifact_id = %m.manifest_artifact.id,
@@ -1479,7 +1483,7 @@ async fn attach_group_members(
             "manifest group-attach failed; not idempotent-shaped (see commit_member_added \
              contract) — this is a genuine error"
         );
-        return Err(OciError::Internal.into_response());
+        return Err(Box::new(OciError::Internal.into_response()));
     }
 
     if let Some(config_artifact) = config_artifact {
@@ -1500,7 +1504,7 @@ async fn attach_group_members(
             .await
         {
             if let Some(busy) = manifest_write_contention(&e, "group_attach_config") {
-                return Err(busy.into_response());
+                return Err(Box::new(busy.into_response()));
             }
             tracing::error!(
                 manifest_artifact_id = %m.manifest_artifact.id,
@@ -1512,7 +1516,7 @@ async fn attach_group_members(
                 "config group-attach failed; not idempotent-shaped (see commit_member_added \
                  contract) — this is a genuine error"
             );
-            return Err(OciError::Internal.into_response());
+            return Err(Box::new(OciError::Internal.into_response()));
         }
     }
 
@@ -1534,7 +1538,7 @@ async fn attach_group_members(
             .await
         {
             if let Some(busy) = manifest_write_contention(&e, "group_attach_layer") {
-                return Err(busy.into_response());
+                return Err(Box::new(busy.into_response()));
             }
             tracing::error!(
                 manifest_artifact_id = %m.manifest_artifact.id,
@@ -1547,7 +1551,7 @@ async fn attach_group_members(
                 "layer group-attach failed; not idempotent-shaped (see commit_member_added \
                  contract) — this is a genuine error"
             );
-            return Err(OciError::Internal.into_response());
+            return Err(Box::new(OciError::Internal.into_response()));
         }
     }
 
@@ -1570,7 +1574,7 @@ async fn set_tag_ref(
     name: &str,
     reference: &str,
     actor: &ApiActor,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     if let Err(e) = ctx
         .ref_use_case
         .set(
@@ -1584,7 +1588,7 @@ async fn set_tag_ref(
         .await
     {
         if let Some(busy) = manifest_write_contention(&e, "ref_set") {
-            return Err(busy.into_response());
+            return Err(Box::new(busy.into_response()));
         }
         tracing::error!(
             manifest_artifact_id = %m.manifest_artifact.id,
@@ -1596,7 +1600,7 @@ async fn set_tag_ref(
             "ref set failed; not idempotent-shaped (see RefUseCase::set contract) — \
              this is a genuine error"
         );
-        return Err(OciError::Internal.into_response());
+        return Err(Box::new(OciError::Internal.into_response()));
     }
     Ok(())
 }
@@ -1801,7 +1805,7 @@ async fn put_manifest_dispatch_inner(
     // audit-trail contract.
     let correlation_id = Uuid::new_v4();
 
-    let (headers, body_bytes) = read_manifest_body(request).await.map_err(Box::new)?;
+    let (headers, body_bytes) = read_manifest_body(request).await?;
     let media_type = validate_manifest_media_type(&headers)?;
     let parsed_manifest = parse_manifest_json(&body_bytes)?;
     let media_type_is_index = check_declared_media_type_matches_shape(&media_type, &body_bytes)?;
@@ -1843,8 +1847,7 @@ async fn put_manifest_dispatch_inner(
         &hashes.computed_hash,
         &body_bytes,
     )
-    .await
-    .map_err(Box::new)?;
+    .await?;
 
     // ONE decision, two consumers: it selects the ingest arm below and it
     // gates the door immediately after. See `run_manifest_ingest`.
@@ -1875,8 +1878,7 @@ async fn put_manifest_dispatch_inner(
         &hashes,
         &body_bytes,
     )
-    .await
-    .map_err(Box::new)?;
+    .await?;
 
     let manifest_artifact = ingest_outcome.artifact;
     let manifest_event_id = ingest_outcome.ingested_event_id;
@@ -1923,14 +1925,10 @@ async fn put_manifest_dispatch_inner(
         actor_any: Actor::Api(actor.clone()),
         group_coords: oci_group_coords(&name, &manifest_digest),
     };
-    attach_group_members(ctx, &post_ingest, &config_artifact, &layer_artifacts)
-        .await
-        .map_err(Box::new)?;
+    attach_group_members(ctx, &post_ingest, &config_artifact, &layer_artifacts).await?;
 
     if !hashes.reference_is_digest {
-        set_tag_ref(ctx, &post_ingest, &name, &reference, &actor)
-            .await
-            .map_err(Box::new)?;
+        set_tag_ref(ctx, &post_ingest, &name, &reference, &actor).await?;
     }
 
     Ok(created_manifest_response(
@@ -2566,7 +2564,7 @@ async fn resolve_referenced_blobs(
     ctx: &AppContext,
     repo: Uuid,
     refs: &[ReferencedBlob],
-) -> Result<ReferenceResolution, Response> {
+) -> Result<ReferenceResolution, Box<Response>> {
     let mut config: Option<Artifact> = None;
     let mut layers: Vec<Artifact> = Vec::new();
     let mut absent: Vec<String> = Vec::new();
@@ -2619,7 +2617,7 @@ async fn resolve_referenced_blobs(
             Ok(o) => o,
             Err(e) => {
                 tracing::error!(error = %e, "referenced-constituent resolution failed");
-                return Err(OciError::Internal.into_response());
+                return Err(Box::new(OciError::Internal.into_response()));
             }
         };
         match hit {

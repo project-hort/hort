@@ -124,6 +124,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer answers `400 MANIFEST_BLOB_UNKNOWN`: a rejected constituent answers
   `403 DENIED` naming that digest, and one held for want of a scan verdict
   answers `503 UNAVAILABLE`. A constituent not yet pushed is unchanged (#429).
+- **Rust toolchain 1.97.1 → 1.100.0** (#437): MSRV 1.100 (`Cargo.toml`,
+  `.clippy.toml`, `rust-toolchain.toml`), builder, compose and E2E client images
+  on `rust:1.100-slim`. Building from source now needs Rust 1.100 or newer;
+  runtime-baseline move only, no behaviour change.
 
 ### Fixed
 
@@ -175,6 +179,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image's verdict decides its manifest's release unconditionally, so a gitops
   apply declaring the field now fails — drop the line to apply. The admin
   effective-config response no longer reports it (#428).
+
+### Security
+
+- **The GitLab pipeline now scans the container images it builds and the base
+  images it pins for fixable `CRITICAL` CVEs** — blocking for an image hort
+  builds, a warning for a base image it only pins, and a hard failure either
+  way when the scan could not run at all. Self-hosted pipelines need the
+  runner to reach Trivy's vulnerability database; see *Runner prerequisites*
+  in `docs/ci/README.md` for the one variable an installation behind a
+  registry mirror has to set (#437).
 
 ## [0.17.3] - 2026-11-08
 

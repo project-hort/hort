@@ -147,10 +147,11 @@ async fn waive_artifact_happy_path_json() {
     };
 
     let mut buf = Vec::new();
-    run_artifact_with_output(client, args, OutputFormat::Json, &mut buf)
+    let exit = run_artifact_with_output(client, args, OutputFormat::Json, &mut buf)
         .await
         .expect("waive succeeds in JSON mode");
     m.assert_async().await;
+    assert_eq!(code(&exit), code(&ExitCode::SUCCESS));
 
     let out = String::from_utf8(buf).expect("utf8");
     let parsed: serde_json::Value = serde_json::from_str(&out).expect("stdout parses as JSON");
@@ -314,9 +315,10 @@ async fn waive_versions_json_is_the_servers_envelope() {
     };
 
     let mut buf = Vec::new();
-    run_versions_with_output(client, args, OutputFormat::Json, &mut buf)
+    let exit = run_versions_with_output(client, args, OutputFormat::Json, &mut buf)
         .await
         .expect("succeeds");
+    assert_eq!(code(&exit), code(&ExitCode::SUCCESS));
 
     let out = String::from_utf8(buf).expect("utf8");
     let got: serde_json::Value = serde_json::from_str(&out).expect("stdout parses as JSON");
@@ -397,10 +399,15 @@ async fn a_prefixed_and_a_bare_digest_list_send_the_same_body() {
         };
 
         let mut buf = Vec::new();
-        run_digests_with_output(client, args, OutputFormat::Table, &mut buf)
+        let exit = run_digests_with_output(client, args, OutputFormat::Table, &mut buf)
             .await
             .unwrap_or_else(|e| panic!("{spelling} succeeds: {e}"));
         m.assert_async().await;
+        assert_eq!(
+            code(&exit),
+            code(&ExitCode::SUCCESS),
+            "{spelling} is accepted, so the command exits 0"
+        );
     }
 }
 
