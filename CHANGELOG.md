@@ -94,6 +94,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as a root filesystem and records "not applicable" instead of package
   findings; a layer, and a blob no manifest names yet, are scanned as before
   (#428).
+- A composed OCI image the scanner assembled whole and found no package
+  surface in — a from-scratch image — is now released rather than held
+  `scan_indeterminate`; an image that could not be assembled is held exactly
+  as before (#440).
 - A gitops apply now fails when a `ScanPolicy` waives scanning
   (`scanBackends: []`) for an `oci` repository: the composed image is such an
   artifact's only assessment, and the waiver skips it while itself authorising

@@ -1342,6 +1342,18 @@ mod tests {
         /// absence — the two must not reach the same outcome, since only
         /// one of them can change on a later attempt.
         Broken,
+        /// Yield the bytes for every hash **but one**, whose read fails
+        /// as an absence; and the same with a **backend** failure.
+        ///
+        /// One withheld constituent rather than a storage that fails
+        /// every read: a composition none of whose constituents is
+        /// readable cannot tell "a partial layout was refused" from
+        /// "there was nothing to assemble at all", so a change that let
+        /// a partial layout out as assembled would leave such a test
+        /// passing.
+        AllButAbsent(Vec<u8>, ContentHash),
+        /// See [`Get::AllButAbsent`].
+        AllButBroken(Vec<u8>, ContentHash),
     }
 
     struct StubStorage(Get);
@@ -1355,7 +1367,7 @@ mod tests {
         }
         fn get(
             &self,
-            _hash: &ContentHash,
+            hash: &ContentHash,
         ) -> BoxFuture<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
             enum Served {
                 Bytes(Vec<u8>),
@@ -1367,6 +1379,20 @@ mod tests {
                 Get::NotFound => Served::Absent,
                 Get::Broken => Served::Broken,
                 Get::Forbidden => panic!("this artifact kind must not cost a CAS read"),
+                Get::AllButAbsent(b, withheld) => {
+                    if hash == withheld {
+                        Served::Absent
+                    } else {
+                        Served::Bytes(b.clone())
+                    }
+                }
+                Get::AllButBroken(b, withheld) => {
+                    if hash == withheld {
+                        Served::Broken
+                    } else {
+                        Served::Bytes(b.clone())
+                    }
+                }
             };
             Box::pin(async move {
                 match served {
@@ -1431,6 +1457,47 @@ mod tests {
                 manifest_media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
             },
         )
+    }
+
+    /// A two-layer composition whose four constituents have **distinct**
+    /// digests, so a storage stub can withhold exactly one of them.
+    /// [`sample_composed_image`] deliberately reuses one hash throughout,
+    /// which is what makes it useless for that.
+    fn distinct_composed_image() -> ComposedImage {
+        use hort_domain::oci::{ImageLayout, ImageLayoutLayer, OCI_IMAGE_MANIFEST_MEDIA_TYPE};
+        let digest = |seed: char| -> ContentHash {
+            std::iter::repeat_n(seed, 64)
+                .collect::<String>()
+                .parse()
+                .expect("synthetic sha256")
+        };
+        ComposedImage::new(
+            digest('a'),
+            ImageLayout {
+                config: digest('c'),
+                layers: vec![
+                    ImageLayoutLayer {
+                        hash: digest('1'),
+                        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    },
+                    ImageLayoutLayer {
+                        hash: digest('2'),
+                        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    },
+                ],
+                manifest_media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            },
+        )
+    }
+
+    /// [`distinct_composed_image`]'s last layer — the one constituent the
+    /// composition-refusal pins withhold, so what is refused is a layout
+    /// that was already most of the way written.
+    fn last_layer_of_distinct_image() -> ContentHash {
+        std::iter::repeat_n('2', 64)
+            .collect::<String>()
+            .parse()
+            .expect("synthetic sha256")
     }
 
     fn storage_of(bytes: Vec<u8>) -> Arc<dyn StoragePort> {
@@ -2377,6 +2444,60 @@ mod tests {
         );
     }
 
+    /// **The structural half of the guarantee the `image`-mode
+    /// empty-report reading rests on.** The adapter reads an empty Trivy
+    /// report over a composed image as a completed fact about the image,
+    /// and that is only available because a composition is handed to the
+    /// scanner **whole or not at all**. This is the "not at all" half,
+    /// over both refusal classes, in the one form a partial layout
+    /// cannot satisfy: `Ready` is never reached, so there is no workspace
+    /// for the scanner to report nothing over.
+    ///
+    /// Beside the two tests above rather than folded into them. Each of
+    /// those asserts *which* outcome a refusal becomes, and either would
+    /// still pass if a refusal were produced **and** a tree handed over
+    /// as well; this is what makes that unrepresentable.
+    #[tokio::test]
+    async fn a_refused_composition_never_hands_over_a_workspace() {
+        let image = distinct_composed_image();
+        let c = coords("library/nginx", None, "manifests/sha256:aa");
+        let target = ScanTarget {
+            unit: ScanUnit::Image(&image),
+            format: "oci",
+            coords: &c,
+            kind: ArtifactKind::OciManifest,
+            layer_role: LayerRole::Unknown,
+        };
+        let bytes = b"constituent bytes".to_vec();
+        for (label, get) in [
+            (
+                "an absent constituent",
+                Get::AllButAbsent(bytes.clone(), last_layer_of_distinct_image()),
+            ),
+            (
+                "a failed constituent read",
+                Get::AllButBroken(bytes.clone(), last_layer_of_distinct_image()),
+            ),
+        ] {
+            let storage: Arc<dyn StoragePort> = Arc::new(StubStorage(get));
+            match materialise(&storage, &target, u64::MAX).await {
+                Ok(Materialised::Ready { mode, .. }) => panic!(
+                    "{label} handed the scanner a {mode:?} workspace; an empty report over \
+                     one of those reads as a completed fact about the image"
+                ),
+                // Which refusal it is, and that it gates, is the two
+                // tests above; here it only has to be an abstention
+                // rather than a materialised tree.
+                Ok(Materialised::Nothing(why)) => assert!(
+                    why.gates_release(ArtifactKind::OciManifest),
+                    "{label}: a composition that was never assembled is a filesystem that \
+                     went unassessed, so its abstention holds the manifest"
+                ),
+                Err(_) => {}
+            }
+        }
+    }
+
     /// An OCI config blob is JSON, not a layer: no package surface, and
     /// that is a clean "not applicable", not a refusal.
     #[tokio::test]
@@ -2516,6 +2637,70 @@ mod tests {
              filesystem verdict: the decoder-inventory exemption needs a container \
              that was positively identified"
         );
+    }
+
+    /// **A non-filesystem payload on the constituent path carries no
+    /// package surface, and that is read off its own bytes.** A cosign
+    /// `simplesigning` signature payload, an in-toto statement, a
+    /// Sigstore bundle and an SPDX or CycloneDX document are — by the
+    /// specification each of their media types names — JSON documents,
+    /// and a JSON document is one of the shapes [`sniff_container`]
+    /// identifies *positively* as excluding a package surface. So none
+    /// of them is ever materialised as an archive, with or without a
+    /// manifest naming it: no hold, no extraction, no refusal about
+    /// bytes that were never an archive.
+    ///
+    /// Taken under [`LayerRole::Unknown`], which is the role every such
+    /// blob carries at its own first scan — on a hosted push the blobs
+    /// are ingested, and their scans enqueued, before the manifest that
+    /// names them exists — so this is the answer with nothing declared
+    /// about the bytes at all. Where a manifest *is* readable the
+    /// resolver reaches the same outcome one stage earlier and for a
+    /// different reason (`hort_app`'s layer-role resolution: a manifest
+    /// declaring a non-filesystem payload layer is not an image, so
+    /// nothing it names is an image layer).
+    #[tokio::test]
+    async fn a_non_filesystem_payload_blob_carries_no_package_surface() {
+        let c = coords("library/nginx", None, "blobs/sha256:aa");
+        for (shape, payload) in [
+            (
+                "cosign simplesigning",
+                br#"{"critical":{"identity":{"docker-reference":"library/nginx"},"image":{"docker-manifest-digest":"sha256:aa"},"type":"cosign container image signature"},"optional":null}"#
+                    .to_vec(),
+            ),
+            (
+                "in-toto statement",
+                br#"{"_type":"https://in-toto.io/Statement/v1","subject":[],"predicateType":"https://slsa.dev/provenance/v1"}"#
+                    .to_vec(),
+            ),
+            (
+                "sigstore bundle",
+                br#"{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json","verificationMaterial":{}}"#
+                    .to_vec(),
+            ),
+            (
+                "spdx json",
+                br#"{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT","packages":[]}"#.to_vec(),
+            ),
+            (
+                "cyclonedx json",
+                br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#.to_vec(),
+            ),
+        ] {
+            let m = materialise_kind(ArtifactKind::OciBlob, &c, payload)
+                .await
+                .expect("a document is not a refusal");
+            assert_eq!(
+                expect_nothing(&m),
+                NotAnalysable::NotApplicable,
+                "a {shape} payload is a document, not an archive: there is no filesystem in \
+                 it for an analyzer to have claimed"
+            );
+            assert!(
+                !expect_nothing(&m).gates_release(ArtifactKind::OciBlob),
+                "{shape}: nothing for a hold to wait on"
+            );
+        }
     }
 
     /// **The mapping table, by value.** Every `ExtractError` variant

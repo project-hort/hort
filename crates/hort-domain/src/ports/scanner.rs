@@ -400,6 +400,18 @@ pub enum NotAnalysable {
     /// path). Where either does not hold, the empty report is an
     /// expected surface left unassessed and belongs on a gating arm.
     ///
+    /// An `image`-mode invocation that reported an empty result is the
+    /// same statement about the composition, and its second half costs
+    /// the adapter nothing to establish because the materialisation
+    /// already guarantees it: a composed image layout is returned whole
+    /// or not at all, so the tree the analyzers walked is every
+    /// constituent the manifest declared. A composition that could not
+    /// be assembled never produces this value — it produces
+    /// [`Self::IncompleteComposition`], or an error — so "the analyzers
+    /// found no package surface in the composed filesystem" is the only
+    /// reading an empty `image`-mode report has. A from-scratch image is
+    /// the population it describes.
+    ///
     /// Does not gate: see the type-level docs.
     NotApplicable,
     /// The payload is an archive the adapter refused to materialise for
@@ -461,15 +473,19 @@ pub enum NotAnalysable {
     /// nothing to analyse". For Trivy this is a report with no `Results`
     /// section: no analyzer claimed anything in the workspace.
     ///
-    /// Two different situations reach it, and both are an expected
-    /// surface left unassessed. For a **single artifact** it says the
-    /// pairing of this artifact with this backend is a policy mismatch.
-    /// For a **composed image** ([`ScanUnit::Image`]) it says the
-    /// composition was assembled and the scanner found nothing in it to
-    /// analyse — which cannot be "no package surface by construction",
-    /// because a composition *is* the thing that was supposed to be
-    /// assessed and its whole reason for existing is that the package
-    /// surface belongs to it rather than to its layers (ADR 0064 D1).
+    /// It is an expected surface left unassessed: the pairing of this
+    /// artifact with this backend is a policy mismatch, or the tree the
+    /// analyzers walked was not the whole artifact (a layer whose link
+    /// entries were skipped on the way in).
+    ///
+    /// A **composed image** ([`ScanUnit::Image`]) does not reach it. An
+    /// empty report over an assembled composition is the analyzers
+    /// agreeing the composed filesystem carries no package surface, and
+    /// that is a completed fact about the image — [`Self::NotApplicable`]
+    /// — because a composition is returned whole or not at all, so there
+    /// is no unread constituent the empty report could be about. An
+    /// image that could not be assembled is
+    /// [`Self::IncompleteComposition`].
     ///
     /// **Gates, except on a constituent whose composition carries the
     /// filesystem verdict** (ADR 0064 D2) — the same conditional answer
@@ -482,10 +498,12 @@ pub enum NotAnalysable {
     /// obligation moves rather than being dropped, which is why it moves
     /// only where an operator has promoted the composite verdict.
     ///
-    /// The composed-image reading above is unaffected: a manifest is not
-    /// a constituent ([`ArtifactKind::is_composition_constituent`]), so
-    /// an assembled image nothing claimed still fails closed — there is
-    /// nothing above it for the obligation to move to.
+    /// On every other row it gates as before: a manifest is not a
+    /// constituent ([`ArtifactKind::is_composition_constituent`]), so
+    /// where a manifest row does reach this value — the orchestrator's
+    /// own inert-pairing record, since the adapter's `image` mode no
+    /// longer produces it — there is nothing above it for the obligation
+    /// to move to and it fails closed.
     NoAnalyzerMatched,
     /// No report about a composed image exists. In every case this value
     /// reaches today, that is because the composition itself was not
@@ -493,7 +511,8 @@ pub enum NotAnalysable {
     /// repository has no upstream to acquire it from, or the composition
     /// tripped the whole-image budget.
     ///
-    /// Deliberately **not** the same value as [`Self::NoAnalyzerMatched`]:
+    /// Deliberately **not** the same value as the one an assembled
+    /// composition that reported nothing produces ([`Self::NotApplicable`]):
     /// "I could not build the image" and "I built the image and nothing
     /// claimed anything in it" are facts about different things, and only
     /// the second says anything at all about the image. Collapsing them
@@ -504,6 +523,11 @@ pub enum NotAnalysable {
     /// false statement in the record of a manifest the gate is holding:
     /// a complete composition that every backend abstained on is none of
     /// the three causes above.
+    ///
+    /// The separation is now also what makes that second reading safe to
+    /// release on: because every unassembled composition lands here and
+    /// nowhere else, an empty `image`-mode report is necessarily about a
+    /// layout that was written whole.
     ///
     /// One arm is not strictly either: a backend that **errored** on an
     /// assembled composition, with its retry request declined. No report

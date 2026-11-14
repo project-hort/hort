@@ -574,21 +574,36 @@ mod tests {
     /// root filesystem. That is the coincidence ADR 0064 D6 took the
     /// materialisation off container shape to stop, arriving through the one
     /// door the config could not close.
+    /// Over **every** payload format the manifest stage recognises as
+    /// not-a-filesystem, not just the in-toto one, because the set is
+    /// what the answer rests on: a member that stopped reaching this
+    /// outcome would put its blob back on the container-decides path,
+    /// and that is exactly the materialisation ADR 0064 D6 took off
+    /// container shape. One per media type rather than a representative
+    /// case, so a set the resolver and the parse disagree about is a
+    /// test failure rather than a reading of two files.
     #[tokio::test]
     async fn an_attestation_manifests_payload_layer_is_declared_not_an_image_layer() {
-        let blob = layer_blob();
-        let h = Harness::new();
-        let (manifest, config) = image_manifest_documents(&[(
+        for media_type in [
             hort_domain::oci::IN_TOTO_STATEMENT_MEDIA_TYPE,
-            &blob.sha256_checksum,
-        )]);
-        h.seed_manifest(&manifest, &config, &blob.sha256_checksum);
-        assert_eq!(
-            h.resolve(&blob, ArtifactKind::OciBlob).await,
-            LayerRole::NotAnImageLayer,
-            "no manifest here composes an image from these bytes, so presenting them as a root \
-             filesystem would be a statement about nothing"
-        );
+            hort_domain::oci::COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+            hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
+            hort_domain::oci::SPDX_JSON_MEDIA_TYPE,
+            hort_domain::oci::CYCLONEDX_JSON_MEDIA_TYPE,
+        ] {
+            let blob = layer_blob();
+            let h = Harness::new();
+            let (manifest, config) =
+                image_manifest_documents(&[(media_type, &blob.sha256_checksum)]);
+            h.seed_manifest(&manifest, &config, &blob.sha256_checksum);
+            assert_eq!(
+                h.resolve(&blob, ArtifactKind::OciBlob).await,
+                LayerRole::NotAnImageLayer,
+                "no manifest declaring a {media_type} layer composes an image from these \
+                 bytes, so presenting them as a root filesystem would be a statement about \
+                 nothing"
+            );
+        }
     }
 
     /// An image hort holds an **incomplete** composition of is still an

@@ -594,9 +594,17 @@ composition its bytes name:
    partial layout, never a clean verdict over a subset. A refused assembly
    removes the directory it was building and reports
    `incomplete_composition`, which is deliberately *not* the same value as
-   an assembled composition that reported nothing (`no_analyzer_matched`):
+   an assembled composition that reported nothing (`not_applicable`):
    "I could not build the image" and "I built it and it reported nothing"
-   are facts about different things.
+   are facts about different things — and only the second is safe to
+   release on, which is the whole reason the separation is load-bearing
+   rather than tidy. Because every unassembled composition lands on
+   `incomplete_composition` and nowhere else, an empty `image`-mode report
+   is necessarily about a layout that was written whole: the analyzers
+   agreeing there is no package surface in it is then a completed fact
+   about the image, and a from-scratch image (`registry.k8s.io/pause:3.10`
+   is three blobs and the pinned Trivy answers `Results: null` over it) is
+   the population that fact describes.
 
    **No verdict is not the same as no further attempt.** A refusal about the
    *image* — more constituents or more bytes than hort will assemble, a
@@ -795,13 +803,22 @@ it warms the vulnerability DB.
 
 ### Empty-report diagnostics
 
-When Trivy returns a report with no analysed target, the adapter's
-`warn!` carries the artifact kind, the format, the subcommand it chose,
-the **tail of Trivy's stderr** (last ~1 KiB, which under `--quiet` is
-where DB and analyzer complaints still land) and **`materialised`** — up
-to 20 relative file names from the workspace. Those last two are what
-separate "no analyzer claimed this, correctly" from "this adapter built
-the wrong tree", which are otherwise the same log line.
+When Trivy returns a report with no analysed target, the adapter logs the
+artifact kind, the format, the subcommand it chose, the **tail of Trivy's
+stderr** (last ~1 KiB, which under `--quiet` is where DB and analyzer
+complaints still land) and **`materialised`** — up to 20 relative file
+names from the workspace. Those last two are what separate "no analyzer
+claimed this, correctly" from "this adapter built the wrong tree", which
+are otherwise the same log line.
+
+The **level follows the outcome**. Where the empty report is a hold it is
+a `warn!` carrying all of it, because the hold is actionable. Where it is
+a completed "nothing to assess" fact — a `rootfs` tree walked whole, an
+`image` layout assembled whole — it is one `info!` stating the fact, with
+the `materialised` listing kept at `debug!` for an operator who doubts
+it. The listing never drops out of the log entirely: it is the evidence
+that tells a correct answer from a materialisation this adapter got
+wrong, and that question survives the outcome being benign.
 
 ### The scanner capability map
 
@@ -937,6 +954,19 @@ A backend returns `NothingAnalysable(reason)` in five situations:
   agreed there is no package surface" is a statement about a tree that is
   not the artifact. The narrowing is withdrawn there and the empty report
   reads as `no_analyzer_matched` instead.
+
+  An **`image`-mode** invocation that came back with no `Results` is the
+  same reason, and its completeness half costs the adapter nothing to
+  establish: a composed image layout is returned whole or not at all
+  (above), so the tree the analyzers walked is every constituent the
+  manifest declared and there is no unread surface the empty report could
+  be about. A composition that could not be assembled never reaches this
+  value — it reaches `incomplete_composition`, or a retryable error — so
+  the only reading an empty `image` report has is the analyzers agreeing
+  the composed filesystem carries no package surface. A from-scratch image
+  is the population: a hold there would never lift, because the
+  composition exists, every analyzer read it, and no later attempt can
+  answer differently.
 - `unusable_archive` — the payload is an archive the adapter refused to
   materialise for a reason **about its own bytes**: a guard above
   tripped, an entry tried to escape the workspace, an entry name could
@@ -960,11 +990,11 @@ A backend returns `NothingAnalysable(reason)` in five situations:
   reported no analysed target at all (for Trivy, a report with no
   `Results` section — absent, `null`, or empty). In `fs` mode that targets
   one artifact whose analyzer either engages or does not, so an empty
-  result stays an expected surface left unassessed. In `image` mode it is
-  an assembled composition that reported nothing, which cannot be "no
-  package surface by construction" — the composition *is* the thing that
-  was supposed to be assessed. In `rootfs` mode over a layer whose link
-  entries were skipped (above) it is the withdrawn narrowing. Whether it
+  result stays an expected surface left unassessed. In `rootfs` mode over
+  a layer whose link entries were skipped (above) it is the withdrawn
+  narrowing. An `image`-mode invocation does not reach it at all — an
+  assembled composition nothing claimed is `not_applicable` (above), and
+  one that was never assembled is `incomplete_composition`. Whether it
   gates is decided by the **row**, not by the mode that produced it: an
   absence of analysis says nothing about the layer's bytes, so on an OCI
   blob ADR 0064 D2 places it with the composition exactly as it places
@@ -973,12 +1003,17 @@ A backend returns `NothingAnalysable(reason)` in five situations:
 - `incomplete_composition` — a composed image could not be assembled: a
   constituent was missing from storage, unreadable, the repository has no
   upstream to acquire it from, or the composition tripped the whole-image
-  budget. No report about the image exists. Kept apart from
-  `no_analyzer_matched` on purpose, and that distinction is carried
-  through to what a manifest inherits from its composition: an assembled
-  composition that every backend abstained on reports
-  `no_analyzer_matched`, because none of this value's causes is true of
-  it. See [the composed image](#the-composed-image-is-the-scan-unit).
+  budget. No report about the image exists. Kept apart from what an
+  assembled composition produces on purpose, and that distinction is
+  carried through to what a manifest inherits from its composition: an
+  assembled composition every backend abstained on inherits **those
+  backends' own absence**, because none of this value's causes is true of
+  it — so a composition every analyzer read and found no package surface
+  in is `not_applicable` and does not hold the manifest, while one whose
+  abstentions include a gating reason keeps that reason and does. A
+  composition no configured backend materialises a payload for is
+  `no_analyzer_matched`: it exists and nothing looked at it. See
+  [the composed image](#the-composed-image-is-the-scan-unit).
 
 The orchestrator records `no_analyzer_matched` and `not_applicable` on a
 backend's behalf in one case: when
@@ -999,8 +1034,9 @@ reason, because two of the five reasons are answered about the artifact
 rather than only about the refusal:
 
 - `not_applicable` never gates, anywhere. It is the absence of a surface:
-  no scanner could ever find a threat level in an OCI manifest row or an
-  image config blob, so a hold has nothing to wait on and would never
+  no scanner could ever find a threat level in an OCI manifest row, an
+  image config blob or an assembled image with no package surface
+  anywhere in it, so a hold has nothing to wait on and would never
   lift.
 - `unsupported_container` and `no_analyzer_matched` do not gate an **OCI
   blob** — unconditionally, for every policy — and gate everywhere else.

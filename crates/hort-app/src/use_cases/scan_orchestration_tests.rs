@@ -8159,6 +8159,91 @@ async fn run_scan_acquires_a_cold_proxy_compositions_layers_and_then_assesses_it
     assert_eq!(row.primary_findings_decision, GateDecision::Clean);
 }
 
+/// **A from-scratch image is released, end to end.** Every constituent
+/// is local, the composition is assembled and handed over whole, and the
+/// backend reports it found no package surface in it — which is a
+/// completed fact about the image and not an unassessed surface. So the
+/// run records a completed not-applicable assessment: scan authority
+/// exists, the release gate opens on the time gate alone, and the trail
+/// says "not applicable".
+///
+/// The whole chain is the point, because each link alone looks harmless:
+/// the manifest row's own bytes carry no package surface
+/// (`trivy=not_applicable`, which has always been correct), the
+/// composition's abstention is folded in beside it, and it is the
+/// *partition* over the two that decides whether a correct artifact is
+/// held. Before this, the composite's absence was re-asserted as an
+/// absence of analysis over an image every analyzer had read, and the
+/// manifest was held `scan_indeterminate` with nothing for the hold to
+/// wait on and no later attempt able to answer differently.
+#[tokio::test]
+async fn an_assembled_composition_with_no_package_surface_completes_as_not_applicable() {
+    let scanner = Arc::new(
+        MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        )
+        .answering_composites_with(Ok(ScanAnalysis::NothingAnalysable(
+            NotAnalysable::NotApplicable,
+        ))),
+    );
+    let (uc, storage, artifacts, repositories, proxy, _resolver, observations) =
+        make_uc_with_handler_storage_and_upstream(
+            vec!["trivy".into()],
+            one_scanner(scanner.clone()),
+            handler_map("oci", ArtifactKind::OciManifest),
+            ScanOrchestrationConfig::defaults_for_worker("test-worker"),
+        );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    // No upstream mapping: the hosted shape, where every constituent is
+    // already local and nothing is acquired.
+    seed_hosted_composition(&storage);
+
+    let job = scan_job_for_format(artifact_id, "oci");
+    let outcome = uc.run_scan(&job).await.expect("run_scan");
+
+    assert!(
+        proxy.blob_fetches().is_empty(),
+        "a hosted composition acquires nothing"
+    );
+    assert_eq!(
+        scanner.seen_units(),
+        vec![ScanUnitShape::Blob, ScanUnitShape::Image(2)],
+        "the backend was pointed at the manifest's own bytes and at the composition"
+    );
+    let ScanRunOutcome::Completed {
+        assessment,
+        ref findings,
+        ..
+    } = outcome
+    else {
+        panic!("an image with no package surface completes the run, got {outcome:?}");
+    };
+    assert_eq!(
+        assessment,
+        ScanAssessment::NotApplicable,
+        "nothing in this artifact or its composition is assessable, so there is nothing \
+         for a hold to wait on"
+    );
+    assert!(findings.is_empty(), "{findings:?}");
+    // The observation still records that the composition produced no
+    // verdict — which is true — with the backend's abstention named.
+    // What changed is whether that absence holds the manifest.
+    let row = observations
+        .row_for(artifact_id)
+        .expect("the composite run recorded an observation");
+    assert_eq!(row.assessment, CompositeAssessment::DeterministicRefusal);
+    assert!(
+        row.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("trivy=not_applicable")),
+        "{:?}",
+        row.reason
+    );
+}
+
 /// The shadow observation's write is best-effort: when the projection
 /// refuses it, the artifact's own scan outcome, the events it produces
 /// and the job row are all exactly what they would have been.
