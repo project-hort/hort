@@ -23,6 +23,17 @@
 //!   `<scope>`, so the scope filter below does not reach it. Warming the
 //!   parent *artifact* does not make the parent's `<dependencyManagement>`
 //!   readable; that stays a counted skip here.
+//! - A `<dependencyManagement>` entry that is a **BOM import**
+//!   (`<type>pom</type><scope>import</scope>`), emitted after the parent
+//!   and ahead of the `<dependencies>` entries. It is not a dependency
+//!   of the project: Maven requires the type to be `pom` precisely
+//!   because the entry's whole effect is to supply versions, which makes
+//!   the imported document a precondition of reading the dependency list
+//!   — the same argument that puts `<parent>` in this set. Ordering is
+//!   all it gets: an import edge spends the cascade's descendant budget
+//!   and depth bound like any other. And as with the parent, warming the
+//!   BOM *artifact* does not make the coordinates it manages readable
+//!   here.
 //! - `<dependencies>` entries whose effective scope is `compile` or
 //!   `runtime` — Maven's runtime declaration classes (ADR 0053 D5), both of
 //!   which Maven propagates transitively to consumers. An absent `<scope>`
@@ -100,6 +111,16 @@ const MAX_PROPERTY_EXPANSION_DEPTH: usize = 16;
 /// The scope Maven applies when a `<dependency>` declares none.
 const DEFAULT_SCOPE: &str = "compile";
 
+/// The `<scope>` that makes a `<dependencyManagement>` entry a BOM import
+/// rather than a version-table row. Maven accepts it in that block only,
+/// which is why it never reaches [`EMITTED_SCOPES`].
+const IMPORT_SCOPE: &str = "import";
+
+/// The `<type>` Maven requires on a BOM import. The default type is `jar`,
+/// so an import always spells this out, and an entry claiming
+/// `scope=import` without it is one Maven declines to honour.
+const IMPORT_TYPE: &str = "pom";
+
 /// The scopes the cascade warms — Maven's **runtime declaration classes**
 /// (ADR 0053 D5).
 ///
@@ -109,8 +130,8 @@ const DEFAULT_SCOPE: &str = "compile";
 /// does `compile`. Omitting it would drop real closure members from every
 /// tree the cascade warms.
 ///
-/// Every other scope is excluded and counted as
-/// [`PomSkipReason::ScopeExcluded`]:
+/// Every other scope a `<dependency>` can declare is excluded and counted
+/// as [`PomSkipReason::ScopeExcluded`]:
 ///
 /// - `provided` — the container supplies it at run time and Maven does not
 ///   propagate it transitively; it is build-time closure, which ADR 0053 D4
@@ -118,21 +139,33 @@ const DEFAULT_SCOPE: &str = "compile";
 /// - `test` — the dev/test closure D5 explicitly keeps out.
 /// - `system` — names a local file path, so there is no upstream artifact to
 ///   warm at all.
-/// - `import` — only meaningful inside `<dependencyManagement>` as a BOM
-///   import, which this reader deliberately does not resolve.
 ///
-/// The `<parent>` edge does **not** pass through this check: a `<parent>`
-/// declares no `<scope>`, so testing it here would count it as
-/// `ScopeExcluded` and drop the one edge the POM cannot be interpolated
-/// without. See [`resolve_parent`].
+/// `import` is **not** one of them, and cannot reach this check at all:
+/// Maven permits `scope=import` only inside `<dependencyManagement>`,
+/// and this filter is applied to `<dependencies>` entries. An import is
+/// also not a dependency of the project — Maven requires it to carry
+/// `<type>pom</type>` because its whole effect is to supply versions — so
+/// it is emitted as an edge by [`resolve_bom_import`] instead. Filing it
+/// beside `test`/`provided`/`system` would be a category error: those
+/// three are real dependencies outside the warmed class.
+///
+/// Two edges therefore never pass through this check, on one argument.
+/// The `<parent>` declares no `<scope>` at all, so testing it here would
+/// count it as `ScopeExcluded` and drop the one edge the POM cannot be
+/// interpolated without (see [`resolve_parent`]); a BOM import declares
+/// a scope this list does not hold. Both are resolution inputs rather
+/// than dependency declarations, and bypassing the filter is the only
+/// thing either gets — neither is exempt from the cascade's descendant
+/// budget or its depth bound.
 const EMITTED_SCOPES: [&str; 2] = ["compile", "runtime"];
 
 // ---------------------------------------------------------------------------
 // Result types
 // ---------------------------------------------------------------------------
 
-/// Why a declared edge — a `<dependency>`, or the `<parent>` coordinate —
-/// did not become a [`DependencySpec`].
+/// Why a declared edge — a `<dependency>`, the `<parent>` coordinate, or a
+/// `<dependencyManagement>` BOM import — did not become a
+/// [`DependencySpec`].
 ///
 /// Every reason here is counted, including [`PomSkipReason::ScopeExcluded`]
 /// — an operator reading the skip counts needs the full accounting of a
@@ -144,12 +177,15 @@ const EMITTED_SCOPES: [&str; 2] = ["compile", "runtime"];
 /// metrics alone for a POM that declares mostly `test`/`provided` deps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum PomSkipReason {
-    /// The dependency declares no `<version>` and this POM's own
+    /// The edge declares no `<version>` and this POM's own
     /// `<dependencyManagement>` does not supply one — the version lives in
     /// a parent POM or an imported BOM, neither of which
     /// `extract_dependency_specs` can reach. The dominant reason on a
     /// managed tree (Spring Boot, Quarkus), and the one that most
-    /// understates how much of a tree the cascade warmed.
+    /// understates how much of a tree the cascade warmed. A BOM import
+    /// lands here too when it declares no version of its own: Maven lets
+    /// a parent's `<dependencyManagement>` version the import, and that
+    /// is beyond these bytes like any other inherited version.
     VersionFromParentOrBom,
     /// A `${...}` placeholder in the coordinate, scope or version did not
     /// resolve from this POM's own `<properties>` or the model built-ins —
@@ -161,19 +197,23 @@ pub enum PomSkipReason {
     /// pure reader does not have; per ADR 0053 D2 a range is never guessed
     /// at, so it is skipped and counted rather than pinned.
     UnsupportedRange,
-    /// The `<dependency>` element declares no `<groupId>` or no
-    /// `<artifactId>`, or the `<parent>` block is missing any of its three
-    /// parts. Structurally incomplete rather than deferred — the edge has
-    /// no identity to enqueue even in principle. A `<parent>` has no
-    /// `<dependencyManagement>` entry that could supply a part later, so a
-    /// part that interpolates to nothing lands here too rather than on
-    /// [`PomSkipReason::VersionFromParentOrBom`].
+    /// A `<dependency>` or BOM-import element declares no `<groupId>` or
+    /// no `<artifactId>`, or the `<parent>` block is missing any of its
+    /// three parts. Structurally incomplete rather than deferred — the
+    /// edge has no identity to enqueue even in principle. A `<parent>` has
+    /// no `<dependencyManagement>` entry that could supply a part later,
+    /// so a part that interpolates to nothing lands here too rather than
+    /// on [`PomSkipReason::VersionFromParentOrBom`].
     IncompleteCoordinate,
     /// The effective scope is not in [`EMITTED_SCOPES`]. Not a coverage
     /// gap — the dependency is outside the cascade's declared class
     /// boundary, working as specified — but counted anyway so the boundary
     /// itself is visible to an operator reading the skip counts, not just
     /// the gaps within it.
+    ///
+    /// Only a `<dependencies>` entry can land here. The `<parent>` and a
+    /// BOM import never reach the filter at all, so neither is ever
+    /// reported under this reason — see [`EMITTED_SCOPES`].
     ScopeExcluded,
 }
 
@@ -221,13 +261,30 @@ pub struct PomSkip {
 /// the ones that did not with the reason for each.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PomDependencies {
-    /// The edges that resolved to a concrete version: the `<parent>`
-    /// coordinate first when the POM declares one, then the emitted-scope
-    /// `<dependencies>` entries in document order.
+    /// The edges that resolved to a concrete version, in emitted order:
+    /// the `<parent>` coordinate first when the POM declares one, then the
+    /// `<dependencyManagement>` BOM imports, then the emitted-scope
+    /// `<dependencies>` entries, each group in document order.
     pub specs: Vec<DependencySpec>,
     /// Edges this reader could not resolve, same order as
-    /// [`Self::specs`] — the `<parent>` first, then document order.
+    /// [`Self::specs`] — the `<parent>` first, then the BOM imports, then
+    /// the `<dependencies>` entries, each group in document order.
     pub skipped: Vec<PomSkip>,
+    /// How many `<dependencyManagement>` entries the POM declared, whether
+    /// or not any of them became an edge.
+    ///
+    /// A managed entry is a version-table row for the `<dependencies>`
+    /// block unless it is a BOM import, so a POM can declare many and emit
+    /// none — and a pure BOM declares nothing else at all. Such a POM
+    /// yields no spec and no skip, because a version-table row is not an
+    /// edge this reader declined and there is nothing to count, which
+    /// leaves it indistinguishable from a leaf artifact in the cascade's
+    /// own counters. This figure is what separates the two. It is
+    /// deliberately the count the POM *declared* rather than a sixth
+    /// [`PomSkipReason`]: a non-import managed entry is not a skipped
+    /// edge, and warming the coordinates a BOM manages is a different
+    /// question than the one this reader answers.
+    pub managed_coordinates: usize,
 }
 
 impl PomDependencies {
@@ -403,6 +460,12 @@ struct RawDependency {
     artifact_id: Option<String>,
     version: Option<String>,
     scope: Option<String>,
+    /// `<type>`. Maven's default is `jar`; this reader needs the element
+    /// only to tell a BOM import (`pom`) from an ordinary
+    /// `<dependencyManagement>` row, so an absent element stays `None`
+    /// rather than being defaulted — absent is not `pom`, which is the
+    /// only question asked of it.
+    r#type: Option<String>,
 }
 
 impl RawDependency {
@@ -412,6 +475,7 @@ impl RawDependency {
             "artifactId" => &mut self.artifact_id,
             "version" => &mut self.version,
             "scope" => &mut self.scope,
+            "type" => &mut self.r#type,
             _ => return,
         };
         *slot = Some(value.to_string());
@@ -777,7 +841,12 @@ fn resolve(pom: &RawPom) -> PomDependencies {
             .or_insert(entry);
     }
 
-    let mut out = PomDependencies::default();
+    let mut out = PomDependencies {
+        // What the POM declared, not what was emitted from it: see
+        // `PomDependencies::managed_coordinates`.
+        managed_coordinates: pom.managed.len(),
+        ..PomDependencies::default()
+    };
 
     // The parent goes first: it is the edge this POM cannot be
     // interpolated without, so a consumer that truncates in emitted order
@@ -787,6 +856,22 @@ fn resolve(pom: &RawPom) -> PomDependencies {
         Some(Ok(spec)) => out.specs.push(spec),
         Some(Err(skip)) => out.skipped.push(skip),
         None => {}
+    }
+
+    // The BOM imports follow the parent and precede the `<dependencies>`
+    // block, for the reason the parent leads: an imported BOM is what
+    // supplies the versions the dependency list is written against, so a
+    // consumer that truncates in emitted order keeps the inputs it cannot
+    // resolve anything without. Ordering is all they get — an import edge
+    // spends the cascade's descendant budget and depth bound like any
+    // other edge. Most managed entries are not imports and yield nothing
+    // here; see `resolve_bom_import`.
+    for entry in &pom.managed {
+        match resolve_bom_import(entry, &managed, &interpolator) {
+            Some(Ok(spec)) => out.specs.push(spec),
+            Some(Err(skip)) => out.skipped.push(skip),
+            None => {}
+        }
     }
 
     for dependency in &pom.dependencies {
@@ -846,39 +931,20 @@ fn resolve(pom: &RawPom) -> PomDependencies {
         // -- version ------------------------------------------------------
         let declared_version = present(&dependency.version)
             .or_else(|| managed_entry.and_then(|entry| present(&entry.version)));
-        let Some(declared_version) = declared_version else {
-            out.skipped.push(PomSkip {
-                coordinate: sanitize(&coordinate),
-                reason: PomSkipReason::VersionFromParentOrBom,
-            });
-            continue;
+        let version = match resolve_declared_version(declared_version, &interpolator) {
+            Ok(version) => version,
+            Err(reason) => {
+                out.skipped.push(PomSkip {
+                    coordinate: sanitize(&coordinate),
+                    reason,
+                });
+                continue;
+            }
         };
-        let Some(version) = interpolator.interpolate(declared_version) else {
-            out.skipped.push(PomSkip {
-                coordinate: sanitize(&coordinate),
-                reason: PomSkipReason::UnresolvedProperty,
-            });
-            continue;
-        };
-        let version = version.trim();
-        if version.is_empty() {
-            out.skipped.push(PomSkip {
-                coordinate: sanitize(&coordinate),
-                reason: PomSkipReason::VersionFromParentOrBom,
-            });
-            continue;
-        }
-        if is_version_range(version) {
-            out.skipped.push(PomSkip {
-                coordinate: sanitize(&coordinate),
-                reason: PomSkipReason::UnsupportedRange,
-            });
-            continue;
-        }
 
         out.specs.push(DependencySpec {
             name: coordinate,
-            range: version.to_string(),
+            range: version,
         });
     }
     out
@@ -960,6 +1026,131 @@ fn resolve_parent(
         name: coordinate,
         range: version.to_string(),
     }))
+}
+
+/// Resolve one `<dependencyManagement>` entry into the BOM-import edge it
+/// names, when it names one.
+///
+/// `None` for an entry that is not an import — the overwhelming majority
+/// of `<dependencyManagement>` entries, which are version-table rows for
+/// the `<dependencies>` block and never edges of their own. Nothing is
+/// counted for them: a version-table row is not an edge this reader
+/// declined, and warming every coordinate a BOM manages is a different
+/// question than the one `extract_dependency_specs` answers.
+/// `Some(Err(skip))` when it is an import whose version these bytes
+/// cannot reach, `Some(Ok(spec))` otherwise.
+///
+/// **Why an import is an edge at all.** `<type>pom</type>` plus
+/// `<scope>import</scope>` is not a dependency declaration. Maven
+/// requires the type to be `pom` precisely because the entry's whole
+/// effect is to supply versions, so the imported document is a
+/// precondition of resolving this POM's `<dependencies>` rather than
+/// something the project depends on. That puts it with the `<parent>`
+/// (see [`resolve_parent`]): the [`EMITTED_SCOPES`] filter must not see
+/// either, and neither is exempt from the cascade's descendant budget or
+/// depth bound.
+///
+/// **Both halves are required, and an unreadable half is not an import.**
+/// Maven honours the import only when the type is `pom` — the default
+/// type is `jar`, so a real import always spells it out — and an entry
+/// whose `<scope>` or `<type>` is a `${...}` placeholder this POM's own
+/// properties cannot resolve is left as an ordinary managed row rather
+/// than counted as a skipped edge. Counting it would claim a coverage gap
+/// for what is most likely a version-table row, which is the opposite of
+/// what [`PomSkipReason`] is for.
+fn resolve_bom_import(
+    entry: &RawDependency,
+    managed: &HashMap<String, &RawDependency>,
+    interpolator: &Interpolator,
+) -> Option<Result<DependencySpec, PomSkip>> {
+    // An entry with no `<scope>` carries Maven's `compile` default, which
+    // is never `import`.
+    let scope = interpolator.interpolate(present(&entry.scope)?)?;
+    if scope.trim() != IMPORT_SCOPE {
+        return None;
+    }
+    let declared_type = interpolator.interpolate(present(&entry.r#type)?)?;
+    if declared_type.trim() != IMPORT_TYPE {
+        return None;
+    }
+
+    // From here the entry IS an import edge, so every way its coordinate
+    // or version can fail to resolve is counted — the same reasons, in the
+    // same order, as a `<dependencies>` entry's.
+    let declared_group = present(&entry.group_id);
+    let declared_artifact = present(&entry.artifact_id);
+    let skip =
+        |coordinate: String, reason: PomSkipReason| Some(Err(PomSkip { coordinate, reason }));
+    let (Some(group), Some(artifact)) = (declared_group, declared_artifact) else {
+        return skip(
+            raw_label(declared_group, declared_artifact),
+            PomSkipReason::IncompleteCoordinate,
+        );
+    };
+    let (Some(group), Some(artifact)) = (
+        interpolator.interpolate(group),
+        interpolator.interpolate(artifact),
+    ) else {
+        return skip(
+            raw_label(declared_group, declared_artifact),
+            PomSkipReason::UnresolvedProperty,
+        );
+    };
+    let coordinate = format!("{group}:{artifact}");
+
+    // An import is itself a row of the table it is looked up in, keyed on
+    // `groupId:artifactId` with the first entry winning — so this is the
+    // import's own `<version>` in the ordinary case, and the first row for
+    // the coordinate when the POM declares more than one. Never a version
+    // from outside these bytes, which is the whole point of consulting the
+    // local table rather than deferring.
+    let managed_entry = managed.get(&coordinate).copied();
+    let declared_version =
+        present(&entry.version).or_else(|| managed_entry.and_then(|row| present(&row.version)));
+    match resolve_declared_version(declared_version, interpolator) {
+        Ok(version) => Some(Ok(DependencySpec {
+            name: coordinate,
+            range: version,
+        })),
+        Err(reason) => skip(sanitize(&coordinate), reason),
+    }
+}
+
+/// Turn an edge's declared `<version>` into a concrete one, or name the
+/// reason these bytes cannot reach it.
+///
+/// `declared` is the version the edge carries, already falling back to the
+/// local `<dependencyManagement>` table where the caller has one. Shared
+/// by the `<dependencies>` loop and the BOM import, which resolve a
+/// version by identical rules; the `<parent>` does not use it, because a
+/// `<parent>` part that interpolates to nothing is structurally
+/// incomplete rather than deferred — no managed entry can complete a
+/// `<parent>` later.
+fn resolve_declared_version(
+    declared: Option<&str>,
+    interpolator: &Interpolator,
+) -> Result<String, PomSkipReason> {
+    // No version here and none in this POM's own `<dependencyManagement>`:
+    // it lives in a parent POM or an imported BOM, and neither is
+    // reachable from one artifact's bytes.
+    let Some(declared) = declared else {
+        return Err(PomSkipReason::VersionFromParentOrBom);
+    };
+    let Some(version) = interpolator.interpolate(declared) else {
+        return Err(PomSkipReason::UnresolvedProperty);
+    };
+    let version = version.trim();
+    // A placeholder that resolved to the empty string says exactly as
+    // little as an absent element does.
+    if version.is_empty() {
+        return Err(PomSkipReason::VersionFromParentOrBom);
+    }
+    // ADR 0053 D2: a range needs the upstream version set this reader does
+    // not have, so it is skipped and counted, never guessed at.
+    if is_version_range(version) {
+        return Err(PomSkipReason::UnsupportedRange);
+    }
+    Ok(version.to_string())
 }
 
 /// Best-effort label for an edge whose coordinate did not resolve — the
@@ -1668,6 +1859,349 @@ mod tests {
         assert_eq!(reasons(&result), [PomSkipReason::VersionFromParentOrBom]);
     }
 
+    // -- the BOM import is an edge -------------------------------------------
+
+    /// A POM declaring a `<dependencyManagement>` block with `entries` in
+    /// it, plus whatever `body` adds outside the block.
+    fn pom_with_managed(entries: &str, body: &str) -> String {
+        pom_with(&format!(
+            "<dependencyManagement><dependencies>{entries}</dependencies>\
+             </dependencyManagement>{body}"
+        ))
+    }
+
+    /// One `<dependencyManagement>` entry in the BOM-import shape Maven
+    /// accepts: `type=pom`, `scope=import`.
+    fn import_entry(group: &str, artifact: &str, version: &str) -> String {
+        format!(
+            "<dependency><groupId>{group}</groupId><artifactId>{artifact}</artifactId>
+               <version>{version}</version><type>pom</type><scope>import</scope></dependency>"
+        )
+    }
+
+    #[test]
+    fn a_bom_import_is_emitted_as_a_spec() {
+        let result = parse(&pom_with_managed(
+            &import_entry("org.junit", "junit-bom", "5.14.4"),
+            "",
+        ));
+        assert_eq!(result.specs, [spec("org.junit:junit-bom", "5.14.4")]);
+        assert!(result.skipped.is_empty());
+    }
+
+    /// The two-level shape a consumer POM produces: the parent edge and
+    /// the import edge are both followed, in that order and ahead of the
+    /// dependency list, while a managed entry that is NOT an import stays
+    /// a version-table row and is not emitted.
+    #[test]
+    fn the_import_edge_follows_the_parent_and_precedes_the_dependencies() {
+        let result = parse(&format!(
+            r#"<project>
+                 <parent><groupId>org.springframework.boot</groupId>
+                   <artifactId>spring-boot-starter-parent</artifactId>
+                   <version>3.3.5</version></parent>
+                 <artifactId>app</artifactId>
+                 <dependencyManagement><dependencies>
+                   {import_entry}
+                   <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>
+                     <version>2.0.9</version></dependency>
+                 </dependencies></dependencyManagement>
+                 <dependencies>
+                   <dependency><groupId>com.example</groupId><artifactId>lib</artifactId>
+                     <version>1.0</version></dependency>
+                 </dependencies>
+               </project>"#,
+            import_entry = import_entry(
+                "org.springframework.boot",
+                "spring-boot-dependencies",
+                "3.3.5"
+            ),
+        ));
+        assert_eq!(
+            result.specs,
+            [
+                spec(
+                    "org.springframework.boot:spring-boot-starter-parent",
+                    "3.3.5"
+                ),
+                spec("org.springframework.boot:spring-boot-dependencies", "3.3.5"),
+                spec("com.example:lib", "1.0"),
+            ]
+        );
+        assert!(result.skipped.is_empty());
+    }
+
+    /// The budget the cascade spends is the length of this vector, and the
+    /// import edge is one of its elements — so a consumer truncating to
+    /// its descendant budget drops the import exactly as it drops any
+    /// other edge. Ordering within the bound is all the parent and the
+    /// import get; neither is exempt from it.
+    #[test]
+    fn the_import_edge_spends_a_row_of_the_descendant_budget() {
+        let result = parse(&pom_with_parent(
+            "<groupId>g</groupId><artifactId>parent</artifactId><version>1.0</version>",
+            &format!(
+                "<dependencyManagement><dependencies>{}</dependencies></dependencyManagement>
+                 <dependencies>
+                   <dependency><groupId>g</groupId><artifactId>one</artifactId>
+                     <version>1.0</version></dependency>
+                   <dependency><groupId>g</groupId><artifactId>two</artifactId>
+                     <version>1.0</version></dependency>
+                 </dependencies>",
+                import_entry("g", "bom", "2.0"),
+            ),
+        ));
+        assert_eq!(
+            result.specs.len(),
+            4,
+            "the import edge is a row like any other"
+        );
+        let mut budgeted = result.specs.clone();
+        budgeted.truncate(2);
+        assert_eq!(
+            budgeted,
+            [spec("g:parent", "1.0"), spec("g:bom", "2.0")],
+            "a two-row budget keeps the resolution inputs and drops the dependency list",
+        );
+    }
+
+    #[test]
+    fn a_managed_entry_that_is_not_an_import_is_not_emitted() {
+        // A pure BOM: every coordinate it manages is a version-table row,
+        // so it emits nothing and counts nothing. Warming those
+        // coordinates is a different question than this reader answers.
+        let result = parse(&pom_with_managed(
+            "<dependency><groupId>g</groupId><artifactId>a</artifactId>
+               <version>1.0</version></dependency>",
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert!(result.skipped.is_empty());
+        assert_eq!(result.managed_coordinates, 1);
+    }
+
+    /// Maven honours an import only when the type is `pom`; the default
+    /// type is `jar`, so an entry that omits it is not an import and this
+    /// reader must not emit the coordinate as an edge.
+    #[test]
+    fn an_import_scope_without_type_pom_is_not_an_edge() {
+        let result = parse(&pom_with_managed(
+            "<dependency><groupId>g</groupId><artifactId>bom</artifactId>
+               <version>1.0</version><scope>import</scope></dependency>
+             <dependency><groupId>g</groupId><artifactId>other</artifactId>
+               <version>1.0</version><type>jar</type><scope>import</scope></dependency>",
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn a_type_pom_entry_without_the_import_scope_is_not_an_edge() {
+        // `type=pom` alone is an ordinary managed row for a POM-packaged
+        // dependency, not a BOM import.
+        let result = parse(&pom_with_managed(
+            "<dependency><groupId>g</groupId><artifactId>a</artifactId>
+               <version>1.0</version><type>pom</type></dependency>",
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn an_import_version_from_this_poms_own_properties_resolves() {
+        let result = parse(&pom_with(
+            r#"<properties><bom.version>5.14.4</bom.version></properties>
+               <dependencyManagement><dependencies>
+                 <dependency><groupId>org.junit</groupId><artifactId>junit-bom</artifactId>
+                   <version>${bom.version}</version><type>pom</type>
+                   <scope>import</scope></dependency>
+               </dependencies></dependencyManagement>"#,
+        ));
+        assert_eq!(result.specs, [spec("org.junit:junit-bom", "5.14.4")]);
+    }
+
+    #[test]
+    fn an_import_coordinate_from_this_poms_own_properties_resolves() {
+        let result = parse(&pom_with(
+            r#"<properties><bom.group>org.junit</bom.group></properties>
+               <dependencyManagement><dependencies>
+                 <dependency><groupId>${bom.group}</groupId><artifactId>junit-bom</artifactId>
+                   <version>5.14.4</version><type>pom</type>
+                   <scope>import</scope></dependency>
+               </dependencies></dependencyManagement>"#,
+        ));
+        assert_eq!(result.specs, [spec("org.junit:junit-bom", "5.14.4")]);
+    }
+
+    /// `${project.version}` is the common shape for a BOM imported from
+    /// the same reactor, and it is computable from these bytes.
+    #[test]
+    fn an_import_version_from_a_model_builtin_resolves() {
+        let result = parse(&pom_with_managed(
+            "<dependency><groupId>com.example</groupId><artifactId>bom</artifactId>
+               <version>${project.version}</version><type>pom</type>
+               <scope>import</scope></dependency>",
+            "",
+        ));
+        assert_eq!(result.specs, [spec("com.example:bom", "1.2.3")]);
+    }
+
+    /// Maven lets a parent's `<dependencyManagement>` version an import.
+    /// That is beyond these bytes, so the edge is skipped and counted —
+    /// the same reason an inherited dependency version gets.
+    #[test]
+    fn an_import_with_no_version_is_a_counted_skip() {
+        let result = parse(&pom_with_managed(
+            "<dependency><groupId>g</groupId><artifactId>bom</artifactId>
+               <type>pom</type><scope>import</scope></dependency>",
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::VersionFromParentOrBom]);
+        assert_eq!(result.skipped[0].coordinate, "g:bom");
+    }
+
+    #[test]
+    fn an_unresolvable_import_version_property_is_a_counted_skip() {
+        let result = parse(&pom_with_managed(
+            r#"<dependency><groupId>g</groupId><artifactId>bom</artifactId>
+                 <version>${from.parent}</version><type>pom</type>
+                 <scope>import</scope></dependency>"#,
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::UnresolvedProperty]);
+    }
+
+    #[test]
+    fn an_import_version_range_is_a_counted_skip() {
+        let result = parse(&pom_with_managed(
+            "<dependency><groupId>g</groupId><artifactId>bom</artifactId>
+               <version>[1.0,2.0)</version><type>pom</type>
+               <scope>import</scope></dependency>",
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::UnsupportedRange]);
+    }
+
+    #[test]
+    fn an_import_missing_a_coordinate_half_is_an_incomplete_coordinate_skip() {
+        let result = parse(&pom_with_managed(
+            "<dependency><artifactId>bom</artifactId>
+               <version>1.0</version><type>pom</type><scope>import</scope></dependency>",
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::IncompleteCoordinate]);
+        assert_eq!(result.skipped[0].coordinate, "?:bom");
+    }
+
+    #[test]
+    fn an_unresolvable_import_coordinate_property_is_a_counted_skip() {
+        let result = parse(&pom_with_managed(
+            r#"<dependency><groupId>${from.parent}</groupId><artifactId>bom</artifactId>
+                 <version>1.0</version><type>pom</type><scope>import</scope></dependency>"#,
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::UnresolvedProperty]);
+    }
+
+    /// An entry whose import-ness is itself unreadable is left as an
+    /// ordinary managed row: counting it would claim a coverage gap for
+    /// what is most likely a version-table entry.
+    #[test]
+    fn an_entry_whose_scope_or_type_does_not_resolve_is_not_classified_as_an_import() {
+        let result = parse(&pom_with_managed(
+            r#"<dependency><groupId>g</groupId><artifactId>a</artifactId>
+                 <version>1.0</version><type>pom</type>
+                 <scope>${from.parent}</scope></dependency>
+               <dependency><groupId>g</groupId><artifactId>b</artifactId>
+                 <version>1.0</version><type>${from.parent}</type>
+                 <scope>import</scope></dependency>"#,
+            "",
+        ));
+        assert!(result.specs.is_empty());
+        assert!(result.skipped.is_empty());
+        assert_eq!(result.managed_coordinates, 2);
+    }
+
+    /// The import entry is a row of the very table its version falls back
+    /// to, keyed on `groupId:artifactId` with the first row winning — so a
+    /// second declaration for the same coordinate resolves from the first
+    /// rather than deferring to a parent.
+    #[test]
+    fn a_duplicate_import_resolves_its_version_from_the_first_managed_row() {
+        let result = parse(&pom_with_managed(
+            "<dependency><groupId>g</groupId><artifactId>bom</artifactId>
+               <version>1.0</version></dependency>
+             <dependency><groupId>g</groupId><artifactId>bom</artifactId>
+               <type>pom</type><scope>import</scope></dependency>",
+            "",
+        ));
+        assert_eq!(result.specs, [spec("g:bom", "1.0")]);
+        assert!(result.skipped.is_empty());
+    }
+
+    /// Maven accepts `scope=import` inside `<dependencyManagement>` only,
+    /// so this input shape is one it rejects — pinned anyway, because the
+    /// emission path above must not be reachable from the dependency
+    /// list: there, `import` is a scope outside the warmed class and
+    /// stays a counted `ScopeExcluded` skip.
+    #[test]
+    fn an_import_scope_in_the_dependencies_block_is_not_an_edge() {
+        let result = parse(&pom_with(
+            "<dependencies><dependency><groupId>g</groupId><artifactId>bom</artifactId>
+               <version>1.0</version><type>pom</type>
+               <scope>import</scope></dependency></dependencies>",
+        ));
+        assert!(result.specs.is_empty());
+        assert_eq!(reasons(&result), [PomSkipReason::ScopeExcluded]);
+    }
+
+    /// The figure that separates a pure BOM from a leaf artifact. The
+    /// walk's own counters see `0` edges either way; this says the reader
+    /// saw managed coordinates and emitted no edge from them.
+    #[test]
+    fn managed_coordinates_counts_every_declared_entry() {
+        let mut entries = String::new();
+        for n in 0..18 {
+            entries.push_str(&format!(
+                "<dependency><groupId>g</groupId><artifactId>a{n}</artifactId>
+                   <version>1.0</version></dependency>"
+            ));
+        }
+        let result = parse(&pom_with_managed(&entries, ""));
+        assert_eq!(result.managed_coordinates, 18);
+        assert!(result.specs.is_empty());
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn managed_coordinates_counts_entries_that_did_not_resolve() {
+        // Declared is the figure, not indexed: an entry this reader could
+        // not place in the version table was still a coordinate the POM
+        // named.
+        let result = parse(&pom_with_managed(
+            "<dependency><artifactId>a</artifactId><version>1.0</version></dependency>",
+            "",
+        ));
+        assert_eq!(result.managed_coordinates, 1);
+    }
+
+    #[test]
+    fn a_pom_with_no_dependency_management_counts_no_managed_coordinates() {
+        let result = parse(&pom_with(
+            "<dependencies><dependency><groupId>g</groupId><artifactId>a</artifactId>
+               <version>1.0</version></dependency></dependencies>",
+        ));
+        assert_eq!(result.managed_coordinates, 0);
+        assert_eq!(result.specs, [spec("g:a", "1.0")]);
+    }
+
     // -- scope filter --------------------------------------------------------
 
     #[test]
@@ -1684,7 +2218,7 @@ mod tests {
     #[test]
     fn non_emitted_scopes_are_excluded_and_counted() {
         let mut body = String::from("<dependencies>");
-        for scope in ["test", "provided", "system", "import"] {
+        for scope in ["test", "provided", "system"] {
             body.push_str(&format!(
                 "<dependency><groupId>g</groupId><artifactId>{scope}</artifactId>
                  <version>1.0</version><scope>{scope}</scope></dependency>"
@@ -1696,7 +2230,7 @@ mod tests {
         );
         let result = parse(&pom_with(&body));
         assert_eq!(result.specs, [spec("g:kept", "1.0")]);
-        assert_eq!(result.skip_count(PomSkipReason::ScopeExcluded), 4);
+        assert_eq!(result.skip_count(PomSkipReason::ScopeExcluded), 3);
         assert!(reasons(&result)
             .iter()
             .all(|r| *r == PomSkipReason::ScopeExcluded));
@@ -2034,8 +2568,10 @@ mod tests {
     #[test]
     fn dependency_management_alone_declares_nothing() {
         // A BOM POM: everything lives in `<dependencyManagement>` and the
-        // POM declares no `<dependencies>` of its own. Nothing to warm,
-        // and nothing skipped — there is no declaration to have missed.
+        // POM declares no `<dependencies>` of its own. A managed entry
+        // that is not a BOM import is a version-table row, so there is
+        // nothing to warm and nothing skipped — no declaration to have
+        // missed. What the POM saw is carried by `managed_coordinates`.
         let result = parse(&pom_with(
             "<packaging>pom</packaging>
              <dependencyManagement><dependencies>

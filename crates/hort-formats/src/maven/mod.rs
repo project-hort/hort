@@ -741,13 +741,16 @@ impl VersionDiscovery for MavenFormatHandler {
     }
 
     /// Extract the edges a stored POM declares: its `<parent>`
-    /// coordinate, then its compile- and runtime-scope `<dependencies>`.
+    /// coordinate, then the BOM imports in its `<dependencyManagement>`,
+    /// then its compile- and runtime-scope `<dependencies>`.
     ///
-    /// The parent leads the returned order. A consumer cannot read this
-    /// POM's dependency list at all until it has the parent, so a caller
-    /// that truncates in this order keeps the edge the rest depends on;
-    /// the parent is otherwise an ordinary edge and spends the cascade's
-    /// descendant budget and depth bound like any other.
+    /// The two resolution inputs lead the returned order. A consumer
+    /// cannot read this POM's dependency list at all until it has the
+    /// parent, nor resolve the versions that list is written against
+    /// until it has the imported BOMs, so a caller that truncates in this
+    /// order keeps the edges the rest depends on; both are otherwise
+    /// ordinary edges and spend the cascade's descendant budget and depth
+    /// bound like any other.
     ///
     /// **Input is the POM's own bytes** — unlike npm/cargo/pypi, Maven's
     /// declared dependencies are not inside an archive: the `.pom` IS the
@@ -762,6 +765,17 @@ impl VersionDiscovery for MavenFormatHandler {
     /// cascade genuinely warmed from one whose versions all live in a
     /// parent.
     ///
+    /// One case the per-reason diagnosis cannot report, and the reason
+    /// for the `info!` below: a POM that yields no edge at all while
+    /// declaring `<dependencyManagement>` entries. A managed entry that
+    /// is not a BOM import is a version-table row rather than an edge
+    /// this reader declined, so there is nothing to count and the
+    /// diagnosis is silent — leaving a pure BOM indistinguishable from a
+    /// leaf artifact in the cascade's own `deps_extracted=0`. The figure
+    /// that separates them is how many managed coordinates the POM
+    /// declared, and it is reported at a level an operator reads rather
+    /// than at `debug`.
+    ///
     /// **`Err` versus `Ok`.** `Err` means the bytes are not a POM (not
     /// XML, wrong root element, over the size cap). A well-formed POM
     /// always yields `Ok`, however little of it resolved — a POM whose
@@ -775,6 +789,17 @@ impl VersionDiscovery for MavenFormatHandler {
         content: &mut dyn Read,
     ) -> DomainResult<Vec<DependencySpec>> {
         let extraction = pom::parse_pom_dependencies(content)?;
+        if extraction.specs.is_empty() && extraction.managed_coordinates > 0 {
+            tracing::info!(
+                managed_coordinates = extraction.managed_coordinates,
+                "maven.pom: no edge extracted, but this POM declares managed \
+                 coordinates — a <dependencyManagement> entry supplies versions \
+                 to the dependency list rather than being an edge of its own, \
+                 unless it is a BOM import (type=pom, scope=import), the one \
+                 kind this reader follows. The cascade's deps_extracted=0 for \
+                 this artifact is therefore not a leaf",
+            );
+        }
         for (reason, count) in extraction.skip_counts() {
             if count > 0 {
                 tracing::debug!(
@@ -2258,6 +2283,66 @@ mod tests {
                 range: "3.2.0".to_string(),
             }]
         );
+    }
+
+    /// The two-level cascade a Spring Boot pull produces: the consumer POM
+    /// warms its parent and the BOM its `<dependencyManagement>` imports,
+    /// and the version-table row beside that import stays a row.
+    #[test]
+    fn extract_dependency_specs_follows_the_parent_and_the_bom_import() {
+        let body = br#"<project>
+            <parent><groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-starter-parent</artifactId>
+              <version>3.3.5</version></parent>
+            <artifactId>demo</artifactId>
+            <dependencyManagement><dependencies>
+              <dependency><groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>3.3.5</version><type>pom</type><scope>import</scope></dependency>
+              <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>
+                <version>2.0.9</version></dependency>
+            </dependencies></dependencyManagement>
+        </project>"#;
+        let specs = discovery()
+            .extract_dependency_specs(&mut Cursor::new(&body[..]))
+            .expect("a BOM-importing POM is valid input");
+        assert_eq!(
+            specs,
+            [
+                DependencySpec {
+                    name: "org.springframework.boot:spring-boot-starter-parent".to_string(),
+                    range: "3.3.5".to_string(),
+                },
+                DependencySpec {
+                    name: "org.springframework.boot:spring-boot-dependencies".to_string(),
+                    range: "3.3.5".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// A pure BOM with no imports of its own: `Ok` with no edge, which is
+    /// what the cascade's `deps_extracted=0` reports for a leaf too. The
+    /// `info!` this exercises is what tells the two apart, carrying the
+    /// managed-coordinate count the POM declared.
+    #[test]
+    fn extract_dependency_specs_is_ok_and_empty_for_a_pure_bom() {
+        let body = br#"<project>
+            <groupId>org.junit</groupId><artifactId>junit-bom</artifactId>
+            <version>5.14.4</version><packaging>pom</packaging>
+            <dependencyManagement><dependencies>
+              <dependency><groupId>org.junit.jupiter</groupId>
+                <artifactId>junit-jupiter-api</artifactId>
+                <version>5.14.4</version></dependency>
+              <dependency><groupId>org.junit.platform</groupId>
+                <artifactId>junit-platform-launcher</artifactId>
+                <version>1.14.4</version></dependency>
+            </dependencies></dependencyManagement>
+        </project>"#;
+        let specs = discovery()
+            .extract_dependency_specs(&mut Cursor::new(&body[..]))
+            .expect("a pure BOM is valid input");
+        assert!(specs.is_empty());
     }
 
     #[test]
