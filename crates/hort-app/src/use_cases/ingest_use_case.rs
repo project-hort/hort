@@ -615,7 +615,13 @@ enum InnerIngestError {
 /// `ingest_inner`'s error shape: the classified error, the repository key
 /// once resolved (`None` before that), and the `IngestResult` metric label
 /// for the arms that need one.
-type IngestInnerError = (InnerIngestError, Option<String>, Option<IngestResult>);
+///
+/// Boxed because the unboxed tuple is 152 bytes — `InnerIngestError`
+/// carries an `AppError` plus the two rendered checksums — and it is the
+/// `Err` arm of a dozen helpers that `?`-propagate up the ingest path, so
+/// every successful return would move those bytes too. The allocation
+/// lands only on the error path (`clippy::result_large_err`).
+type IngestInnerError = Box<(InnerIngestError, Option<String>, Option<IngestResult>)>;
 
 /// `ingest_inner`'s success shape: `(artifact, was_duplicate, repo_key,
 /// ingested_event_id)` — see [`IngestUseCase::ingest_inner`] docstring.
@@ -1340,7 +1346,8 @@ impl IngestUseCase {
                 false,
             )
             .await
-            .map_err(|(err, repo_key, preclassified)| {
+            .map_err(|boxed| {
+                let (err, repo_key, preclassified) = *boxed;
                 (err.into_app_error(), repo_key, preclassified)
             });
 
@@ -2317,7 +2324,8 @@ impl IngestUseCase {
                     claimed_edges_written,
                 })
             }
-            Err((inner_err, repo_key, preclassified)) => {
+            Err(boxed) => {
+                let (inner_err, repo_key, preclassified) = *boxed;
                 // Verification mismatch emission. A substring
                 // discriminator (`msg.contains("computed=")` against
                 // the inner `Conflict` message) is deliberately avoided
@@ -2561,14 +2569,14 @@ impl IngestUseCase {
             .map_err(|e| (InnerIngestError::Other(AppError::Domain(e)), None, None))?;
 
         if coords.format != repo.format {
-            return Err((
+            return Err(Box::new((
                 InnerIngestError::Other(AppError::Domain(DomainError::Validation(format!(
                     "format mismatch: repository {} is {}, coords declare {}",
                     repo.key, repo.format, coords.format
                 )))),
                 Some(repo.key.clone()),
                 None,
-            ));
+            )));
         }
 
         Ok(repo)
@@ -2683,14 +2691,14 @@ impl IngestUseCase {
                 );
                 return Ok(ControlFlow::Break(early_ok));
             }
-            return Err((
+            return Err(Box::new((
                 InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
                     "path {} already exists with different content (existing={}, declared={})",
                     coords.path, existing.sha256_checksum, declared
                 )))),
                 Some(repo_key.to_string()),
                 None,
-            ));
+            )));
         }
 
         Ok(ControlFlow::Continue(existing))
@@ -2742,14 +2750,14 @@ impl IngestUseCase {
                 tracing::debug!(artifact_id = %artifact_id, "deduplicated");
                 return Ok(ControlFlow::Break(early_ok));
             }
-            return Err((
+            return Err(Box::new((
                 InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
                     "path {} already exists with different content (existing={}, new={})",
                     coords_path, existing.sha256_checksum, put_result.hash
                 )))),
                 Some(repo_key.to_string()),
                 None,
-            ));
+            )));
         }
 
         Ok(ControlFlow::Continue(put_result))
@@ -2800,7 +2808,7 @@ impl IngestUseCase {
         let source = AppError::Domain(DomainError::Conflict(format!(
             "declared sha256 does not match computed hash (declared={declared}, computed={put_hash})",
         )));
-        Err((
+        Err(Box::new((
             InnerIngestError::VerificationMismatch {
                 algorithm: HashAlgorithm::Sha256,
                 upstream_value: declared.to_string(),
@@ -2809,7 +2817,7 @@ impl IngestUseCase {
             },
             Some(repo_key.to_string()),
             Some(IngestResult::DeclaredHashMismatch),
-        ))
+        )))
     }
 
     /// Step 5b: SHA-512 verification arm. Reached only for the npm SRI
@@ -2844,7 +2852,7 @@ impl IngestUseCase {
             "upstream sha512 does not match computed hash \
              (upstream={upstream_value}, computed={computed})"
         )));
-        Err((
+        Err(Box::new((
             InnerIngestError::VerificationMismatch {
                 algorithm: HashAlgorithm::Sha512,
                 upstream_value: upstream_value.clone(),
@@ -2853,7 +2861,7 @@ impl IngestUseCase {
             },
             Some(repo_key.to_string()),
             Some(IngestResult::DeclaredHashMismatch),
-        ))
+        )))
     }
 
     /// Step 5c: SHA-1 transfer-verification *floor* arm (ADR 0033 — the
@@ -2890,7 +2898,7 @@ impl IngestUseCase {
             "upstream sha1 does not match computed hash \
              (upstream={upstream_value}, computed={computed})"
         )));
-        Err((
+        Err(Box::new((
             InnerIngestError::VerificationMismatch {
                 algorithm: HashAlgorithm::Sha1,
                 upstream_value: upstream_value.clone(),
@@ -2899,7 +2907,7 @@ impl IngestUseCase {
             },
             Some(repo_key.to_string()),
             Some(IngestResult::DeclaredHashMismatch),
-        ))
+        )))
     }
 
     /// Resolve the deferred metadata decision into the `(inline
@@ -3513,11 +3521,11 @@ impl IngestUseCase {
                         {
                             Ok(put_result) => put_result.hash,
                             Err(e) => {
-                                return Err((
+                                return Err(Box::new((
                                     InnerIngestError::Other(AppError::Storage(e.to_string())),
                                     Some(repo_key.to_string()),
                                     None,
-                                ));
+                                )));
                             }
                         };
                         // The link back to the parent wheel. Handed to the
@@ -3558,11 +3566,11 @@ impl IngestUseCase {
                         .increment(1);
                         Ok(None)
                     }
-                    Err(e) => Err((
+                    Err(e) => Err(Box::new((
                         InnerIngestError::Other(AppError::Domain(e)),
                         Some(repo_key.to_string()),
                         None,
-                    )),
+                    ))),
                 }
             }
             Err(e) => {
@@ -3570,11 +3578,11 @@ impl IngestUseCase {
                 // wheel-metadata extraction pipeline could not run, and
                 // nothing has been committed, so the ingest fails whole
                 // and the client retries.
-                Err((
+                Err(Box::new((
                     InnerIngestError::Other(AppError::Domain(e)),
                     Some(repo_key.to_string()),
                     None,
-                ))
+                )))
             }
         }
     }

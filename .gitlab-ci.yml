@@ -111,12 +111,15 @@ workflow:
 # change a heavy job's output?" test): `.github/**` (GitHub-only CI; no
 # GitLab job reads it), `.agents/**` (auto-agents config), `.env.example`,
 # `.gitguardian.yaml`, `.mergify.yml`, `renovate.json`, `install/**` (the CLI
-# installer served at hort.rs — not built/tested by the Rust pipeline),
-# `.trivyignore`
-# (grep-confirmed not referenced by any GitLab job — it is the suppression
-# list for the Trivy publish gate in `.github/workflows/docker-publish.yml`,
-# a GitHub Actions workflow triggered on `v*` tags independently of this
-# GitLab-only path list, so it is correctly inert to every GitLab job).
+# installer served at hort.rs — not built/tested by the Rust pipeline).
+#
+# `.trivyignore` USED to be on that skip-safe list, on the ground that no
+# GitLab job read it. That stopped being true when the image CVE gates landed
+# (`security:base-image-scan` and the pre-push scan inside `build-images:*`,
+# both via `scripts/ci/trivy-image-gate.sh`): trivy reads the file from the
+# repository root, so an edit to it now changes what those gates suppress,
+# which is a heavy job's output by this list's own test. It is code-side
+# below.
 .code-changed-paths: &code-changed-paths
   - "crates/**/*"
   - "Cargo.toml"
@@ -155,6 +158,10 @@ workflow:
   - "about/**/*"
   - "THIRD-PARTY-LICENSES.md"
   - "THIRD-PARTY-LICENSES.json"
+  # The accepted-CVE list the image CVE gates honour (one list, shared with
+  # the ghcr publish gate). An edit to it changes a gate verdict, so it must
+  # re-run the gate that reads it.
+  - ".trivyignore"
 
 # Shared rule template for jobs with no other rules: `!reference`'d as
 # `<<: [*other-anchor, *rules-code-changed]` (YAML merge; GitLab supports
@@ -1582,6 +1589,108 @@ security:cargo-deny:
   script:
     - cargo deny --workspace check
 
+# CVE gate on the base images hort PINS, as opposed to the images it builds
+# (those are gated inside `build-images:*`, before their first push).
+#
+# The reference set is NOT restated here. `scripts/ci/base-image-refs.sh` is
+# the single enumeration of the digest-pinned `FROM` lines across
+# `docker/Dockerfile.hort-server`, `docker/Dockerfile.worker` and
+# `deploy/compose/Dockerfile`, and `base-images:preflight` already consumes it
+# for the availability precondition. A second list is a list that drifts: it
+# goes stale the moment a Dockerfile gains a stage, and the stale half is the
+# one nobody is scanning. That script also REFUSES a Dockerfile elsewhere in
+# the tree that pins a digest without being in its release set, so a new
+# pinned base cannot quietly escape this gate either.
+#
+# `*rules-code-changed`, deliberately NOT the tag/main/release scoping
+# `base-images:preflight` carries: a gate's value is failing in the run that
+# introduces the problem, and a pin bump arrives on a branch long before it
+# reaches a tag. The two `security:` jobs above use the same trigger for the
+# same reason — an advisory lands against an unchanged pin, so the run that
+# has to notice is the next one, not the next release.
+#
+# The buildah image + the `platform` tag + the CA-and-credential before_script
+# are what let the pull resolve the way the BUILD resolves it: the runner's
+# registries.conf short-name aliases, prefix rewrites and digest-eligible
+# mirrors, authenticated with the credential `buildah login` holds. Trivy
+# cannot read any of that, so the bytes reach it through the local container
+# store (see scripts/ci/trivy-image-gate.sh's header).
+#
+# The pull uses the runner's SHARED store, deliberately — not the throwaway
+# `--root` store `base-images:warm` builds. That job needs every object to
+# cross the network, because warming the proxy IS its result; this one needs
+# the bytes, and a digest-pinned reference served from the local store is
+# byte-identical to the same reference served from the registry. The set is
+# the same three images the builds pull anyway, so it does not grow the store.
+#
+# A CVE FINDING HERE IS A WARNING, and a scan that did not run is still a hard
+# failure. The two leave the gate under different exit codes for exactly this
+# reason (see scripts/ci/trivy-image-gate.sh's "Exit codes"):
+#
+#   exit 2  CRITICAL — a fixable CRITICAL in a base image this pipeline only
+#           pins. It is cleared by an upstream rebuild, which no change in this
+#           repository can produce, so a blocking verdict here would hold every
+#           branch for work nobody here can do. Allowed below: the job goes
+#           yellow, the finding is in its log, and the pipeline continues.
+#   exit 1  INDETERMINATE — a refused pull, a database that would not download,
+#           a scanner that errored. Nothing was scanned. That is this pipeline
+#           breaking, not an upstream CVE, and it is NOT allowed: a scan that
+#           silently stops running is the one state the three-valued verdict
+#           exists to prevent.
+#
+# `exit_codes:` rather than `allow_failure: true`, which cannot tell the two
+# apart and would downgrade both. The pipeline already reads exit 2 as its
+# warning code (`quality:no-plans-on-default-branch`); exit 1 keeps meaning
+# "act on this", as it does in every other job here.
+#
+# The images this pipeline BUILDS are a different question and keep the
+# blocking gate: see `build-images:hort-server` / `:hort-worker`, which carry
+# no `allow_failure` at all.
+security:base-image-scan:
+  stage: security
+  image: quay.io/buildah/stable:v1.43
+  tags:
+    - platform
+  needs: []
+  <<: *rules-code-changed
+  allow_failure:
+    exit_codes:
+      - 2
+  before_script:
+    # CA first, as in `.docker`: the login and the pulls below are TLS calls
+    # to an internal-PKI registry once PLATFORM_CA_PATH is set.
+    - *platform-ca-rhel
+    - *resolve-registry-creds
+    - |
+      # Unlike `.docker` this job also runs on MR and develop pipelines, so a
+      # missing credential must not hard-fail before the gate has said
+      # anything. Warn and continue: an unauthenticated pull that is refused
+      # reports INDETERMINATE per reference, which is a scan that did not run
+      # and is not the same thing as a clean image.
+      if [ -n "${REGISTRY:-}" ] && [ -n "${REGISTRY_USER:-}" ]; then
+        buildah login --username "${REGISTRY_USER}" --password "${REGISTRY_PASSWORD}" "${REGISTRY}"
+      else
+        echo "::warning::no registry credential resolved (REGISTRY='${REGISTRY:-}'); the pulls below are unauthenticated — a mirror that requires a credential will refuse them and each reference reports INDETERMINATE, never clean"
+      fi
+  script:
+    - |
+      set -euo pipefail
+      # Until the gate itself runs, every failure here is this job breaking
+      # rather than a CVE verdict — and it must not borrow the one exit code
+      # this job is allowed to fail with. `set -e` leaves under the failing
+      # tool's own status, and both sed and grep answer 2 on an unreadable
+      # file, so the trap pins everything below to 1. It is lifted immediately
+      # before the gate call, whose exit code IS the verdict.
+      trap 'exit 1' ERR
+      refs="$(bash scripts/ci/base-image-refs.sh)"
+      echo "pinned base-image references under this gate:"
+      printf '%s\n' "${refs}" | sed 's/^/  /'
+      trap - ERR
+      # Word-splitting is intended: base-image-refs.sh emits one reference per
+      # line and a container reference cannot contain whitespace.
+      # shellcheck disable=SC2086
+      bash scripts/ci/trivy-image-gate.sh --pull ${refs}
+
 # ===========================================================================
 # Stage 3: quality — SonarQube/SonarCloud gate
 # ===========================================================================
@@ -1776,6 +1885,21 @@ quality:base-image-preflight-test:
     - apk add --no-cache bash grep findutils coreutils sed
   script:
     - bash scripts/run-shell-guards.sh scripts/test-base-image-preflight.sh
+
+# The image CVE gate is wired where it has to be wired: every job that runs
+# `buildah bud` calls scripts/ci/trivy-image-gate.sh BEFORE its first
+# `buildah push`, and the pinned-base scan reads the one reference
+# enumeration on code-changing pushes rather than only on a release. Derived
+# corpus, no allow-list, with a mutation check — see the script's header.
+quality:image-scan-gate-guard:
+  stage: quality
+  image: alpine:3.24
+  needs: []
+  <<: *rules-code-changed
+  before_script:
+    - apk add --no-cache bash grep findutils coreutils sed
+  script:
+    - bash scripts/run-shell-guards.sh scripts/test-image-scan-gate.sh
 
 # Keep the shell-guard runner's inventory and result semantics under test.
 quality:shell-guard-runner-test:
@@ -2027,6 +2151,17 @@ build-images:hort-server:
         -f docker/Dockerfile.hort-server \
         .
 
+      # CVE gate on the image this job just built, BEFORE the first push: a
+      # fixable CRITICAL must not reach the registry at all, let alone get a
+      # cosign signature over it. The built image is in the runner's local
+      # container store here and nowhere else, which is the only point in the
+      # pipeline where refusing it costs nothing to undo.
+      #
+      # Same policy as the ghcr publish gate in
+      # `.github/workflows/docker-publish.yml` (severity CRITICAL, fixable
+      # only), so the two gates cannot disagree about the same image.
+      bash "${CI_PROJECT_DIR}/scripts/ci/trivy-image-gate.sh" "${IMAGE}:${VERSION_TAG}"
+
       buildah push --digestfile /tmp/digest "${IMAGE}:${VERSION_TAG}"
       DIGEST=$(cat /tmp/digest)
 
@@ -2109,6 +2244,10 @@ build-images:hort-worker:
         ${BUILDAH_TAGS} \
         -f docker/Dockerfile.worker \
         .
+
+      # Pre-push CVE gate — see build-images:hort-server for why it sits
+      # here rather than after the push.
+      bash "${CI_PROJECT_DIR}/scripts/ci/trivy-image-gate.sh" "${IMAGE}:${VERSION_TAG}"
 
       buildah push --digestfile /tmp/digest "${IMAGE}:${VERSION_TAG}"
       DIGEST=$(cat /tmp/digest)

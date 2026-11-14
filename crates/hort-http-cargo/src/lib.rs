@@ -711,7 +711,7 @@ async fn publish(
                 return Ok(identity_refusal(&divergence.message("cargo .crate")));
             }
         }
-        Err(refusal) => return Ok(refusal),
+        Err(refusal) => return Ok(*refusal),
     }
 
     // Project the publish body onto the sparse-index entry document
@@ -817,7 +817,7 @@ async fn publish(
 /// failed to read is not one that agreed.
 async fn read_declared_crate_identity(
     crate_bytes: Bytes,
-) -> Result<hort_formats::cargo::CrateIdentity, Response> {
+) -> Result<hort_formats::cargo::CrateIdentity, Box<Response>> {
     let compressed_size = crate_bytes.len() as u64;
     let joined = tokio::task::spawn_blocking(move || {
         let mut reader = std::io::Cursor::new(crate_bytes);
@@ -837,7 +837,7 @@ async fn read_declared_crate_identity(
     // established is not an identity that agreed — cargo's `.crate` format
     // requires a top-level `{name}-{version}/Cargo.toml`, so its absence or
     // corruption is a malformed publish, not a fact to wave through.
-    joined.map_err(|domain_err| identity_refusal(&domain_err.to_string()))
+    joined.map_err(|domain_err| Box::new(identity_refusal(&domain_err.to_string())))
 }
 
 /// The cargo-shaped refusal for a publish whose archive disagrees with its

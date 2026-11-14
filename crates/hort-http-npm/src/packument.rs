@@ -792,7 +792,6 @@ mod tests {
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::repository::{IndexMode, RepositoryFormat, RepositoryType};
     use hort_domain::ports::ephemeral_store::EphemeralStore;
-    use hort_domain::ports::metadata_mirror_store::MetadataMirrorStore as _;
     use hort_domain::ports::repository_upstream_mapping_repository::{
         RepositoryUpstreamMapping, UpstreamAuth,
     };
