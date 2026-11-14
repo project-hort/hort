@@ -257,6 +257,16 @@ pub(crate) struct LayoutStats {
 /// guarantee of this function rather than of the caller's RAII, because
 /// it is the property the whole path turns on: the RAII cleanup covers
 /// the production workspace, and this covers the statement.
+///
+/// **`Ok` is therefore the claim that the layout is whole**, and a
+/// release decision rests on it: the adapter reads an empty
+/// `trivy image` report as a completed "no package surface" fact about
+/// the image, which is only available because the scanner cannot have
+/// been handed fewer constituents than the manifest declared. A change
+/// here that let a partial layout out as `Ok` would turn that reading
+/// into a clean verdict over a subset — the hazard named above, now with
+/// the release gate behind it. The refusal tests below are the pins; the
+/// adapter's own three are beside the arm that depends on them.
 pub(crate) async fn write_image_layout(
     storage: &Arc<dyn StoragePort>,
     image: &ComposedImage,

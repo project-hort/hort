@@ -47,8 +47,11 @@
 //!   result is a completed "not applicable" fact about those bytes rather
 //!   than a hold — the layer's package surface belongs to the composition
 //!   it is part of (ADR 0064, amending ADR 0007). An empty report from an
-//!   `image`-mode invocation is neither: the composition *is* the thing
-//!   that was supposed to be assessed, so it fails closed.
+//!   `image`-mode invocation is the same completed fact, and it needs no
+//!   completeness check of its own: the only layout that invocation can
+//!   be reached with is one [`oci_layout::write_image_layout`] wrote
+//!   whole, so there is no unread surface for the empty report to be
+//!   about and the analyzers agreeing is a fact about the image.
 //! - **A failure** — the binary is missing, the child timed out, the
 //!   report blew its cap. `Err`, and retryable.
 //!
@@ -595,45 +598,79 @@ impl ScannerPort for TrivyAdapter {
             //    Collapsing the two is the defect this distinction
             //    exists to remove: the first has no verdict to give.
             if report.results.is_empty() {
-                // The two facts that make either branch's log actionable:
+                // The two facts that make every branch's log actionable:
                 // what the scanner said on its way to saying nothing, and
                 // what the tree it was pointed at actually contained.
-                // Without them the two outcomes below are indistinguishable
-                // from a materialisation this adapter got wrong.
+                // Without them the outcomes below are indistinguishable
+                // from a materialisation this adapter got wrong — which
+                // is why the listing survives at `debug!` on the arms
+                // whose outcome is not a hold.
                 //
                 // Both are computed *before* the macros: a `.await` inside
-                // `warn!`/`info!` would hold the event's `Arguments` across
-                // it and make the whole future non-`Send`.
+                // `warn!`/`info!`/`debug!` would hold the event's
+                // `Arguments` across it and make the whole future
+                // non-`Send`.
                 let materialised = ws.listing().await;
+                // And `kind` beside them, for the same reason one level down:
+                // inside a macro body the call is skipped whenever that level
+                // is disabled, so the six sites below would each compute it
+                // only when someone is listening.
+                let kind = target.kind.as_str();
                 match mode {
-                    // A composition that reports nothing has no excuse to
-                    // offer. The `rootfs` rule below exists because a
-                    // *layer's* package surface belongs to the
-                    // composition it is part of — but a composition IS
-                    // that thing, assembled from every constituent the
-                    // manifest declared and verified on the way in, so
-                    // "no package surface by construction" is not
-                    // available to it. Either the image genuinely holds
-                    // no package surface anywhere (which for a runnable
-                    // filesystem is remarkable rather than routine) or
-                    // the scanner did not read what hort assembled; the
-                    // two are indistinguishable from here, and only one
-                    // of them is safe to release on. So it fails closed,
-                    // and the materialised listing stays at `warn!`
-                    // because it is the evidence that tells them apart.
+                    // A composition that reports nothing is the
+                    // analyzers agreeing the composed filesystem carries
+                    // no package surface — a completed fact about the
+                    // image, with the reasoning the `rootfs` arm below
+                    // states. A from-scratch image is the population:
+                    // `registry.k8s.io/pause:3.10` is three blobs and
+                    // Trivy answers `Results: null` over it with an
+                    // empty stderr and exit 0.
+                    //
+                    // **The two readings this arm used to call
+                    // indistinguishable are not.** The second of them —
+                    // "the scanner did not read what hort assembled" —
+                    // cannot reach this line, and that is a structural
+                    // property of the materialisation rather than a
+                    // judgement about images: [`oci_layout`]'s
+                    // `write_image_layout` returns `Ok` only once every
+                    // constituent the manifest declared (the manifest,
+                    // the config and each layer) was read from CAS
+                    // through the verified read path and written into
+                    // the layout. Every failure is a `LayoutRefusal` the
+                    // materialiser splits in two, and neither half
+                    // arrives here: a transient one becomes an `Err`
+                    // the orchestrator reschedules under the scan job's
+                    // attempt budget, and a deterministic one becomes
+                    // `NotAnalysable::IncompleteComposition`, which
+                    // gates unconditionally and is a different outcome
+                    // with a different name. So this arm's only
+                    // reachable input is a layout that was written
+                    // whole, which is why — unlike the `rootfs` arm,
+                    // whose tree *can* be returned partial — there is
+                    // no completeness condition to check here.
+                    //
+                    // The listing stays available for an operator who
+                    // doubts the fact, at `debug!` because the outcome
+                    // is no longer a hold; the fact itself is one
+                    // `info!`.
                     ScanMode::Image => {
-                        tracing::warn!(
+                        tracing::debug!(
                             scanner = "trivy",
-                            kind = target.kind.as_str(),
+                            kind,
+                            materialised,
+                            "trivy adapter: composed image layout listing"
+                        );
+                        tracing::info!(
+                            scanner = "trivy",
+                            kind,
                             format = target.format,
                             subcommand = mode.subcommand(),
                             stderr_tail = stderr_tail(&stderr),
-                            materialised,
-                            "trivy adapter: composed image carries no analysed target; \
-                             no composite verdict"
+                            "trivy adapter: composed image assembled whole and carries no \
+                             package surface — nothing to assess"
                         );
                         return Ok(ScanAnalysis::NothingAnalysable(
-                            NotAnalysable::NoAnalyzerMatched,
+                            NotAnalysable::NotApplicable,
                         ));
                     }
                     // `rootfs` runs every OS-package, language and binary
@@ -666,13 +703,13 @@ impl ScannerPort for TrivyAdapter {
                     ScanMode::Rootfs if ws.skipped_links() == 0 => {
                         tracing::debug!(
                             scanner = "trivy",
-                            kind = target.kind.as_str(),
+                            kind,
                             materialised,
                             "trivy adapter: root filesystem listing"
                         );
                         tracing::info!(
                             scanner = "trivy",
-                            kind = target.kind.as_str(),
+                            kind,
                             format = target.format,
                             subcommand = mode.subcommand(),
                             stderr_tail = stderr_tail(&stderr),
@@ -686,7 +723,7 @@ impl ScannerPort for TrivyAdapter {
                     ScanMode::Rootfs => {
                         tracing::warn!(
                             scanner = "trivy",
-                            kind = target.kind.as_str(),
+                            kind,
                             format = target.format,
                             subcommand = mode.subcommand(),
                             stderr_tail = stderr_tail(&stderr),
@@ -707,7 +744,7 @@ impl ScannerPort for TrivyAdapter {
                     ScanMode::Fs => {
                         tracing::warn!(
                             scanner = "trivy",
-                            kind = target.kind.as_str(),
+                            kind,
                             format = target.format,
                             subcommand = mode.subcommand(),
                             stderr_tail = stderr_tail(&stderr),
@@ -821,6 +858,20 @@ mod tests {
         NotFound,
         /// Panic — asserts a code path must not read storage at all.
         Forbidden,
+        /// Yield the bytes for every hash **but one**, whose read fails
+        /// as an absence; and the same with a **backend** failure. The
+        /// two must not reach the same outcome, because only one of them
+        /// can be different on a later attempt.
+        ///
+        /// One withheld constituent rather than a storage that fails
+        /// every read, and that is what makes these pins pins: a
+        /// composition none of whose constituents is readable cannot
+        /// tell "a partial layout was refused" from "there was nothing
+        /// to assemble at all", so a change that let a partial layout
+        /// out as assembled would leave such a test passing.
+        AllButAbsent(Vec<u8>, Ch),
+        /// See [`Get::AllButAbsent`].
+        AllButBroken(Vec<u8>, Ch),
     }
 
     struct StubStorage(Get);
@@ -838,22 +889,44 @@ mod tests {
         fn put(&self, _s: Box<dyn AsyncRead + Send + Unpin>) -> Bf<'_, DomainResult<PutResult>> {
             Box::pin(async { unreachable!("tests never write") })
         }
-        fn get(&self, _h: &Ch) -> Bf<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
-            let bytes = match &self.0 {
-                Get::Bytes(b) => Some(b.clone()),
-                Get::NotFound => None,
+        fn get(&self, h: &Ch) -> Bf<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
+            enum Served {
+                Bytes(Vec<u8>),
+                Absent,
+                Broken,
+            }
+            let served = match &self.0 {
+                Get::Bytes(b) => Served::Bytes(b.clone()),
+                Get::NotFound => Served::Absent,
                 Get::Forbidden => panic!("this code path must not read storage"),
+                Get::AllButAbsent(b, withheld) => {
+                    if h == withheld {
+                        Served::Absent
+                    } else {
+                        Served::Bytes(b.clone())
+                    }
+                }
+                Get::AllButBroken(b, withheld) => {
+                    if h == withheld {
+                        Served::Broken
+                    } else {
+                        Served::Bytes(b.clone())
+                    }
+                }
             };
             Box::pin(async move {
-                match bytes {
-                    Some(b) => {
+                match served {
+                    Served::Bytes(b) => {
                         let r: Box<dyn AsyncRead + Send + Unpin> = Box::new(Cursor::new(b));
                         Ok(r)
                     }
-                    None => Err(DomainError::NotFound {
+                    Served::Absent => Err(DomainError::NotFound {
                         entity: "content",
                         id: "x".into(),
                     }),
+                    Served::Broken => Err(DomainError::Invariant(
+                        "object store returned 503".to_string(),
+                    )),
                 }
             })
         }
@@ -917,16 +990,27 @@ mod tests {
         }
     }
 
+    /// A synthetic 64-hex digest — the shape every constituent of
+    /// [`composed_image`] takes, so a test can name one of them (the
+    /// one a storage stub withholds).
+    fn digest(seed: char) -> Ch {
+        std::iter::repeat_n(seed, 64)
+            .collect::<String>()
+            .parse()
+            .expect("synthetic sha256")
+    }
+
+    /// [`composed_image`]'s **last** layer — the constituent the
+    /// composition-refusal pins withhold, so what is refused is a layout
+    /// that was already most of the way written.
+    fn last_layer_of_composed_image() -> Ch {
+        digest('2')
+    }
+
     /// A two-layer composition. Only constructible through
     /// `ComposedImage::new` from an `ImageLayout`, which is what makes a
     /// malformed composite unrepresentable here as in production.
     fn composed_image() -> ComposedImage {
-        let digest = |seed: char| -> Ch {
-            std::iter::repeat_n(seed, 64)
-                .collect::<String>()
-                .parse()
-                .expect("synthetic sha256")
-        };
         ComposedImage::new(
             digest('a'),
             hort_domain::oci::ImageLayout {
@@ -1576,15 +1660,24 @@ mod tests {
         }
     }
 
-    /// The composite's own answer to the same question, and the one it
-    /// must NOT give: `NotApplicable`. The `rootfs` rule above exists
-    /// because a layer's package surface belongs to the composition — a
-    /// composition has no such excuse, since it *is* the thing that was
-    /// supposed to be assessed. So an empty report over an assembled
-    /// image fails closed.
+    /// The composite's own answer to the same question: an assembled
+    /// composition whose report names no analysed target is the
+    /// analyzers agreeing the composed filesystem carries no package
+    /// surface — a completed fact about the image, which does not hold
+    /// it. A from-scratch image is the population:
+    /// `registry.k8s.io/pause:3.10` is three blobs and the pinned Trivy
+    /// answers `Results: null` over it, exit 0, empty stderr.
+    ///
+    /// **What makes that reading available here and not on the `fs` arm
+    /// is an upstream guarantee, so it is asserted beside the two
+    /// outcomes that are its complement** (the next two tests): a
+    /// composed-image layout is returned whole or not at all, so "the
+    /// scanner did not read what hort assembled" cannot reach this line.
+    /// Were a partial layout ever returnable as assembled, those two
+    /// would be the tests that notice.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_report_with_no_results_in_image_mode_is_a_hold_not_not_applicable() {
+    async fn a_report_with_no_results_in_image_mode_is_a_completed_not_applicable_fact() {
         if !std::path::Path::new("/bin/sh").exists() {
             return;
         }
@@ -1595,33 +1688,42 @@ mod tests {
                 scan_against_fake_trivy_target(report, &composite_target(&coords, &image))
                     .await
                     .expect("the child exited 0, so the scan itself succeeded");
+            let why = NotAnalysable::NotApplicable;
             assert_eq!(
                 analysis,
-                ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched),
-                "report {report} over a composed image must hold, not release"
+                ScanAnalysis::NothingAnalysable(why),
+                "report {report} over an assembled composition is a completed fact about the \
+                 image, not an unassessed surface"
             );
-            assert_ne!(
-                analysis,
-                ScanAnalysis::NothingAnalysable(NotAnalysable::NotApplicable),
-                "a composition that reports nothing is not an absent surface"
+            assert!(
+                !why.gates_release(hort_domain::types::ArtifactKind::OciManifest),
+                "an image with no package surface anywhere has nothing for a hold to wait on"
             );
         }
     }
 
-    /// A composition whose constituents are not all in storage never
-    /// reaches the CLI, and the outcome is the one no assembled
-    /// composition can produce. The bogus binary path is the proof that
-    /// no invocation happened: reaching it would surface as a "not found"
+    /// **Pin 1 of the guarantee the arm above rests on.** A composition
+    /// whose constituents are not all in storage never reaches the CLI,
+    /// and the outcome is the one no assembled composition can produce —
+    /// which still gates. The bogus binary path is the proof that no
+    /// invocation happened: reaching it would surface as a "not found"
     /// `Invariant`.
+    ///
+    /// This is the assertion that fails if a partial layout ever becomes
+    /// returnable as an assembled one: the absent constituent would then
+    /// reach the `image`-mode arm, and the arm above would release it.
     #[tokio::test]
-    async fn an_unassemblable_composition_abstains_without_invoking_the_cli() {
+    async fn an_absent_constituent_is_an_incomplete_composition_that_still_gates() {
         let c = TrivyConfig {
             trivy_bin: PathBuf::from("/no/such/trivy/binary/exists/here"),
             ..TrivyConfig::default()
         };
         let adapter = TrivyAdapter::new(
             c,
-            Arc::new(StubStorage(Get::NotFound)) as Arc<dyn StoragePort>,
+            Arc::new(StubStorage(Get::AllButAbsent(
+                b"constituent bytes".to_vec(),
+                last_layer_of_composed_image(),
+            ))) as Arc<dyn StoragePort>,
         );
         let coords = oci_manifest_coords();
         let image = composed_image();
@@ -1629,11 +1731,60 @@ mod tests {
             .scan(&composite_target(&coords, &image), None)
             .await
             .expect("an unassemblable composition is an abstention, not a backend failure");
+        // Named once and asserted twice — which outcome the adapter
+        // produced, and what that outcome costs the manifest. A
+        // destructure would need an arm no input can reach.
+        let why = NotAnalysable::IncompleteComposition;
         assert_eq!(
             analysis,
-            ScanAnalysis::NothingAnalysable(NotAnalysable::IncompleteComposition),
+            ScanAnalysis::NothingAnalysable(why),
             "\"I could not build the image\" must not arrive looking like \
              \"I built it and it reported nothing\""
+        );
+        assert!(
+            why.gates_release(hort_domain::types::ArtifactKind::OciManifest),
+            "an image that was never assembled is an image whose filesystem went \
+             unassessed, and it is held for it"
+        );
+        assert_ne!(
+            why,
+            NotAnalysable::NotApplicable,
+            "the value the assembled-and-empty arm produces must be unreachable from an \
+             incomplete composition"
+        );
+    }
+
+    /// **Pin 2 of the same guarantee.** The same shape of refusal with a
+    /// **failed** read instead of an absence is an `Err` — the path the
+    /// orchestrator already reschedules under the scan job's attempt
+    /// budget — and emphatically not an abstention. Folding it into one
+    /// would turn a storage hiccup into a statement about the image, and
+    /// a partial layout returnable as assembled would turn it into a
+    /// release.
+    #[tokio::test]
+    async fn a_transient_constituent_read_failure_is_an_error_not_an_abstention() {
+        let c = TrivyConfig {
+            trivy_bin: PathBuf::from("/no/such/trivy/binary/exists/here"),
+            ..TrivyConfig::default()
+        };
+        let adapter = TrivyAdapter::new(
+            c,
+            Arc::new(StubStorage(Get::AllButBroken(
+                b"constituent bytes".to_vec(),
+                last_layer_of_composed_image(),
+            ))) as Arc<dyn StoragePort>,
+        );
+        let coords = oci_manifest_coords();
+        let image = composed_image();
+        let rendered = adapter
+            .scan(&composite_target(&coords, &image), None)
+            .await
+            .expect_err("a transient refusal must not arrive as a no-verdict")
+            .to_string();
+        assert!(rendered.contains("did not complete"), "{rendered}");
+        assert!(
+            rendered.contains("object store returned 503"),
+            "the backend's own words survive: {rendered}"
         );
     }
 

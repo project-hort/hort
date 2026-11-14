@@ -525,6 +525,62 @@ fn classify_config_refusal(refusal: &ConfigRefusal) -> CompositeResolution {
     }
 }
 
+/// Which absence a manifest inherits from a composition that **was
+/// assembled** and produced no verdict.
+///
+/// Two questions look like one here and only the second is this
+/// function's: *was the composition produced?* and *what did the
+/// backends that read it say?* The first is answered before this is
+/// reached — every unassembled composition lands on
+/// [`NotAnalysable::IncompleteComposition`] or on a retry request — so
+/// the input is always a layout that was written whole, and re-asserting
+/// an absence of analysis over it would put a statement in the record
+/// that the run itself contradicts.
+///
+/// The fold is **fail-closed and read off
+/// [`NotAnalysable::gates_release`]** rather than off a list of variant
+/// names, exactly as the primary orchestrator's own abstention partition
+/// is: one gating abstention among several is enough to hold the
+/// artifact, because the surface it names is still unassessed, and
+/// splitting or adding a reason therefore cannot move an artifact across
+/// the line by accident.
+///
+/// When nothing gates, the absence is **the one the backends named** —
+/// for an assembled composition every backend abstained on with
+/// [`NotAnalysable::NotApplicable`], the analyzers agreed the composed
+/// filesystem carries no package surface, which is a completed fact
+/// about the image rather than an unassessed one. A from-scratch image
+/// is the population: there is no package surface anywhere in it, so no
+/// scanner can ever find a threat level in it and a hold has nothing to
+/// wait on.
+///
+/// An **empty** abstention set is the other thing entirely: the
+/// composition exists and nothing looked at it, which is an expected
+/// surface left unassessed, so it keeps
+/// [`NotAnalysable::NoAnalyzerMatched`] and keeps gating.
+fn assembled_composition_absence(
+    abstentions: &[(String, NotAnalysable)],
+    kind: ArtifactKind,
+) -> NotAnalysable {
+    abstentions
+        .iter()
+        .map(|(_, why)| *why)
+        .find(|why| why.gates_release(kind))
+        .or_else(|| abstentions.first().map(|(_, why)| *why))
+        .unwrap_or(NotAnalysable::NoAnalyzerMatched)
+}
+
+/// `backend=reason` per abstention, comma-joined — the spelling the
+/// primary orchestrator's own no-verdict reason uses, so an operator
+/// reading the two records side by side reads one format.
+fn render_abstentions(abstentions: &[(String, NotAnalysable)]) -> String {
+    abstentions
+        .iter()
+        .map(|(backend, why)| format!("{backend}={}", why.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// What the composite path leaves for the scan job to do.
 ///
 /// Independent of what the composition's answer turns out to be: a retry
@@ -704,11 +760,15 @@ struct ShadowOutcome {
     /// only [`NotAnalysable::IncompleteComposition`] is true of the first
     /// — its own documentation names the three causes, and all three are
     /// false of a complete composition the scanners claimed nothing in.
-    /// `NoAnalyzerMatched` already says that true thing.
     ///
-    /// Both gate, so nothing is mis-decided either way; what the
-    /// distinction fixes is the statement in the record of a manifest the
-    /// release gate is holding.
+    /// The assembled side is therefore not one value but the fold of
+    /// what the backends said ([`assembled_composition_absence`]), and
+    /// **it does not always gate**: an assembled composition every
+    /// backend abstained on as not-applicable is the analyzers agreeing
+    /// the composed filesystem has no package surface, which is a
+    /// completed fact about the image. A re-asserted absence of analysis
+    /// there is not a cautious record of the same decision — it is a hold
+    /// on a correct artifact with nothing for the hold to wait on.
     ///
     /// The two non-refusal arms carry [`NotAnalysable::NotApplicable`],
     /// which is not a dead value: an assessed composition has no
@@ -1008,7 +1068,14 @@ impl CompositeScan<'_> {
         // composite verdict is the fail-open ADR 0007 exists to refuse.
         let mut composite_findings: Vec<Finding> = Vec::new();
         let mut analysed_by: Option<String> = None;
-        let mut abstentions: Vec<String> = Vec::new();
+        // Typed, not pre-rendered: the absence the manifest inherits from
+        // an assembled composition is read off these values
+        // ([`assembled_composition_absence`]), so a vector of strings
+        // would make the run's own answer unreadable to the one place
+        // that has to decide whether it holds the artifact. The label is
+        // kept beside it because the observation row names the backend
+        // that abstained.
+        let mut abstentions: Vec<(String, NotAnalysable)> = Vec::new();
         for backend in self.backends {
             let Some(scanner) = self.scanners.get(backend) else {
                 continue;
@@ -1052,7 +1119,7 @@ impl CompositeScan<'_> {
                         gates_release = why.gates_release(self.kind),
                         "composite scan: no composite verdict from this backend",
                     );
-                    abstentions.push(format!("{backend}={}", why.as_str()));
+                    abstentions.push((backend.clone(), why));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -1115,16 +1182,16 @@ impl CompositeScan<'_> {
                         format!(
                             "the composition was assembled and every backend that ran \
                              abstained: {}",
-                            abstentions.join(",")
+                            render_abstentions(&abstentions)
                         )
                     },
                     // The composition was complete and nothing claimed
                     // anything in it. `IncompleteComposition` would say a
                     // constituent was missing, unreadable or over budget,
-                    // and all three are false; `NoAnalyzerMatched` says
-                    // the true thing, and its own documentation already
-                    // names this exact case for a composed image.
-                    NotAnalysable::NoAnalyzerMatched,
+                    // and all three are false — so the absence comes from
+                    // what the backends actually said, which is not the
+                    // same question as whether the composition was built.
+                    assembled_composition_absence(&abstentions, self.kind),
                 )
             },
         };
@@ -1173,14 +1240,18 @@ impl CompositeScan<'_> {
     ///   Neither is an unassessed image, so neither may be made to gate
     ///   on a composition it does not have.
     /// - **DeterministicRefusal / TransientRefusal** → no verdict, which
-    ///   is the fail-closed absence the run itself
-    ///   named ([`ShadowOutcome::absence`]): the composition is the unit
-    ///   of filesystem assessment (D1), so an image whose filesystem went
-    ///   unassessed is held by ADR 0007 either way, and *which* absence
-    ///   is the difference between a record that says a constituent was
-    ///   missing and one that says the assembled image was never claimed
-    ///   by an analyzer. The two refusal arms differ in whether another
-    ///   attempt is worth making — which is the
+    ///   is the absence the run itself named
+    ///   ([`ShadowOutcome::absence`]): the composition is the unit of
+    ///   filesystem assessment (D1), so an image whose filesystem went
+    ///   unassessed is held by ADR 0007, and *which* absence is the
+    ///   difference between a record that says a constituent was missing,
+    ///   one that says nobody looked at the assembled image, and one that
+    ///   says every analyzer looked and found no package surface — the
+    ///   last of which is a completed fact and does not hold the
+    ///   manifest. Whether it holds is
+    ///   [`NotAnalysable::gates_release`]'s answer about the value, not a
+    ///   second decision here. The two refusal arms differ in whether
+    ///   another attempt is worth making — which is the
     ///   [`CompositeDisposition`]'s question, not this one — and a
     ///   transient refusal reaches here only once the caller has
     ///   declined that request, which it does when the attempt budget is
@@ -4297,6 +4368,133 @@ mod tests {
             )
             .await,
             CompositeVerdict::Absent(NotAnalysable::IncompleteComposition),
+        );
+    }
+
+    /// **An assembled composition every backend found nothing to assess
+    /// in does not hold the manifest.** The backend read the composed
+    /// layout and answered `not_applicable` — the analyzers agreeing the
+    /// composed filesystem carries no package surface, which a
+    /// from-scratch image is the population of — so the absence the
+    /// manifest inherits is that one and the release gate opens on the
+    /// time gate alone.
+    ///
+    /// Re-asserting `no_analyzer_matched` here would be a hold on a
+    /// correct artifact with nothing for the hold to wait on: the
+    /// composition was produced, the scanner read all of it, and the
+    /// answer cannot change on any later attempt — which is exactly the
+    /// permanent, deadline-less hold ADR 0062 exists to prevent.
+    ///
+    /// Asserted as a pair with the gating case below it, because the
+    /// fold is fail-closed and a single assertion cannot show that: one
+    /// gating abstention among several still holds the manifest.
+    #[tokio::test]
+    async fn an_assembled_composition_with_nothing_to_assess_does_not_hold_the_manifest() {
+        let img = TwoLayerImage::new();
+        let storage: Arc<dyn StoragePort> = img.warm_storage();
+        let artifact = manifest_artifact(img.manifest.clone());
+        let (proxy, resolver) = hosted();
+        let not_applicable = RecordingScanner::new(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        );
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
+        let outcome = outcome_of(
+            &storage,
+            &proxy,
+            &resolver,
+            &registry(vec![not_applicable]),
+            &artifact,
+            "oci",
+            ArtifactKind::OciManifest,
+            &["trivy".to_string()],
+            &fixture,
+        )
+        .await;
+        // Named once and asserted twice — which absence the manifest
+        // inherits, and what it costs it. A destructure would need an arm
+        // no input can reach.
+        let why = NotAnalysable::NotApplicable;
+        assert_eq!(
+            outcome.verdict,
+            CompositeVerdict::Absent(why),
+            "the composition was assembled and the analyzers found no package surface in \
+             it; that is a completed fact about the image, not an unassessed one"
+        );
+        assert!(
+            !why.gates_release(ArtifactKind::OciManifest),
+            "a hold here would never lift: the composition exists, every analyzer read it, \
+             and no later attempt can answer differently"
+        );
+        // The observation row still records a deterministic refusal —
+        // the composition produced no verdict, which is true — with the
+        // backend's own abstention named in the reason. What the fold
+        // changes is whether that absence holds the artifact, not what
+        // the run is recorded as having done.
+        let rows = fixture.observations.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].assessment,
+            CompositeAssessment::DeterministicRefusal
+        );
+        assert!(
+            rows[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("trivy=not_applicable")),
+            "{:?}",
+            rows[0].reason
+        );
+    }
+
+    /// The other half of that pair: the fold is **fail-closed**, so one
+    /// gating abstention among several holds the manifest even though a
+    /// sibling found nothing to assess. The surface the gating one names
+    /// is still unassessed, and a majority vote over abstentions would
+    /// release on the strength of the backends that did not look.
+    ///
+    /// Read off `gates_release` rather than a list of variant names, so
+    /// splitting or adding a reason cannot move an artifact across the
+    /// line by accident — the same rule the primary orchestrator's own
+    /// abstention partition follows.
+    #[tokio::test]
+    async fn one_gating_abstention_holds_the_manifest_whatever_its_siblings_said() {
+        let img = TwoLayerImage::new();
+        let storage: Arc<dyn StoragePort> = img.warm_storage();
+        let artifact = manifest_artifact(img.manifest.clone());
+        let (proxy, resolver) = hosted();
+        let not_applicable = RecordingScanner::new(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NotApplicable,
+            )),
+        );
+        let gating = RecordingScanner::new(
+            "grype",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::UnusableArchive,
+            )),
+        );
+        let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
+        let outcome = outcome_of(
+            &storage,
+            &proxy,
+            &resolver,
+            &registry(vec![not_applicable, gating]),
+            &artifact,
+            "oci",
+            ArtifactKind::OciManifest,
+            &["trivy".to_string(), "grype".to_string()],
+            &fixture,
+        )
+        .await;
+        assert_eq!(
+            outcome.verdict,
+            CompositeVerdict::Absent(NotAnalysable::UnusableArchive),
+            "a surface one backend could not assess is still unassessed, whatever a \
+             sibling that found nothing to look at reported"
         );
     }
 
