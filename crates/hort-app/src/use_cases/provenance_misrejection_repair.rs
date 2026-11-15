@@ -133,7 +133,6 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
 use uuid::Uuid;
 
 use hort_domain::entities::artifact::{
@@ -441,7 +440,7 @@ impl ProvenanceMisrejectionRepairUseCase {
             // so this runs against a throwaway clone and the loaded
             // artifact is discarded either way.
             let mut probe = paired.artifact().clone();
-            probe.repair_provenance_misrejection(terminal_record, provenance, Utc::now())?;
+            probe.repair_provenance_misrejection(terminal_record, provenance)?;
             return Ok(true);
         }
 
@@ -456,7 +455,7 @@ impl ProvenanceMisrejectionRepairUseCase {
         let previous_status = paired.artifact().quarantine_status;
         let quarantined = paired
             .artifact_mut()
-            .repair_provenance_misrejection(terminal_record, provenance, Utc::now())
+            .repair_provenance_misrejection(terminal_record, provenance)
             .map_err(AppError::Domain)?;
         let new_status = paired.artifact().quarantine_status;
         let artifact = paired.into_artifact();

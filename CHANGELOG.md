@@ -152,6 +152,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A re-scan that supersedes an absent verdict no longer restarts the
+  observation window, so an artifact that has long outlived its repository's
+  `quarantineDuration` is released instead of being withheld for another full
+  duration on every tick (#443).
 - The rescan sweep no longer re-enqueues a scan for the same artifacts on every
   tick when their scan reaches no verdict — an image whose constituent the
   upstream no longer serves, or an artifact no configured backend can analyse.

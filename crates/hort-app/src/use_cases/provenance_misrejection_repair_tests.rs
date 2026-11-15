@@ -14,7 +14,7 @@
 use super::*;
 use crate::use_cases::STREAM_EVENT_CAP;
 
-use chrono::{DateTime, Duration};
+use chrono::{DateTime, Duration, Utc};
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::scan_policy::{
     NegligibleAction, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
