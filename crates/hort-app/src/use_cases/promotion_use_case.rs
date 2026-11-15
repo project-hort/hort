@@ -744,6 +744,7 @@ mod tests {
             finding_count,
             severity_summary: summary,
             findings_blob,
+            findings_blob_retained: None,
             assessment: ScanAssessment::Analysed,
         });
         events.set_stream(
@@ -1198,6 +1199,7 @@ mod tests {
                             .parse::<ContentHash>()
                             .expect("static valid SHA-256 hex"),
                     ),
+                    findings_blob_retained: None,
                     assessment: ScanAssessment::Analysed,
                 }),
             )],

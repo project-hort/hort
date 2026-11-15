@@ -1741,13 +1741,16 @@ impl PolicyUseCase {
     /// evidence it violates).
     ///
     /// **"No stored findings" means there are none, not that this process
-    /// could not read them.** A `findings_blob` the CAS cannot hand back
-    /// leaves the artifact's recorded severity counts as the only evidence
-    /// about it, and those are evaluated
-    /// ([`evaluate_scan_summary`]) rather than replaced with an empty
-    /// list: an empty list is clean, clean is a no-op, and the artifact
-    /// would stay released against a threshold its own scan breached.
-    /// [`scan_history::FindingsEvidence`] is what keeps the two apart.
+    /// could not read them, and not that it read fewer than there are.**
+    /// A `findings_blob` the CAS cannot hand back — or one holding only
+    /// the most severe of a set too large to store whole — leaves the
+    /// artifact's recorded severity counts as the only evidence about
+    /// it, and those are evaluated ([`evaluate_scan_summary`]) rather
+    /// than replaced with an empty list: an empty list is clean, clean is
+    /// a no-op, and the artifact would stay released against a threshold
+    /// its own scan breached.
+    /// [`scan_history::FindingsEvidence`] is what keeps the three
+    /// apart.
     #[allow(clippy::too_many_arguments)]
     async fn re_evaluate_one_active(
         &self,
@@ -1884,6 +1887,26 @@ impl PolicyUseCase {
                     trigger = ?trigger,
                     "re-evaluation (tighten): the stored findings could not be read; \
                      deriving the verdict from the recorded severity counts instead",
+                );
+                evaluate_scan_summary(&summary, Some(policy))
+            }
+            // Findings exist and the blob holds only the most severe of
+            // them, because the complete set does not fit the 8 MiB blob
+            // cap. Epistemically this is the arm above: the CVE-level
+            // question cannot be answered, the recorded aggregate is of
+            // the complete set and a threshold walk is exactly what
+            // counts can feed, so the same definition decides — see
+            // there for why substituting the subset is not an option. A
+            // separate arm only because the cause an operator can act on
+            // is a different one.
+            scan_history::FindingsEvidence::Truncated { summary } => {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    trigger = ?trigger,
+                    "re-evaluation (tighten): the stored findings_blob holds only the most \
+                     severe of this artifact's findings; deriving the verdict from the \
+                     recorded severity counts instead",
                 );
                 evaluate_scan_summary(&summary, Some(policy))
             }
@@ -4287,6 +4310,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: Some(blob_hash),
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
@@ -8412,6 +8436,7 @@ mod tests {
                     finding_count,
                     severity_summary: summary,
                     findings_blob,
+                    findings_blob_retained: None,
                     assessment: ScanAssessment::Analysed,
                 }),
                 correlation_id: Uuid::new_v4(),
@@ -8478,6 +8503,101 @@ mod tests {
             }
             other => panic!("expected ArtifactReEvaluated, got {other:?}"),
         }
+    }
+
+    /// **The fail-open the bounded blob had to be stopped from
+    /// opening.** The loosen direction's whole purpose is to release a
+    /// `Rejected` artifact whose findings an exclusion now clears — and
+    /// it matches exclusions by CVE id against the hydrated per-finding
+    /// list. Over a blob holding only the most severe of a set too large
+    /// to store, "every finding is excluded" is a statement about the
+    /// subset: the findings it dropped name CVEs the operator was never
+    /// asked about, and the artifact would be released on them.
+    ///
+    /// The pairing with
+    /// [`run_pass_loosen_releases_clean_artifact`] above is the whole
+    /// assertion: identical fixture and an exclusion covering every CVE
+    /// in the blob, differing only in whether the blob is the complete
+    /// set. Complete releases; bounded stays `Rejected` on the recorded
+    /// counts, which carry no CVE id for an exclusion to subtract.
+    #[tokio::test]
+    async fn run_pass_loosen_does_not_release_on_a_truncated_blob_every_exclusion_covers() {
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+        projections.insert_exclusion(ExclusionProjection {
+            exclusion_id: Uuid::new_v4(),
+            policy_id,
+            cve_id: "CVE-2024-3094".into(),
+            package_pattern: None,
+            scope: PolicyScope::Global,
+            reason: "the only CVE the bounded blob holds".into(),
+            added_by_actor_id: None,
+            expires_at: None,
+        });
+
+        // The same fixture `run_pass_loosen_releases_clean_artifact`
+        // releases on — one Critical, excluded — except that the scan
+        // records nine Criticals and the blob holds only this one.
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
+        let bounded = ScanCompleted {
+            artifact_id,
+            scanner: "trivy".into(),
+            finding_count: 9,
+            severity_summary: SeveritySummary {
+                critical: 9,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: Some(VALID_SHA256.parse::<ContentHash>().unwrap()),
+            findings_blob_retained: Some(1),
+            assessment: ScanAssessment::Analysed,
+        };
+        bounded
+            .validate()
+            .expect("the fixture must be an event a producer could write");
+        events.seed_stream(
+            StreamId::artifact(artifact_id),
+            vec![
+                PersistedEvent {
+                    event_id: Uuid::new_v4(),
+                    stream_id: StreamId::artifact(artifact_id),
+                    stream_position: 0,
+                    global_position: 0,
+                    event: DomainEvent::ScanCompleted(bounded),
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: api_actor(),
+                    event_version: 1,
+                    stored_at: Utc::now(),
+                },
+                persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+            ],
+        );
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        artifacts.seed_active_for_policy(policy_id, vec![]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert_eq!(
+            lifecycle.committed_transitions().len(),
+            0,
+            "an exclusion covering every finding a bounded blob holds must not release \
+             the artifact",
+        );
+        assert_eq!(
+            artifacts
+                .get(artifact_id)
+                .expect("the artifact is still there")
+                .quarantine_status,
+            QuarantineStatus::Rejected,
+        );
     }
 
     /// Loosen direction driven by `enforcement` alone: a
@@ -8700,6 +8820,184 @@ mod tests {
             }
             other => panic!("expected ArtifactRejected, got {other:?}"),
         }
+    }
+
+    /// Seed an active artifact whose stored `ScanCompleted` records
+    /// `recorded_critical` Critical findings but whose `findings_blob`
+    /// holds only `retained` — the shape a re-evaluation pass meets
+    /// after a finding set too large for the 8 MiB blob cap was bounded
+    /// to its most severe (`ScanCompleted.findings_blob_retained`).
+    ///
+    /// The retained findings are seeded into CAS and are deliberately
+    /// **harmless**: `Low`, which no `High`-threshold policy blocks on.
+    /// So a path that decided over the blob would decide clean, and only
+    /// a path that decided over the recorded counts re-holds. That gap
+    /// is what the tests below measure.
+    fn seed_active_with_truncated_findings(
+        artifacts: &Arc<crate::use_cases::test_support::MockArtifactRepository>,
+        events: &Arc<MockEventStore>,
+        storage: &Arc<crate::use_cases::test_support::MockStoragePort>,
+        repo_id: Uuid,
+        status: QuarantineStatus,
+        recorded_critical: u32,
+        retained: u32,
+    ) -> Uuid {
+        let artifact = active_artifact_for_repo(repo_id, "xz-utils", status);
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+
+        let harmless: Vec<Finding> = (0..retained)
+            .map(|i| sample_finding(&format!("CVE-2024-RETAINED-{i}"), SeverityThreshold::Low))
+            .collect();
+        let bytes = serde_json::to_vec(&harmless).unwrap();
+        let blob_hash: ContentHash = hex::encode(Sha256::digest(&bytes)).parse().unwrap();
+        storage.insert_content(blob_hash.clone(), bytes);
+
+        let scan = ScanCompleted {
+            artifact_id,
+            scanner: "trivy".into(),
+            finding_count: recorded_critical,
+            severity_summary: SeveritySummary {
+                critical: recorded_critical,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: Some(blob_hash),
+            findings_blob_retained: Some(retained),
+            assessment: ScanAssessment::Analysed,
+        };
+        scan.validate()
+            .expect("the fixture must be an event a producer could write");
+        events.seed_stream(
+            StreamId::artifact(artifact_id),
+            vec![PersistedEvent {
+                event_id: Uuid::new_v4(),
+                stream_id: StreamId::artifact(artifact_id),
+                stream_position: 0,
+                global_position: 0,
+                event: DomainEvent::ScanCompleted(scan),
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: api_actor(),
+                event_version: 1,
+                stored_at: Utc::now(),
+            }],
+        );
+        artifact_id
+    }
+
+    /// **A truncated findings blob is not the complete finding set.**
+    /// The artifact's own `ScanCompleted` records nine Criticals; the
+    /// blob behind it holds one harmless `Low`, because the complete set
+    /// did not fit the cap. Deciding over the blob evaluates clean,
+    /// `reject_from_scan_policy_retroactive` turns clean into a no-op,
+    /// and the artifact stays `Released` against a threshold its own
+    /// scan breached. The recorded counts are of the complete set, and
+    /// the tighten walk judges them.
+    #[tokio::test]
+    async fn run_pass_tighten_re_holds_when_the_findings_blob_is_truncated() {
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        let artifact_id = seed_active_with_truncated_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            9,
+            1,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "nine recorded Criticals must not leave the artifact released because the \
+             one finding that fit the blob happens to be harmless"
+        );
+        let (committed_artifact, committed_events, _meta) = &transitions[0];
+        assert_eq!(committed_artifact.id, artifact_id);
+        assert_eq!(
+            committed_artifact.quarantine_status,
+            QuarantineStatus::Rejected
+        );
+        assert_eq!(
+            committed_artifact.rejection_reason,
+            Some(RejectionReason::ScanPolicyRetroactive)
+        );
+        match &committed_events.events[1].event {
+            DomainEvent::ArtifactRejected(r) => {
+                assert_eq!(r.rejected_by, RejectionReason::ScanPolicyRetroactive);
+            }
+            other => panic!("expected ArtifactRejected, got {other:?}"),
+        }
+    }
+
+    /// The exclusion set does not reach the truncated arm either, and
+    /// here it is the **releasing** direction that matters: an exclusion
+    /// naming every CVE the blob happens to hold would clear the subset
+    /// and release an artifact whose dropped findings name CVEs nobody
+    /// was asked about. Both retained CVEs are excluded; the artifact is
+    /// still re-held on the counts.
+    #[tokio::test]
+    async fn run_pass_tighten_truncated_blob_ignores_the_exclusion_set() {
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        for i in 0..2 {
+            projections.insert_exclusion(ExclusionProjection {
+                exclusion_id: Uuid::new_v4(),
+                policy_id,
+                cve_id: format!("CVE-2024-RETAINED-{i}"),
+                package_pattern: None,
+                scope: PolicyScope::Global,
+                reason: "every CVE the bounded blob holds".into(),
+                added_by_actor_id: None,
+                expires_at: None,
+            });
+        }
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        seed_active_with_truncated_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            9,
+            2,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "excluding every CVE a bounded blob happens to hold says nothing about the \
+             findings it dropped"
+        );
+        assert_eq!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Rejected
+        );
     }
 
     /// The exclusion set does not reach the unreadable arm. Same fixture
@@ -8959,6 +9257,7 @@ mod tests {
                             negligible: 0,
                         },
                         findings_blob: Some(blob_hash.clone()),
+                        findings_blob_retained: None,
                         assessment: ScanAssessment::Analysed,
                     }),
                     correlation_id: Uuid::new_v4(),
@@ -9057,6 +9356,7 @@ mod tests {
                         finding_count: 1,
                         severity_summary: summary,
                         findings_blob: Some(blob_hash),
+                        findings_blob_retained: None,
                         assessment: ScanAssessment::Analysed,
                     }),
                     correlation_id: Uuid::new_v4(),

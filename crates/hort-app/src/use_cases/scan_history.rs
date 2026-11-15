@@ -43,7 +43,7 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::ReleaseOrigin;
 use hort_domain::events::{
-    DomainEvent, PersistedEvent, PolicyResult, RejectionReason, ScanCompleted, SeveritySummary,
+    DomainEvent, PersistedEvent, PolicyResult, RejectionReason, SeveritySummary,
 };
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{ContentHash, Finding};
@@ -61,10 +61,22 @@ use hort_domain::types::{ContentHash, Finding};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScanCompletedSnapshot {
     pub summary: SeveritySummary,
+    /// The complete set's size, whatever the blob holds — the scan's own
+    /// `finding_count`. Carried so the degraded arm can say how much of
+    /// the evidence is behind it.
+    pub finding_count: u32,
     pub findings_blob: Option<ContentHash>,
+    /// The scan's own `findings_blob_retained`: `Some(n)` when the blob
+    /// holds only the `n` most severe of `finding_count` findings.
+    ///
+    /// Read through
+    /// [`findings_blob_is_complete`](hort_domain::events::ScanCompleted::findings_blob_is_complete)
+    /// rather than by re-stating what `None` means here.
+    pub findings_blob_retained: Option<u32>,
 }
 
-/// Scan `stream` in reverse and return the most recent [`ScanCompleted`]
+/// Scan `stream` in reverse and return the most recent
+/// [`ScanCompleted`](hort_domain::events::ScanCompleted)
 /// payload as a [`ScanCompletedSnapshot`].
 ///
 /// `None` means the stream carries no `ScanCompleted` (never scanned).
@@ -84,13 +96,11 @@ pub(crate) fn last_scan_completed(stream: &[PersistedEvent]) -> Option<ScanCompl
     // Iterate in reverse — `ScanCompleted` is typically near the end
     // (post-quarantine, pre-rejection on the same stream).
     stream.iter().rev().find_map(|event| match &event.event {
-        DomainEvent::ScanCompleted(ScanCompleted {
-            severity_summary,
-            findings_blob,
-            ..
-        }) => Some(ScanCompletedSnapshot {
-            summary: severity_summary.clone(),
-            findings_blob: findings_blob.clone(),
+        DomainEvent::ScanCompleted(scan) => Some(ScanCompletedSnapshot {
+            summary: scan.severity_summary.clone(),
+            finding_count: scan.finding_count,
+            findings_blob: scan.findings_blob.clone(),
+            findings_blob_retained: scan.findings_blob_retained,
         }),
         _ => None,
     })
@@ -376,8 +386,8 @@ pub(crate) fn latest_scan_standing<'a>(
 /// What the artifact's latest scan can tell a verdict about its
 /// **per-finding** evidence — surfaced by [`last_findings`].
 ///
-/// Three variants rather than an `Option`, because the absence of a
-/// finding list has two meanings a caller must not merge:
+/// Four variants rather than an `Option`, because the absence of a
+/// usable finding list has three meanings a caller must not merge:
 ///
 /// * [`Absent`](Self::Absent) — there are no findings. Either the stream
 ///   carries no `ScanCompleted` at all, or the latest one recorded no
@@ -387,6 +397,10 @@ pub(crate) fn latest_scan_standing<'a>(
 /// * [`Unreadable`](Self::Unreadable) — there ARE findings and this
 ///   process could not read them: the recorded `findings_blob` is absent
 ///   from CAS, could not be streamed, or did not deserialise.
+/// * [`Truncated`](Self::Truncated) — the blob is readable and is not
+///   the whole finding set: the scan found more findings than the 8 MiB
+///   blob cap fits, so what was stored is the most severe of them
+///   (`ScanCompleted::findings_blob_retained`).
 ///
 /// **An unreadable blob is not an empty finding set**, and an `Option`
 /// said it was. Both callers evaluate the artifact against a policy, so
@@ -396,18 +410,32 @@ pub(crate) fn latest_scan_standing<'a>(
 /// that has never been scanned). Neither reading can be right while the
 /// two facts share a representation.
 ///
-/// `Unreadable` carries the aggregate the same `ScanCompleted` recorded,
-/// so the caller has evidence to decide on rather than nothing: the
-/// counts say how many findings sat in each severity tier, which is
-/// exactly what a threshold walk needs
-/// ([`hort_domain::policy::evaluate_scan_summary`]). It rides the variant
-/// because it is only meaningful alongside it — a caller cannot read the
-/// summary of a scan whose blob it could read and get the narrowing
-/// right, and cannot be handed one for a scan that recorded no findings
-/// and tell it apart from zeros.
+/// **A truncated blob is not a complete one**, for the same shape of
+/// reason one step further in. Both callers *re-decide* a verdict from
+/// `Resolved` findings, and the thing they decide that counts cannot —
+/// whether an operator's exclusion list clears every finding — is
+/// exactly what a subset answers wrongly: ten thousand criticals, the
+/// retained prefix all excluded by a newly-added exclusion, and a
+/// dropped critical with a CVE nothing in the blob mentions still
+/// violating. The artifact releases. So a short blob is a separate
+/// state, the compiler reaches every consumer through it, and the
+/// findings themselves do not ride it — a caller that cannot reach them
+/// cannot decide over a subset by accident.
+///
+/// `Unreadable` and `Truncated` both carry the aggregate the same
+/// `ScanCompleted` recorded, so the caller has evidence to decide on
+/// rather than nothing: the counts say how many findings sat in each
+/// severity tier, which is exactly what a threshold walk needs
+/// ([`hort_domain::policy::evaluate_scan_summary`]), and they are of the
+/// **complete** set in both cases. The summary rides the variants
+/// because it is only meaningful alongside them — a caller cannot read
+/// the summary of a scan whose blob it could read whole and get the
+/// narrowing right, and cannot be handed one for a scan that recorded no
+/// findings and tell it apart from zeros.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum FindingsEvidence {
-    /// The latest scan's `findings_blob` resolved and deserialised.
+    /// The latest scan's `findings_blob` resolved and deserialised, and
+    /// holds every finding the scan recorded.
     Resolved(Vec<Finding>),
     /// There are no findings to read — no `ScanCompleted` on the stream,
     /// or a scan that recorded no blob because it found nothing.
@@ -415,6 +443,10 @@ pub(crate) enum FindingsEvidence {
     /// The latest scan recorded findings whose blob this process could
     /// not read. `summary` is that scan's own `severity_summary`.
     Unreadable { summary: SeveritySummary },
+    /// The latest scan recorded more findings than its blob holds, so no
+    /// CVE-level question can be answered from it. `summary` is that
+    /// scan's own `severity_summary`, of the complete set.
+    Truncated { summary: SeveritySummary },
 }
 
 /// Resolve the stream's most recent `ScanCompleted.findings_blob` to the
@@ -423,15 +455,22 @@ pub(crate) enum FindingsEvidence {
 /// [`hort_domain::policy::exclusion::filter_excluded_findings`].
 ///
 /// The return type separates "no findings" from "findings this process
-/// could not read" — see [`FindingsEvidence`] for why a caller cannot be
-/// correct while those share one answer.
+/// could not read" and from "findings whose blob is not all of them" —
+/// see [`FindingsEvidence`] for why a caller cannot be correct while
+/// those share one answer.
 ///
-/// The unreadable modes log a `tracing::warn!` so operators can correlate
-/// a degraded verdict with CAS rot. Degrading rather than erroring is
-/// still the right trade — skipping the artifact entirely leaves it in
-/// whatever state it was in with nothing recorded about why — but the
-/// caller now knows the verdict it is about to compute rests on counts
-/// alone.
+/// The degraded modes log a `tracing::warn!` so operators can correlate
+/// a counts-only verdict with its cause — CAS rot for the unreadable
+/// ones, a finding set past the blob cap for the truncated one.
+/// Degrading rather than erroring is still the right trade — skipping
+/// the artifact entirely leaves it in whatever state it was in with
+/// nothing recorded about why — but the caller now knows the verdict it
+/// is about to compute rests on counts alone.
+///
+/// A truncated blob is answered **without fetching it**: the decision is
+/// a property of the record (`findings_blob_retained`), not of the read,
+/// so the fetch could only produce findings no caller may decide over —
+/// up to 8 MiB of them, on every artifact of a re-evaluation pass.
 pub(crate) async fn last_findings(
     stream: &[PersistedEvent],
     storage: &Arc<dyn StoragePort>,
@@ -446,6 +485,19 @@ pub(crate) async fn last_findings(
     let unreadable = || FindingsEvidence::Unreadable {
         summary: snapshot.summary.clone(),
     };
+    if let Some(retained) = snapshot.findings_blob_retained {
+        tracing::warn!(
+            artifact_id = %artifact_id,
+            findings_blob = %blob_hash,
+            retained,
+            finding_count = snapshot.finding_count,
+            "findings_blob holds only the most severe of this scan's findings; the verdict \
+             falls back to the recorded severity counts",
+        );
+        return FindingsEvidence::Truncated {
+            summary: snapshot.summary.clone(),
+        };
+    }
 
     let mut reader = match storage.get(&blob_hash).await {
         Ok(r) => r,
@@ -617,6 +669,7 @@ mod tests {
                 } else {
                     None
                 },
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
         )
@@ -1049,6 +1102,7 @@ mod tests {
                     finding_count: 1,
                     severity_summary: findings_in_tier(1, SeverityThreshold::Critical),
                     findings_blob: Some(placeholder_findings_blob()),
+                    findings_blob_retained: None,
                     assessment: ScanAssessment::Analysed,
                 }),
             ),
@@ -1075,6 +1129,7 @@ mod tests {
                 finding_count: 3,
                 severity_summary: findings_in_tier(3, SeverityThreshold::Critical),
                 findings_blob: Some(blob.clone()),
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
         )];
@@ -1099,6 +1154,7 @@ mod tests {
                     finding_count: 1,
                     severity_summary: findings_in_tier(1, SeverityThreshold::Critical),
                     findings_blob: Some(placeholder_findings_blob()),
+                    findings_blob_retained: None,
                     assessment: ScanAssessment::Analysed,
                 }),
             ),
@@ -1120,6 +1176,7 @@ mod tests {
                     finding_count: 5,
                     severity_summary: findings_in_tier(5, SeverityThreshold::Critical),
                     findings_blob: Some(placeholder_findings_blob()),
+                    findings_blob_retained: None,
                     assessment: ScanAssessment::Analysed,
                 }),
             ),
@@ -1145,6 +1202,7 @@ mod tests {
                     finding_count: 7,
                     severity_summary: findings_in_tier(7, SeverityThreshold::Critical),
                     findings_blob: Some(placeholder_findings_blob()),
+                    findings_blob_retained: None,
                     assessment: ScanAssessment::Analysed,
                 }),
             ),
@@ -1196,6 +1254,7 @@ mod tests {
                 finding_count: 0,
                 severity_summary: no_findings(),
                 findings_blob: None,
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
         )];
@@ -1237,6 +1296,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: Some(blob_hash),
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
         )];
@@ -1250,6 +1310,100 @@ mod tests {
         assert_eq!(hydrated.len(), 2);
         assert_eq!(hydrated[0].vulnerability_id, "CVE-2021-23337");
         assert_eq!(hydrated[1].vulnerability_id, "CVE-OTHER");
+    }
+
+    /// A blob that holds every finding the scan recorded is
+    /// `Resolved` — the snapshot carries the retained marker and the
+    /// absence of one is what "complete" is spelled as, so this is the
+    /// counter-assertion that keeps the arm below from swallowing
+    /// everything.
+    #[tokio::test]
+    async fn last_findings_resolves_when_the_blob_is_complete() {
+        let mock_storage = Arc::new(MockStoragePort::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = StreamId::artifact(artifact_id);
+
+        let findings = vec![finding("CVE-1", SeverityThreshold::Critical)];
+        let bytes = serde_json::to_vec(&findings).unwrap();
+        let blob_hash: ContentHash = hex::encode(Sha256::digest(&bytes)).parse().unwrap();
+        mock_storage.insert_content(blob_hash.clone(), bytes);
+
+        let stream = vec![persisted(
+            &stream_id,
+            0,
+            DomainEvent::ScanCompleted(ScanCompleted {
+                artifact_id,
+                scanner: "osv".into(),
+                finding_count: 1,
+                severity_summary: findings_in_tier(1, SeverityThreshold::Critical),
+                findings_blob: Some(blob_hash),
+                findings_blob_retained: None,
+                assessment: ScanAssessment::Analysed,
+            }),
+        )];
+
+        let storage: Arc<dyn StoragePort> = mock_storage;
+        let evidence = last_findings(&stream, &storage, artifact_id).await;
+        assert!(
+            matches!(&evidence, FindingsEvidence::Resolved(f) if f.len() == 1),
+            "a complete blob is the per-finding evidence; got {evidence:?}",
+        );
+    }
+
+    /// Reason (5): the blob is readable and is **not the whole finding
+    /// set** — the scan found more findings than the 8 MiB cap fits, so
+    /// what was stored is the most severe of them.
+    ///
+    /// `Truncated`, not `Resolved`: both consumers re-decide a verdict
+    /// from `Resolved` findings, and over a subset the CVE-level
+    /// question — "does this operator's exclusion list clear every
+    /// finding?" — is answered wrongly in the releasing direction.
+    ///
+    /// **The blob is not fetched.** The verdict is a property of the
+    /// record, so the bytes could only produce findings no caller may
+    /// decide over: storage here holds the blob, and the unread
+    /// `get_call_count` is what says the arm did not ask for it.
+    #[tokio::test]
+    async fn last_findings_is_truncated_when_the_blob_holds_only_the_most_severe() {
+        let mock_storage = Arc::new(MockStoragePort::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = StreamId::artifact(artifact_id);
+
+        // The blob is present and perfectly readable — it is simply not
+        // all of the findings the scan recorded.
+        let retained = vec![finding("CVE-RETAINED", SeverityThreshold::Critical)];
+        let bytes = serde_json::to_vec(&retained).unwrap();
+        let blob_hash: ContentHash = hex::encode(Sha256::digest(&bytes)).parse().unwrap();
+        mock_storage.insert_content(blob_hash.clone(), bytes);
+
+        let stream = vec![persisted(
+            &stream_id,
+            0,
+            DomainEvent::ScanCompleted(ScanCompleted {
+                artifact_id,
+                scanner: "osv".into(),
+                finding_count: 9,
+                severity_summary: findings_in_tier(9, SeverityThreshold::Critical),
+                findings_blob: Some(blob_hash),
+                findings_blob_retained: Some(1),
+                assessment: ScanAssessment::Analysed,
+            }),
+        )];
+
+        let storage: Arc<dyn StoragePort> = mock_storage.clone();
+        assert_eq!(
+            last_findings(&stream, &storage, artifact_id).await,
+            FindingsEvidence::Truncated {
+                summary: findings_in_tier(9, SeverityThreshold::Critical)
+            },
+            "a blob holding only the most severe findings is not the complete set, and \
+             the counts that ride the variant are of the complete set",
+        );
+        assert_eq!(
+            mock_storage.get_call_count(),
+            0,
+            "the truncation is answered from the record, not from an 8 MiB read",
+        );
     }
 
     /// Reason (3): the `ScanCompleted` references a hash that is NOT in
@@ -1271,6 +1425,7 @@ mod tests {
                 finding_count: 1,
                 severity_summary: findings_in_tier(1, SeverityThreshold::Critical),
                 findings_blob: Some(placeholder_findings_blob()),
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
         )];
@@ -1308,6 +1463,7 @@ mod tests {
                 finding_count: 1,
                 severity_summary: findings_in_tier(1, SeverityThreshold::Critical),
                 findings_blob: Some(blob_hash),
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
         )];
@@ -1347,6 +1503,7 @@ mod tests {
                 finding_count: 1,
                 severity_summary: findings_in_tier(1, SeverityThreshold::Critical),
                 findings_blob: Some(blob_hash),
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
         )];

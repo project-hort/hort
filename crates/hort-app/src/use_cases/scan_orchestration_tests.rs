@@ -949,6 +949,7 @@ fn persisted_scan_completed(
             finding_count,
             severity_summary: severity,
             findings_blob,
+            findings_blob_retained: None,
             assessment: ScanAssessment::Analysed,
         }),
         correlation_id: Uuid::new_v4(),

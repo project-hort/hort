@@ -10813,6 +10813,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                findings_blob_retained: None,
                 assessment: hort_domain::events::ScanAssessment::Analysed,
             }),
         )];

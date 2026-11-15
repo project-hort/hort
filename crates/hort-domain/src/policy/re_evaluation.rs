@@ -145,9 +145,11 @@ pub enum ReEvaluationOutcome {
 /// 2. **Aggregate-summary mode** — when `last_findings` is `None`, the
 ///    `ScanCompleted` aggregate the caller loaded is the verdict input
 ///    **as recorded**, and [`evaluate_scan_summary`] walks it. Reached
-///    when the per-finding blob could not be resolved: a scan that
-///    recorded no blob because it found nothing, a `findings_blob`
-///    absent from CAS, or one that did not deserialise.
+///    when the per-finding blob could not be resolved *whole*: a scan
+///    that recorded no blob because it found nothing, a `findings_blob`
+///    absent from CAS, one that did not deserialise, or one holding only
+///    the most severe of a finding set too large to store whole
+///    (`ScanCompleted::findings_blob_retained`).
 ///
 ///    **The exclusion set does not reach this input, and that is the
 ///    rule rather than an omission.** An exclusion names one CVE; a
@@ -161,6 +163,19 @@ pub enum ReEvaluationOutcome {
 ///    about, so it subtracts nothing. An operator whose exclusion should
 ///    clear this artifact gets that through a rescan, which rebuilds the
 ///    blob and re-enters mode 1.
+///
+///    **A truncated blob is the one cause a rescan does not fix**, and
+///    the consequence is worth stating plainly: the finding set still
+///    will not fit, so the rebuilt blob is short again and this mode is
+///    where the artifact stays. An artifact with that many findings
+///    therefore cannot be released by excluding CVEs — not because the
+///    exclusions are wrong, but because the input an exclusion matches
+///    against is not all there. What moves it is the finding count
+///    coming down (a fix, a patched version, a narrowed SBOM) or a
+///    curator waiver, which is an operator decision taken with the
+///    counts in front of them rather than a verdict derived from
+///    evidence that is missing its tail. That is the conservative
+///    direction and it is the intended one.
 ///
 ///    **This path also cannot narrow the condemning set, and that
 ///    residual is fail-closed.** Per-tier counts carry no per-finding
@@ -178,14 +193,15 @@ pub enum ReEvaluationOutcome {
 ///    and the fail-closed reading of absent evidence is that the finding
 ///    still counts (ADR 0007); the correctable path is the same rescan.
 ///
-///    **An absent blob and an unreadable one are not told apart here,
-///    and need not be.** A `ScanCompleted` that recorded no blob has
-///    `finding_count == 0`, and its own validator requires
-///    `finding_count` to equal the sum of the severity counts — so a
-///    genuine absence arrives as an all-zero summary that walks to
-///    `Clean`, while an unreadable blob arrives with the counts its scan
-///    actually recorded and is judged on them. The summary is what
-///    distinguishes the two cases, so the caller does not have to.
+///    **An absent blob, an unreadable one and a truncated one are not
+///    told apart here, and need not be.** A `ScanCompleted` that
+///    recorded no blob has `finding_count == 0`, and its own validator
+///    requires `finding_count` to equal the sum of the severity counts —
+///    so a genuine absence arrives as an all-zero summary that walks to
+///    `Clean`, while an unreadable or truncated blob arrives with the
+///    counts its scan actually recorded, which are of the complete set
+///    either way, and is judged on them. The summary is what
+///    distinguishes the cases, so the caller does not have to.
 ///
 /// The caller has already loaded the artifact's last `ScanCompleted`
 /// summary (`last_scan_summary`), the resolved active scan policy

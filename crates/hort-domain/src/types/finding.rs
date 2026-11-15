@@ -19,6 +19,8 @@
 //!
 //! See `docs/architecture/explanation/scanning-pipeline.md`.
 
+use std::cmp::Ordering;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -694,13 +696,11 @@ pub fn highest_severity(findings: &[Finding]) -> Option<SeverityThreshold> {
 /// higher severity. Internal helper for [`highest_severity`], the
 /// alias-group winner tie-break in
 /// [`super::alias_group::collapse_alias_groups`], the `merge_findings`
-/// collision policy in `hort-app::scan_orchestration`, and the
-/// most-severe-first order in
-/// [`ArtifactBecameVulnerable::retaining_most_severe`](crate::events::ArtifactBecameVulnerable::retaining_most_severe),
-/// which decides which findings survive a payload the event store
-/// cannot hold whole — the one consumer whose answer is *what gets
-/// written*, which is why it calls this rather than re-typing the
-/// order beside the construction.
+/// collision policy in `hort-app::scan_orchestration`, and
+/// [`most_severe_first`] — the order that decides which findings survive
+/// a payload a store cannot hold whole. That last one is the consumer
+/// whose answer is *what gets written*, which is why it calls this
+/// rather than re-typing the ranking beside either fill.
 pub(crate) fn severity_tier(s: SeverityThreshold) -> u8 {
     match s {
         SeverityThreshold::Critical => 0,
@@ -708,6 +708,133 @@ pub(crate) fn severity_tier(s: SeverityThreshold) -> u8 {
         SeverityThreshold::Medium => 2,
         SeverityThreshold::Low => 3,
     }
+}
+
+/// The total order a retained finding set is a prefix of: severity tier
+/// ascending (`Critical` first), then `cvss_score` descending with
+/// `None` last, then `purl`, then `vulnerability_id`.
+///
+/// **The severity tier is the first key, and nothing may be promoted
+/// above it.** The tier is the only axis a policy decision reads —
+/// [`finding_exceeds_threshold`](crate::policy::threshold::finding_exceeds_threshold)
+/// is a comparison of `Finding::severity` against the configured maximum
+/// allowed threat level and consults no other field — so leading with it
+/// is what makes a short list answer the policy's question the same way
+/// the complete set would: whatever exceeded a threshold before the
+/// truncation still exceeds it after, for every threshold. `cvss_score`
+/// is a *within-tier* preference, chosen because the better-scored
+/// finding is the better record of two equals, and that is the whole of
+/// its authority.
+///
+/// Promote the score above the tier and a CVSS 9.8 `High` sorts ahead of
+/// an unscored `Critical`: the sort is still total, every tie-break
+/// still fires, and a truncation then drops the only `Critical` while
+/// keeping a pile of `High`s — a record of what an artifact is exposed
+/// to that a reader asking "was anything critical?" gets the wrong
+/// answer from. Every existing test still passes under that edit, which
+/// is why the case is pinned on its own and the property stated in
+/// general at both consumers.
+///
+/// The three tie-breaks are what make the retained set a function of the
+/// findings rather than of the order they arrived in: `(purl,
+/// vulnerability_id)` is the identity key
+/// [`compute_added_findings`](crate::policy::scan_delta::compute_added_findings)
+/// keys its output on, so those four keys are a total order over any set
+/// it produces.
+///
+/// **One definition, two consumers.** Both
+/// [`ArtifactBecameVulnerable::retaining_most_severe`](crate::events::ArtifactBecameVulnerable::retaining_most_severe)
+/// (the stored event envelope) and the CAS findings-blob write in
+/// `hort-app`'s `QuarantineUseCase::persist_findings_blob` fill a
+/// bounded payload with the most severe of an unbounded finding set, and
+/// they must agree about which findings those are: the blob is the
+/// evidence a re-evaluation reads back and the event is the audit record
+/// beside it, so two orders would mean the retained evidence and the
+/// retained record disagree about the same scan. The ranking it leads
+/// with ([`severity_tier`]) is crate-private, which is also what keeps
+/// the order from being re-typed above the domain.
+#[must_use]
+pub fn most_severe_first(a: &Finding, b: &Finding) -> Ordering {
+    severity_tier(a.severity)
+        .cmp(&severity_tier(b.severity))
+        .then_with(|| by_descending_score(a.cvss_score, b.cvss_score))
+        .then_with(|| a.purl.cmp(&b.purl))
+        .then_with(|| a.vulnerability_id.cmp(&b.vulnerability_id))
+}
+
+/// `cvss_score` descending, an absent score ordered after every present
+/// one — a finding whose backend published no score is not evidence of a
+/// low one, but it is the weaker record of two and so yields the
+/// retained slot.
+///
+/// Compared with [`f32::total_cmp`] and not `partial_cmp`: a `NaN` score
+/// makes every `partial_cmp` answer `None`, and a comparator that
+/// reports "equal" for a pair it cannot order is not transitive.
+/// `sort_by` on an inconsistent comparator may return an arbitrary
+/// permutation, which is the one thing a retained set must not depend
+/// on.
+fn by_descending_score(a: Option<f32>, b: Option<f32>) -> Ordering {
+    match (a, b) {
+        (Some(a), Some(b)) => b.total_cmp(&a),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+/// `findings` ordered under [`most_severe_first`].
+///
+/// Sorted **stably**, so the comparator's four keys are all that
+/// decides: a residual tie — two findings sharing the identity key the
+/// delta function dedups on — keeps input order rather than being
+/// permuted by an unstable sort's pivot choice.
+#[must_use]
+pub fn ordered_most_severe_first(findings: &[Finding]) -> Vec<Finding> {
+    let mut ordered = findings.to_vec();
+    ordered.sort_by(most_severe_first);
+    ordered
+}
+
+/// The largest `n` in `1..=total` for which `fits(n)` holds, or `0` when
+/// not even `fits(1)` does.
+///
+/// The measured half of "retain the most severe that fit": a caller
+/// orders its findings with [`ordered_most_severe_first`] and asks this
+/// for how long a prefix its payload can hold. **The fill is measured,
+/// not estimated** — `fits` serialises the real payload, because a cap
+/// on the *count* would not bound the bytes: `title`, `references` and
+/// `fixed_versions` are variable-length, and the payloads measured on a
+/// running instance ranged from 1.1x to 19x their cap. Bisection is what
+/// makes that affordable: `O(log total)` serialisations rather than one
+/// per candidate, and exact rather than conservative.
+///
+/// **`fits` must be monotone** — `fits(n)` ⇒ `fits(n - 1)` — or the
+/// bisection answers about the probe it happened to land on. A payload
+/// whose non-findings bytes are identical across probes is monotone
+/// because its size is then strictly increasing in `n`; a caller whose
+/// probes differ in anything else (a key that only a truncated payload
+/// carries, say) has to hold that fixed across every probe it passes
+/// here. Both callers do, and both say how at the closure.
+///
+/// Stated once here because the two callers are the stored-event
+/// envelope and the CAS findings blob, the argument for exactness is the
+/// same at both, and a second copy of a bisection is a second chance to
+/// get an off-by-one wrong in a function whose answer is which evidence
+/// survives.
+pub fn largest_fitting_prefix(total: usize, mut fits: impl FnMut(usize) -> bool) -> usize {
+    let mut low = 1;
+    let mut high = total;
+    let mut retained = 0;
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        if fits(mid) {
+            retained = mid;
+            low = mid + 1;
+        } else {
+            high = mid - 1;
+        }
+    }
+    retained
 }
 
 impl Finding {
@@ -2506,5 +2633,315 @@ mod tests {
                  being refused release authority must be the same thing",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod retained_order_tests {
+    use std::cell::RefCell;
+
+    use super::*;
+    use crate::policy::threshold::finding_exceeds_threshold;
+
+    /// Every [`SeverityThreshold`], written out rather than iterated, so
+    /// a new tier is a compile error in the sweeps below instead of a
+    /// silently unswept case.
+    const EVERY_THRESHOLD: [SeverityThreshold; 4] = [
+        SeverityThreshold::Critical,
+        SeverityThreshold::High,
+        SeverityThreshold::Medium,
+        SeverityThreshold::Low,
+    ];
+
+    fn finding(
+        severity: SeverityThreshold,
+        cvss_score: Option<f32>,
+        purl: &str,
+        vulnerability_id: &str,
+    ) -> Finding {
+        Finding {
+            purl: purl.into(),
+            vulnerability_id: vulnerability_id.into(),
+            severity,
+            cvss_score,
+            title: "t".into(),
+            fixed_versions: Vec::new(),
+            source_scanner: "trivy".into(),
+            references: Vec::new(),
+            aliases: Vec::new(),
+            informational_class: None,
+            severity_basis: SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
+            statement: FindingStatement::Unstated,
+            advisory_published_at: None,
+        }
+    }
+
+    fn ids(findings: &[Finding]) -> Vec<&str> {
+        findings
+            .iter()
+            .map(|f| f.vulnerability_id.as_str())
+            .collect()
+    }
+
+    // ----- most_severe_first -----------------------------------------------
+
+    /// The severity tier is the first key and nothing is promoted above
+    /// it: a `Critical` with the worst score in the corpus still sorts
+    /// ahead of a 9.8 `High`. The whole point of the order — a
+    /// truncation that dropped the only `Critical` while keeping a pile
+    /// of `High`s answers "was anything critical?" wrongly, and every
+    /// other test in this module still passes under that edit.
+    #[test]
+    fn the_tier_outranks_the_score() {
+        let critical = finding(SeverityThreshold::Critical, Some(0.1), "pkg:npm/z@1", "C");
+        let high = finding(SeverityThreshold::High, Some(9.8), "pkg:npm/a@1", "H");
+        assert_eq!(most_severe_first(&critical, &high), Ordering::Less);
+        assert_eq!(most_severe_first(&high, &critical), Ordering::Greater);
+
+        // Both input orders, so the answer is the comparator's and not
+        // the stable sort keeping whatever arrived first.
+        for input in [
+            vec![high.clone(), critical.clone()],
+            vec![critical.clone(), high.clone()],
+        ] {
+            assert_eq!(ids(&ordered_most_severe_first(&input)), vec!["C", "H"]);
+        }
+    }
+
+    /// Every tier pair, so the first key is swept rather than sampled.
+    #[test]
+    fn the_tiers_order_most_severe_first() {
+        for (i, a) in EVERY_THRESHOLD.iter().enumerate() {
+            for (j, b) in EVERY_THRESHOLD.iter().enumerate() {
+                let left = finding(*a, None, "pkg:npm/a@1", "CVE-1");
+                let right = finding(*b, None, "pkg:npm/a@1", "CVE-1");
+                assert_eq!(
+                    most_severe_first(&left, &right),
+                    i.cmp(&j),
+                    "{a:?} vs {b:?}: the tier order must follow the severity ranking",
+                );
+            }
+        }
+    }
+
+    /// Every arm of the score comparator, including the pair that is
+    /// genuinely equal — `(None, None)` must fall through to the
+    /// remaining keys rather than deciding. An absent score orders
+    /// *after* every present one: a backend that published no score is
+    /// not evidence of a low one, but it is the weaker record of two.
+    #[test]
+    fn the_score_orders_descending_with_absent_last() {
+        let cases = [
+            (Some(1.0), Some(2.0), Ordering::Greater),
+            (Some(2.0), Some(1.0), Ordering::Less),
+            (Some(1.0), None, Ordering::Less),
+            (None, Some(1.0), Ordering::Greater),
+            (None, None, Ordering::Equal),
+        ];
+        for (left, right, expected) in cases {
+            let a = finding(SeverityThreshold::High, left, "pkg:npm/a@1", "CVE-1");
+            let b = finding(SeverityThreshold::High, right, "pkg:npm/a@1", "CVE-1");
+            assert_eq!(
+                most_severe_first(&a, &b),
+                expected,
+                "scores {left:?} vs {right:?}",
+            );
+        }
+    }
+
+    /// The two tie-breaks after the score, each reached only when
+    /// everything ahead of it ties: `purl`, then `vulnerability_id`.
+    /// They are what make the retained set a function of the findings
+    /// rather than of the order they arrived in.
+    #[test]
+    fn the_identity_key_breaks_the_remaining_ties() {
+        let input = vec![
+            finding(SeverityThreshold::High, Some(4.0), "pkg:npm/b@1", "CVE-2"),
+            finding(SeverityThreshold::High, Some(4.0), "pkg:npm/a@1", "CVE-9"),
+            finding(SeverityThreshold::High, Some(4.0), "pkg:npm/a@1", "CVE-1"),
+        ];
+        assert_eq!(
+            ids(&ordered_most_severe_first(&input)),
+            vec!["CVE-1", "CVE-9", "CVE-2"],
+            "purl decides first, then the vulnerability id",
+        );
+    }
+
+    /// A `NaN` score cannot make the comparator inconsistent — a
+    /// `partial_cmp` would answer `None` for every pair involving it and
+    /// report "equal", which is not transitive, and `sort_by` on an
+    /// inconsistent comparator may return an arbitrary permutation. The
+    /// retained set must not depend on that.
+    #[test]
+    fn a_nan_score_still_yields_one_order() {
+        let input = vec![
+            finding(
+                SeverityThreshold::High,
+                Some(f32::NAN),
+                "pkg:npm/b@1",
+                "CVE-2",
+            ),
+            finding(SeverityThreshold::High, Some(5.0), "pkg:npm/a@1", "CVE-1"),
+            finding(SeverityThreshold::High, None, "pkg:npm/c@1", "CVE-3"),
+        ];
+        let forward = ordered_most_severe_first(&input);
+        let mut reversed = input;
+        reversed.reverse();
+        assert_eq!(
+            ids(&forward),
+            ids(&ordered_most_severe_first(&reversed)),
+            "the order must be the comparator's, from either input order",
+        );
+    }
+
+    /// The sort is **stable**, so a residual tie — two findings sharing
+    /// the identity key the delta function dedups on — keeps input order
+    /// rather than being permuted by an unstable sort's pivot choice.
+    #[test]
+    fn a_residual_tie_keeps_input_order() {
+        let mut first = finding(SeverityThreshold::Low, Some(1.0), "pkg:npm/a@1", "CVE-1");
+        first.title = "arrived first".into();
+        let mut second = finding(SeverityThreshold::Low, Some(1.0), "pkg:npm/a@1", "CVE-1");
+        second.title = "arrived second".into();
+        let ordered = ordered_most_severe_first(&[first, second]);
+        assert_eq!(ordered[0].title, "arrived first");
+        assert_eq!(ordered[1].title, "arrived second");
+    }
+
+    /// A set that fits is not reordered away from the documented order,
+    /// and ordering an already-ordered set is a no-op.
+    #[test]
+    fn the_order_is_idempotent() {
+        let input = vec![
+            finding(SeverityThreshold::Medium, Some(5.0), "pkg:npm/a@1", "CVE-2"),
+            finding(SeverityThreshold::Critical, None, "pkg:npm/b@1", "CVE-1"),
+            finding(SeverityThreshold::Low, Some(1.0), "pkg:npm/c@1", "CVE-3"),
+        ];
+        let once = ordered_most_severe_first(&input);
+        assert_eq!(ids(&once), vec!["CVE-1", "CVE-2", "CVE-3"]);
+        assert_eq!(ids(&ordered_most_severe_first(&once)), ids(&once));
+    }
+
+    /// An empty input orders to an empty output — the shape both callers
+    /// guard against before filling, kept answerable here rather than
+    /// panicking.
+    #[test]
+    fn an_empty_set_orders_to_an_empty_set() {
+        assert!(ordered_most_severe_first(&[]).is_empty());
+    }
+
+    // ----- the property both fills rest on ---------------------------------
+
+    /// **The property the whole order exists for**, stated in general so
+    /// it covers both consumers: for *every* [`SeverityThreshold`] and
+    /// every non-empty retained prefix, if the complete set contains a
+    /// finding that exceeds the threshold then so does the prefix.
+    ///
+    /// Asserted through
+    /// [`finding_exceeds_threshold`] itself — the function a policy
+    /// decision actually calls — so this test and the policy cannot
+    /// drift: a change to what "exceeds" means moves both sides at once.
+    ///
+    /// The corpus bites on purpose. The only finding that exceeds the
+    /// `Critical` threshold **arrives last** in the input, so a prefix
+    /// of the arrival order would drop it, and it carries the **lowest**
+    /// `cvss_score` in the set, so any order that let the score outrank
+    /// the tier would drop it too.
+    #[test]
+    fn every_retained_prefix_answers_every_threshold_as_the_complete_set_does() {
+        let mut complete: Vec<Finding> = (0..40)
+            .map(|i| {
+                finding(
+                    match i % 3 {
+                        0 => SeverityThreshold::High,
+                        1 => SeverityThreshold::Medium,
+                        _ => SeverityThreshold::Low,
+                    },
+                    Some(9.9 - (i as f32) / 100.0),
+                    &format!("pkg:npm/p{i:03}@1"),
+                    &format!("CVE-{i:04}"),
+                )
+            })
+            .collect();
+        complete.push(finding(
+            SeverityThreshold::Critical,
+            Some(0.1),
+            "pkg:npm/zzz@1",
+            "CVE-9999",
+        ));
+
+        let ordered = ordered_most_severe_first(&complete);
+        for threshold in EVERY_THRESHOLD {
+            let complete_exceeds = complete
+                .iter()
+                .any(|f| finding_exceeds_threshold(f.severity, threshold));
+            for retained in 1..=ordered.len() {
+                let prefix_exceeds = ordered[..retained]
+                    .iter()
+                    .any(|f| finding_exceeds_threshold(f.severity, threshold));
+                assert_eq!(
+                    complete_exceeds,
+                    prefix_exceeds,
+                    "threshold {threshold:?}, {retained} retained of {}: a retained prefix \
+                     must answer every threshold the way the complete set does",
+                    ordered.len(),
+                );
+            }
+        }
+    }
+
+    // ----- largest_fitting_prefix ------------------------------------------
+
+    /// The fill is the largest prefix that fits, and it is exact: one
+    /// more than the answer does not fit.
+    #[test]
+    fn the_fill_is_the_largest_prefix_that_fits() {
+        for budget in 0..=10 {
+            let retained = largest_fitting_prefix(10, |n| n <= budget);
+            assert_eq!(retained, budget, "budget {budget}");
+        }
+    }
+
+    /// Nothing fits: the caller gets `0` and decides what to do about an
+    /// input no retained set can represent — both callers turn it into a
+    /// `Validation` error rather than storing an empty payload.
+    #[test]
+    fn the_fill_is_zero_when_not_even_one_fits() {
+        assert_eq!(largest_fitting_prefix(10, |_| false), 0);
+    }
+
+    /// A zero total asks nothing: the answer is `0` and the predicate is
+    /// **never consulted**, which is load-bearing rather than tidy —
+    /// both callers measure a prefix by slicing their serialised
+    /// payload, and a probe against an empty one would index past the
+    /// end. The predicate here panics if it is called at all, so the
+    /// `unreachable!` is the assertion (and is the one line in this
+    /// module coverage cannot reach without falsifying what it states).
+    #[test]
+    fn a_zero_total_never_consults_the_predicate() {
+        assert_eq!(
+            largest_fitting_prefix(0, |_| unreachable!("a zero total consulted the predicate")),
+            0
+        );
+    }
+
+    /// Bisection, not a linear walk: a 1 000-element fill asks the
+    /// predicate `O(log n)` times. The exactness above is what makes
+    /// that safe to care about — this is why the fill can afford to
+    /// serialise the real payload.
+    #[test]
+    fn the_fill_probes_logarithmically() {
+        let calls = RefCell::new(0u32);
+        let retained = largest_fitting_prefix(1_000, |n| {
+            *calls.borrow_mut() += 1;
+            n <= 613
+        });
+        assert_eq!(retained, 613);
+        assert!(
+            *calls.borrow() <= 11,
+            "1 000 candidates must cost at most ceil(log2(1001)) probes; took {}",
+            *calls.borrow(),
+        );
     }
 }
