@@ -288,8 +288,7 @@ a last resort if the HTTP surface itself is unreachable.
   completed and `select_stranded` does not select it at all — the sweep
   is not a slow exit for this population, it is not an exit. What moves
   it is **removing the cause** (a `ScanPolicy` change: a backend that
-  can analyse the format, or
-  `compositeVerdictMode: promoted` where that is the right call) and
+  can analyse the format) and
   then a rescan — §3a's `POST /api/v1/artifacts/:id/rescan` reaches it,
   since a completed last job is not an in-flight one — after which the
   verdict lands and the release sweep decides. The curator's
@@ -302,6 +301,17 @@ a last resort if the HTTP surface itself is unreachable.
   `Permission::Curate` OR `Permission::Admin`, so an admin credential
   works too. Post-exclusion policy re-evaluation is another. See
   [the curator workflow guide](curator-workflow.md).
+
+  **`compositeVerdictMode: promoted` is not a lever here, and reaching for
+  it costs an outage rather than a no-op.** A composed image's verdict
+  decides its manifest's release unconditionally
+  ([ADR 0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+  D2), so neither value of the field selects anything — and declaring it at
+  all is an apply-time rejection
+  (`scan_policy_composite_verdict_mode_retired`). The gitops apply runs at
+  boot before any route is mounted, so a `ScanPolicy` carrying the field
+  parks the process on the config-invalid router and readiness never flips.
+  Remove the line from every policy document.
 - **Waiting past `quarantine_until` does nothing on its own.** The
   release predicate has no timer-only authority (ADR 0007); a stranded
   artifact only releases once a scan actually succeeds.
