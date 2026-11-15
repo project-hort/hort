@@ -3889,6 +3889,16 @@ one tick can drain. Operators alert on
 "queue can't keep up" signal — increase tick frequency or the batch
 cap.
 
+The predicate is `last_scan_at` older than the resolved interval **and**
+the artifact's most recent `kind='scan'` request older than it too. The
+second half is what keeps the gauge from counting the same rows every
+tick: `last_scan_at` is written only by the scan-result commit, so a scan
+that ran and reached no verdict — every backend abstained, or a composed
+image's constituent could not be acquired — leaves it untouched, and on a
+`released` artifact the run may not move the status either. Before that
+bound existed, such an artifact was re-selected on every tick for as long
+as the deployment ran.
+
 **`hort_cron_rescan_stranded_eligible_artifacts` semantics** (issue #6)
 — set by the same `CronRescanTickHandler::run` tick, independently, to
 the count returned by
@@ -3911,13 +3921,24 @@ distinguish the sources.
 
 **`hort_cron_rescan_composite_unassessed_artifacts` semantics** — set by
 the same tick, independently again, to the count returned by
-`RescanCandidatesRepository::select_composite_unassessed(BATCH_SIZE)`.
+`RescanCandidatesRepository::select_composite_unassessed(BATCH_SIZE, now)`.
 Same `BATCH_SIZE` cap and gauge shape as its two siblings, and a third
 predicate: a live OCI image manifest with no `composite_scan_observations`
 row at all. A composed image's scan verdict is the manifest's and that is
 unconditional (ADR 0064 D2), but a manifest released under the earlier
 rule keeps its release until a scan is driven — so a non-zero value here
 is an estate still serving on evidence the current rule did not produce.
+
+The gauge drains to zero and stays there because recording an assessment
+takes the manifest out of the predicate — **and** because candidacy is
+additionally bounded by the manifest's most recent `kind='scan'` request
+against its resolved `rescan_interval_hours`. The second bound is what
+makes a sustained non-zero value mean "there is still an estate to
+reassess" rather than "the same manifests are being re-enqueued every
+tick": recording the observation row is best-effort by design (it is a
+measurement surface and may not withhold an artifact), so without it a
+manifest whose row never landed would be re-presented on every tick
+indefinitely.
 Alert meaning differs from both siblings: this is not a rate problem and
 not an outage, it is an **upgrade** that has not finished, and the
 operator action is to keep driving the tick

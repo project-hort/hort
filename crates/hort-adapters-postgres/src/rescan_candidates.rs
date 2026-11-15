@@ -48,6 +48,17 @@
 //! predates the composed verdict carrying release authority. See the
 //! port's module doc.
 //!
+//! **All three bound candidacy by the most recent `kind='scan'`
+//! request**, against the resolved `rescan_interval_hours`, because that
+//! terminal `jobs` row is the one trace every reported scan leaves
+//! whatever it reported — the artifact's status and `last_scan_at` are
+//! both deliberately untouched by a verdictless run on an artifact that
+//! already carries a verdict, and the composite observation row is a
+//! best-effort write. Without it a sweep re-presents the rows its own
+//! run does not change, on every tick, for as long as the deployment
+//! runs. Each query's own comment carries the argument; the port's
+//! module doc carries it once for all three.
+//!
 //! # Repo→policy resolution
 //!
 //! `policy_projections.scope` is JSONB:
@@ -115,6 +126,50 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // `repositories.format` carries the lowercase format token
             // (`'npm'`, `'pypi'`, …) that `enqueue_scan` writes into
             // `jobs.format`.
+            //
+            // **`last_scan_at` alone cannot say whether a scan ran**, so
+            // the `last_job` LATERAL below is the other half of the
+            // interval gate. The column advances only inside
+            // `PgArtifactLifecycle::commit_scan_result_with_score`, the
+            // commit that records a *verdict* — and it is also the
+            // identity of that verdict's finding rows, which three reads
+            // join on (`sf.detected_at = a.last_scan_at`: the curation
+            // queue, the patch-candidate listing, the retention
+            // evaluator; `findings_reads_are_last_scan_scoped` pins
+            // them). A scan that ran and reached no verdict therefore
+            // must not advance it: that would make an artifact nobody
+            // could re-assess read as an artifact with no findings. So
+            // such a scan leaves this predicate's `last_scan_at` arm
+            // exactly as it found it, and on an artifact already carrying
+            // a terminal verdict — the `'released'` half of the status
+            // filter — it changes no status either
+            // (`QuarantineUseCase::record_scan_indeterminate` and
+            // `hold_for_unproduced_composition` both take their
+            // already-terminal skip). The row then satisfies this query
+            // on every tick, forever, for a scan whose answer re-running
+            // reproduces.
+            //
+            // The trace a reported scan *does* leave is its terminal
+            // `jobs` row, which `TaskDispatcher` is the single writer of
+            // (`jobs_row_has_one_owner`). So candidacy is bounded by the
+            // most recent scan **request** as well, against the same
+            // resolved interval — the rule
+            // `select_stranded`'s absent-verdict arm already states and
+            // for the same reason: the re-ask is then self-limiting
+            // whatever the next answer is. The bound is deliberately read
+            // off the request's age and not off the row's status, because
+            // the two verdictless outcomes land on different statuses
+            // (an abstention completes its row, an unproduced composition
+            // fails it) while being the same fact here.
+            //
+            // The in-flight `NOT EXISTS` below already excludes an
+            // artifact with a `pending`/`running` scan job, so a
+            // `last_job` that survives to this comparison is terminal and
+            // no status filter is needed to say so. `IS NULL` admits an
+            // artifact that never had a scan job, and one whose terminal
+            // rows the `scan-row-retention-sweep` horizon has since
+            // reclaimed — in both cases `last_scan_at` is the only
+            // evidence there is and governs alone.
             let sql = r#"
                 SELECT a.id            AS artifact_id,
                        a.repository_id AS repository_id,
@@ -141,6 +196,14 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                     ORDER BY (pp.scope ? 'Repository') DESC
                     LIMIT 1
                 ) p ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT j.created_at
+                    FROM jobs j
+                    WHERE j.kind = 'scan'
+                      AND j.artifact_id = a.id
+                    ORDER BY j.created_at DESC
+                    LIMIT 1
+                ) last_job ON TRUE
                 WHERE COALESCE(p.rescan_interval_hours, $3) > 0
                   AND a.deleted_at IS NULL
                   AND (a.quarantine_status = 'released'
@@ -148,6 +211,12 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                   AND (
                         a.last_scan_at IS NULL
                      OR a.last_scan_at
+                          < $1 - make_interval(
+                                     hours => COALESCE(p.rescan_interval_hours, $3))
+                      )
+                  AND (
+                        last_job.created_at IS NULL
+                     OR last_job.created_at
                           < $1 - make_interval(
                                      hours => COALESCE(p.rescan_interval_hours, $3))
                       )
@@ -360,9 +429,10 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
     fn select_composite_unassessed<'a>(
         &'a self,
         batch_size: u32,
+        now: DateTime<Utc>,
     ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
         Box::pin(async move {
-            tracing::debug!(batch_size, "select_composite_unassessed");
+            tracing::debug!(batch_size, %now, "select_composite_unassessed");
             // Live OCI image manifests with no recorded composite
             // assessment. The population neither companion query can
             // see: it is not held, so `select_stranded`'s statuses
@@ -391,15 +461,45 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // default.
             //
             // **The predicate is the absence of an observation row, not
-            // the absence of a successful one**, and that is what makes
-            // the sweep self-limiting with no interval of its own: every
-            // composite scan records a row, whatever it concluded, so a
-            // reassessed manifest leaves the set on the next tick. A
-            // manifest whose composite assessment is already recorded —
-            // including one recording a refusal — is reached by the
-            // ordinary interval sweep like any other released artifact,
-            // and re-deriving a refusal from the same immutable bytes
-            // would reach the same answer anyway.
+            // the absence of a successful one**: every composite scan
+            // records a row, whatever it concluded, so a reassessed
+            // manifest leaves the set on the next tick. A manifest whose
+            // composite assessment is already recorded — including one
+            // recording a refusal — is reached by the ordinary interval
+            // sweep like any other released artifact, and re-deriving a
+            // refusal from the same immutable bytes would reach the same
+            // answer anyway.
+            //
+            // **And the row-absence predicate alone does not make the
+            // sweep self-limiting**, because "every composite scan
+            // records a row" is a best-effort write and says so where it
+            // is written: `ShadowObservationSink::record` logs a storage
+            // failure and returns, deliberately, since a measurement
+            // surface may not be able to withhold an artifact, and a run
+            // whose exclusion set would not resolve records nothing at
+            // all so the row's two sides cannot be judged by different
+            // rules. Both leave a manifest whose scan ran and reported
+            // with no row for the next tick to read, and with no interval
+            // of its own this query would then re-present it on that tick
+            // and on every tick after it — one enqueued scan per
+            // manifest per tick, permanently.
+            //
+            // So candidacy is bounded by the most recent `kind='scan'`
+            // **request** as well, against the resolved
+            // `rescan_interval_hours`: the rule
+            // `select_stranded`'s absent-verdict arm states, with
+            // `NULLIF(…, 0)` reading a configured `0` as "no resolved
+            // interval" for the reason given there. This is a
+            // **backstop, not a cadence** — a manifest whose scan did
+            // record its row has already left the set by the row-absence
+            // predicate before this one is reached, so nothing about the
+            // cutover's pace changes for a scan that works.
+            //
+            // The in-flight `NOT EXISTS` below excludes an artifact with
+            // a `pending`/`running` scan job, so a `last_job` reaching
+            // this comparison is terminal; `IS NULL` admits a manifest
+            // that never had a scan job, and one whose terminal rows the
+            // `scan-row-retention-sweep` horizon has reclaimed.
             //
             // Reading the observation projection here is a *selection*,
             // not a decision: it answers "has this manifest ever been
@@ -421,7 +521,7 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                 FROM artifacts a
                 JOIN repositories r ON r.id = a.repository_id
                 LEFT JOIN LATERAL (
-                    SELECT pp.scan_backends
+                    SELECT pp.scan_backends, pp.rescan_interval_hours
                     FROM policy_projections pp
                     WHERE pp.archived = false
                       AND (
@@ -438,6 +538,14 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                     ORDER BY (pp.scope ? 'Repository') DESC
                     LIMIT 1
                 ) p ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT j0.created_at
+                    FROM jobs j0
+                    WHERE j0.kind = 'scan'
+                      AND j0.artifact_id = a.id
+                    ORDER BY j0.created_at DESC
+                    LIMIT 1
+                ) last_job ON TRUE
                 WHERE a.deleted_at IS NULL
                   AND (a.quarantine_status = 'released'
                        OR a.quarantine_status IS NULL)
@@ -446,6 +554,13 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                   AND NOT EXISTS (
                         SELECT 1 FROM composite_scan_observations o
                         WHERE o.artifact_id = a.id
+                      )
+                  AND (
+                        last_job.created_at IS NULL
+                     OR last_job.created_at
+                          < $5 - make_interval(
+                                     hours => COALESCE(
+                                         NULLIF(p.rescan_interval_hours, 0), $6))
                       )
                   AND NOT EXISTS (
                         SELECT 1 FROM artifact_metadata m
@@ -466,6 +581,8 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                 .bind(DefaultPolicy::block_on_critical_default_backends().len() as i32)
                 .bind(hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE)
                 .bind(hort_domain::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE)
+                .bind(now)
+                .bind(DefaultPolicy::rescan_interval_hours())
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| {

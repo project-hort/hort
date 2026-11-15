@@ -152,6 +152,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The rescan sweep no longer re-enqueues a scan for the same artifacts on every
+  tick when their scan reaches no verdict — an image whose constituent the
+  upstream no longer serves, or an artifact no configured backend can analyse.
+  Both the interval sweep and the composite-reassessment sweep now wait out the
+  policy's `rescanIntervalHours` after a scan has reported (#427).
 - A rescan that finds very many new vulnerabilities no longer leaves the
   artifact without a verdict: the audit event now records the most severe new
   findings plus the true total, instead of being too large to store.

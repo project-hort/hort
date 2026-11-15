@@ -20,7 +20,7 @@
 //! - `select_eligible_skips_quarantined_artifact`
 //! - `select_eligible_skips_rejected_artifact`
 //! - `select_eligible_skips_artifact_with_pending_scan_job`
-//! - `select_eligible_returns_artifact_with_completed_scan_job_only`
+//! - `select_eligible_returns_artifact_with_completed_scan_job_past_the_interval`
 //! - `select_eligible_returns_null_quarantine_artifact`
 //! - `select_eligible_returns_null_quarantine_no_policy_artifact`
 //!
@@ -79,6 +79,25 @@
 //! - `select_composite_unassessed_spends_no_batch_slot_on_a_soft_deleted_manifest`
 //! - `select_composite_unassessed_is_bounded_by_the_batch_size`
 //! - `select_composite_unassessed_errs_when_the_observation_projection_is_unreadable`
+//!
+//! **A reported scan leaves a trace that takes the artifact out of the
+//! selection.** `select_eligible` reads `artifacts.last_scan_at`, which
+//! only the scan-result commit writes, and `select_composite_unassessed`
+//! reads the absence of an observation row, which is a best-effort
+//! write — so a verdictless run left both predicates holding and both
+//! sweeps re-presented the same rows on every tick. Both now bound
+//! candidacy by the most recent `kind='scan'` request against the
+//! resolved interval, the rule `select_stranded`'s absent-verdict arm
+//! already carried. Each pair is the two-pass shape, because the
+//! property is that the re-presentation *ends*:
+//!
+//! - `select_eligible_stops_re_presenting_an_artifact_once_its_scan_reported`
+//! - `select_eligible_skips_an_artifact_whose_scan_reported_a_failure_within_the_interval`
+//! - `select_eligible_scan_request_bound_honours_the_resolved_interval`
+//! - `select_eligible_returns_an_artifact_with_no_scan_job_row_at_all`
+//! - `select_composite_unassessed_stops_re_presenting_a_manifest_once_its_scan_reported`
+//! - `select_composite_unassessed_returns_a_manifest_whose_request_predates_the_interval`
+//! - `select_composite_unassessed_reads_a_zero_interval_as_the_default`
 //!
 //! Soft delete, which both predicates share (`a.deleted_at IS NULL`):
 //!
@@ -481,18 +500,30 @@ async fn select_eligible_skips_artifact_with_pending_scan_job() {
 
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn select_eligible_returns_artifact_with_completed_scan_job_only() {
+async fn select_eligible_returns_artifact_with_completed_scan_job_past_the_interval() {
     let Some(pool) = admin_pool().await else {
         return;
     };
     let repo = seed_repo(&pool).await;
     let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let now = Utc::now();
     let artifact = seed_artifact(&pool, repo, Some("released"), None).await;
-    let _completed = seed_scan_job(&pool, repo, artifact, "completed").await;
+    // Terminal, and requested longer ago than the resolved interval —
+    // which is what the in-flight clause has never been the thing
+    // deciding. The row's `completed` status does not keep the artifact
+    // out; the cooldown does, and it has elapsed.
+    let _completed = seed_scan_job_at(
+        &pool,
+        repo,
+        artifact,
+        "completed",
+        now - ChronoDuration::hours(30),
+    )
+    .await;
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_eligible(1000, Utc::now())
+        .select_eligible(1000, now)
         .await
         .expect("select_eligible Ok");
 
@@ -1719,7 +1750,7 @@ async fn select_composite_unassessed_returns_a_released_manifest_with_no_observa
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -1752,7 +1783,7 @@ async fn select_composite_unassessed_returns_a_null_status_manifest() {
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -1786,7 +1817,7 @@ async fn select_composite_unassessed_returns_a_manifest_with_no_stored_media_typ
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -1821,7 +1852,7 @@ async fn select_composite_unassessed_skips_a_manifest_with_any_recorded_observat
         let manifest = seed_manifest(&pool, repo, Some("released")).await;
         // The premise: without the observation it IS a candidate.
         let before = port
-            .select_composite_unassessed(1000)
+            .select_composite_unassessed(1000, Utc::now())
             .await
             .expect("select_composite_unassessed Ok");
         assert_eq!(
@@ -1833,7 +1864,7 @@ async fn select_composite_unassessed_skips_a_manifest_with_any_recorded_observat
         seed_composite_observation(&pool, repo, manifest, assessment).await;
 
         let after = port
-            .select_composite_unassessed(1000)
+            .select_composite_unassessed(1000, Utc::now())
             .await
             .expect("select_composite_unassessed Ok");
         assert!(
@@ -1864,7 +1895,7 @@ async fn select_composite_unassessed_skips_an_image_index() {
         seed_oci_media_type(&pool, index, media_type).await;
 
         let rows = port
-            .select_composite_unassessed(1000)
+            .select_composite_unassessed(1000, Utc::now())
             .await
             .expect("select_composite_unassessed Ok");
         assert!(
@@ -1879,7 +1910,7 @@ async fn select_composite_unassessed_skips_an_image_index() {
     let image = seed_manifest(&pool, repo, Some("released")).await;
     seed_oci_media_type(&pool, image, "application/vnd.oci.image.manifest.v1+json").await;
     let rows = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
     assert_eq!(
@@ -1911,7 +1942,7 @@ async fn select_composite_unassessed_skips_a_non_manifest_artifact() {
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -1938,7 +1969,7 @@ async fn select_composite_unassessed_skips_a_manifest_that_is_not_live() {
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -1963,7 +1994,7 @@ async fn select_composite_unassessed_skips_a_manifest_under_a_scan_waived_policy
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -1987,7 +2018,7 @@ async fn select_composite_unassessed_skips_a_manifest_with_an_in_flight_scan() {
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -2018,7 +2049,7 @@ async fn select_composite_unassessed_spends_no_batch_slot_on_a_soft_deleted_mani
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(1)
+        .select_composite_unassessed(1, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -2062,7 +2093,7 @@ async fn select_composite_unassessed_errs_when_the_observation_projection_is_unr
     assert_eq!(
         filter_to(
             &port
-                .select_composite_unassessed(1000)
+                .select_composite_unassessed(1000, Utc::now())
                 .await
                 .expect("select_composite_unassessed Ok"),
             &[manifest]
@@ -2077,7 +2108,7 @@ async fn select_composite_unassessed_errs_when_the_observation_projection_is_unr
         .expect("drop the observation projection in this test's own database");
 
     let err = port
-        .select_composite_unassessed(1000)
+        .select_composite_unassessed(1000, Utc::now())
         .await
         .expect_err("an unreadable observation projection must surface as an Err");
     let text = format!("{err}");
@@ -2103,7 +2134,7 @@ async fn select_composite_unassessed_is_bounded_by_the_batch_size() {
 
     let port = PgRescanCandidatesRepository::new(pool.clone());
     let rows = port
-        .select_composite_unassessed(2)
+        .select_composite_unassessed(2, Utc::now())
         .await
         .expect("select_composite_unassessed Ok");
 
@@ -2112,5 +2143,320 @@ async fn select_composite_unassessed_is_bounded_by_the_batch_size() {
         filter_to(&rows, &[a, b, c]).len(),
         2,
         "and the rows it returned are this fixture's"
+    );
+}
+
+// =====================================================================
+// A reported scan leaves a trace that takes the artifact out of the
+// selection — whatever it reported.
+//
+// The two sweeps above read candidacy off something a verdictless run
+// does not change. `select_eligible` reads `artifacts.last_scan_at`,
+// which only the scan-result commit writes, so a run that reached no
+// verdict leaves it exactly as it found it; and on an artifact already
+// carrying a terminal verdict — every row in this query's own status
+// filter — the run changes no status either, because both
+// `QuarantineUseCase::record_scan_indeterminate` and
+// `hold_for_unproduced_composition` take their already-terminal skip.
+// `select_composite_unassessed` reads the absence of an observation row,
+// which a best-effort projection write may leave absent.
+//
+// Either way the candidate predicate still holds after the run that
+// answered it, so the sweep re-presents the same rows on the next tick
+// and on every tick after it — one enqueued scan per row per tick, for
+// an answer re-running reproduces. The bound both queries now carry is
+// the most recent `kind='scan'` request against the resolved interval:
+// the terminal `jobs` row is the one trace every reported scan leaves.
+//
+// Each pair below is the two-pass shape, because the property is that
+// the re-presentation *ends*: the first pass selects the row, the trace
+// the run leaves is written, and the second pass does not.
+// =====================================================================
+
+/// `select_eligible`, both passes. The artifact is `released` with no
+/// verdict timestamp — the state a composed image whose constituent the
+/// upstream does not have is left in, since the abstention that run
+/// reports neither writes `last_scan_at` nor may overwrite the release.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_eligible_stops_re_presenting_an_artifact_once_its_scan_reported() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let now = Utc::now();
+    let artifact = seed_artifact(&pool, repo, Some("released"), None).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let first = port
+        .select_eligible(1000, now)
+        .await
+        .expect("select_eligible Ok");
+    assert_eq!(
+        filter_to(&first, &[artifact]).len(),
+        1,
+        "the first pass selects it: nothing has scanned it"
+    );
+
+    // What the run leaves behind. The disposition is `completed` because
+    // every backend ran and reported — nothing failed — and neither the
+    // artifact's status nor its `last_scan_at` moved.
+    let _reported = seed_scan_job_at(&pool, repo, artifact, "completed", now).await;
+
+    let second = port
+        .select_eligible(1000, now)
+        .await
+        .expect("select_eligible Ok");
+    assert!(
+        filter_to(&second, &[artifact]).is_empty(),
+        "and the second pass does not: the scan ran and reported, so the next ask waits \
+         for the policy's own interval rather than for the next five-minute tick"
+    );
+}
+
+/// The trace is read off the request's **age**, not the row's status: an
+/// unproduced composition fails its row where an abstention completes
+/// one, and both are the same fact here — a run that reported and
+/// reached no verdict.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_eligible_skips_an_artifact_whose_scan_reported_a_failure_within_the_interval() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let now = Utc::now();
+    let artifact = seed_artifact(&pool, repo, Some("released"), None).await;
+    let _failed = seed_scan_job_at(
+        &pool,
+        repo,
+        artifact,
+        "failed",
+        now - ChronoDuration::hours(1),
+    )
+    .await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_eligible(1000, now)
+        .await
+        .expect("select_eligible Ok");
+
+    assert!(
+        filter_to(&rows, &[artifact]).is_empty(),
+        "an already-serving artifact whose scan was requested an hour ago under a 24h \
+         cadence is not re-asked on this tick, whatever that request's row says"
+    );
+}
+
+/// The bound is the **resolved** interval, not a constant: a 168h policy
+/// holds a 30h-old request back and admits a 200h-old one.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_eligible_scan_request_bound_honours_the_resolved_interval() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 168).await;
+    let now = Utc::now();
+    let recent = seed_artifact(&pool, repo, Some("released"), None).await;
+    let _recent_job = seed_scan_job_at(
+        &pool,
+        repo,
+        recent,
+        "completed",
+        now - ChronoDuration::hours(30),
+    )
+    .await;
+    let stale = seed_artifact(&pool, repo, Some("released"), None).await;
+    let _stale_job = seed_scan_job_at(
+        &pool,
+        repo,
+        stale,
+        "completed",
+        now - ChronoDuration::hours(200),
+    )
+    .await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_eligible(1000, now)
+        .await
+        .expect("select_eligible Ok");
+
+    assert!(
+        filter_to(&rows, &[recent]).is_empty(),
+        "30h since the request under a 168h cadence is not due"
+    );
+    assert_eq!(
+        filter_to(&rows, &[stale]).len(),
+        1,
+        "200h is, and the artifact is re-asked exactly as it was before this bound existed"
+    );
+}
+
+/// An artifact whose terminal scan rows the `scan-row-retention-sweep`
+/// horizon has reclaimed reads as never-requested, and `last_scan_at`
+/// governs alone — which is the arm that keeps a swept row from making
+/// the artifact permanently ineligible.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_eligible_returns_an_artifact_with_no_scan_job_row_at_all() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let now = Utc::now();
+    let artifact = seed_artifact(
+        &pool,
+        repo,
+        Some("released"),
+        Some(now - ChronoDuration::hours(30)),
+    )
+    .await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_eligible(1000, now)
+        .await
+        .expect("select_eligible Ok");
+
+    assert_eq!(
+        filter_to(&rows, &[artifact]).len(),
+        1,
+        "no `kind='scan'` row is not a recent request — the interval-stale verdict is the \
+         only evidence there is and it admits the artifact"
+    );
+}
+
+/// `select_composite_unassessed`, both passes. The manifest's scan ran
+/// and reported, and its observation row is absent because recording one
+/// is best-effort by construction — the sink logs a storage failure and
+/// returns, and a run that could not resolve its exclusion set records
+/// nothing at all. The row-absence predicate therefore still holds after
+/// the run that answered it.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_composite_unassessed_stops_re_presenting_a_manifest_once_its_scan_reported() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let now = Utc::now();
+    let manifest = seed_manifest(&pool, repo, Some("released")).await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let first = port
+        .select_composite_unassessed(1000, now)
+        .await
+        .expect("select_composite_unassessed Ok");
+    assert_eq!(
+        filter_to(&first, &[manifest]).len(),
+        1,
+        "the first pass selects it: no composite assessment is on record"
+    );
+
+    let _reported = seed_scan_job_at(&pool, repo, manifest, "completed", now).await;
+
+    let second = port
+        .select_composite_unassessed(1000, now)
+        .await
+        .expect("select_composite_unassessed Ok");
+    assert!(
+        filter_to(&second, &[manifest]).is_empty(),
+        "and the second pass does not, with no observation row needed to say so — the \
+         cutover sweep is self-limiting on the trace the scan itself left"
+    );
+}
+
+/// And it is a backstop rather than a cadence: once the interval has
+/// elapsed the manifest is re-asked, so a run whose row went missing is
+/// retried at the policy's own pace instead of never.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_composite_unassessed_returns_a_manifest_whose_request_predates_the_interval() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let now = Utc::now();
+    let manifest = seed_manifest(&pool, repo, Some("released")).await;
+    let _old = seed_scan_job_at(
+        &pool,
+        repo,
+        manifest,
+        "completed",
+        now - ChronoDuration::hours(30),
+    )
+    .await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_composite_unassessed(1000, now)
+        .await
+        .expect("select_composite_unassessed Ok");
+
+    assert_eq!(
+        filter_to(&rows, &[manifest]).len(),
+        1,
+        "a manifest still carrying no composite assessment 30h after its last scan \
+         request is asked again under a 24h cadence"
+    );
+}
+
+/// A configured `0` is "no resolved interval" here, not "every tick":
+/// `0` turns off the interval rescan of a live, already-assessed
+/// artifact, and this query's whole population is the manifests
+/// `select_eligible` therefore never drives. Reading it literally would
+/// make `make_interval(hours => 0)` admit every row on every tick, which
+/// is the loop the bound exists to end.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_composite_unassessed_reads_a_zero_interval_as_the_default() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 0).await;
+    let now = Utc::now();
+    let recent = seed_manifest(&pool, repo, Some("released")).await;
+    let _recent_job = seed_scan_job_at(
+        &pool,
+        repo,
+        recent,
+        "completed",
+        now - ChronoDuration::hours(1),
+    )
+    .await;
+    let stale = seed_manifest(&pool, repo, Some("released")).await;
+    let _stale_job = seed_scan_job_at(
+        &pool,
+        repo,
+        stale,
+        "completed",
+        now - ChronoDuration::hours(30),
+    )
+    .await;
+
+    let port = PgRescanCandidatesRepository::new(pool.clone());
+    let rows = port
+        .select_composite_unassessed(1000, now)
+        .await
+        .expect("select_composite_unassessed Ok");
+
+    assert!(
+        filter_to(&rows, &[recent]).is_empty(),
+        "an hour after the request, under the DefaultPolicy interval the 0 falls back to"
+    );
+    assert_eq!(
+        filter_to(&rows, &[stale]).len(),
+        1,
+        "and 30h after it, the manifest is asked again"
     );
 }

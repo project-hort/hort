@@ -373,6 +373,20 @@ artifact's status was never moved: a `quarantined` one is re-picked by
 `select_eligible`, whose `last_scan_at IS NULL` arm admits exactly an
 artifact no scan ever completed.
 
+The two re-asks differ in **pace**, and deliberately. `select_stranded`
+re-asks a held artifact with an errored or absent scan on the next tick,
+with no cooldown: that artifact is withheld from every client until a
+verdict is reached, so the latency of the re-ask is the latency of the
+recovery. `select_eligible` re-asks at the policy's own
+`rescan_interval_hours` instead, because it bounds candidacy by the
+artifact's most recent `kind='scan'` request as well as by `last_scan_at`
+— and its population is already serving on a verdict it has. Without
+that bound, a scan that ran and reached no verdict left both halves of
+the predicate as it found them (`last_scan_at` is written only by the
+scan-result commit, and a verdictless run may not overwrite a release),
+so the artifact was re-selected and re-scanned on every tick for as long
+as the deployment ran, for an answer re-running reproduces.
+
 The same fail-closed path absorbs a hostile scanner output. Both
 scanner adapters drain the child process's report pipes through a
 bounded reader (`drain_capped`, capped by

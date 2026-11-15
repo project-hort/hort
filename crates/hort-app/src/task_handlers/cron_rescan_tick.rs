@@ -24,6 +24,16 @@
 //!    recorded composite assessment — released on evidence that predates
 //!    the composed verdict carrying release authority (ADR 0064 D2), and
 //!    reached by neither query above.
+//!
+//! The `now` captured in step 1 is handed to **all three** queries, and
+//! each one spends it on the same comparison: an artifact whose most
+//! recent `kind='scan'` request is newer than its resolved rescan
+//! interval is not re-presented. That is what keeps a tick from
+//! re-enqueueing a scan whose answer the previous tick already has — see
+//! the port's module doc for why the trace has to be the job row rather
+//! than the artifact's status, its `last_scan_at`, or a projection row.
+//! Two clock reads here would let one sweep admit a boundary artifact
+//! the next declines.
 //! 5. For each candidate from any source, call
 //!    [`JobsRepository::enqueue_scan`] with `priority=10` and
 //!    `trigger_source="cron"`.
@@ -284,7 +294,7 @@ impl TaskHandler for CronRescanTickHandler {
 
             let composite_unassessed_candidates = match self
                 .candidates
-                .select_composite_unassessed(BATCH_SIZE)
+                .select_composite_unassessed(BATCH_SIZE, now)
                 .await
             {
                 Ok(rows) => rows,
@@ -466,6 +476,7 @@ mod tests {
         composite_unassessed_err: Mutex<Option<DomainError>>,
         last_stranded_now: Mutex<Option<DateTime<Utc>>>,
         last_eligible_now: Mutex<Option<DateTime<Utc>>>,
+        last_composite_now: Mutex<Option<DateTime<Utc>>>,
     }
 
     impl MockCandidates {
@@ -480,6 +491,7 @@ mod tests {
                 composite_unassessed_err: Mutex::new(None),
                 last_stranded_now: Mutex::new(None),
                 last_eligible_now: Mutex::new(None),
+                last_composite_now: Mutex::new(None),
             }
         }
 
@@ -494,6 +506,7 @@ mod tests {
                 composite_unassessed_err: Mutex::new(None),
                 last_stranded_now: Mutex::new(None),
                 last_eligible_now: Mutex::new(None),
+                last_composite_now: Mutex::new(None),
             }
         }
 
@@ -511,6 +524,7 @@ mod tests {
                 composite_unassessed_err: Mutex::new(None),
                 last_stranded_now: Mutex::new(None),
                 last_eligible_now: Mutex::new(None),
+                last_composite_now: Mutex::new(None),
             }
         }
 
@@ -553,6 +567,13 @@ mod tests {
         fn last_eligible_now(&self) -> Option<DateTime<Utc>> {
             *self.last_eligible_now.lock().unwrap()
         }
+
+        /// The `now` the handler passed to `select_composite_unassessed`.
+        /// It bounds that sweep's re-ask by the artifact's most recent
+        /// scan request, so it is the third half of the same comparison.
+        fn last_composite_now(&self) -> Option<DateTime<Utc>> {
+            *self.last_composite_now.lock().unwrap()
+        }
     }
 
     impl RescanCandidatesRepository for MockCandidates {
@@ -588,7 +609,9 @@ mod tests {
         fn select_composite_unassessed<'a>(
             &'a self,
             _batch_size: u32,
+            now: DateTime<Utc>,
         ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
+            *self.last_composite_now.lock().unwrap() = Some(now);
             let maybe_err = self.composite_unassessed_err.lock().unwrap().take();
             if let Some(err) = maybe_err {
                 return Box::pin(async move { Err(err) });
@@ -1444,12 +1467,15 @@ mod tests {
         }
     }
 
-    /// Both time-reading queries are driven off the **one** timestamp the
-    /// tick captured. `select_stranded`'s absent-verdict arm compares a
-    /// job's `created_at` against it, so a second clock read here would
-    /// let the two halves of one tick disagree about when the tick was.
+    /// All three queries are driven off the **one** timestamp the tick
+    /// captured. Each compares a `jobs.created_at` against it — the
+    /// trace a reported scan leaves, bounding every sweep's re-ask by
+    /// the resolved interval — so a second clock read here would let the
+    /// halves of one tick disagree about when the tick was, and an
+    /// artifact at the boundary would be admitted by one sweep and
+    /// declined by the next.
     #[tokio::test]
-    async fn run_passes_one_captured_now_to_both_time_reading_queries() {
+    async fn run_passes_one_captured_now_to_every_time_reading_query() {
         let candidates = Arc::new(MockCandidates::new(Vec::new()));
         let jobs = Arc::new(MockJobs::new(FailureMode::None));
 
@@ -1472,7 +1498,13 @@ mod tests {
         assert_eq!(
             candidates_for_assert.last_eligible_now(),
             Some(stranded_now),
-            "both queries must read the same captured instant",
+            "every query must read the same captured instant",
+        );
+        assert_eq!(
+            candidates_for_assert.last_composite_now(),
+            Some(stranded_now),
+            "including the composite-unassessed sweep, whose bound on the most recent \
+             scan request is evaluated at that same instant",
         );
     }
 
