@@ -672,15 +672,29 @@ async fn a_persistence_failure_at_the_cap_leaves_a_quarantined_artifact_stranded
 }
 
 /// The permissive-default half of the same case: an artifact with no
-/// quarantine status and no completed scan stays visible to
-/// `select_eligible`, whose `last_scan_at IS NULL` arm admits exactly an
-/// artifact no scan ever finished.
+/// quarantine status and no completed scan is not abandoned by a
+/// verdict-less terminal row — `select_eligible`'s `last_scan_at IS NULL`
+/// arm admits exactly an artifact no scan ever finished.
 ///
 /// `select_stranded` would not find this one — it requires
 /// `quarantine_status = 'quarantined'` — so the two queries between them
 /// are what keep a verdict-less terminal row from being the end of the
 /// story, and both halves are asserted rather than one standing in for the
 /// other.
+///
+/// **Eligibility is interval-bound, so this is asserted at two instants.**
+/// All three selectors bound candidacy by the most recent `kind='scan'`
+/// request against the resolved `rescan_interval_hours`, because that
+/// terminal `jobs` row is the one trace a verdict-less run leaves: without
+/// the bound a sweep re-presents the rows its own run does not change, on
+/// every tick, for as long as the deployment runs. The artifact is
+/// therefore withheld immediately after its failed request and admitted
+/// once the interval has elapsed — and asserting only the second instant
+/// would leave the bound itself unpinned from this scenario, which is how
+/// a single-instant assertion of the pre-bound behaviour survived here.
+///
+/// No policy is seeded, so the resolved interval is resolution tier 3 —
+/// `DefaultPolicy::rescan_interval_hours()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial(hort_pg_db)]
 async fn a_persistence_failure_at_the_cap_leaves_a_permissive_artifact_rescan_eligible() {
@@ -699,15 +713,34 @@ async fn a_persistence_failure_at_the_cap_leaves_a_permissive_artifact_rescan_el
 
     assert_eq!(row_state(&pool, job_id).await.status, "failed");
 
-    let candidates = PgRescanCandidatesRepository::new(pool.clone())
+    let repository = PgRescanCandidatesRepository::new(pool.clone());
+    let interval = chrono::Duration::hours(i64::from(
+        hort_domain::policy::scan::DefaultPolicy::rescan_interval_hours(),
+    ));
+
+    let immediately = repository
         .select_eligible(50, chrono::Utc::now())
         .await
         .expect("select_eligible");
     assert!(
-        candidates.iter().any(|c| c.artifact_id == artifact),
-        "an artifact no scan ever completed must stay rescan-eligible after a verdict-less \
-         terminal row. Got {} candidates",
-        candidates.len()
+        !immediately.iter().any(|c| c.artifact_id == artifact),
+        "the request-time bound must withhold an artifact whose scan was just requested, \
+         or a sweep re-presents it on every tick. Got {} candidates",
+        immediately.len()
+    );
+
+    let after_the_interval = repository
+        .select_eligible(
+            50,
+            chrono::Utc::now() + interval + chrono::Duration::hours(1),
+        )
+        .await
+        .expect("select_eligible");
+    assert!(
+        after_the_interval.iter().any(|c| c.artifact_id == artifact),
+        "an artifact no scan ever completed must become rescan-eligible again once the \
+         interval has elapsed after a verdict-less terminal row. Got {} candidates",
+        after_the_interval.len()
     );
 }
 
