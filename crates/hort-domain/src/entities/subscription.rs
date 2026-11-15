@@ -1583,6 +1583,7 @@ mod tests {
                         advisory_published_at: None,
                     }],
                     previously_clean_at: Utc::now(),
+                    truncated_from_total: None,
                 }),
                 EventTypeKind::ArtifactBecameVulnerable,
                 None,

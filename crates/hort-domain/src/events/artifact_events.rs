@@ -1,3 +1,5 @@
+use std::cmp::Ordering;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -8,9 +10,11 @@ use crate::error::{DomainError, DomainResult};
 use crate::ports::provenance::{ProvenanceHoldReason, ProvenanceRejectReason, SignerIdentity};
 use crate::retention::{ExpirationReason, HeldStateEntry};
 use crate::types::checksum::HashAlgorithm;
+use crate::types::finding::severity_tier;
 use crate::types::{ArtifactCoords, ContentHash, Finding};
 
 use super::validation::{validate_json, validate_optional_string, validate_string};
+use super::{DomainEvent, MAX_EVENT_JSON_BYTES};
 
 // ---------------------------------------------------------------------------
 // Validation constants
@@ -461,6 +465,53 @@ impl SeveritySummary {
 // ArtifactBecameVulnerable
 // ---------------------------------------------------------------------------
 
+/// Bytes held back from [`MAX_EVENT_JSON_BYTES`] when
+/// [`ArtifactBecameVulnerable::retaining_most_severe`] fills
+/// `new_findings` up to the budget.
+///
+/// The margin exists because the same payload is bounded by **two
+/// different measurements** and the domain can only take one of them.
+/// [`MAX_EVENT_JSON_BYTES`] bounds the serialised *text* of the stored
+/// envelope; `migrations/004_events.sql`'s `events_event_data_check`
+/// independently bounds `pg_column_size(event_data)` — the stored
+/// `jsonb` *datum*, whose uncompressed binary form pays a four-byte
+/// `JEntry` per key and per array element on top of the text it
+/// encodes. A findings array carries a dozen keys per element, so a
+/// payload filled exactly to the text cap can measure past the datum
+/// CHECK, and the append this truncation exists to let through would
+/// fail on the constraint instead. A producer *filling to* the limit is
+/// the only caller for which that disagreement is reachable, which is
+/// why the reserve is here and not in the cap.
+///
+/// 8 KiB is an eighth of the cap, which covers that per-element
+/// overhead for this payload's shape even if the datum is stored
+/// uncompressed. What the reserve costs is retained findings, and those
+/// are the cheapest thing in this payload to give up: the complete set
+/// is written to `scan_findings` and to the CAS findings blob in the
+/// same transaction, and this event records the *transition*, not the
+/// evidence.
+const BECAME_VULNERABLE_RESERVED_BYTES: usize = 8 * 1024;
+
+/// The serialised-envelope budget
+/// [`ArtifactBecameVulnerable::retaining_most_severe`] fills findings
+/// up to: [`MAX_EVENT_JSON_BYTES`] less
+/// [`BECAME_VULNERABLE_RESERVED_BYTES`]. Derived rather than typed, so
+/// the reserve stays a reserve if the cap ever moves.
+const BECAME_VULNERABLE_ENVELOPE_BUDGET: usize =
+    MAX_EVENT_JSON_BYTES - BECAME_VULNERABLE_RESERVED_BYTES;
+
+/// The reserve is a reserve: the fill target is strictly below the cap,
+/// and the whole of the difference is the reserve. Asserted at compile
+/// time rather than in a test, because the relationship between three
+/// constants is decidable there — a reserve edited down to nothing
+/// fails the build of every crate in the workspace, not a test run.
+const _: () = assert!(
+    BECAME_VULNERABLE_RESERVED_BYTES > 0
+        && BECAME_VULNERABLE_ENVELOPE_BUDGET < MAX_EVENT_JSON_BYTES
+        && MAX_EVENT_JSON_BYTES - BECAME_VULNERABLE_ENVELOPE_BUDGET
+            == BECAME_VULNERABLE_RESERVED_BYTES
+);
+
 /// Discrete signal that a previously-clean (or differently-vulnerable)
 /// artifact is now flagged with NEW findings — the unit operators
 /// alarm on. Fired only when a *prior* `ScanCompleted` exists for the
@@ -481,14 +532,157 @@ pub struct ArtifactBecameVulnerable {
     /// Findings present in the current scan that were absent from the
     /// most recent prior `ScanCompleted` for this artifact, keyed by
     /// `(purl, vulnerability_id)`.
+    ///
+    /// The **most severe** of them when `truncated_from_total` is set:
+    /// see [`Self::retaining_most_severe`], the only producer.
     pub new_findings: Vec<Finding>,
     /// Timestamp of the most recent prior `ScanCompleted` event — the
     /// audit-trail anchor. The artifact was provably clean *of these
     /// specific findings* from this point until now.
     pub previously_clean_at: DateTime<Utc>,
+    /// The true number of new findings when `new_findings` holds only
+    /// the most severe of them; `None` when it holds all of them.
+    ///
+    /// The input set is unbounded and the stored envelope is capped at
+    /// [`MAX_EVENT_JSON_BYTES`], so a transition with enough new
+    /// findings has no complete representation. Before this field, such
+    /// an event was refused on append and the scan that produced it
+    /// ended with no verdict at all — worst for precisely the artifacts
+    /// with the most findings. A truncation that said nothing about
+    /// what it dropped would be an audit record that lies, which is
+    /// worse than a short one, so the total travels with the list:
+    /// [`Self::total_new_findings`] reads it, and `Some`/`None` tells a
+    /// reader short from complete with nothing to recompute.
+    ///
+    /// Absent ⇒ complete, which is sound for every event written
+    /// before this field existed: an over-cap event could never have
+    /// been stored, so a stored list was the whole set.
+    ///
+    /// `#[serde(default, skip_serializing_if = …)]` rather than a bare
+    /// `#[serde(default)]`, for the reason spelled out on
+    /// [`ScanCompleted::assessment`]: the chain verifier re-derives a
+    /// stored payload's canonical bytes by deserialising and
+    /// re-serialising it, so a field that always writes a key makes
+    /// every event appended before it existed re-serialise to bytes it
+    /// was never hashed with — a `HashMismatch` indistinguishable from
+    /// tampering. A complete list writes no key and so is byte-identical
+    /// to what it was before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated_from_total: Option<u32>,
 }
 
 impl ArtifactBecameVulnerable {
+    /// The event for `new_findings`, holding as many of them as the
+    /// payload budget fits, **most severe first**.
+    ///
+    /// The construction lives here, beside [`Self::validate`] and the
+    /// [`MAX_EVENT_JSON_BYTES`] cap it has to respect, because a caller
+    /// assembling the struct literal cannot be stopped from building an
+    /// event no store accepts — and that is measured, not
+    /// hypothetical: an unbounded `new_findings` against the fixed cap
+    /// terminally failed the scans of the most vulnerable artifacts in
+    /// a running fleet, eleven of them inside one quarter-hour. Keeping
+    /// the construction in the domain is also what keeps the severity
+    /// ranking private to it.
+    ///
+    /// **Order before filling**, so that what survives is what
+    /// matters: severity tier ascending (`Critical` first) under the
+    /// one ranking — `types::finding::severity_tier`, shared with
+    /// `highest_severity`, the alias-group tie-break and
+    /// `merge_findings` (crate-private, so not linkable here) — then
+    /// `cvss_score` descending with `None` last, then `purl`, then
+    /// `vulnerability_id`. A prefix of the *input* order could drop
+    /// every `Critical` and keep a pile of `Low`, which for an event
+    /// whose subject is "this artifact became vulnerable" is backwards.
+    /// The three tie-breaks are what make the retained set a function
+    /// of the findings rather than of the order they arrived in:
+    /// `(purl, vulnerability_id)` is the identity key
+    /// [`compute_added_findings`](crate::policy::scan_delta::compute_added_findings)
+    /// keys its output on, so those four keys are a total order over
+    /// any set it produces.
+    ///
+    /// **The fill is measured, not estimated.** A cap on the *count*
+    /// would not bound the bytes — `title`, `references` and
+    /// `fixed_versions` are variable-length, and the measured payloads
+    /// ranged from 1.1× to 19× the cap — so the retained count is
+    /// bisected against the real
+    /// [`stored_payload_envelope`](super::stored_payload_envelope) at
+    /// `O(log n)` serialisations, which makes it exact rather than
+    /// conservative. The complete list is measured first and returned
+    /// untouched when it fits, so nothing is dropped and no total is
+    /// recorded unless the payload genuinely has no complete form.
+    ///
+    /// Returns [`DomainError::Validation`] when `new_findings` is empty
+    /// or holds a finding [`Finding::validate`] rejects, and when the
+    /// single most severe finding exceeds the budget *on its own* — the
+    /// one input shape no retained set can represent. That last case is
+    /// a different defect from the one this constructor exists for: a
+    /// `Finding`'s `references` and `fixed_versions` entries carry no
+    /// per-entry length cap, so one finding can be arbitrarily large,
+    /// and the fix for it is a per-entry cap on `Finding` rather than a
+    /// smaller retained set here. Every event this does return
+    /// satisfies [`Self::validate`] and `validate_for_storage`.
+    pub fn retaining_most_severe(
+        artifact_id: Uuid,
+        new_findings: &[Finding],
+        previously_clean_at: DateTime<Utc>,
+    ) -> DomainResult<Self> {
+        let mut event = Self {
+            artifact_id,
+            new_findings: Self::by_descending_severity(new_findings),
+            previously_clean_at,
+            truncated_from_total: None,
+        };
+        event.validate()?;
+        let total = event.new_findings.len();
+        if event.fits_budget(total, None) {
+            return Ok(event);
+        }
+        // Every probe below carries the total, so the envelope's
+        // non-findings bytes are identical across them and its size is
+        // strictly increasing in the retained count — which is what
+        // makes the bisection exact. The complete form is measured
+        // above rather than as `retained == total` because it carries
+        // no total and so is not a member of this family: dropping a
+        // finding to pay for the key it adds would be a truncation the
+        // payload did not need.
+        let recorded_total = Some(total as u32);
+        let mut low = 1;
+        let mut high = total - 1;
+        let mut retained = 0;
+        while low <= high {
+            let mid = low + (high - low) / 2;
+            if event.fits_budget(mid, recorded_total) {
+                retained = mid;
+                low = mid + 1;
+            } else {
+                high = mid - 1;
+            }
+        }
+        if retained == 0 {
+            return Err(DomainError::Validation(format!(
+                "ArtifactBecameVulnerable: the most severe of {total} new findings exceeds the \
+                 {BECAME_VULNERABLE_ENVELOPE_BUDGET} byte payload budget on its own"
+            )));
+        }
+        event.new_findings.truncate(retained);
+        event.truncated_from_total = recorded_total;
+        Ok(event)
+    }
+
+    /// The number of new findings this transition actually had: the
+    /// recorded total when the list was truncated, the list's own
+    /// length when it is complete.
+    ///
+    /// Stated once here so that no reader re-states the
+    /// "absent means complete" half of [`Self::truncated_from_total`]
+    /// and gets it half right.
+    #[must_use]
+    pub fn total_new_findings(&self) -> u64 {
+        self.truncated_from_total
+            .map_or(self.new_findings.len() as u64, u64::from)
+    }
+
     pub fn validate(&self) -> DomainResult<()> {
         if self.new_findings.is_empty() {
             return Err(DomainError::Validation(
@@ -498,7 +692,108 @@ impl ArtifactBecameVulnerable {
         for f in &self.new_findings {
             f.validate()?;
         }
+        // The total means "there were more than these", so one at or
+        // below the retained count is not a short list — it is two
+        // disagreeing statements about the same set, and `None` is the
+        // only spelling of a complete one.
+        if let Some(total) = self.truncated_from_total {
+            let retained = self.new_findings.len() as u64;
+            if u64::from(total) <= retained {
+                return Err(DomainError::Validation(format!(
+                    "ArtifactBecameVulnerable.truncated_from_total ({total}) must exceed the \
+                     {retained} retained findings; a complete list records no total"
+                )));
+            }
+        }
         Ok(())
+    }
+
+    /// Whether the event holding the first `retained` of this one's
+    /// severity-ordered findings, recording `truncated_from_total`,
+    /// fits [`BECAME_VULNERABLE_ENVELOPE_BUDGET`].
+    ///
+    /// Measured through
+    /// [`stored_payload_envelope`](super::stored_payload_envelope) —
+    /// the one producer of the bytes the store writes and the chain
+    /// hashes. An estimate assembled here would be a second voice for
+    /// that shape, and the reason to measure at all is that a
+    /// `Finding`'s own length is not knowable from its count.
+    fn fits_budget(&self, retained: usize, truncated_from_total: Option<u32>) -> bool {
+        DomainEvent::ArtifactBecameVulnerable(Self {
+            artifact_id: self.artifact_id,
+            new_findings: self.new_findings[..retained].to_vec(),
+            previously_clean_at: self.previously_clean_at,
+            truncated_from_total,
+        })
+        .stored_envelope_len()
+            <= BECAME_VULNERABLE_ENVELOPE_BUDGET
+    }
+
+    /// `findings` ordered most-severe-first under
+    /// [`Self::most_severe_first`].
+    fn by_descending_severity(findings: &[Finding]) -> Vec<Finding> {
+        let mut ordered = findings.to_vec();
+        // Stable, so the comparator's four keys are all that decides:
+        // a residual tie — two findings sharing the identity key the
+        // delta function dedups on — keeps input order rather than
+        // being permuted by an unstable sort's pivot choice.
+        ordered.sort_by(Self::most_severe_first);
+        ordered
+    }
+
+    /// The total order the retained set is a prefix of: severity tier
+    /// ascending (`Critical` first), then `cvss_score` descending with
+    /// `None` last, then `purl`, then `vulnerability_id`.
+    ///
+    /// **The severity tier is the first key, and nothing may be promoted
+    /// above it.** The tier is the only axis a policy decision reads —
+    /// [`finding_exceeds_threshold`](crate::policy::threshold::finding_exceeds_threshold)
+    /// is a comparison of `Finding::severity` against the configured
+    /// maximum allowed threat level and consults no other field — so
+    /// leading with it is what makes the short list answer the policy's
+    /// question the same way the complete set would: whatever exceeded a
+    /// threshold before the truncation still exceeds it after, for every
+    /// threshold. `cvss_score` is a *within-tier* preference, chosen
+    /// because the better-scored finding is the better audit record of
+    /// two equals, and that is the whole of its authority.
+    ///
+    /// Promote the score above the tier and a CVSS 9.8 `High` sorts
+    /// ahead of an unscored `Critical`: the sort is still total, every
+    /// tie-break still fires, and a truncation then drops the only
+    /// `Critical` while keeping a pile of `High`s — an audit record of
+    /// "this artifact became vulnerable" that a reader asking "was
+    /// anything critical?" gets the wrong answer from. Every existing
+    /// test still passes under that edit, which is why the case is
+    /// pinned on its own (`the_tier_outranks_the_score`) and the
+    /// property stated in general
+    /// (`the_retained_set_answers_every_threshold_as_the_complete_set_does`),
+    /// both in this module's tests.
+    fn most_severe_first(a: &Finding, b: &Finding) -> Ordering {
+        severity_tier(a.severity)
+            .cmp(&severity_tier(b.severity))
+            .then_with(|| Self::by_descending_score(a.cvss_score, b.cvss_score))
+            .then_with(|| a.purl.cmp(&b.purl))
+            .then_with(|| a.vulnerability_id.cmp(&b.vulnerability_id))
+    }
+
+    /// `cvss_score` descending, an absent score ordered after every
+    /// present one — a finding whose backend published no score is not
+    /// evidence of a low one, but it is the weaker audit record of two
+    /// and so yields the retained slot.
+    ///
+    /// Compared with [`f32::total_cmp`] and not `partial_cmp`: a `NaN`
+    /// score makes every `partial_cmp` answer `None`, and a comparator
+    /// that reports "equal" for a pair it cannot order is not
+    /// transitive. `sort_by` on an inconsistent comparator may return
+    /// an arbitrary permutation, which is the one thing an audit record
+    /// must not depend on.
+    fn by_descending_score(a: Option<f32>, b: Option<f32>) -> Ordering {
+        match (a, b) {
+            (Some(a), Some(b)) => b.total_cmp(&a),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        }
     }
 }
 
@@ -2355,14 +2650,742 @@ mod provenance_rejected_wire_tests {
                 "reason": "BundleMalformed",
             }
         });
-        let loaded: crate::events::DomainEvent =
-            serde_json::from_value(envelope).expect("the envelope loads");
+        let loaded: DomainEvent = serde_json::from_value(envelope).expect("the envelope loads");
         match loaded {
-            crate::events::DomainEvent::ProvenanceRejected(e) => {
+            DomainEvent::ProvenanceRejected(e) => {
                 assert_eq!(e.reason, ProvenanceRejectReason::BundleMalformed);
                 assert_eq!(e.backend, "cosign-key");
             }
             other => panic!("expected ProvenanceRejected, got {other:?}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ArtifactBecameVulnerable — the bounded constructor
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod became_vulnerable_bounded_tests {
+    use super::*;
+    use crate::policy::threshold::finding_exceeds_threshold;
+    use crate::types::{ComponentRelation, FindingStatement, SeverityBasis};
+
+    fn ts() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    /// A finding whose bulk is its `title`, so a corpus's serialised
+    /// length is a known multiple of ~1.3 KB and a set can be built just
+    /// past the budget without guessing.
+    fn finding(
+        severity: SeverityThreshold,
+        cvss: Option<f32>,
+        purl: &str,
+        vulnerability_id: &str,
+    ) -> Finding {
+        Finding {
+            purl: purl.into(),
+            vulnerability_id: vulnerability_id.into(),
+            severity,
+            cvss_score: cvss,
+            title: "t".repeat(1024),
+            fixed_versions: vec!["1.2.3".into()],
+            source_scanner: "trivy".into(),
+            references: vec!["https://example.test/advisory".into()],
+            aliases: vec![],
+            informational_class: None,
+            severity_basis: SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
+            statement: FindingStatement::Unstated,
+            advisory_published_at: None,
+        }
+    }
+
+    /// The `n`-th finding at `severity`, with a unique identity key.
+    fn nth(severity: SeverityThreshold, n: usize) -> Finding {
+        finding(
+            severity,
+            Some(5.0),
+            &format!("pkg:npm/p{n:04}@1.0.0"),
+            &format!("CVE-2026-{n:04}"),
+        )
+    }
+
+    /// `n` findings cycling through all four tiers with unique identity
+    /// keys and repeating scores, so the tier decides first and the
+    /// `purl` tie-break decides the rest.
+    fn mixed_corpus(n: usize) -> Vec<Finding> {
+        (0..n)
+            .map(|i| {
+                let severity = match i % 4 {
+                    0 => SeverityThreshold::Low,
+                    1 => SeverityThreshold::Critical,
+                    2 => SeverityThreshold::Medium,
+                    _ => SeverityThreshold::High,
+                };
+                let mut f = nth(severity, i);
+                f.cvss_score = Some((i % 10) as f32);
+                f
+            })
+            .collect()
+    }
+
+    fn key(f: &Finding) -> (String, String) {
+        (f.purl.clone(), f.vulnerability_id.clone())
+    }
+
+    fn keys(e: &ArtifactBecameVulnerable) -> Vec<(String, String)> {
+        e.new_findings.iter().map(key).collect()
+    }
+
+    fn envelope_len(e: &ArtifactBecameVulnerable) -> usize {
+        DomainEvent::ArtifactBecameVulnerable(e.clone()).stored_envelope_len()
+    }
+
+    fn build(findings: &[Finding]) -> ArtifactBecameVulnerable {
+        ArtifactBecameVulnerable::retaining_most_severe(Uuid::nil(), findings, ts())
+            .expect("a corpus of ordinary findings is representable")
+    }
+
+    // -- the budget itself --------------------------------------------------
+
+    /// A filled payload lands below the cap by the **whole reserve**,
+    /// not on the cap. A producer that filled to the cap would be
+    /// handing the database's own `pg_column_size(event_data)` CHECK a
+    /// payload measured by a different ruler — see
+    /// [`BECAME_VULNERABLE_RESERVED_BYTES`]. The arithmetic between the
+    /// three constants is asserted at compile time beside them; this is
+    /// the measurement on a payload the constructor actually produced.
+    #[test]
+    fn a_filled_payload_lands_below_the_cap_by_the_reserve() {
+        let event = build(&mixed_corpus(200));
+        assert!(event.truncated_from_total.is_some(), "a filled payload");
+        let len = envelope_len(&event);
+        assert!(
+            len <= BECAME_VULNERABLE_ENVELOPE_BUDGET,
+            "{len} bytes exceeds the {BECAME_VULNERABLE_ENVELOPE_BUDGET} byte budget"
+        );
+        assert!(
+            MAX_EVENT_JSON_BYTES - len >= BECAME_VULNERABLE_RESERVED_BYTES,
+            "{len} bytes leaves less than the reserve below the {MAX_EVENT_JSON_BYTES} byte cap"
+        );
+    }
+
+    // -- a set that fits ---------------------------------------------------
+
+    /// A set inside the budget is returned whole, records no total, and
+    /// is ordered — not left in input order and not reordered away from
+    /// the documented one.
+    #[test]
+    fn a_fitting_set_is_complete_and_ordered() {
+        let input = vec![
+            nth(SeverityThreshold::Low, 1),
+            nth(SeverityThreshold::Critical, 2),
+            nth(SeverityThreshold::Medium, 3),
+            nth(SeverityThreshold::High, 4),
+        ];
+        let event = build(&input);
+
+        assert_eq!(event.truncated_from_total, None, "nothing was dropped");
+        assert_eq!(event.total_new_findings(), 4);
+        assert_eq!(
+            event
+                .new_findings
+                .iter()
+                .map(|f| f.severity)
+                .collect::<Vec<_>>(),
+            vec![
+                SeverityThreshold::Critical,
+                SeverityThreshold::High,
+                SeverityThreshold::Medium,
+                SeverityThreshold::Low,
+            ]
+        );
+        event.validate().unwrap();
+        DomainEvent::ArtifactBecameVulnerable(event)
+            .validate_for_storage()
+            .unwrap();
+    }
+
+    /// One finding: complete, no total, storable.
+    #[test]
+    fn a_single_finding_is_complete() {
+        let event = build(&[nth(SeverityThreshold::High, 1)]);
+        assert_eq!(event.new_findings.len(), 1);
+        assert_eq!(event.truncated_from_total, None);
+        assert_eq!(event.total_new_findings(), 1);
+        DomainEvent::ArtifactBecameVulnerable(event)
+            .validate_for_storage()
+            .unwrap();
+    }
+
+    // -- the tie-breaks ----------------------------------------------------
+
+    /// All one severity, so the three tie-breaks are exercised on their
+    /// own: score descending with an absent score last, then `purl`,
+    /// then `vulnerability_id`.
+    #[test]
+    fn one_severity_orders_by_score_then_purl_then_vulnerability_id() {
+        let input = vec![
+            finding(SeverityThreshold::High, None, "pkg:npm/a@1", "CVE-0001"),
+            finding(
+                SeverityThreshold::High,
+                Some(4.0),
+                "pkg:npm/b@1",
+                "CVE-0002",
+            ),
+            finding(
+                SeverityThreshold::High,
+                Some(9.8),
+                "pkg:npm/z@1",
+                "CVE-0003",
+            ),
+            // Same score as the next one — `purl` decides between them.
+            finding(
+                SeverityThreshold::High,
+                Some(4.0),
+                "pkg:npm/a@1",
+                "CVE-0004",
+            ),
+            // Same score AND same purl as the one above — the
+            // vulnerability id is the last key.
+            finding(
+                SeverityThreshold::High,
+                Some(4.0),
+                "pkg:npm/a@1",
+                "CVE-0000",
+            ),
+        ];
+        let event = build(&input);
+        assert_eq!(
+            event
+                .new_findings
+                .iter()
+                .map(|f| f.vulnerability_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["CVE-0003", "CVE-0000", "CVE-0004", "CVE-0002", "CVE-0001"],
+            "9.8 first; then the three 4.0s by purl then id; the absent score last"
+        );
+    }
+
+    /// Every arm of the score comparator, including the pair that is
+    /// genuinely equal — `(None, None)` must fall through to `purl`
+    /// rather than deciding.
+    #[test]
+    fn absent_scores_fall_through_to_the_remaining_keys() {
+        assert_eq!(
+            ArtifactBecameVulnerable::by_descending_score(Some(1.0), Some(2.0)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            ArtifactBecameVulnerable::by_descending_score(Some(2.0), Some(1.0)),
+            Ordering::Less
+        );
+        assert_eq!(
+            ArtifactBecameVulnerable::by_descending_score(Some(1.0), None),
+            Ordering::Less
+        );
+        assert_eq!(
+            ArtifactBecameVulnerable::by_descending_score(None, Some(1.0)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            ArtifactBecameVulnerable::by_descending_score(None, None),
+            Ordering::Equal
+        );
+
+        let event = build(&[
+            finding(SeverityThreshold::Low, None, "pkg:npm/b@1", "CVE-2"),
+            finding(SeverityThreshold::Low, None, "pkg:npm/a@1", "CVE-1"),
+        ]);
+        assert_eq!(
+            event.new_findings[0].purl, "pkg:npm/a@1",
+            "two unscored findings are ordered by purl, not by arrival"
+        );
+    }
+
+    /// A `NaN` score cannot make the comparator inconsistent: the sort
+    /// completes and lands on the same order from either input order.
+    /// `partial_cmp` would report `None` for every pair involving it,
+    /// and a comparator that calls a pair it cannot order "equal" is
+    /// not transitive.
+    #[test]
+    fn a_nan_score_still_yields_one_deterministic_order() {
+        let mut input = vec![
+            finding(
+                SeverityThreshold::High,
+                Some(f32::NAN),
+                "pkg:npm/a@1",
+                "CVE-1",
+            ),
+            finding(SeverityThreshold::High, Some(9.8), "pkg:npm/b@1", "CVE-2"),
+            finding(SeverityThreshold::High, None, "pkg:npm/c@1", "CVE-3"),
+            finding(SeverityThreshold::High, Some(1.0), "pkg:npm/d@1", "CVE-4"),
+        ];
+        let forward = build(&input);
+        input.reverse();
+        let backward = build(&input);
+        assert_eq!(keys(&forward), keys(&backward));
+        assert_eq!(
+            forward
+                .new_findings
+                .last()
+                .map(|f| f.vulnerability_id.clone()),
+            Some("CVE-3".to_string()),
+            "the unscored finding is last whatever NaN does above it"
+        );
+    }
+
+    // -- the truncation ----------------------------------------------------
+
+    /// A set whose complete serialisation is far past the cap becomes an
+    /// event the store accepts, with the true total recorded and the
+    /// truncation visible without recomputing anything.
+    #[test]
+    fn an_over_budget_set_becomes_a_storable_event() {
+        let input = mixed_corpus(200);
+        let complete_len = envelope_len(&ArtifactBecameVulnerable {
+            artifact_id: Uuid::nil(),
+            new_findings: input.clone(),
+            previously_clean_at: ts(),
+            truncated_from_total: None,
+        });
+        assert!(
+            complete_len > MAX_EVENT_JSON_BYTES,
+            "the corpus must be the defect's shape; measured {complete_len} bytes"
+        );
+
+        let event = build(&input);
+        assert_eq!(event.truncated_from_total, Some(200));
+        assert_eq!(event.total_new_findings(), 200);
+        assert!(event.new_findings.len() < 200);
+        assert!(!event.new_findings.is_empty());
+        event.validate().unwrap();
+        let envelope = DomainEvent::ArtifactBecameVulnerable(event.clone())
+            .validate_for_storage()
+            .expect("the truncated event is storable");
+        assert!(envelope.to_string().len() <= BECAME_VULNERABLE_ENVELOPE_BUDGET);
+    }
+
+    /// The retained count is the largest one that fits — the fill is a
+    /// measurement, not a guess. One more finding would cross the
+    /// budget.
+    #[test]
+    fn the_retained_count_is_maximal() {
+        let input = mixed_corpus(200);
+        let event = build(&input);
+        let retained = event.new_findings.len();
+        let ordered = ArtifactBecameVulnerable::by_descending_severity(&input);
+        let probe = ArtifactBecameVulnerable {
+            artifact_id: Uuid::nil(),
+            new_findings: ordered,
+            previously_clean_at: ts(),
+            truncated_from_total: None,
+        };
+        assert!(probe.fits_budget(retained, Some(200)));
+        assert!(
+            !probe.fits_budget(retained + 1, Some(200)),
+            "retaining one more finding must exceed the budget"
+        );
+    }
+
+    /// **The point of the change.** A `Critical` arriving last in the
+    /// input survives a truncation that drops the `Low`s ahead of it. A
+    /// prefix of the input order would have kept the pile of `Low`s and
+    /// thrown the `Critical` away — for an event whose subject is "this
+    /// artifact became vulnerable", exactly backwards.
+    #[test]
+    fn a_trailing_critical_survives_a_truncation_that_drops_leading_lows() {
+        let mut input: Vec<Finding> = (0..200).map(|i| nth(SeverityThreshold::Low, i)).collect();
+        let critical = nth(SeverityThreshold::Critical, 999);
+        input.push(critical.clone());
+
+        let event = build(&input);
+
+        assert_eq!(
+            event.truncated_from_total,
+            Some(201),
+            "the set does not fit, so this is a truncation"
+        );
+        assert!(event.new_findings.len() < 201);
+        assert_eq!(
+            event.new_findings.first().map(key),
+            Some(key(&critical)),
+            "the only Critical must be retained, and first"
+        );
+        assert!(
+            event.new_findings[1..]
+                .iter()
+                .all(|f| f.severity == SeverityThreshold::Low),
+            "the rest of the retained set is the Lows that fit behind it"
+        );
+    }
+
+    /// The retained set is a function of the findings, not of the order
+    /// they arrived in — it is an audit record, and three permutations
+    /// of one corpus must produce one event.
+    #[test]
+    fn the_retained_set_does_not_depend_on_input_order() {
+        let base = mixed_corpus(200);
+        let reference = build(&base);
+        assert!(reference.truncated_from_total.is_some(), "a truncating set");
+
+        let mut reversed = base.clone();
+        reversed.reverse();
+
+        let mut rotated = base.clone();
+        rotated.rotate_left(37);
+
+        // A stride permutation: 7 is coprime with 200, so this visits
+        // every index exactly once in an order unlike the two above.
+        let strided: Vec<Finding> = (0..base.len())
+            .map(|i| base[(i * 7) % base.len()].clone())
+            .collect();
+
+        for (name, permutation) in [
+            ("reversed", reversed),
+            ("rotated", rotated),
+            ("strided", strided),
+        ] {
+            let event = build(&permutation);
+            assert_eq!(
+                event, reference,
+                "{name} input produced a different retained set"
+            );
+        }
+    }
+
+    // -- the policy-relevant axis ------------------------------------------
+
+    /// The invariant stated on [`ArtifactBecameVulnerable::most_severe_first`]:
+    /// the severity tier outranks `cvss_score`, so a well-scored `High`
+    /// never sorts ahead of a `Critical`.
+    ///
+    /// Every other ordering test in this module compares findings of one
+    /// severity, which is the adjacent statement — what the score decides
+    /// *within* a tier — and all of them stay green if the two keys are
+    /// swapped. This is the one that does not: swap them and the `High`
+    /// below, carrying the higher score of the two, leads the retained
+    /// set.
+    #[test]
+    fn the_tier_outranks_the_score() {
+        let critical = finding(
+            SeverityThreshold::Critical,
+            Some(1.0),
+            "pkg:npm/z@1",
+            "CVE-9999",
+        );
+        let high = finding(
+            SeverityThreshold::High,
+            Some(9.8),
+            "pkg:npm/a@1",
+            "CVE-0001",
+        );
+
+        assert_eq!(
+            ArtifactBecameVulnerable::most_severe_first(&critical, &high),
+            Ordering::Less,
+            "the comparator must order the lower-scored Critical ahead of the \
+             higher-scored High"
+        );
+
+        // Both input orders, so the answer is the comparator's and not
+        // the stable sort keeping whatever arrived first.
+        for input in [
+            vec![high.clone(), critical.clone()],
+            vec![critical.clone(), high.clone()],
+        ] {
+            let event = build(&input);
+            assert_eq!(
+                event.new_findings.first().map(key),
+                Some(key(&critical)),
+                "a CVSS 9.8 High must not displace a Critical"
+            );
+        }
+
+        // And under a truncation, where displacing it means losing it: a
+        // single Critical behind enough well-scored Highs to fill the
+        // payload.
+        let mut input: Vec<Finding> = (0..200)
+            .map(|i| {
+                let mut f = nth(SeverityThreshold::High, i);
+                f.cvss_score = Some(9.8);
+                f
+            })
+            .collect();
+        input.push(critical.clone());
+        let event = build(&input);
+        assert_eq!(
+            event.truncated_from_total,
+            Some(201),
+            "the corpus must truncate, or nothing is being displaced"
+        );
+        assert_eq!(
+            event.new_findings.first().map(key),
+            Some(key(&critical)),
+            "the Critical must survive a truncation that keeps CVSS 9.8 Highs"
+        );
+    }
+
+    /// **The general form of the requirement the truncation exists to
+    /// satisfy:** for every policy threshold, if the complete set
+    /// contains a finding that exceeds it, so does the retained set.
+    ///
+    /// The value the comparison against a repository's maximum allowed
+    /// threat level reads is the severity tier and nothing else, so the
+    /// property is stated through
+    /// [`finding_exceeds_threshold`](crate::policy::threshold::finding_exceeds_threshold)
+    /// itself rather than through a second copy of the mapping here —
+    /// a re-typed copy would keep agreeing with this test while the
+    /// policy moved away from both.
+    ///
+    /// `a_trailing_critical_survives_a_truncation_that_drops_leading_lows`
+    /// pins one case of this; the loop below is the statement, over the
+    /// four thresholds and over corpora whose exceeding finding is the
+    /// rare one. The per-threshold `exercised` tally is what keeps it
+    /// from passing vacuously: a corpus set that stopped carrying an
+    /// exceeding finding for some threshold would otherwise assert
+    /// nothing about it.
+    #[test]
+    fn the_retained_set_answers_every_threshold_as_the_complete_set_does() {
+        const THRESHOLDS: [SeverityThreshold; 4] = [
+            SeverityThreshold::Critical,
+            SeverityThreshold::High,
+            SeverityThreshold::Medium,
+            SeverityThreshold::Low,
+        ];
+
+        /// 200 well-scored `Low` findings, then one poorly-scored
+        /// finding at `severity`.
+        ///
+        /// Two ways of being the rare one at once: it arrives last, so a
+        /// prefix of the *input* order drops it, and it carries the
+        /// lowest `cvss_score` in the corpus, so any ordering that lets
+        /// the score outrank the tier drops it too. The thresholds above
+        /// `Low` have no other finding to be satisfied by.
+        fn lows_then(severity: SeverityThreshold) -> Vec<Finding> {
+            let mut input: Vec<Finding> = (0..200)
+                .map(|i| {
+                    let mut f = nth(SeverityThreshold::Low, i);
+                    f.cvss_score = Some(9.8);
+                    f
+                })
+                .collect();
+            let mut rare = nth(severity, 999);
+            rare.cvss_score = Some(0.1);
+            input.push(rare);
+            input
+        }
+
+        let corpora: [(&str, Vec<Finding>); 5] = [
+            ("all four tiers interleaved", mixed_corpus(200)),
+            (
+                "200 lows then one critical",
+                lows_then(SeverityThreshold::Critical),
+            ),
+            ("200 lows then one high", lows_then(SeverityThreshold::High)),
+            (
+                "200 lows then one medium",
+                lows_then(SeverityThreshold::Medium),
+            ),
+            (
+                "200 lows only",
+                (0..200).map(|i| nth(SeverityThreshold::Low, i)).collect(),
+            ),
+        ];
+
+        let mut exercised = [false; THRESHOLDS.len()];
+        for (name, complete) in &corpora {
+            let event = build(complete);
+            assert!(
+                event.truncated_from_total.is_some(),
+                "{name}: the corpus must truncate, or the property is being \
+                 asserted about a set nothing was dropped from"
+            );
+
+            for (slot, threshold) in THRESHOLDS.iter().enumerate() {
+                let exceeds = |f: &Finding| finding_exceeds_threshold(f.severity, *threshold);
+                if !complete.iter().any(exceeds) {
+                    continue;
+                }
+                exercised[slot] = true;
+                assert!(
+                    event.new_findings.iter().any(exceeds),
+                    "{name}: the complete set of {} findings carries one that \
+                     exceeds {threshold:?}, and the {} retained do not — the \
+                     truncated audit record answers the policy's question \
+                     differently from the set it was taken from",
+                    complete.len(),
+                    event.new_findings.len(),
+                );
+            }
+        }
+
+        for (slot, threshold) in THRESHOLDS.iter().enumerate() {
+            assert!(
+                exercised[slot],
+                "no corpus above carries a finding exceeding {threshold:?}, so \
+                 the property is vacuously true for it"
+            );
+        }
+    }
+
+    // -- the refusals ------------------------------------------------------
+
+    /// No findings is no transition — the constructor refuses it with
+    /// `validate()`'s own message rather than inventing a second one.
+    #[test]
+    fn an_empty_set_is_refused() {
+        let err = ArtifactBecameVulnerable::retaining_most_severe(Uuid::nil(), &[], ts())
+            .expect_err("an empty set is not a transition");
+        assert!(matches!(err, DomainError::Validation(_)));
+        assert!(
+            err.to_string().contains("at least one new finding"),
+            "got: {err}"
+        );
+    }
+
+    /// A finding `Finding::validate` rejects is refused before anything
+    /// is dropped — truncating an invalid set would hide the invalid
+    /// finding behind the truncation whenever it sorted low.
+    #[test]
+    fn an_invalid_finding_is_refused() {
+        let mut bad = nth(SeverityThreshold::Low, 1);
+        bad.purl = "x".repeat(600);
+        let input = vec![nth(SeverityThreshold::Critical, 2), bad];
+        let err = ArtifactBecameVulnerable::retaining_most_severe(Uuid::nil(), &input, ts())
+            .expect_err("an invalid finding is refused");
+        assert!(err.to_string().contains("purl"), "got: {err}");
+    }
+
+    /// One finding too large to store on its own is the input shape no
+    /// retained set can represent, and it is refused naming that. A
+    /// `Finding`'s `references` entries carry no per-entry length cap,
+    /// so the finding itself is valid.
+    #[test]
+    fn a_single_finding_over_the_budget_is_refused() {
+        let mut huge = nth(SeverityThreshold::Critical, 1);
+        huge.references = (0..32).map(|_| "u".repeat(4096)).collect();
+        huge.validate().expect("the finding itself is valid");
+
+        let err =
+            ArtifactBecameVulnerable::retaining_most_severe(Uuid::nil(), &[huge.clone()], ts())
+                .expect_err("a finding that cannot be stored alone is refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("most severe of 1 new findings") && msg.contains("on its own"),
+            "the refusal names the cause; got: {msg}"
+        );
+
+        // Also when it arrives beside findings that would have fit: the
+        // most severe one is the one that must be kept, and it cannot
+        // be.
+        let input = vec![huge, nth(SeverityThreshold::Low, 2)];
+        let err = ArtifactBecameVulnerable::retaining_most_severe(Uuid::nil(), &input, ts())
+            .expect_err("the most severe finding is the one that must fit");
+        assert!(err.to_string().contains("most severe of 2 new findings"));
+    }
+
+    // -- the recorded total ------------------------------------------------
+
+    /// A recorded total at or below the retained count is two
+    /// disagreeing statements about one set, not a short list.
+    #[test]
+    fn validate_rejects_a_total_that_does_not_exceed_the_retained_count() {
+        for total in [0, 1] {
+            let e = ArtifactBecameVulnerable {
+                artifact_id: Uuid::nil(),
+                new_findings: vec![nth(SeverityThreshold::High, 1)],
+                previously_clean_at: ts(),
+                truncated_from_total: Some(total),
+            };
+            let err = e
+                .validate()
+                .expect_err("{total} does not exceed 1 retained");
+            assert!(
+                err.to_string()
+                    .contains("must exceed the 1 retained findings"),
+                "got: {err}"
+            );
+        }
+
+        let ok = ArtifactBecameVulnerable {
+            artifact_id: Uuid::nil(),
+            new_findings: vec![nth(SeverityThreshold::High, 1)],
+            previously_clean_at: ts(),
+            truncated_from_total: Some(2),
+        };
+        ok.validate().expect("one of two retained is a short list");
+        assert_eq!(ok.total_new_findings(), 2);
+    }
+
+    /// A complete list writes no key, so an event that drops nothing
+    /// serialises to exactly the bytes it did before this field existed
+    /// — which is what keeps the chain verifier's re-derivation of
+    /// every already-stored `ArtifactBecameVulnerable` landing on the
+    /// hash it was written with.
+    #[test]
+    fn a_complete_list_adds_no_key_to_the_stored_payload() {
+        let complete = build(&[nth(SeverityThreshold::High, 1)]);
+        let envelope = crate::events::stored_payload_envelope(
+            &DomainEvent::ArtifactBecameVulnerable(complete),
+        );
+        let data = envelope.get("data").expect("the envelope carries data");
+        assert!(
+            data.get("truncated_from_total").is_none(),
+            "a complete list is spelled by the key's absence: {data}"
+        );
+
+        let truncated = build(&mixed_corpus(200));
+        let envelope = crate::events::stored_payload_envelope(
+            &DomainEvent::ArtifactBecameVulnerable(truncated),
+        );
+        assert_eq!(
+            envelope
+                .get("data")
+                .and_then(|d| d.get("truncated_from_total")),
+            Some(&serde_json::json!(200)),
+            "a truncation says so in the payload"
+        );
+    }
+
+    /// A payload written before the field existed reads as complete,
+    /// which is sound: an over-cap event could never have been stored,
+    /// so a stored list was the whole set.
+    #[test]
+    fn a_payload_without_the_key_reads_as_complete() {
+        let complete = build(&[nth(SeverityThreshold::High, 1)]);
+        let mut value = serde_json::to_value(&complete).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("truncated_from_total");
+        let back: ArtifactBecameVulnerable = serde_json::from_value(value).unwrap();
+        assert_eq!(back.truncated_from_total, None);
+        assert_eq!(back.total_new_findings(), 1);
+        assert_eq!(back, complete);
+    }
+
+    /// A truncated event round-trips through the stored envelope: the
+    /// total survives the trip, so the audit record a reader gets back
+    /// is the one that was written.
+    #[test]
+    fn a_truncated_event_round_trips_through_serde() {
+        let event = DomainEvent::ArtifactBecameVulnerable(build(&mixed_corpus(200)));
+        let back: DomainEvent = serde_json::from_str(&serde_json::to_string(&event).unwrap())
+            .expect("a truncated event round-trips");
+        assert_eq!(back, event);
+    }
+
+    /// The measurement the bisection fills to is the one the cap
+    /// refuses on — [`DomainEvent::stored_envelope_len`] is the length
+    /// of the very envelope `validate_for_storage` returns.
+    #[test]
+    fn the_measured_length_is_the_stored_envelope_length() {
+        let event = DomainEvent::ArtifactBecameVulnerable(build(&mixed_corpus(200)));
+        let envelope = event.validate_for_storage().unwrap();
+        assert_eq!(event.stored_envelope_len(), envelope.to_string().len());
+        assert!(event.fits_storage_cap());
     }
 }

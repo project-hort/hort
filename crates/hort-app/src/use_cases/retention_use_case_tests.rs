@@ -1271,6 +1271,7 @@ async fn artifact_became_vulnerable_no_longer_anchors_the_grace_period() {
         artifact_id: c.artifact.id,
         new_findings: vec![finding(SeverityThreshold::High, Some(7.0), vec![])],
         previously_clean_at: ts(0),
+        truncated_from_total: None,
     });
     seed_fresh_scanned_stream(&store, &c, now, vec![abv]);
     let p = policy(
