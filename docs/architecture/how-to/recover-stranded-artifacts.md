@@ -176,9 +176,9 @@ The three sources the tick drives, and which population each exists for:
 
 | Source | Population | Why nothing else reaches it |
 |---|---|---|
-| `select_eligible` | live artifacts whose policy interval elapsed | the routine case |
+| `select_eligible` | live artifacts whose policy interval elapsed, measured on both `last_scan_at` **and** the most recent `kind='scan'` request | the routine case. The second half of the interval test is what ends the re-presentation of an artifact whose scan ran and reached no verdict: `last_scan_at` is written only by the scan-result commit, and on a `released` artifact a verdictless run may not move the status either, so the artifact satisfied the predicate again on every tick |
 | `select_stranded` | the two holds whose scan errored or was never requested, **and** an artifact held `scan_indeterminate` whose last scan request is older than its resolved rescan interval | a `scan_indeterminate` artifact is outside `select_eligible`'s statuses entirely. The second half matters because a scan in which every backend ran and reported *nothing to analyse* produces a **completed** job: a predicate reading only the job's status cannot see the artifact it left held |
-| `select_composite_unassessed` | live OCI **image manifests** with no composite assessment on record | they are serving, so `select_stranded` does not apply; their own evidence may be minutes old, so `select_eligible`'s interval does not either — while the evidence was reached under a rule in which a composed image's verdict carried no release authority |
+| `select_composite_unassessed` | live OCI **image manifests** with no composite assessment on record whose most recent `kind='scan'` request is older than the resolved interval | they are serving, so `select_stranded` does not apply; their own evidence may be minutes old, so `select_eligible`'s interval does not either — while the evidence was reached under a rule in which a composed image's verdict carried no release authority. The interval bound is a backstop, not a cadence: a manifest whose scan recorded its assessment has already left the set, and the bound only governs the manifest whose best-effort observation write did not land |
 
 **What drives it on an upgrade.** Nothing automatic: the chart ships
 `scheduledTasks.cronRescanTick.enabled: false`, so either schedule the

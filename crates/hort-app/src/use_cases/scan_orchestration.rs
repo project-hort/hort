@@ -1133,8 +1133,10 @@ impl ScanOrchestrationUseCase {
                     max_attempts = self.config.max_attempts,
                     reason = %why,
                     "composite scan: the attempt budget is spent and the composition was \
-                     never produced — holding the artifact recoverably, so a later scan \
-                     and a write-granted read can both still reach it",
+                     never produced — reporting a verdictless run, which withholds an \
+                     artifact that carries no verdict recoverably (a later scan and a \
+                     write-granted read both still reach it) and leaves one that does \
+                     exactly as it is",
                 );
                 return Ok(ScanRunOutcome::CompositionNotProduced { reason });
             }
@@ -1544,14 +1546,25 @@ impl ScanOrchestrationUseCase {
                 // `nothing_analysable`, not `completed` — a held,
                 // unassessed artifact must not read as clean — and not
                 // `failed`, because nothing failed.
+                // What this line may claim is what this scope knows. The
+                // run produced no verdict and therefore no release
+                // authority, and that is unconditional. Whether the
+                // artifact *becomes* `scan_indeterminate` is not: on one
+                // already carrying a terminal verdict the call below
+                // takes its already-terminal skip and holds nothing, so a
+                // line asserting the transition would describe an outcome
+                // the call did not produce for the row an operator is
+                // reading about. `record_scan_indeterminate` logs the
+                // transition where it happens, and only when it happens.
                 tracing::warn!(
                     artifact_id = %job.artifact_id,
                     format = %job.format,
                     scanner = %scanner,
                     reason = %reason,
-                    "no scan backend produced a verdict — holding artifact scan_indeterminate \
-                     (fail-closed); a backend that cannot analyse this format is a policy \
-                     mismatch, not a clean scan",
+                    "no scan backend produced a verdict: this run mints no release authority \
+                     and overwrites no verdict the artifact already carries — an artifact \
+                     that carries none is held scan_indeterminate (fail-closed). A backend \
+                     that cannot analyse this format is a policy mismatch, not a clean scan",
                 );
                 self.quarantine
                     .record_scan_indeterminate(job.artifact_id, scanner, reason, job.attempts)
@@ -1588,15 +1601,24 @@ impl ScanOrchestrationUseCase {
                 // composition unproducible. Leaving the artifact `None` is
                 // not the third option: that serves an image whose
                 // filesystem nothing assessed.
+                // Same scoping as the arm above: the absent verdict is
+                // this run's fact, the hold is not. On an artifact
+                // already carrying a verdict —
+                // `select_composite_unassessed`'s whole population is
+                // `released`/`NULL` — `hold_for_unproduced_composition`
+                // leaves the state alone and logs that where it decides
+                // it, so this line states the run's outcome and names the
+                // hold only as what an unverdicted artifact receives.
                 tracing::warn!(
                     artifact_id = %job.artifact_id,
                     format = %job.format,
                     attempts = job.attempts,
                     reason = %reason,
-                    "the composed image was never produced within the attempt budget — \
-                     holding the artifact (no verdict, no release authority) in the \
-                     recoverable hold, from which the rescan sweep re-asks and a \
-                     write-granted read still reaches it",
+                    "the composed image was never produced within the attempt budget: no \
+                     verdict, so no release authority, and no verdict the artifact already \
+                     carries is overwritten — one that carries none takes the recoverable \
+                     hold, from which the rescan sweep re-asks and a write-granted read \
+                     still reaches it",
                 );
                 self.quarantine
                     .hold_for_unproduced_composition(job.artifact_id, reason.clone())

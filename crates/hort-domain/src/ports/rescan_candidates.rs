@@ -4,7 +4,8 @@
 //! delegates the SQL-side eligibility predicate — joining `artifacts`
 //! to `policy_projections` via the repo→policy chain, filtering
 //! `quarantine_status='released'` and `rescan_interval_hours > 0`,
-//! comparing `last_scan_at` against the policy interval, and excluding
+//! comparing both `last_scan_at` and the artifact's most recent
+//! `kind='scan'` request against the policy interval, and excluding
 //! artifacts that already have an in-flight `kind='scan'` job — to this
 //! port. Keeping the SQL inside the Postgres adapter and exposing the
 //! result as a flat `Vec<RescanCandidate>` lets the handler stay a pure
@@ -116,13 +117,58 @@
 //! be true of everything hort ingests next and false of everything it
 //! already holds.
 //!
-//! The predicate is the **absence of a composite observation row**, and
-//! that is what makes it self-limiting with no interval of its own: every
-//! composite scan records one, whatever it concluded, so a reassessed
-//! manifest leaves the set. A manifest whose composite assessment is
-//! already recorded — including one that recorded a refusal — is not in
-//! it, and is reached by the ordinary interval sweep like any other
-//! released artifact.
+//! The predicate is the **absence of a composite observation row**:
+//! every composite scan records one, whatever it concluded, so a
+//! reassessed manifest leaves the set. A manifest whose composite
+//! assessment is already recorded — including one that recorded a
+//! refusal — is not in it, and is reached by the ordinary interval sweep
+//! like any other released artifact.
+//!
+//! # A reported scan leaves a trace, and the trace is the job row
+//!
+//! What all three queries need, and what two of them lacked, is the same
+//! thing: a scan that **ran and reported** must leave something that
+//! takes the artifact out of the selection, whatever it reported. Absent
+//! that, a sweep whose candidate predicate the run does not change
+//! re-presents the same rows on every tick for as long as the deployment
+//! runs — one enqueued scan per row per tick, for an answer re-running
+//! reproduces.
+//!
+//! Neither of the two obvious candidates for that trace carries it:
+//!
+//! - **The artifact's status** is deliberately untouched by a verdictless
+//!   run on an artifact that already carries a verdict. Both
+//!   `QuarantineUseCase::record_scan_indeterminate` and
+//!   `hold_for_unproduced_composition` take an already-terminal skip
+//!   there, because a run that reached no verdict has no standing to
+//!   overwrite one that did.
+//! - **`artifacts.last_scan_at`** is the *verdict's* timestamp, written
+//!   only by the scan-result commit, and it is also that verdict's
+//!   finding rows' identity: three reads join `sf.detected_at =
+//!   a.last_scan_at`. Advancing it for a scan that produced no findings
+//!   would make an artifact nobody could re-assess read as an artifact
+//!   with none — the curator's worklist, the patch-candidate listing and
+//!   the retention evaluator all at once.
+//! - **A projection row** is best-effort where it is a measurement
+//!   surface, which the composite observation deliberately is.
+//!
+//! The terminal `kind='scan'` `jobs` row is the trace that does carry
+//! it. It exists for every reported scan, whatever the disposition, and
+//! `TaskDispatcher` is its single writer. So each query bounds candidacy
+//! by the most recent scan **request** against the same resolved
+//! `rescan_interval_hours` it already resolves — stated once in
+//! [`Self::select_stranded`]'s absent-verdict arm and now the rule in all
+//! three. Read off the request's age rather than the row's status,
+//! because the verdictless outcomes land on different statuses (an
+//! abstention completes its row, an unproduced composition fails it)
+//! while being one fact here.
+//!
+//! Its one limit, stated rather than discovered: the
+//! `scan-row-retention-sweep` reclaims terminal `kind='scan'` rows past
+//! its horizon, so a resolved interval longer than that horizon falls
+//! back to whatever the query's other arm says. That bounds the re-ask at
+//! the horizon instead of at the interval; it does not restore the
+//! per-tick loop.
 
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
@@ -245,15 +291,34 @@ pub trait RescanCandidatesRepository: Send + Sync {
     /// reached under a rule in which the composed image's verdict carried
     /// no release authority. See the module doc for why the predicate is
     /// the *absence* of an observation rather than the absence of a
-    /// successful one, and why that is what makes the sweep self-limiting
-    /// without an interval of its own.
+    /// successful one.
+    ///
+    /// **And why that predicate alone does not make the sweep
+    /// self-limiting.** "Every composite scan records a row" is a
+    /// best-effort write by construction: the observation projection is a
+    /// measurement surface and may not be able to withhold an artifact,
+    /// so `ShadowObservationSink::record` logs a storage failure and
+    /// returns, and the run that could not resolve its exclusion set
+    /// records nothing at all and says so. Either way the manifest's scan
+    /// ran and reported while the row the next tick reads for is absent,
+    /// and this query would re-present it on that tick and on every tick
+    /// after it. So candidacy is **also** bounded by the most recent
+    /// `kind='scan'` request against the resolved `rescan_interval_hours`
+    /// — the same bound [`Self::select_stranded`]'s absent-verdict arm
+    /// carries, and a backstop rather than a cadence: a manifest whose
+    /// scan did record its row has already left the set by the
+    /// row-absence predicate before this one is reached.
     ///
     /// An image **index** is excluded: it composes nothing of its own —
     /// its children are the manifests that do — so a composite
     /// assessment is not a thing it can lack.
+    ///
+    /// `now` is the tick's captured wall-clock, for the same reason the
+    /// two queries above take it.
     fn select_composite_unassessed<'a>(
         &'a self,
         batch_size: u32,
+        now: DateTime<Utc>,
     ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>>;
 }
 
@@ -329,6 +394,7 @@ mod tests {
             fn select_composite_unassessed<'a>(
                 &'a self,
                 _batch_size: u32,
+                _now: DateTime<Utc>,
             ) -> BoxFuture<'a, DomainResult<Vec<RescanCandidate>>> {
                 Box::pin(async { Ok(vec![sentinel_candidate()]) })
             }
@@ -344,7 +410,10 @@ mod tests {
         assert_eq!(stranded.len(), 1);
         assert_eq!(stranded[0].rescan_interval_hours, 0);
 
-        let unassessed = port.select_composite_unassessed(1000).await.expect("Ok");
+        let unassessed = port
+            .select_composite_unassessed(1000, now)
+            .await
+            .expect("Ok");
         assert_eq!(unassessed.len(), 1);
         // Both companion queries carry the interval sentinel: neither
         // selects on a policy-derived wait the caller could act on.
