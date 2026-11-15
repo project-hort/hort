@@ -1028,7 +1028,7 @@ fn refusal_of(error: &ExtractError) -> NotAnalysable {
         ExtractError::ExtractedBytesCap { .. }
         | ExtractError::CompressionRatioCap { .. }
         | ExtractError::EntryCap { .. }
-        | ExtractError::UncontainedPath
+        | ExtractError::UncontainedPath { .. }
         | ExtractError::UndecodableEntryName { .. }
         | ExtractError::Malformed(_) => NotAnalysable::UnusableArchive,
     }
@@ -1316,6 +1316,8 @@ async fn stream_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::extract::UncontainedComponent;
 
     use std::io::Cursor;
     use std::io::Write as _;
@@ -2287,6 +2289,37 @@ mod tests {
         );
     }
 
+    /// At the adapter boundary: an OCI layer whose member names are
+    /// absolute — the pax-header member `/PaxHeaders.0`, the root member
+    /// `/`, then an ordinary package database. This shape used to answer
+    /// `UnusableArchive`, which holds the layer and every image binding
+    /// it without anything ever having been examined, so what the test
+    /// pins is that the layer reaches a scan at all.
+    ///
+    /// `gzip_tar` writes the header's name field directly, which is the
+    /// only way to build this fixture: `Header::set_path` refuses an
+    /// absolute name, and a real archiver handed an absolute path writes
+    /// one anyway.
+    #[tokio::test]
+    async fn oci_layer_with_absolute_member_names_extracts_instead_of_holding() {
+        let c = coords("library/alpine", None, "blobs/sha256:aa");
+        let bytes = gzip_tar(&[
+            ("/PaxHeaders.0", b""),
+            ("/", b""),
+            ("/lib/apk/db/installed", b"P:musl\n"),
+        ]);
+        let m = materialise_kind(ArtifactKind::OciBlob, &c, bytes)
+            .await
+            .expect("absolute member names must not refuse the archive");
+        let (ws, mode) = expect_ready(m);
+        assert_eq!(mode, ScanMode::Rootfs);
+        assert_eq!(
+            std::fs::read(ws.dir().join("lib/apk/db/installed")).expect("read the package db"),
+            b"P:musl\n",
+            "the absolute member lands under the scan root, not at the path it spells"
+        );
+    }
+
     /// The raw payload is never a scan target: it is written beside the
     /// directory Trivy is pointed at, and removed once extracted.
     #[tokio::test]
@@ -2721,7 +2754,14 @@ mod tests {
                 compressed: 7,
             },
             ExtractError::EntryCap { cap: 1 },
-            ExtractError::UncontainedPath,
+            ExtractError::UncontainedPath {
+                index: 2,
+                component: UncontainedComponent::ParentDir,
+            },
+            ExtractError::UncontainedPath {
+                index: 0,
+                component: UncontainedComponent::Prefix,
+            },
             ExtractError::UndecodableEntryName { index: 0 },
             // The undecidable case, deliberately on this side: the
             // readers behind it report "no decoder for this" and "a
@@ -2752,7 +2792,11 @@ mod tests {
         // reason lands is `NotAnalysable::gates_release`'s.
         let kind = ArtifactKind::OciBlob;
         assert!(
-            refusal_of(&ExtractError::UncontainedPath).gates_release(kind),
+            refusal_of(&ExtractError::UncontainedPath {
+                index: 0,
+                component: UncontainedComponent::ParentDir,
+            })
+            .gates_release(kind),
             "an entry that tried to escape the workspace is about these bytes"
         );
         assert!(

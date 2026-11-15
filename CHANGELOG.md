@@ -146,6 +146,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- An image layer or archive whose members carry absolute paths is now scanned
+  instead of being held unassessed as an unusable archive.
 - The Maven transitive-prefetch cascade now warms a BOM a POM imports through
   `<dependencyManagement>` (`type=pom, scope=import`), so a BOM-managed tree
   cascades instead of stopping at `deps_extracted=0` (#439).
