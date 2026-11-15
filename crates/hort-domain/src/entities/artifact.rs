@@ -1033,23 +1033,31 @@ impl Artifact {
     /// partition of the policy verdict, exactly as it already is between
     /// `record_clean_scan` and `reject_from_scan`.
     ///
-    /// The observation-window anchor is **restored, not restarted**: an
-    /// artifact that reached `ScanIndeterminate` from `Quarantined`
-    /// carries one and keeps it, so the window that was already running
-    /// is the window the release gate reads. `now` is the anchor for the
-    /// one population that has none — an artifact that reached the state
-    /// from `None` under `quarantineDuration: 0`, which never had a
-    /// window — because a `Quarantined` artifact with no anchor is one no
+    /// The observation-window anchor is **restored, not restarted**, and
+    /// either way it is the artifact's own time evidence: the window the
+    /// artifact already carries when it has one — an artifact that
+    /// reached `ScanIndeterminate` from `Quarantined` keeps the window
+    /// that was already running, which is the window the release gate
+    /// reads — and its ingest instant, [`Self::created_at`], otherwise.
+    /// The population with no window is the one that reached the state
+    /// from `None` under `quarantineDuration: 0`; `created_at` is never
+    /// absent for it, so the requirement the fallback exists for is still
+    /// met — a `Quarantined` artifact with no anchor is one no
     /// release-candidacy query can see, and the method must not produce a
-    /// hold that nothing can decide.
+    /// hold that nothing can decide. It is the same anchor
+    /// `QuarantineUseCase::hold_for_unproduced_composition` already takes
+    /// for the same population, and the conservative of the two choices
+    /// available here: a later anchor is a longer remaining window, and
+    /// ADR 0054's content-level evidence only ever moves an anchor
+    /// earlier than the ingest instant. A quarantine begins where hort
+    /// can prove the artifact was already published, so the anchor is a
+    /// property of the artifact and not of the run that happens to look
+    /// at it — which is why this method reads no clock at all.
     ///
     /// Refuses with [`DomainError::Invariant`] **without mutating**, so a
     /// caller can record the fresh scan evidence and withhold only the
     /// transition.
-    pub fn supersede_absent_verdict(
-        &mut self,
-        now: DateTime<Utc>,
-    ) -> DomainResult<ArtifactQuarantined> {
+    pub fn supersede_absent_verdict(&mut self) -> DomainResult<ArtifactQuarantined> {
         if quarantine_transitions::allowed_targets(
             QuarantineEvent::SupersedeAbsentVerdict,
             self.quarantine_status,
@@ -1062,7 +1070,7 @@ impl Artifact {
             )));
         }
         self.quarantine_status = QuarantineStatus::Quarantined;
-        let anchor = self.quarantine_window_start.unwrap_or(now);
+        let anchor = self.quarantine_window_start.unwrap_or(self.created_at);
         self.quarantine_window_start = Some(anchor);
         Ok(ArtifactQuarantined {
             artifact_id: self.id,
@@ -2133,7 +2141,7 @@ impl Artifact {
                 artifact_id: self.id,
                 // The re-quarantine preserves the original anchor — the
                 // observation window is unchanged, not restarted.
-                quarantine_window_start: self.quarantine_window_start.unwrap_or(now),
+                quarantine_window_start: self.quarantine_window_start.unwrap_or(self.created_at),
             }))
         } else {
             // (b) The release arm additionally requires provenance to
@@ -2285,15 +2293,10 @@ impl Artifact {
     /// rejection to the next reader. (For this population the column is
     /// already `None`; the assignment states the invariant rather than
     /// relying on the field's incoming value.)
-    ///
-    /// `now` is only a fallback for the anchor — an artifact in this
-    /// state always has one, but the method must not fabricate a status
-    /// change without a window to go with it.
     pub fn repair_provenance_misrejection(
         &mut self,
         terminal_record: TerminalRejectionRecord,
         provenance: ProvenanceRejectionEvidence,
-        now: DateTime<Utc>,
     ) -> DomainResult<ArtifactQuarantined> {
         if quarantine_transitions::allowed_targets(
             QuarantineEvent::RepairProvenanceMisrejection,
@@ -2362,7 +2365,7 @@ impl Artifact {
             artifact_id: self.id,
             // The original anchor — the observation window is restored,
             // not restarted.
-            quarantine_window_start: self.quarantine_window_start.unwrap_or(now),
+            quarantine_window_start: self.quarantine_window_start.unwrap_or(self.created_at),
         })
     }
 
@@ -3029,9 +3032,12 @@ mod tests {
         let mut a = scan_indeterminate_artifact();
         let anchor = Utc::now() - chrono::Duration::days(3);
         a.quarantine_window_start = Some(anchor);
+        // Distinct from the anchor, so the assertions below cannot pass
+        // on a method that reached for the fallback instead.
+        a.created_at = Utc::now() - chrono::Duration::days(30);
 
         let event = a
-            .supersede_absent_verdict(Utc::now())
+            .supersede_absent_verdict()
             .expect("a reached verdict is admissible from scan_indeterminate");
 
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
@@ -3041,27 +3047,39 @@ mod tests {
         // makes the artifact a release candidate on the very next sweep.
         assert_eq!(event.quarantine_window_start, anchor);
         assert_eq!(a.quarantine_window_start, Some(anchor));
+        assert_ne!(
+            event.quarantine_window_start, a.created_at,
+            "an artifact that carries a window keeps it — the ingest instant is \
+             the fallback for the population that has none, not a replacement"
+        );
         // Never `Released`: the release decision stays with the gate.
         assert!(!a.is_downloadable());
     }
 
     /// The one population with no anchor — it reached
     /// `ScanIndeterminate` from `None` under `quarantineDuration: 0`, so
-    /// it never had a window. `now` becomes the anchor, on the entity as
-    /// well as on the event: a `Quarantined` artifact with a NULL anchor
-    /// is invisible to every release-candidacy query, so leaving the
-    /// field empty would trade one dead end for another.
+    /// it never had a window. Its ingest instant becomes the anchor, on
+    /// the entity as well as on the event: a `Quarantined` artifact with
+    /// a NULL anchor is invisible to every release-candidacy query, so
+    /// leaving the field empty would trade one dead end for another.
+    ///
+    /// The anchor is the artifact's own time evidence and never a clock
+    /// reading taken at the hold. An artifact long past its quarantine
+    /// duration must come back to the hold with an **elapsed** window,
+    /// so the release gate can decide it immediately; anchoring at the
+    /// moment hort looked would withhold it for another full duration
+    /// and do so again on every pass.
     #[test]
-    fn supersede_absent_verdict_anchors_an_artifact_that_never_had_a_window() {
+    fn supersede_absent_verdict_anchors_a_window_less_artifact_at_its_ingest_instant() {
         let mut a = scan_indeterminate_artifact();
         a.quarantine_window_start = None;
-        let now = Utc::now();
+        a.created_at = Utc::now() - chrono::Duration::days(30);
 
-        let event = a.supersede_absent_verdict(now).expect("admissible");
+        let event = a.supersede_absent_verdict().expect("admissible");
 
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
-        assert_eq!(event.quarantine_window_start, now);
-        assert_eq!(a.quarantine_window_start, Some(now));
+        assert_eq!(event.quarantine_window_start, a.created_at);
+        assert_eq!(a.quarantine_window_start, Some(a.created_at));
     }
 
     #[test]
@@ -3079,7 +3097,7 @@ mod tests {
             let before = a.quarantine_status;
             let before_anchor = a.quarantine_window_start;
             let err = a
-                .supersede_absent_verdict(Utc::now())
+                .supersede_absent_verdict()
                 .expect_err("only scan_indeterminate is admissible");
             match err {
                 DomainError::Invariant(msg) => assert!(
@@ -5667,6 +5685,55 @@ mod tests {
         }
     }
 
+    /// The re-quarantine arm's anchor, both halves. `RejectFromScan` is
+    /// admissible from `None` (permissive mode under
+    /// `quarantineDuration: 0`: the artifact was downloadable and
+    /// findings retroactively blocked it), so a `Rejected` artifact can
+    /// carry no window — and the arm must hand it the artifact's own
+    /// ingest instant rather than a clock reading, which would restart
+    /// the window the comment at that line says it keeps.
+    #[test]
+    fn re_evaluate_re_quarantine_keeps_an_existing_anchor() {
+        let mut a = rejected_artifact();
+        let anchor = Utc::now() - chrono::Duration::hours(6);
+        a.quarantine_window_start = Some(anchor);
+        a.created_at = Utc::now() - chrono::Duration::days(30);
+        a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(18));
+        let (prov, cur) = clears();
+
+        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
+
+        match event {
+            DomainEvent::ArtifactQuarantined(e) => {
+                assert_eq!(e.quarantine_window_start, anchor);
+                assert_ne!(
+                    e.quarantine_window_start, a.created_at,
+                    "the ingest instant is the fallback, not a replacement"
+                );
+            }
+            other => panic!("expected ArtifactQuarantined, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn re_evaluate_re_quarantine_anchors_a_window_less_artifact_at_its_ingest_instant() {
+        let mut a = rejected_artifact();
+        a.quarantine_window_start = None;
+        a.created_at = Utc::now() - chrono::Duration::days(30);
+        a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(18));
+        let (prov, cur) = clears();
+
+        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
+
+        assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        match event {
+            DomainEvent::ArtifactQuarantined(e) => {
+                assert_eq!(e.quarantine_window_start, a.created_at);
+            }
+            other => panic!("expected ArtifactQuarantined, got {other:?}"),
+        }
+    }
+
     #[test]
     fn re_evaluate_from_none_fails() {
         let mut a = sample_artifact();
@@ -6545,13 +6612,13 @@ mod tests {
     fn repair_returns_a_stranded_artifact_to_the_hold_and_preserves_the_anchor() {
         let mut a = stranded_artifact();
         let anchor = a.quarantine_window_start.expect("fixture sets the anchor");
+        a.created_at = Utc::now() - chrono::Duration::days(30);
         let now = Utc::now();
 
         let event = a
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
                 ProvenanceRejectionEvidence::Contradicted,
-                now,
             )
             .expect("the three-conjunct state is exactly what this repairs");
 
@@ -6562,24 +6629,32 @@ mod tests {
         // so the ordinary sweep sees an already-elapsed window.
         assert_eq!(event.quarantine_window_start, anchor);
         assert_ne!(event.quarantine_window_start, now);
+        assert_ne!(
+            event.quarantine_window_start, a.created_at,
+            "the ingest instant is the fallback, not a replacement"
+        );
     }
 
     /// A stranded artifact with no stored anchor still produces a
     /// well-formed event rather than a status change with no window
-    /// behind it.
+    /// behind it, and the anchor it is handed is the artifact's own
+    /// ingest instant. `RejectFromScan` is admissible from `None`
+    /// (permissive mode under `quarantineDuration: 0`), so this
+    /// population exists here too; a clock reading would restore the
+    /// artifact to the hold with a *fresh* window and withhold it for
+    /// another full duration.
     #[test]
-    fn repair_falls_back_to_now_when_the_anchor_is_missing() {
+    fn repair_anchors_a_window_less_artifact_at_its_ingest_instant() {
         let mut a = stranded_artifact();
         a.quarantine_window_start = None;
-        let now = Utc::now();
+        a.created_at = Utc::now() - chrono::Duration::days(30);
         let event = a
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
                 ProvenanceRejectionEvidence::Contradicted,
-                now,
             )
             .expect("an absent anchor is not a reason to refuse the repair");
-        assert_eq!(event.quarantine_window_start, now);
+        assert_eq!(event.quarantine_window_start, a.created_at);
     }
 
     /// **The negative test that matters.** A genuinely disproven
@@ -6599,7 +6674,6 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Present,
                 ProvenanceRejectionEvidence::Contradicted,
-                Utc::now(),
             )
             .expect_err("a real terminal rejection is not repairable");
 
@@ -6622,7 +6696,6 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::CorruptionTombstone,
                 ProvenanceRejectionEvidence::Contradicted,
-                Utc::now(),
             )
             .expect_err("corrupt bytes are a genuine terminal condemnation");
         assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6644,7 +6717,6 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Present,
                 ProvenanceRejectionEvidence::Contradicted,
-                Utc::now(),
             )
             .expect_err("a scan rejection is a real verdict");
         assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6666,7 +6738,6 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
                 ProvenanceRejectionEvidence::NeverTerminal,
-                Utc::now(),
             )
             .expect("a verdict that may never be terminal is repairable on its own terms");
 
@@ -6708,7 +6779,6 @@ mod tests {
                 .repair_provenance_misrejection(
                     TerminalRejectionRecord::Absent,
                     ProvenanceRejectionEvidence::Disproved(reason),
-                    Utc::now(),
                 )
                 .expect_err("a positive disproof is entitled to be terminal");
             assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6731,7 +6801,6 @@ mod tests {
         a.repair_provenance_misrejection(
             TerminalRejectionRecord::Absent,
             ProvenanceRejectionEvidence::NeverTerminal,
-            Utc::now(),
         )
         .expect("the Unsigned reason is the one D1 forbids from being terminal");
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
@@ -6751,7 +6820,6 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
                 ProvenanceRejectionEvidence::NoVerdict,
-                Utc::now(),
             )
             .expect_err("no evidence, no repair");
         assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6805,7 +6873,6 @@ mod tests {
                 .repair_provenance_misrejection(
                     TerminalRejectionRecord::Absent,
                     ProvenanceRejectionEvidence::Contradicted,
-                    Utc::now(),
                 )
                 .unwrap_err();
             assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6828,7 +6895,6 @@ mod tests {
         a.repair_provenance_misrejection(
             TerminalRejectionRecord::Absent,
             ProvenanceRejectionEvidence::Contradicted,
-            Utc::now(),
         )
         .expect("repair succeeds");
         let err = a

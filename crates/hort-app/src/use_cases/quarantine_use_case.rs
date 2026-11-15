@@ -633,7 +633,7 @@ impl QuarantineUseCase {
     pub async fn quarantine_artifact(
         &self,
         artifact_id: Uuid,
-        until: DateTime<Utc>,
+        window_start: DateTime<Utc>,
         actor: Actor,
     ) -> AppResult<()> {
         let stream_id = StreamId::artifact(artifact_id);
@@ -658,7 +658,7 @@ impl QuarantineUseCase {
         // sitting exactly on it past.
         refuse_append_past_cap(paired.stream_id(), paired.stream_len(), 1)?;
         let repository_id = paired.artifact().repository_id;
-        let event_payload = paired.artifact_mut().quarantine(until)?;
+        let event_payload = paired.artifact_mut().quarantine(window_start)?;
         let artifact = paired.into_artifact();
 
         // Bump quarantined_count in the same tx.
@@ -746,7 +746,7 @@ impl QuarantineUseCase {
         // design — the two events are deliberately distinct.
         let returned_to_hold = if artifact.quarantine_status == QuarantineStatus::ScanIndeterminate
         {
-            let quarantined = artifact.supersede_absent_verdict(ctx.now)?;
+            let quarantined = artifact.supersede_absent_verdict()?;
             tracing::info!(
                 artifact_id = %ctx.artifact_id,
                 correlation_id = %ctx.correlation_id,
@@ -3736,8 +3736,8 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
-        uc.quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+        let window_start = Utc::now() - chrono::Duration::hours(24);
+        uc.quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap();
 
@@ -3749,7 +3749,7 @@ mod tests {
             saved_artifact.quarantine_status,
             QuarantineStatus::Quarantined
         );
-        assert_eq!(saved_artifact.quarantine_window_start, Some(until));
+        assert_eq!(saved_artifact.quarantine_window_start, Some(window_start));
         assert_eq!(batch.events.len(), 1);
         assert!(matches!(
             &batch.events[0].event,
@@ -3763,9 +3763,9 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
+        let window_start = Utc::now() - chrono::Duration::hours(24);
         let err = uc
-            .quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+            .quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cannot quarantine"));
@@ -3784,9 +3784,9 @@ mod tests {
             .collect();
         events.set_stream(&stream_id, dummy_events);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
+        let window_start = Utc::now() - chrono::Duration::hours(24);
         let err = uc
-            .quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+            .quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap_err();
         assert!(err
@@ -3807,8 +3807,8 @@ mod tests {
             .collect();
         events.set_stream(&stream_id, dummy_events);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
-        uc.quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+        let window_start = Utc::now() - chrono::Duration::hours(24);
+        uc.quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap();
 
@@ -3823,8 +3823,8 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
-        uc.quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+        let window_start = Utc::now() - chrono::Duration::hours(24);
+        uc.quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap();
 
@@ -11081,12 +11081,15 @@ spec:
     /// is a window of zero length" property the provenance-misrejection
     /// repair's permissive-strand test pins.
     ///
-    /// The anchor is `now` and not the artifact's ingest time, which is
-    /// the fail-closed direction: an earlier anchor would be a default
-    /// substituted for missing evidence on the permissive side of a
-    /// release gate (ADR 0065 D2). Under a zero window the two agree,
-    /// and under a non-zero one the artifact serves a window instead of
-    /// skipping it.
+    /// The anchor is the artifact's own ingest instant and not a clock
+    /// reading taken at the hold: a quarantine window begins where hort
+    /// can prove the artifact was already published, so the anchor is a
+    /// property of the artifact rather than of the run that happened to
+    /// look at it, and `created_at` is the evidence hort always holds.
+    /// Under a zero window the two agree; under a non-zero one the
+    /// difference is the whole duration, which
+    /// [`scan_indeterminate_with_an_elapsed_ingest_window_heals_in_the_same_batch`]
+    /// pins.
     #[tokio::test]
     async fn scan_indeterminate_with_no_window_anchor_heals_in_a_permissive_repository() {
         let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
@@ -11134,11 +11137,98 @@ spec:
         let DomainEvent::ArtifactQuarantined(ev) = &batch.events[2].event else {
             panic!("expected ArtifactQuarantined third");
         };
+        assert_eq!(
+            ev.quarantine_window_start,
+            artifacts.get(artifact_id).unwrap().created_at,
+            "an artifact that never had a window is anchored at its ingest instant"
+        );
         assert!(
             ev.quarantine_window_start >= started,
-            "an artifact that never had a window is anchored now, not earlier"
+            "this fixture's ingest instant is itself after `started`, so the \
+             assertion above is the one carrying the anchor's identity"
         );
         assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+    }
+
+    /// **The availability claim.** An artifact whose ingest instant is
+    /// long past the matched policy's `quarantineDuration`, held in
+    /// `scan_indeterminate` with no window of its own, is released
+    /// **inline in the same batch** as the non-rejecting verdict that
+    /// lifts the hold: anchored at `created_at`, its deadline has
+    /// already elapsed, so the fast path's candidacy check passes and a
+    /// scan-axis authority is constructible from the verdict beside it.
+    ///
+    /// This is the case a wall-clock anchor got wrong, and it is not a
+    /// corner: the population is every artifact that was downloadable
+    /// under `quarantineDuration: 0` and whose repository later carries
+    /// a real window — anchored at the moment of the hold it answers
+    /// `503` for a full duration, and because a fresh fallback is taken
+    /// on every pass, each rescan tick restarts it. Here the window is
+    /// an entire month elapsed and the artifact has served for that
+    /// long, so withholding it is the wrong answer by any reading.
+    #[tokio::test]
+    async fn scan_indeterminate_with_an_elapsed_ingest_window_heals_in_the_same_batch() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, Utc::now());
+        // The permissive-ingest population: never time-held, so no
+        // window of its own — and ingested long before the window its
+        // repository now carries.
+        let ingested_at = Utc::now() - chrono::Duration::days(30);
+        artifacts.insert({
+            let mut a = artifacts.get(artifact_id).unwrap();
+            a.quarantine_window_start = None;
+            a.created_at = ingested_at;
+            a
+        });
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // A real, non-zero observation window — 24 h, against an
+        // artifact ingested 30 days ago.
+        seed_windowed_policy(&projections, repo_id);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "ScanCompleted",
+                "PolicyEvaluated",
+                "ArtifactQuarantined",
+                "ArtifactReleased"
+            ],
+            "the hold is lifted and the elapsed window decided in one append — a \
+             wall-clock anchor leaves this at three events and the artifact \
+             `Quarantined` for another full duration"
+        );
+        let DomainEvent::ArtifactQuarantined(ev) = &batch.events[2].event else {
+            panic!("expected ArtifactQuarantined third");
+        };
+        assert_eq!(
+            ev.quarantine_window_start, ingested_at,
+            "the anchor is the artifact's own ingest instant"
+        );
+        let DomainEvent::ArtifactReleased(released) = &batch.events[3].event else {
+            panic!("expected ArtifactReleased fourth");
+        };
+        assert_eq!(released.released_by, ReleaseReason::Timer);
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        assert!(
+            saved.is_downloadable(),
+            "the artifact an operator has been serving for a month is servable again"
+        );
     }
 
     /// The same chain where the window is still open: the verdict leaves
@@ -11875,8 +11965,8 @@ spec:
         let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
-        let until = Utc::now() + chrono::Duration::hours(24);
-        uc.quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+        let window_start = Utc::now() - chrono::Duration::hours(24);
+        uc.quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap();
 
