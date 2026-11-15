@@ -36,11 +36,17 @@
 //!    trips the absolute cap.
 //! 3. **Entry-count cap** — bounds the per-entry syscall and inode cost
 //!    of an archive made of a million one-byte files.
-//! 4. **Path containment** — an entry's own **name** must be relative and
-//!    must not contain a `..` component. Checked **lexically, before any
-//!    filesystem call**, so nothing is created outside the root even
-//!    transiently. A name that escapes is refused: it is the one property
-//!    that decides whether extraction ever writes outside the root.
+//! 4. **Path containment** — an entry's own **name** must not contain a
+//!    `..` component (nor a Windows drive/UNC prefix). Checked
+//!    **lexically, before any filesystem call**, so nothing is created
+//!    outside the root even transiently. A name that escapes is refused:
+//!    it is the one property that decides whether extraction ever writes
+//!    outside the root. A *leading separator* is not an escape — it is
+//!    dropped, because `/usr/bin/foo` names the same place under the
+//!    root as `usr/bin/foo` and is the shape an archiver produces when
+//!    it is handed an absolute path; see
+//!    [`contained_relative_path`] for why dropping it cannot widen what
+//!    the `..` rule admits.
 //! 5. **Stripped permissions** — files land `0o644`, directories
 //!    `0o755`, regardless of the archive's mode bits. setuid/setgid and
 //!    world-writable modes from an untrusted archive have no business on
@@ -113,6 +119,38 @@ impl ExtractBounds {
     }
 }
 
+/// Which lexical containment rule an archive entry's own name broke.
+///
+/// Carried on [`ExtractError::UncontainedPath`]. Both values are fixed
+/// strings from this crate, never a byte of the entry's name: the name
+/// is attacker-controlled and the rule is what an operator can act on.
+///
+/// Only `ParentDir` is constructible on the targets hort ships: `std::path`
+/// parses a `Component::Prefix` only on a Windows target, so no entry name
+/// can produce `Prefix` on a build of this crate that runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UncontainedComponent {
+    /// A `..` component. The one shape that names a location *outside*
+    /// the extraction root, and so the refusal that makes containment a
+    /// property of the path bytes rather than of the filesystem.
+    ParentDir,
+    /// A Windows path prefix (`C:`, `\\server\share`): it names a volume
+    /// root, which no extraction root contains. `std::path` parses a
+    /// prefix only on a Windows target, so a Unix build refuses the
+    /// shape without being able to produce it.
+    Prefix,
+}
+
+impl UncontainedComponent {
+    /// The rule, in the words the refusal's `Display` carries.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentDir => "upward-traversing `..` component",
+            Self::Prefix => "Windows drive or UNC path prefix",
+        }
+    }
+}
+
 /// Why an extraction was refused.
 ///
 /// Every variant is terminal for that archive. None of them means "retry
@@ -148,8 +186,22 @@ pub(crate) enum ExtractError {
     CompressionRatioCap { limit: u64, compressed: u64 },
     #[error("archive entry cap exceeded ({cap} entries)")]
     EntryCap { cap: usize },
-    #[error("archive entry path is not contained in the workspace")]
-    UncontainedPath,
+    /// An entry's own name broke one of the lexical containment rules,
+    /// named by `component` so the refusal an operator reads says
+    /// *which* rule fired, and located by `index` — the entry's
+    /// zero-based position in the archive's own iteration order — so the
+    /// operator can reach that entry. The name itself is never
+    /// reproduced: it is archive data, and the rule plus the position
+    /// are the actionable part. A position is not archive content, so
+    /// nothing attacker-controlled reaches a log field.
+    #[error(
+        "archive entry {index} has a path that is not contained in the workspace ({})",
+        component.as_str()
+    )]
+    UncontainedPath {
+        index: usize,
+        component: UncontainedComponent,
+    },
     /// A ZIP entry carries a name this process cannot decode, so the name
     /// cannot be evaluated against the containment rule at all. Carries
     /// the entry index and nothing else: the undecodable bytes are not
@@ -233,39 +285,67 @@ enum PathContainment {
     /// A safe, non-empty, root-relative path.
     Relative(PathBuf),
     /// The name normalises to the workspace root itself: made only of
-    /// `CurDir` components (`.`, `./`, `./.`, …). Every `tar -C dir .`
-    /// producer emits this as the archive's own first entry, and it
-    /// names a location that already exists — not a traversal.
+    /// components that do not move the path — `CurDir` (`.`, `./`,
+    /// `./.`, …) and a leading separator (`/`). Every `tar -C dir .`
+    /// producer emits the first shape as the archive's own first entry,
+    /// and an archiver handed an absolute directory emits the second for
+    /// the same member. Both name a location that already exists — not a
+    /// traversal.
     Root,
 }
 
 /// Lexically validate an archive entry path.
 ///
-/// Returns `None` — meaning refuse the archive — for an absolute path, a
-/// Windows prefix, or any `..` component. `.` components are dropped; if
-/// that drops the path to nothing, the entry named the workspace root
-/// itself ([`PathContainment::Root`]), not an escape. **No filesystem
-/// call happens here**: containment is decided from the bytes of the
-/// path alone, so a hostile entry never reaches a `create_dir_all` or an
+/// `Err` means refuse the whole archive, and names the rule that fired:
+/// a `..` component or a Windows path prefix. Components that do not
+/// move the path — `.` and a leading separator — are dropped; if that
+/// leaves nothing, the entry named the workspace root itself
+/// ([`PathContainment::Root`]), not an escape. **No filesystem call
+/// happens here**: containment is decided from the bytes of the path
+/// alone, so a hostile entry never reaches a `create_dir_all` or an
 /// `open`.
-fn contained_relative_path(raw: &Path) -> Option<PathContainment> {
+///
+/// # A leading separator is dropped, not refused
+///
+/// `/usr/bin/foo` and `usr/bin/foo` name the same place under the
+/// extraction root. The first is the shape an archiver produces when it
+/// is handed an absolute path, so it is an ordinary tar — a whole OCI
+/// layer inventory can carry it, and the mainstream extractor strips the
+/// separator rather than erroring. Dropping it cannot turn a contained
+/// path into an escaping one:
+///
+/// - The refusal that prevents an escape is the `..` arm, and it runs
+///   over the **same component stream**, so `/../etc/passwd` is refused
+///   exactly as `../etc/passwd` is. A dropped separator buys nothing
+///   past that arm, because the arm does not depend on what preceded it.
+/// - A name that drops to nothing names the extraction root, which
+///   already exists: the [`PathContainment::Root`] answer. A member
+///   named `/` is that same answer, not a traversal.
+/// - The accumulated result is still built only from `Normal`
+///   components and is still joined onto the root, so every path this
+///   returns is under it.
+fn contained_relative_path(raw: &Path) -> Result<PathContainment, UncontainedComponent> {
     let mut out = PathBuf::new();
     for component in raw.components() {
         match component {
             Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            // Absolute, drive-prefixed, or upward-traversing: all three
-            // can name a location outside the root, so the archive is
-            // refused rather than the entry sanitised. Sanitising is what
-            // lets a crafted archive smuggle a payload in under a name
-            // the operator never sees.
-            Component::RootDir | Component::Prefix(_) | Component::ParentDir => return None,
+            // Neither moves the accumulated path: `.` names where the
+            // path already is, and a leading separator names the root
+            // the result is joined onto.
+            Component::CurDir | Component::RootDir => {}
+            // Upward-traversing or drive-prefixed: either can name a
+            // location outside the root, so the archive is refused
+            // rather than the entry sanitised. Sanitising *these* is
+            // what would let a crafted archive smuggle a payload in
+            // under a name the operator never sees.
+            Component::ParentDir => return Err(UncontainedComponent::ParentDir),
+            Component::Prefix(_) => return Err(UncontainedComponent::Prefix),
         }
     }
     if out.as_os_str().is_empty() {
-        return Some(PathContainment::Root);
+        return Ok(PathContainment::Root);
     }
-    Some(PathContainment::Relative(out))
+    Ok(PathContainment::Relative(out))
 }
 
 /// Create `root`-relative `rel` as a directory with permissions stripped
@@ -353,7 +433,7 @@ pub(crate) fn extract_tar<R: Read>(
         .entries()
         .map_err(|e| ExtractError::Malformed(format!("expected a tar archive: {e}")))?;
 
-    for entry in entries {
+    for (index, entry) in entries.enumerate() {
         if stats.entries >= bounds.max_entries {
             return Err(ExtractError::EntryCap {
                 cap: bounds.max_entries,
@@ -377,8 +457,8 @@ pub(crate) fn extract_tar<R: Read>(
             .map_err(|e| ExtractError::Malformed(format!("tar entry path: {e}")))?
             .into_owned();
         let rel = match contained_relative_path(&raw) {
-            None => return Err(ExtractError::UncontainedPath),
-            Some(PathContainment::Root) => {
+            Err(component) => return Err(ExtractError::UncontainedPath { index, component }),
+            Ok(PathContainment::Root) => {
                 // The archive's own root entry: nothing to create for a
                 // directory, since the root already exists. A regular
                 // file cannot be named "the workspace root" — refuse
@@ -391,7 +471,7 @@ pub(crate) fn extract_tar<R: Read>(
                     "archive root entry cannot be a regular file with content".to_string(),
                 ));
             }
-            Some(PathContainment::Relative(rel)) => rel,
+            Ok(PathContainment::Relative(rel)) => rel,
         };
 
         if entry_type.is_symlink() || entry_type.is_hard_link() {
@@ -486,8 +566,13 @@ pub(crate) fn extract_zip<R: Read + io::Seek>(
             }
         };
         let rel = match contained_relative_path(&raw) {
-            None => return Err(ExtractError::UncontainedPath),
-            Some(PathContainment::Root) => {
+            Err(component) => {
+                return Err(ExtractError::UncontainedPath {
+                    index: i,
+                    component,
+                })
+            }
+            Ok(PathContainment::Root) => {
                 // Same reasoning as the tar path: the archive's own root
                 // entry is a no-op for a directory (or an empty file),
                 // and a refusal only if a "root" file actually carries a
@@ -499,7 +584,7 @@ pub(crate) fn extract_zip<R: Read + io::Seek>(
                     "archive root entry cannot be a regular file with content".to_string(),
                 ));
             }
-            Some(PathContainment::Relative(rel)) => rel,
+            Ok(PathContainment::Relative(rel)) => rel,
         };
 
         if entry.is_symlink() {
@@ -823,9 +908,13 @@ mod tests {
 
     // -- bound: path containment ---------------------------------------
 
+    /// `/../escape` is in the list deliberately: the leading separator
+    /// is dropped, and the `..` behind it is refused over the same
+    /// component stream, so an absolutely-spelled traversal is refused
+    /// exactly as its relative spelling is.
     #[test]
     fn extract_tar_refuses_a_traversing_entry_path() {
-        for path in ["../escape", "a/../../escape", "./../escape"] {
+        for path in ["../escape", "a/../../escape", "./../escape", "/../escape"] {
             let bytes = file_tar(&[(path, b"payload")]);
             let dir = root();
             let len = bytes.len() as u64;
@@ -836,7 +925,14 @@ mod tests {
                 ExtractBounds::default_for_scan_materialisation(),
             )
             .expect_err("traversal must be refused");
-            assert_eq!(err, ExtractError::UncontainedPath, "path {path}");
+            assert_eq!(
+                err,
+                ExtractError::UncontainedPath {
+                    index: 0,
+                    component: UncontainedComponent::ParentDir
+                },
+                "path {path}"
+            );
         }
     }
 
@@ -852,7 +948,44 @@ mod tests {
             ExtractBounds::default_for_scan_materialisation(),
         )
         .expect_err("traversal must be refused");
-        assert_eq!(err, ExtractError::UncontainedPath);
+        assert_eq!(
+            err,
+            ExtractError::UncontainedPath {
+                index: 0,
+                component: UncontainedComponent::ParentDir
+            }
+        );
+    }
+
+    /// The refusal locates the entry it refused: a traversal is refused
+    /// wherever in the archive it sits, and the index an operator reads
+    /// is that member's own position rather than the first one's. Two
+    /// benign members ahead of it is what makes the assertion falsifiable
+    /// — a refusal hard-coded to the start would read `0` here.
+    #[test]
+    fn extract_tar_refusal_names_the_position_of_the_traversing_member() {
+        let bytes = file_tar(&[
+            ("pkg/one.txt", b"first"),
+            ("pkg/two.txt", b"second"),
+            ("../escape", b"payload"),
+        ]);
+        let dir = root();
+        let len = bytes.len() as u64;
+        let err = extract_tar(
+            Cursor::new(bytes),
+            len,
+            dir.path(),
+            ExtractBounds::default_for_scan_materialisation(),
+        )
+        .expect_err("traversal must be refused");
+        assert_eq!(
+            err,
+            ExtractError::UncontainedPath {
+                index: 2,
+                component: UncontainedComponent::ParentDir
+            }
+        );
+        assert!(err.to_string().contains('2'), "{err}");
     }
 
     /// A refusal must leave nothing behind outside the root. The
@@ -878,19 +1011,86 @@ mod tests {
         );
     }
 
+    /// An absolute member name is not an escape attempt: it names the
+    /// same place under the root that its relative spelling does, so it
+    /// extracts there. The leading separator is the *only* thing dropped
+    /// — the entry lands under the extraction root, never at the
+    /// filesystem path it spells.
     #[test]
-    fn absolute_entry_paths_are_refused() {
+    fn an_absolute_entry_path_extracts_under_the_root() {
         let bytes = tar_bytes(&[("/etc/passwd", tar::EntryType::Regular, b"root:x:0:0")]);
         let dir = root();
         let len = bytes.len() as u64;
-        let err = extract_tar(
+        let stats = extract_tar(
             Cursor::new(bytes),
             len,
             dir.path(),
             ExtractBounds::default_for_scan_materialisation(),
         )
-        .expect_err("absolute path must be refused");
-        assert_eq!(err, ExtractError::UncontainedPath);
+        .expect("an absolute member name is an ordinary tar shape, not a refusal");
+        assert_eq!(stats.entries, 1);
+        assert_eq!(
+            fs::read(dir.path().join("etc/passwd")).expect("read the contained path"),
+            b"root:x:0:0"
+        );
+    }
+
+    #[test]
+    fn an_absolute_zip_entry_path_extracts_under_the_root() {
+        let bytes = zip_bytes(&[("/etc/passwd", b"root:x:0:0")]);
+        let dir = root();
+        let len = bytes.len() as u64;
+        extract_zip(
+            Cursor::new(bytes),
+            len,
+            dir.path(),
+            ExtractBounds::default_for_scan_materialisation(),
+        )
+        .expect("an absolute member name is an ordinary zip shape, not a refusal");
+        assert_eq!(
+            fs::read(dir.path().join("etc/passwd")).expect("read the contained path"),
+            b"root:x:0:0"
+        );
+    }
+
+    /// The member list measured on every OCI layer blob of the
+    /// population this rule exists for — `/PaxHeaders.0`, `/`, then
+    /// ordinary relative members — with every one of them an entry the
+    /// iteration yields, so every one of them is put to the containment
+    /// rule. Each absolute name used to refuse the whole archive, so
+    /// none of those layers was ever examined; all four must now land.
+    ///
+    /// A real pax extension record is folded away before the rule sees
+    /// it, which is what
+    /// `a_pax_extension_record_is_folded_away_before_the_path_check`
+    /// pins; this test is the containment rule over the same names.
+    #[test]
+    fn extract_tar_accepts_the_measured_absolute_member_shape() {
+        let bytes = file_tar(&[
+            ("/PaxHeaders.0", b""),
+            ("/", b""),
+            ("app/", b""),
+            ("app/app.jar", b"jar bytes"),
+        ]);
+        let dir = root();
+        let len = bytes.len() as u64;
+        let stats = extract_tar(
+            Cursor::new(bytes),
+            len,
+            dir.path(),
+            ExtractBounds::default_for_scan_materialisation(),
+        )
+        .expect("the measured real-world layer shape must extract");
+        assert_eq!(stats.entries, 4);
+        assert!(
+            dir.path().join("PaxHeaders.0").is_file(),
+            "the absolute pax-header member lands under the root"
+        );
+        assert!(dir.path().join("app").is_dir());
+        assert_eq!(
+            fs::read(dir.path().join("app/app.jar")).expect("read app.jar"),
+            b"jar bytes"
+        );
     }
 
     /// The shape every `tar -C dir .` producer emits: the archive's own
@@ -932,6 +1132,57 @@ mod tests {
         assert_eq!(
             fs::read(dir.path().join("usr/share/x.crt")).expect("read"),
             b"cert"
+        );
+    }
+
+    /// Where the refusal in the measured population actually came from.
+    ///
+    /// A pax local-extension record (tar `typeflag 'x'`) whose header
+    /// carries recognised ustar or GNU magic is **not** yielded by `tar`
+    /// 0.4.46: the crate reads it, folds its fields into the member that
+    /// follows, and the iteration never sees it. So its name never
+    /// reaches [`contained_relative_path`], and an archive whose only
+    /// absolute names are such a record plus the root member `/` was
+    /// refused by the `/` member alone.
+    ///
+    /// Pinned because the containment rule's reach rests on it: if the
+    /// crate ever starts yielding these records, their names start being
+    /// evaluated and this test goes red instead of the behaviour
+    /// changing unobserved.
+    #[test]
+    fn a_pax_extension_record_is_folded_away_before_the_path_check() {
+        let bytes = tar_bytes(&[
+            ("/PaxHeaders.0", tar::EntryType::XHeader, b""),
+            ("/", tar::EntryType::Directory, b""),
+            ("app/app.jar", tar::EntryType::Regular, b"jar bytes"),
+        ]);
+        let yielded: Vec<PathBuf> = {
+            let mut archive = tar::Archive::new(Cursor::new(bytes.clone()));
+            archive
+                .entries()
+                .expect("entries")
+                .map(|e| e.expect("entry").path().expect("entry path").into_owned())
+                .collect()
+        };
+        assert_eq!(
+            yielded,
+            vec![PathBuf::from("/"), PathBuf::from("app/app.jar")],
+            "a pax extension record must not reach the iteration"
+        );
+
+        let dir = root();
+        let len = bytes.len() as u64;
+        let stats = extract_tar(
+            Cursor::new(bytes),
+            len,
+            dir.path(),
+            ExtractBounds::default_for_scan_materialisation(),
+        )
+        .expect("the absolute root member must not refuse the archive");
+        assert_eq!(stats.entries, 2);
+        assert_eq!(
+            fs::read(dir.path().join("app/app.jar")).expect("read app.jar"),
+            b"jar bytes"
         );
     }
 
@@ -1121,30 +1372,116 @@ mod tests {
     // -- pure helpers --------------------------------------------------
 
     #[test]
-    fn contained_relative_path_normalises_and_refuses() {
+    fn contained_relative_path_normalises_a_relative_name() {
         assert_eq!(
             contained_relative_path(Path::new("./a/./b")),
-            Some(PathContainment::Relative(PathBuf::from("a/b")))
+            Ok(PathContainment::Relative(PathBuf::from("a/b")))
         );
         assert_eq!(
             contained_relative_path(Path::new("a/b")),
-            Some(PathContainment::Relative(PathBuf::from("a/b")))
+            Ok(PathContainment::Relative(PathBuf::from("a/b")))
         );
+    }
+
+    #[test]
+    fn contained_relative_path_reads_a_name_that_normalises_to_nothing_as_the_root() {
+        for name in ["", ".", "./"] {
+            assert_eq!(
+                contained_relative_path(Path::new(name)),
+                Ok(PathContainment::Root),
+                "name {name:?}"
+            );
+        }
+    }
+
+    /// A leading separator is dropped: `/usr/bin/foo` names the same
+    /// place under the extraction root as `usr/bin/foo`, and is what an
+    /// archiver produces when it is handed an absolute path.
+    #[test]
+    fn contained_relative_path_strips_a_leading_separator() {
         assert_eq!(
-            contained_relative_path(Path::new("")),
-            Some(PathContainment::Root)
+            contained_relative_path(Path::new("/usr/bin/foo")),
+            Ok(PathContainment::Relative(PathBuf::from("usr/bin/foo")))
         );
+    }
+
+    /// The measured real-world entry: the pax-header member an archiver
+    /// writes beside an absolute member name.
+    #[test]
+    fn contained_relative_path_strips_the_separator_from_a_pax_header_name() {
         assert_eq!(
-            contained_relative_path(Path::new(".")),
-            Some(PathContainment::Root)
+            contained_relative_path(Path::new("/PaxHeaders.0")),
+            Ok(PathContainment::Relative(PathBuf::from("PaxHeaders.0")))
         );
+    }
+
+    /// A bare separator takes the same answer `.` takes: it names the
+    /// extraction root, which already exists.
+    #[test]
+    fn contained_relative_path_reads_a_bare_separator_as_the_root() {
         assert_eq!(
-            contained_relative_path(Path::new("./")),
-            Some(PathContainment::Root)
+            contained_relative_path(Path::new("/")),
+            Ok(PathContainment::Root)
         );
-        assert_eq!(contained_relative_path(Path::new("/abs")), None);
-        assert_eq!(contained_relative_path(Path::new("../up")), None);
-        assert_eq!(contained_relative_path(Path::new("a/../../up")), None);
+    }
+
+    /// The arm that does not move. Dropping the leading separator runs
+    /// over the same component stream the `..` refusal does, so an
+    /// absolutely-spelled traversal is refused exactly as its relative
+    /// spelling is — and the refusal names the rule that fired.
+    #[test]
+    fn contained_relative_path_refuses_a_traversal_however_it_is_spelled() {
+        for name in ["../up", "a/../../up", "/../etc/passwd", "/a/../../up"] {
+            assert_eq!(
+                contained_relative_path(Path::new(name)),
+                Err(UncontainedComponent::ParentDir),
+                "name {name:?}"
+            );
+        }
+    }
+
+    /// A refusal names its rule in words and the refused entry's
+    /// position as a number, and never reproduces the entry's own name,
+    /// which is archive data.
+    #[test]
+    fn an_uncontained_refusal_names_the_rule_and_the_position_and_not_the_entry() {
+        for component in [
+            UncontainedComponent::ParentDir,
+            UncontainedComponent::Prefix,
+        ] {
+            let rendered = ExtractError::UncontainedPath {
+                index: 9,
+                component,
+            }
+            .to_string();
+            assert!(rendered.contains("not contained"), "{rendered}");
+            assert!(rendered.contains(component.as_str()), "{rendered}");
+            assert!(rendered.contains('9'), "{rendered}");
+        }
+        assert!(UncontainedComponent::ParentDir.as_str().contains(".."));
+        assert!(UncontainedComponent::Prefix.as_str().contains("prefix"));
+        assert_ne!(
+            ExtractError::UncontainedPath {
+                index: 0,
+                component: UncontainedComponent::ParentDir
+            },
+            ExtractError::UncontainedPath {
+                index: 0,
+                component: UncontainedComponent::Prefix
+            },
+            "the two rules are different refusals, not one"
+        );
+        assert_ne!(
+            ExtractError::UncontainedPath {
+                index: 0,
+                component: UncontainedComponent::ParentDir
+            },
+            ExtractError::UncontainedPath {
+                index: 2,
+                component: UncontainedComponent::ParentDir
+            },
+            "one rule at two positions is two refusals, not one"
+        );
     }
 
     #[test]
@@ -1207,9 +1544,12 @@ mod tests {
         assert!(ExtractError::EntryCap { cap: 3 }
             .to_string()
             .contains("entry cap"));
-        assert!(ExtractError::UncontainedPath
-            .to_string()
-            .contains("not contained"));
+        assert!(ExtractError::UncontainedPath {
+            index: 0,
+            component: UncontainedComponent::ParentDir
+        }
+        .to_string()
+        .contains("not contained"));
         assert!(ExtractError::UndecodableEntryName { index: 4 }
             .to_string()
             .contains("cannot be decoded"));
@@ -1334,7 +1674,13 @@ mod tests {
         let rendered = e.to_string();
         assert!(rendered.contains("17"), "{rendered}");
         assert!(rendered.contains("cannot be decoded"), "{rendered}");
-        assert_ne!(e, ExtractError::UncontainedPath);
+        assert_ne!(
+            e,
+            ExtractError::UncontainedPath {
+                index: 17,
+                component: UncontainedComponent::ParentDir
+            }
+        );
         assert_eq!(e, ExtractError::UndecodableEntryName { index: 17 });
     }
 

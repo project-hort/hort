@@ -903,10 +903,16 @@ attacker-supplied archive entries to a filesystem path, so every guard
 lives in one module (`crates/hort-adapters-scanner-trivy/src/extract.rs`)
 and every guard refuses the **whole archive** rather than skipping an
 entry: extracted-bytes cap, decompression-ratio cap, entry-count cap, and
-lexical path containment on the entry's own **name** (relative, no `..`,
-checked before any filesystem call) — the one property that decides
-whether extraction ever writes outside the root. Files and directories
-land with permissions stripped to a fixed mode.
+lexical path containment on the entry's own **name** (no `..`, no Windows
+drive or UNC prefix, checked before any filesystem call) — the one
+property that decides whether extraction ever writes outside the root. A
+*leading separator* is dropped rather than refused: `/usr/bin/foo` names
+the same place under the extraction root as `usr/bin/foo`, it is the
+shape an archiver produces when it is handed an absolute path (a whole
+OCI layer inventory can carry it), and the `..` rule runs over the same
+component stream either way, so `/../etc/passwd` is refused exactly as
+`../etc/passwd` is. Files and directories land with permissions stripped
+to a fixed mode.
 
 A symlink or hardlink entry is **never materialised**, so its **target**
 is never validated and never a reason to refuse: a link carries no bytes
