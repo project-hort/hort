@@ -5,13 +5,17 @@ metadata:
 spec:
   # Deliberately QUARANTINING, and deliberately NON-ZERO (24h) — see
   # scripts/native-tests/scenarios/quarantine/proxy-multiarch-zero-window.sh's
-  # header comment for the full "hollowness trap" rationale: with
+  # header comment for the full "hollowness trap" rationale. In short, a
+  # zero-duration window would gut that scenario from both ends: with
   # quarantineDuration: 0s (as on oci-mirror-e2e), `created_at` and
-  # `created_at - duration` are the same instant, so the scenario's
-  # index-vs-child window-differential assertion would pass regardless of
-  # whether the referenced-tree-descendant zero-window carve-out actually fires
-  # (`ingest_use_case.rs`, which gives a descendant of a referenced tree a zero
-  # window while its index keeps the full one). The 24h window,
+  # `created_at - duration` are the same instant, so its index-vs-child
+  # window assertion would pass whether or not the referenced-tree-descendant
+  # carve-out fired — and "this row is not release-eligible" would be false
+  # of every row, because a zero-length window is always already elapsed.
+  # The carve-out itself is conditional on at least one referencing parent
+  # being `Released` (ADR 0007, "The carve-out is conditional on inherited
+  # trust"), and no row in this repository can reach `Released` inside a
+  # smoke run, which is exactly the side that scenario pins. The 24h window,
   # not a scan result, is what holds the rows (same rationale as
   # oci-quarantine-e2e-quarantine.yaml): it outlasts any smoke run, and before
   # the deadline there is no release authority for a scan to supply.

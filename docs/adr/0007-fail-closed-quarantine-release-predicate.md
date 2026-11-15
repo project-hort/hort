@@ -57,12 +57,6 @@ A `ScanRunOutcome::Failed` that exhausts `HORT_SCANNER_MAX_ATTEMPTS` is a scanne
 
 A **scoped carve-out**, NOT a reversal of the rejected "clean scan releases immediately" alternative below: a scanned-clean artifact that is a `content_references` **target** of an already-ingested parent (a referenced-tree descendant — e.g. an OCI image-index child manifest, or a manifest's config/layer blob) releases on its own `ScanSucceeded` **without re-applying the observation window**; forward observation is the standard released-artifact rescan.
 
-**Why this loses no protection:**
-
-1. **No in-window rescan (verified).** `RescanCandidatesRepository::select_eligible` rescans only `released`/`NULL` artifacts on the 24h interval — the window never re-scans a `quarantined` artifact. So for *every* artifact, quarantined or not, the window is a single-scan-at-ingest + timer, not a rescan mechanism; it does not itself realise "reputation catch-up."
-2. **Fresher scan.** The descendant is scanned at first-touch against the *current* CVE database — strictly more recent than the parent's ingest-time scan the operator already trusted at release.
-3. **Identical forward observation.** On release the descendant enters the same 24h released-artifact rescan pool as everything else; post-release CVEs are caught identically to any other released artifact.
-
 **Explicitly narrow.** This is *not* the general "clean scan releases immediately" alternative (below), which stays rejected. Only `content_references` **targets** qualify — an artifact with no parent referencing it keeps the full window, unchanged. A blob touched before its referencing manifest exists (no edge yet) takes the normal window; a later re-touch after the edge appears is a non-issue because the pull flow ingests the manifest before its blobs.
 
 **The two impossible failure modes from *Context* are preserved verbatim:**
@@ -70,7 +64,58 @@ A **scoped carve-out**, NOT a reversal of the rejected "clean scan releases imme
 1. A clean scan cannot release *early*: the release predicate is completely untouched (`Artifact::release`'s deny-by-default `(reason, authority)` match) — a descendant still needs its own `ScanSucceeded`; releasing purely because the window collapsed to zero, with no scan, remains impossible.
 2. A never-successfully-scanned artifact cannot release on the timer alone: the carve-out changes only the ingest-time **anchor** (`quarantine_window_start`), never the authority check — `resolve_release_authority` still requires a real `ScanCompleted` event on the artifact's own stream.
 
-**As-built:** the anchor-backdating lives in `IngestUseCase::ingest_inner` (`crates/hort-app/src/use_cases/ingest_use_case.rs`) — a referenced-tree-descendant artifact's `quarantine_window_start` is set to `ingested_at - effective_duration` instead of `ingested_at`, so the live-computed deadline (`effective_quarantine_deadline(anchor, duration)`) equals `ingested_at`. The target-check excludes the self-referencing refcount kinds `primary_content` / `metadata_blob` — every artifact's own ingest writes a `primary_content` row targeting its own hash, so an unfiltered "is this hash a target of any kind" check would misidentify every artifact as its own descendant; this exclusion is load-bearing for the carve-out to stay correctly scoped. The predicate itself now lives in one shared helper (`hort_app::use_cases::referenced_descendant::is_referenced_tree_descendant`) used by both the ingest anchor decision and the provenance hold below, so the two definitions cannot drift.
+#### The carve-out is conditional on inherited trust (amended 2026-11-15; human-approved)
+
+**Decision.** The observation window belongs to the bytes. A referenced-tree
+descendant skips it only where it inherits trust that already exists: the
+window is waived for a `content_references` target of which **at least one
+referencing parent is itself `Released`**. A descendant whose parents are all
+still held keeps the full window. `content_references` are resolved within one
+repository, so a parent and the constituent it references are governed by the
+same policy and the same window length.
+
+**Why the condition is the rationale.** The carve-out rested on the
+descendant's scan being more recent than *the parent's ingest-time scan the
+operator already trusted at release*, which presupposes a released parent. On
+a cold pull of a composed artifact, parent and constituents are minted seconds
+apart against the same advisory data and the parent's own window is still
+running: there is no earlier trusted assessment for the descendant's to be
+fresher than, so the premise is absent and the waiver rests on nothing. Making
+it a condition takes nothing from the carve-out — it states when it applies.
+
+**What the window is for.** It is a proxy for elapsed *ecosystem exposure*
+([ADR 0054](0054-content-level-age-evidence-anchors-quarantine.md)): the
+assumption that content available in the world for the window's duration has
+had the ecosystem's scanners, advisories and researchers looking at it. An
+argument from hort's own behaviour — the window never re-scans a quarantined
+artifact, so it is pure latency — is true and not the point: the protection is
+the world's clock, not hort's rescan, and a first-touch scan against advisory
+data that has had no time to learn about the content is the gap the window
+covers. Where the two readings disagree, ADR 0054's governs, because it states
+what the window measures.
+
+**No authority is added and no release path changes.** The carve-out touches
+only the ingest-time anchor, never the authority check; `resolve_release_authority`
+still requires the artifact's own `ScanSucceeded` / `ScanWaived`. The condition
+can only lengthen a window, never shorten one — the direction ADR 0054's anchor
+module names as the one that cannot open a hole.
+
+**Retired with this amendment:** the as-built paragraph naming the anchor
+arithmetic and its call sites, and the three-part justification that preceded
+this one. A mechanism recorded in an ADR expires with the mechanism while the
+decision underneath does not — the same correction
+[ADR 0064](0064-a-filesystem-finding-is-about-the-composed-filesystem.md) D6
+made for its own retired posture field. What this ADR carries is the decision
+above.
+
+**Corrected here because it misleads a reader of this ADR:** the #115
+amendment below states that `Artifact::complete_provenance`'s
+`NoAttestation × Required` arm holds on
+`window_open || is_referenced_descendant`. That enumeration was removed on
+2026-09-12 ([ADR 0039](0039-keyed-provenance-verification.md) D1/D3): an
+absent attestation holds unconditionally, and only a signature that is
+present, readable and invalid is terminal. The provenance axis no longer
+consults the window, and nothing in this amendment affects it.
 
 #### The window is ALSO the `Required`-mode provenance hold predicate (issue #115, amended 2026-08-05)
 

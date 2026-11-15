@@ -1,23 +1,40 @@
 #!/usr/bin/env bash
 # requires: egress db
 #
-# Proxy multi-arch pull-through -> #46 Item 2 zero-window descendant release
-# (issue #50 / backlog/037). Regression gate for the composition of
-# pull-through edge-write x ingest target-check x release-eligibility that
-# shipped broken once (hosted-push path only) and had to be re-fixed
-# (`58b8548c`, the pull-through path) with no automated E2E catching either
-# failure — only prod validation did.
+# Proxy multi-arch pull-through -> a referenced-tree descendant keeps its
+# observation window while every referencing parent is still held. Regression
+# gate for the composition of pull-through edge-write x ingest target-check x
+# release-eligibility that shipped broken once (hosted-push path only) and had
+# to be re-fixed (`58b8548c`, the pull-through path) with no automated E2E
+# catching either failure — only prod validation did.
+#
+# ---------------------------------------------------------------------------
+# THE FILE NAME IS HISTORICAL. KEPT ON PURPOSE.
+# ---------------------------------------------------------------------------
+# "zero-window" named what this scenario asserted before ADR 0007's
+# "The carve-out is conditional on inherited trust" amendment: a
+# `content_references` target waived its observation window unconditionally,
+# so a proxy-pulled index's child manifest was stamped
+# `created_at - quarantineDuration` and was release-eligible the instant it
+# existed. The waiver is now conditional on at least one referencing parent
+# being itself `Released`, and in this repository none ever is inside a smoke
+# run, so what this file pins is the OTHER side of that condition — the full
+# window a held-parent descendant keeps. The name is left alone because
+# `run.sh --list` prints it as the inventory and several sibling fixtures and
+# scenarios cross-reference it by name; a rename is a sweep of its own, not a
+# side effect of this correction. Read the assertions, not the file name.
 #
 # ---------------------------------------------------------------------------
 # WHY A DIFFERENTIAL ASSERTION, NOT "the child releases on its own
-# ScanSucceeded" (the issue's literal acceptance criterion).
+# ScanSucceeded" (the original acceptance criterion this file was built for).
 # ---------------------------------------------------------------------------
 # It cannot assert that here. `deploy/compose/example-config/policies/
-# oci-quarantine-e2e-quarantine.yaml` records why: the compose stack runs NO
-# hort-worker, so no scan ever completes — `scanBackends: []` keeps the hold
-# purely time-based on purpose. Chasing `ScanSucceeded` would mean standing up
-# machinery that does not exist in this harness (explicitly out of scope —
-# see the directive's "Do NOT" list).
+# oci-proxy-quarantine-e2e-quarantine.yaml` records why: the 24h window
+# outlasts any smoke run and `enforcement: record` makes a Trivy verdict a
+# timer authority rather than a gate, so before the deadline there is no
+# release authority for a scan to supply and the hold is purely time-based.
+# Chasing `ScanSucceeded` would mean standing up machinery this harness does
+# not have.
 #
 # The substitute — under ONE policy (quarantineDuration: 24h), pulled in ONE
 # proxy fetch — compares two artifacts from the same pull:
@@ -25,13 +42,62 @@
 #   | Artifact                         | Expected quarantine_window_start |
 #   |-----------------------------------|-----------------------------------|
 #   | the INDEX (not a content_references TARGET of anything) | == the earliest observation of its OWN bytes, `MIN(created_at)` over every `artifacts` row sharing its checksum (ADR 0054) |
-#   | a CHILD MANIFEST (a referenced descendant — the index's `oci_index_member` target) | == created_at - 24h (zero window, #46 Item 2 carve-out) |
+#   | a CHILD MANIFEST (a referenced descendant — the index's `oci_index_member` target, whose only referencing parent is that still-held index) | == the SAME thing: `MIN(created_at)` over its own checksum. No waiver, because there is no released parent to inherit one from |
 #
-# This proves the #46 Item 2 carve-out fires for PROXY-PULLED trees
-# specifically (the pull-through path #50 was filed against, not the hosted
-# push path `quarantine/oci-image-index.sh` already covers), needs no worker,
-# and — per the hollowness trap below — cannot pass no matter what the code
-# does.
+# The two rows are the differential: they are the two sides of the predicate
+# `is this content a target of a parent that is itself Released`, which is
+# `false` for both here — once because the index is nobody's target at all,
+# once because its child's only parent is held. A build carrying the
+# unconditional carve-out answers `created_at - 24h` for the second row and
+# fails; a build that lost the ADR 0054 age evidence answers `created_at` for
+# the first row and fails. It pins the PROXY-PULLED path specifically (the
+# pull-through path the original defect was filed against, not the hosted push
+# path `quarantine/oci-image-index.sh` already covers), needs no worker, and —
+# per the hollowness trap below — cannot pass on a build that gets either row
+# wrong.
+#
+# ---------------------------------------------------------------------------
+# WHAT THIS SCENARIO DOES NOT COVER, AND WHY IT CANNOT.
+# ---------------------------------------------------------------------------
+# The condition's OTHER side — a descendant minted while a referencing parent
+# is ALREADY `Released`, which must then take the waiver — is not asserted
+# anywhere below. It is not producible through an index, and the reason is
+# worth stating because it is a property of the ingest path, not a gap in
+# this file.
+#
+# A proxy pull-through of an index completes the whole tree up front. The
+# index's own ingest enqueues one `oci-index-child-ingest` row per declared
+# child (ungated, `crates/hort-http-oci/src/manifests.rs`), and the handler
+# behind those rows ingests the child AND warms its config + layer blobs in
+# the same run, explicitly not conditional on `prefetch_policy.enabled`
+# (`crates/hort-app/src/task_handlers/oci_index_child_ingest.rs`, step 8). So
+# every descendant of the index is minted within seconds of the index itself,
+# while the index and each child manifest are still held — long before any
+# window in the tree could close. The one instrument that CAN release a
+# parent inside a smoke run (the curator waive,
+# `POST /api/v1/admin/curation/quarantine/:id/waive`) therefore has no
+# un-minted descendant left to act on, whatever order it is used in.
+#
+# A worker is what drains those rows, and this scenario's `requires:` line
+# does not ask for one — so in a run where no selected scenario asks for a
+# worker, the children stay un-minted and waiving the index first WOULD
+# produce the released-parent case. That is not a premise anything here can
+# assert on: `run.sh` decides `--profile worker` ONCE from the union of every
+# selected scenario's `requires:`, the full CI gate selects worker-requiring
+# scenarios and so runs with the profile up, and a scenario cannot observe
+# which way that went. A second side that quietly becomes a cache hit in the
+# gate run is the hollowness trap below in a different costume.
+#
+# The remaining route is the Referrers flow, where `oci_subject` is
+# deliberately NOT gated on the subject being present
+# (`manifest_ingest_claims`, crates/hort-http-oci/src/manifests_write.rs):
+# a referrer pushed for a subject this repository has not got writes a tree
+# edge onto an absent target, so releasing that referrer and THEN ingesting
+# the subject does produce a descendant with a released parent. That is a
+# hosted-push referrer fixture rather than anything this proxy-multi-arch
+# scenario drives, and no scenario in this harness pushes a hand-built
+# referrer today. It is the shape to build the positive case from; asserting
+# it here would mean asserting it on content this scenario never mints.
 #
 # ---------------------------------------------------------------------------
 # WHY THE INDEX'S EXPECTED ANCHOR IS NOT `created_at` — CROSS-REPOSITORY AGE
@@ -57,78 +123,95 @@
 # fresh row always anchored at `now` unless the descendant carve-out applied;
 # it fails on a correct build the moment another scenario shares the content.
 #
-# The assertion below is therefore stated as the invariant itself: anchor ==
-# `MIN(created_at)` over the index's own checksum. For genuinely cold content
-# that reduces to `created_at` and asserts exactly what the old form did, so
-# nothing is weakened; here it matches the `proxy/oci-mirror.sh` row, and the
-# scenario LOGS which of the two cases it observed. The differential's other
-# half is unaffected: the child's carve-out contributes `minted_at - 24h`,
-# which is the minimum against any observation made minutes ago, so a warm
-# child still anchors at exactly `created_at - 24h`. (Only an observation
-# older than the full 24h window could beat the carve-out — impossible
-# within one compose run, and Step 7 names it if a long-lived stack ever
-# produces one.) That the index did NOT take the carve-out is proven by
-# Step 7: a carve-out anchor is immediately release-eligible, and Step 7
-# asserts the index is not.
+# Both assertions below are therefore stated as the invariant itself: anchor
+# == `MIN(created_at)` over that row's own checksum. For genuinely cold
+# content it reduces to `created_at`, so nothing is weakened; here the index
+# matches the `proxy/oci-mirror.sh` row, and the scenario LOGS which of the
+# two cases it observed.
+#
+# The child takes the SAME form for a different reason, and that is the point
+# of the pairing. It IS a `content_references` target, so the pre-amendment
+# code answered `created_at - 24h` for it. Its only referencing parent is the
+# index, which is held for a fresh 24h and cannot release inside a smoke run,
+# so the waiver's condition — at least one parent itself `Released` — is
+# unmet and the child falls through to exactly the age evidence the index
+# gets. `proxy/oci-mirror.sh` pulls the amd64 child too (a bare `skopeo copy`
+# resolves and fetches the host platform's manifest), so the child is
+# typically WARM in the same way the index is, and the invariant form covers
+# both cases without a coldness premise.
+#
+# That neither row took the waiver is proven twice over: by the anchors here,
+# and by Step 7 — a waived anchor is release-eligible the instant it is
+# stamped, and Step 7 asserts NEITHER row is.
 #
 # ---------------------------------------------------------------------------
 # THE HOLLOWNESS TRAP — DO NOT "SIMPLIFY" THIS ONTO oci-mirror-e2e.
 # ---------------------------------------------------------------------------
 # oci-mirror-e2e's ScanPolicy is quarantineDuration: 0s. Reaching for that
 # existing permissive repo is the obvious shortcut, and it SILENTLY GUTS this
-# scenario: with duration=0, `created_at` and `created_at - duration` are the
-# literal same instant, so "index window == created_at" and "child window ==
-# created_at - duration" both trivially hold REGARDLESS of whether the #46
-# Item 2 carve-out is even wired — the assertion would pass on code that
-# never anchors a zero window at all. That is exactly the class of gap #50
-# exists to close (the fix shipped broken once with no test to catch it).
+# scenario — in both directions, which is why the trap survives the
+# amendment rather than being a note about the old assertion:
+#
+#  - the ANCHOR half stops discriminating. With duration=0, `created_at` and
+#    `created_at - duration` are the literal same instant, so "anchor ==
+#    MIN(created_at)" holds on a build carrying the unconditional carve-out
+#    exactly as it does on a correct one. The assertion would pass on code
+#    that waives a window it must not waive.
+#  - the ELIGIBILITY half stops being satisfiable at all. `quarantine_window_
+#    start <= now() - 0` is true of any past anchor, so "the child is NOT
+#    release-eligible" would fail on a correct build. A zero-duration policy
+#    has no observation window to have an opinion about.
+#
 # This is why a DEDICATED, NON-ZERO-DURATION repo+policy
 # (oci-proxy-quarantine-e2e, quarantineDuration: 24h) exists rather than
 # reusing oci-mirror-e2e or oci-quarantine-e2e (that one's push-based, not
-# proxy pull-through). See backlog/037's "hollowness trap" section — the same
-# failure mode backlog/036 guards against with its >5 MiB blob-size floor.
+# proxy pull-through). The same failure mode the >5 MiB blob-size floor in
+# the large-blob proxy fixture guards against.
 #
 # ---------------------------------------------------------------------------
-# WHY "releasable-OR-released" — the eligibility predicate.
+# WHY EVERY STATUS ASSERTION BELOW IS STRICT — nothing here can release.
 # ---------------------------------------------------------------------------
-# The child's window anchor (created_at - 24h) means its computed deadline
-# (anchor + 24h == created_at) has ALREADY PASSED the instant it is ingested.
-# This scenario's own `requires:` line (egress db) does not need a worker, so
-# in an ISOLATED run (e.g. `--scenario`) nothing ever claims the
-# `quarantine-release-sweep` job and the row just sits ELIGIBLE. But
-# `scripts/native-tests/run.sh` computes `--profile worker` ONCE, over the
-# union of every selected scenario's `requires:` — so in a combined/full run
-# that also selects a worker-requiring scenario (e.g.
-# `proxy-required-multilayer.sh`), the shared compose stack's hort-worker AND
-# `hort-sweep-ticker` (also `profile: worker`) are BOTH live for this
-# scenario's entire run too. The ticker's cadence is `SWEEP_TICK_SECS`
-# (dev/CI default 30s, see deploy/compose/docker-compose.yml) — fast enough
-# that the sweep can legitimately claim and release this already-eligible
-# child mid-scenario. A `released` status is a STRICTLY STRONGER proof that
-# the release-sweep selection predicate held (it only fires post-hoc on rows
-# that satisfied it) than an unconsumed `eligible` reading — so every
-# assertion below that touches the child's `quarantine_status` accepts
-# EITHER outcome. The exact predicate
+# Both rows carry a full, fresh 24h window: the index because it is nobody's
+# `content_references` target, the child because its only parent is that
+# still-held index. Neither window can elapse inside a smoke run, and
+# `enforcement: record` makes a Trivy verdict a timer authority rather than a
+# gate, so no scan outcome can release either row early and none can reject
+# one. So `quarantined` is the only status either row may carry, and
+# `quarantine_status = 'released'` is not tolerated anywhere below.
+#
+# That strictness is new and it is the POINT: while the carve-out was
+# unconditional the child was release-eligible from the instant it was
+# minted, and `scripts/native-tests/run.sh` computes `--profile worker` ONCE
+# over the union of every selected scenario's `requires:` — so in a
+# combined/full run the `hort-sweep-ticker` (`profile: worker`) could
+# legitimately claim and release that child mid-scenario, and every child
+# status assertion had to accept `released` as well. Under the condition
+# there is nothing for the sweep to claim, so a `released` child is now a
+# real finding rather than a fast tick: it means something waived a window
+# with no released parent to inherit from.
+#
+# The eligibility assertions evaluate the exact predicate
 # `crates/hort-adapters-postgres/src/quarantine_release_candidates.rs`'s
 # `select_expired` query uses — `quarantine_status = 'quarantined' AND
-# quarantine_window_start <= now() - duration` — is evaluated directly via
-# `psql_one` for the eligible case; it needs no sweep task to actually run to
-# be true or false right now, and it is exactly what "becomes releasable at
-# the next sweep" means operationally: the row satisfies the sweep's own
-# selection query, whenever a worker next polls it. The index's window is a
-# full, fresh 24h — it cannot elapse mid-run — so index assertions stay
-# strict (`quarantined` / not-eligible only).
+# quarantine_window_start <= now() - duration` — directly via `psql_one`. It
+# needs no sweep task to actually run to be true or false right now, and it
+# is exactly what "would become releasable at the next sweep" means
+# operationally: whether the row satisfies the sweep's own selection query
+# whenever a worker next polls it.
 #
 # ---------------------------------------------------------------------------
 # WHY alpine:3.19, WHY digests not counts.
 # ---------------------------------------------------------------------------
 # alpine:3.19 is a genuine multi-arch OCI image index and is already the
 # upstream fixture `proxy/oci-mirror.sh` pulls — no new external dependency.
-# Per #51 (merged): blob warming now fires on the digest path, so pulling the
-# child manifest also spawns BACKGROUND pull-throughs of its config + layer
-# blobs. Extra artifacts appearing shortly after are expected and correct,
-# not a leak — so every assertion below targets a SPECIFIC digest (parsed out
-# of the actual served index/manifest JSON), never a row count.
+# Rows this scenario never asked for appear in this repository and are
+# expected: the index's own ingest enqueues one `oci-index-child-ingest` row
+# per declared child, and a worker that picks those up ingests EVERY platform
+# child and warms each one's config and layer blobs. (Which rows exist
+# therefore depends on whether the shared stack happens to have the worker
+# profile up — see the `--profile worker` note above.) So every assertion
+# below targets a SPECIFIC digest, parsed out of the actual served
+# index/manifest JSON, and never a row count.
 
 # shellcheck source=../../lib/common.sh
 # shellcheck disable=SC1091
@@ -155,7 +238,7 @@ esac
 
 BASE_URL="${HORT_URL}/v2/${REPO_KEY}/dockerhub/${IMAGE_PATH}"
 
-log "==> Proxy multi-arch pull -> zero-window descendant release (issue #50)"
+log "==> Proxy multi-arch pull -> a held-parent descendant keeps its observation window"
 log "Registry:  ${HORT_URL}"
 log "Repo key:  ${REPO_KEY}"
 log "Image:     ${IMAGE} (${IMAGE_PATH})"
@@ -269,8 +352,7 @@ CHILD_HASH="${CHILD_DIGEST#sha256:}"
 # ---------------------------------------------------------------------
 # Step 2: AUTHENTICATED pull of the platform-specific child manifest BY
 # DIGEST — the write-authorized hold-read exemption again (the child is
-# also still quarantined), and the leg that spawns #51's background blob
-# warming.
+# also still quarantined).
 # ---------------------------------------------------------------------
 log ""
 log "--- Step 2: AUTHENTICATED GET the child manifest by digest"
@@ -347,8 +429,12 @@ pass "index artifact id=${INDEX_ID}, child artifact id=${CHILD_ID}"
 
 # ---------------------------------------------------------------------
 # Step 4: content_references — the pull-through edge-write half of the
-# composition #46/#50 gate. Target SPECIFIC digests (never a count —
-# #51's background blob warming means unrelated rows can appear).
+# composition under test. The edges are the INPUT to the carve-out's
+# condition: without the index -> child edge the child is not a
+# referenced-tree descendant at all, and Step 6 would then be asserting the
+# default window of an unrelated artifact rather than the condition's
+# held-parent side. Target SPECIFIC digests, never a count — the eager
+# index-child ingest legitimately adds rows this scenario never asked for.
 # ---------------------------------------------------------------------
 log ""
 log "--- Step 4: content_references edges"
@@ -394,23 +480,25 @@ if [ "$index_status" = "quarantined" ]; then
 else
     fail "index quarantine_status = quarantined" "got '${index_status}'"
 fi
-# released-OR-quarantined: see "WHY releasable-OR-released" above — a fast
-# sweep tick can legitimately release the zero-window child before this
-# check runs when a worker-requiring scenario shares the stack.
-if [ "$child_status" = "quarantined" ] || [ "$child_status" = "released" ]; then
-    pass "child quarantine_status = quarantined (or already released by a fast sweep tick)"
+# Strict, and deliberately: see "WHY EVERY STATUS ASSERTION BELOW IS STRICT"
+# above. The child's parent is held for a fresh 24h, so under the carve-out's
+# inherited-trust condition the child carries a full window too and no sweep
+# tick has anything to claim. A `released` reading here is the signature of a
+# window waived with no released parent to inherit it from.
+if [ "$child_status" = "quarantined" ]; then
+    pass "child quarantine_status = quarantined"
 else
-    fail "child quarantine_status = quarantined (or released)" "got '${child_status}'"
+    fail "child quarantine_status = quarantined" \
+        "got '${child_status}'. 'released' means something waived this descendant's window while its only referencing parent (the index) was still held — the unconditional carve-out ADR 0007's inherited-trust amendment retired. 'scan_indeterminate' is a different axis: a scan that abstained and fell to the fail-closed hold, which this repository's enforcement:record policy is not supposed to reach."
 fi
 
 # ---------------------------------------------------------------------
 # Step 6: THE assertion — the index/child quarantine_window_start
-# differential. This is the one that would have caught the original #46
-# breakage; see the header comment for why it must be run against a
+# differential. See the header comment for why it must be run against a
 # non-zero-duration policy to mean anything.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 6: quarantine_window_start differential (the #46 Item 2 gate) — index anchored on ADR 0054 age evidence, child on the descendant carve-out"
+log "--- Step 6: quarantine_window_start — both rows anchored on ADR 0054 age evidence, neither on the descendant carve-out"
 
 # The index is not a content_references target, so no carve-out applies and
 # its anchor is ADR 0054's age evidence: the earliest observation of its own
@@ -439,15 +527,57 @@ else
         "got '${index_anchored_on_evidence}' (expected t): window_start=${index_window_start} first_seen=${INDEX_FIRST_SEEN} own created_at=${INDEX_OWN_CREATED}"
 fi
 
-# Unchanged by ADR 0054 and deliberately still exact: the carve-out
-# contributes `minted_at - 24h`, which is the minimum against any observation
-# hort could have made during this run, so the child's anchor is that value
-# whether or not its bytes were seen earlier.
-child_zero_window="$(psql_one "SELECT (quarantine_window_start = created_at - interval '24 hours') FROM artifacts WHERE id = '${CHILD_ID}';")"
-if [ "$child_zero_window" = "t" ]; then
-    pass "child: quarantine_window_start == created_at - 24h (zero window — the #46 Item 2 referenced-tree-descendant carve-out fired)"
+# The child IS a content_references target — Step 4 asserted the index ->
+# child `oci_index_member` edge — so this is the carve-out's condition being
+# evaluated, not a row the condition never reached. Two premises make that
+# precise, and both are asserted rather than assumed:
+#
+#  - the edge existed when the child was MINTED, not merely now. It commits
+#    in the index's own ingest transition, so `child.created_at >
+#    index.created_at` is what makes it reachable by the child's own
+#    carve-out probe. (If it were the other way round the child would not be
+#    a descendant at all, its anchor would be the same value asserted below,
+#    and the assertion would pass while exercising nothing — which is why
+#    this is a separate check and not a comment.)
+#  - the parent was HELD at that moment. Step 5 asserted the index is still
+#    `quarantined`, and with a fresh 24h window it cannot have been released
+#    and re-held in between — release is one-way and needs the timer — so
+#    "held now" is also "held when this child was minted".
+child_minted_after_index="$(psql_one "SELECT (c.created_at > p.created_at) \
+    FROM artifacts c, artifacts p WHERE c.id = '${CHILD_ID}' AND p.id = '${INDEX_ID}';")"
+if [ "$child_minted_after_index" = "t" ]; then
+    pass "child was minted AFTER the index, so the index -> child edge already existed at the child's own mint (the carve-out's condition was genuinely evaluated for it)"
 else
-    fail "child quarantine_window_start == created_at - 24h" "got '${child_zero_window}' (expected t)"
+    fail "child was minted after the index" \
+        "got '${child_minted_after_index:-<null>}' (expected t) — the child row predates the index row in this repository, so there was no oci_index_member edge for the carve-out to find and this row is not exercising the condition at all. Something ingested the child manifest into ${REPO_KEY} before the index that references it"
+fi
+
+# With no released parent to inherit trust from, the waiver does not apply
+# and the child falls through to exactly the age evidence the index got —
+# asserted in the same invariant form, for the same reason: `oci-mirror.sh`
+# pulls this platform's child manifest too, so these bytes are typically
+# already observed and `created_at` is the answer only when they are not.
+CHILD_FIRST_SEEN="$(psql_one "SELECT replace(MIN(created_at)::text, ' ', 'T') FROM artifacts WHERE checksum_sha256 = '${CHILD_HASH}';")"
+CHILD_OWN_CREATED="$(psql_one "SELECT replace(created_at::text, ' ', 'T') FROM artifacts WHERE id = '${CHILD_ID}';")"
+CHILD_OBSERVATIONS="$(psql_one "SELECT count(*) FROM artifacts WHERE checksum_sha256 = '${CHILD_HASH}';")"
+log "  child bytes are held by ${CHILD_OBSERVATIONS} artifact row(s) across all repositories"
+log "  earliest observation (first_seen) = ${CHILD_FIRST_SEEN}; this row's created_at = ${CHILD_OWN_CREATED}"
+
+child_anchored_on_evidence="$(psql_one "SELECT (quarantine_window_start = \
+    (SELECT MIN(created_at) FROM artifacts WHERE checksum_sha256 = '${CHILD_HASH}')) \
+    FROM artifacts WHERE id = '${CHILD_ID}';")"
+if [ "$child_anchored_on_evidence" = "t" ]; then
+    pass "child: quarantine_window_start == earliest observation of its own bytes — a referenced-tree descendant whose only parent is held inherits no trust, so it keeps its full observation window (ADR 0007, the carve-out is conditional on inherited trust)"
+else
+    child_window_start="$(psql_one "SELECT replace(quarantine_window_start::text, ' ', 'T') FROM artifacts WHERE id = '${CHILD_ID}';")"
+    child_took_waiver="$(psql_one "SELECT (quarantine_window_start = created_at - interval '24 hours') FROM artifacts WHERE id = '${CHILD_ID}';")"
+    if [ "$child_took_waiver" = "t" ]; then
+        fail "child quarantine_window_start == MIN(created_at) over artifacts sharing checksum ${CHILD_HASH}" \
+            "the child is anchored at created_at - 24h, i.e. it WAIVED its observation window while its only referencing parent was still quarantined. That is the unconditional referenced-tree-descendant carve-out ADR 0007's inherited-trust amendment retired: window_start=${child_window_start} own created_at=${CHILD_OWN_CREATED}"
+    else
+        fail "child quarantine_window_start == MIN(created_at) over artifacts sharing checksum ${CHILD_HASH}" \
+            "got '${child_anchored_on_evidence}' (expected t), and it is not the retired waiver's value either: window_start=${child_window_start} first_seen=${CHILD_FIRST_SEEN} own created_at=${CHILD_OWN_CREATED}"
+    fi
 fi
 
 # ---------------------------------------------------------------------
@@ -456,36 +586,34 @@ fi
 # quarantine_release_candidates.rs's select_expired query uses.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 7: release-eligibility predicate (child eligible now, index not)"
+log "--- Step 7: release-eligibility predicate (NEITHER row eligible — both hold a full window)"
 
-child_status_now="$(psql_one "SELECT quarantine_status FROM artifacts WHERE id = '${CHILD_ID}';")"
-child_window_elapsed="$(psql_one "SELECT (quarantine_window_start <= now() - interval '24 hours') FROM artifacts WHERE id = '${CHILD_ID}';")"
-# released-OR-eligible: quarantine_status = 'released' is a strictly
-# stronger proof the sweep's predicate held (see "WHY releasable-OR-released"
-# above) than an unconsumed eligible reading — a fast sweep tick sharing the
-# stack can legitimately claim this row before this line runs.
-if [ "$child_status_now" = "released" ] || \
-   { [ "$child_status_now" = "quarantined" ] && [ "$child_window_elapsed" = "t" ]; }; then
-    pass "child satisfies the release-sweep selection predicate NOW (releasable at the next sweep, or already released by a fast tick)"
-else
-    fail "child satisfies the release-sweep selection predicate" \
-        "got status='${child_status_now}' window_elapsed='${child_window_elapsed}' (expected quarantined+elapsed or released)"
-fi
-
-# Still strict, and it is also what proves the index did not take the
-# descendant carve-out: a carve-out anchor is release-eligible the instant it
-# is stamped. Its anchor is the age evidence Step 6 pinned, which in this
-# suite is minutes old against a 24h window — so the only way this flips is a
-# stack that has held these exact bytes for more than 24h (a long-lived DB
-# volume reused across days), which is a stale-fixture condition, not a
-# regression.
-index_eligible="$(psql_one "SELECT (quarantine_status = 'quarantined' AND quarantine_window_start <= now() - interval '24 hours') FROM artifacts WHERE id = '${INDEX_ID}';")"
-if [ "$index_eligible" = "f" ]; then
-    pass "index does NOT satisfy the release-sweep selection predicate (still mid-window)"
-else
-    index_anchor_age="$(psql_one "SELECT (now() - quarantine_window_start)::text FROM artifacts WHERE id = '${INDEX_ID}';")"
-    fail "index does NOT satisfy the release-sweep selection predicate" \
-        "got '${index_eligible}' (expected f): its age-evidence anchor is already ${index_anchor_age} old, i.e. hort has held these exact bytes for over 24h — a database volume carried over from an earlier run, not a code defect"
-fi
+# Both legs run the same query, which is what makes "the child is treated
+# like any other fresh artifact" an assertion rather than a claim. A waived
+# anchor is release-eligible the instant it is stamped, so this is the
+# operational form of Step 6: it reads the sweep's own selection predicate
+# instead of the anchor column, and it fails on a build that waives either
+# row's window.
+#
+# The only way either leg flips without a code defect is a stack that has
+# held these exact bytes for more than 24h — a database volume carried over
+# across days, which `run.sh`'s own `compose down -v` prevents but a
+# long-lived `--hort=external` instance does not. The failure messages name
+# that, because it is a stale-fixture condition and reads identically to the
+# regression otherwise.
+assert_not_release_eligible() {
+    local id="$1" label="$2" eligible anchor_age status
+    eligible="$(psql_one "SELECT (quarantine_status = 'quarantined' AND quarantine_window_start <= now() - interval '24 hours') FROM artifacts WHERE id = '${id}';")"
+    if [ "$eligible" = "f" ]; then
+        pass "${label} does NOT satisfy the release-sweep selection predicate (still mid-window)"
+    else
+        anchor_age="$(psql_one "SELECT (now() - quarantine_window_start)::text FROM artifacts WHERE id = '${id}';")"
+        status="$(psql_one "SELECT quarantine_status FROM artifacts WHERE id = '${id}';")"
+        fail "${label} does NOT satisfy the release-sweep selection predicate" \
+            "got '${eligible}' (expected f): status='${status}', and its anchor is already ${anchor_age} old against a 24h window. Either a window was waived at mint (see Step 6's verdict for which value was stamped) or hort has genuinely held these exact bytes for over 24h — a database volume carried over from an earlier run, not a code defect"
+    fi
+}
+assert_not_release_eligible "$CHILD_ID" "child (a held-parent referenced-tree descendant)"
+assert_not_release_eligible "$INDEX_ID" "index (nobody's content_references target)"
 
 summary

@@ -251,6 +251,16 @@ pub struct MockArtifactRepository {
     /// Seeded via
     /// [`set_status_after_next_find_by_path`](Self::set_status_after_next_find_by_path).
     status_after_next_find_by_path: Mutex<HashMap<Uuid, QuarantineStatus>>,
+    /// FIFO of injected errors for
+    /// [`find_by_id`](ArtifactRepository::find_by_id). Each call pops the
+    /// front and returns it verbatim.
+    ///
+    /// Distinct from simply not seeding the row, which answers
+    /// `NotFound`: a caller that degrades on an unreadable row has to be
+    /// drivable against a read that *failed* as well as one that found
+    /// nothing, because the two are different facts and a fixture that
+    /// can only produce the second cannot show the first is handled.
+    find_by_id_errors: Mutex<std::collections::VecDeque<DomainError>>,
 }
 
 /// One recorded call to either backfill-candidacy query. See
@@ -283,6 +293,7 @@ impl MockArtifactRepository {
             row_after_next_find_by_id: Mutex::new(HashMap::new()),
             status_after_next_find_by_path: Mutex::new(HashMap::new()),
             status_after_next_checksum_read: Mutex::new(HashMap::new()),
+            find_by_id_errors: Mutex::new(std::collections::VecDeque::new()),
         }
     }
 
@@ -295,6 +306,14 @@ impl MockArtifactRepository {
             .lock()
             .unwrap()
             .push_back(err);
+    }
+
+    /// Arm the next [`find_by_id`](ArtifactRepository::find_by_id) call
+    /// to fail with `err`. Queued, so a test can arm several consecutive
+    /// failures — or arm one and let the next read succeed, which is how
+    /// "one parent unreadable, the next one released" is expressed.
+    pub fn fail_next_find_by_id(&self, err: DomainError) {
+        self.find_by_id_errors.lock().unwrap().push_back(err);
     }
 
     /// After the next `find_by_id(artifact_id)` serves the current row,
@@ -665,6 +684,9 @@ impl MockArtifactRepository {
 
 impl ArtifactRepository for MockArtifactRepository {
     fn find_by_id(&self, id: Uuid) -> BoxFut<'_, DomainResult<Artifact>> {
+        if let Some(err) = self.find_by_id_errors.lock().unwrap().pop_front() {
+            return Box::pin(async move { Err(err) });
+        }
         let mut artifacts = self.artifacts.lock().unwrap();
         let result = artifacts
             .get(&id)

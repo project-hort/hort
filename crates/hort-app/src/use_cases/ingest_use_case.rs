@@ -51,7 +51,7 @@ use crate::use_cases::multi_hash::{
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
 use crate::use_cases::quarantine_hold::{resolve_transient_hold, TransientHold};
-use crate::use_cases::referenced_descendant::resolve_referenced_tree_descendant_fail_safe;
+use crate::use_cases::referenced_descendant::resolve_released_parent_trust_fail_safe;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_unpaired_append_version,
     ArtifactAtVersion, OverCapStream, UnpairedAppend, EVENT_APPEND_RETRY_ATTEMPTS,
@@ -3147,26 +3147,32 @@ impl IngestUseCase {
     /// on an operator policy) — the artifact stays in `None`, downloadable,
     /// per `Artifact::is_downloadable`.
     ///
-    /// Referenced-tree descendant zero-window carve-out (#46 Item 2,
-    /// design doc §4 final shape + §4a). A SCOPED carve-out of ADR 0007,
-    /// NOT a reversal. This artifact is a "referenced-tree descendant" iff
-    /// it is already a `content_references` **target** of some other,
-    /// already-ingested artifact — a child manifest (`kind =
-    /// "oci_index_member"`), a referrer's subject (`kind = "oci_subject"`),
-    /// or a config/layer blob (`kind = "oci_config"` / `"oci_layer"`, #46
-    /// Item 1). The predicate itself lives in
+    /// Referenced-tree descendant zero-window carve-out. A SCOPED
+    /// carve-out of ADR 0007, NOT a reversal, and **conditional on
+    /// inherited trust**: it applies to an artifact that is already a
+    /// `content_references` **target** of some other, already-ingested
+    /// artifact — a child manifest (`kind = "oci_index_member"`), a
+    /// referrer's subject (`kind = "oci_subject"`), or a config/layer
+    /// blob (`kind = "oci_config"` / `"oci_layer"`) — **of which at least
+    /// one referencing parent is itself `Released`**. A descendant whose
+    /// parents are all still held keeps the full window: on a cold pull
+    /// parent and constituents are minted seconds apart against the same
+    /// advisory data, so there is no earlier trusted assessment for the
+    /// descendant's own scan to be fresher than.
+    ///
+    /// The topology half lives in
     /// [`crate::use_cases::referenced_descendant::is_referenced_tree_descendant`]
-    /// — shared verbatim with the provenance orchestrator's `NoAttestation
-    /// × Required` hold (issue #115 item 3) so the two can never drift;
-    /// see that module for why the self-referential kinds are excluded.
-    /// The lookup + its fail-safe-on-error posture are shared with
-    /// `register_by_hash_inner`'s identical carve-out through
-    /// `resolve_referenced_tree_descendant_fail_safe`, so the two minting
-    /// paths cannot drift either. This lookup does NOT depend on this
-    /// ingest's OWN `content_references` rows — those are resolved further
-    /// down and committed by the transition itself, so nothing this ingest
-    /// claims is visible here. It only ever matches rows written by OTHER,
-    /// already-ingested artifacts.
+    /// — see that module for why the self-referential kinds are
+    /// excluded. The parents' statuses are I/O, so the whole condition is
+    /// resolved by
+    /// [`crate::use_cases::referenced_descendant::resolve_released_parent_trust_fail_safe`],
+    /// which `register_by_hash_inner`'s identical carve-out also calls:
+    /// the two minting paths cannot drift, and both lookups degrade
+    /// toward the FULL window on error. This lookup does NOT depend on
+    /// this ingest's OWN `content_references` rows — those are resolved
+    /// further down and committed by the transition itself, so nothing
+    /// this ingest claims is visible here. It only ever matches rows
+    /// written by OTHER, already-ingested artifacts.
     ///
     /// Resolves the quarantine-window anchor (`quarantine_window_start`)
     /// as the MINIMUM of the applicable age sources (ADR 0054), in the one
@@ -3197,16 +3203,16 @@ impl IngestUseCase {
     ///   window of one proxying the genuine upstream — the ADR 0016
     ///   cross-opt-in collapse pattern, in the weakening direction.
     /// - The referenced-tree-descendant carve-out's `ingested_at -
-    ///   effective_duration`, i.e. a window that is already over. The
-    ///   RELEASE PREDICATE is completely unchanged (`Artifact::release`
-    ///   still requires its own `ScanSucceeded`/`ScanWaived` authority —
-    ///   ADR 0007's two impossible failure modes stay impossible); this
-    ///   only removes the *timer* wait, so the descendant's own clean scan
-    ///   trips the existing event-driven fast-path release in
-    ///   `QuarantineUseCase::record_scan_result` instead of waiting out a
-    ///   window that provides no additional observation (§4a: no
-    ///   in-window rescan exists, so the window is pure latency for every
-    ///   artifact, not protection).
+    ///   effective_duration`, i.e. a window that is already over —
+    ///   contributed only when a referencing parent is `Released`, so
+    ///   what the descendant skips is a wait on exposure the parent's
+    ///   release already stood for. The RELEASE PREDICATE is completely
+    ///   unchanged (`Artifact::release` still requires its own
+    ///   `ScanSucceeded`/`ScanWaived` authority — ADR 0007's two
+    ///   impossible failure modes stay impossible); this only removes the
+    ///   *timer* wait, so the descendant's own clean scan trips the
+    ///   existing event-driven fast-path release in
+    ///   `QuarantineUseCase::record_scan_result`.
     ///
     /// Invariant: store the **anchor**, never a precomputed deadline. The
     /// release sweep and the proxy-503 read path compute the deadline live
@@ -3241,8 +3247,9 @@ impl IngestUseCase {
             return Ok(None);
         }
 
-        let is_referenced_descendant = resolve_referenced_tree_descendant_fail_safe(
+        let inherits_released_parent_trust = resolve_released_parent_trust_fail_safe(
             &*self.content_references,
+            &*self.artifacts,
             repository_id,
             artifact.id,
             &artifact.sha256_checksum,
@@ -3261,7 +3268,7 @@ impl IngestUseCase {
             trusted_upstream_published_at: trust_upstream_publish_time
                 .then_some(upstream_published_at)
                 .flatten(),
-            is_referenced_descendant,
+            inherits_released_parent_trust,
         });
         let anchor = derived.anchor;
 
@@ -3750,7 +3757,8 @@ impl IngestUseCase {
                 window_duration_secs = effective_duration_secs,
                 anchor_source = "referenced_descendant",
                 "quarantine window collapsed to zero: artifact is a content_references \
-                 target of an already-ingested manifest/index (#46 Item 2 scoped carve-out; \
+                 target of an already-ingested manifest/index with at least one RELEASED \
+                 referencing parent, whose trust it inherits (scoped ADR 0007 carve-out; \
                  release still requires this artifact's own ScanSucceeded/ScanWaived)"
             ),
         }
@@ -4309,7 +4317,7 @@ impl IngestUseCase {
         // the single commit below; only the logs/metrics fire late. See
         // `decide_and_apply_quarantine` for the full quarantine-by-default
         // (ADR 0007) rationale and the referenced-tree-descendant
-        // zero-window carve-out (#46 Item 2).
+        // carve-out, which waives the window only on inherited trust.
         let quarantine_fired = self
             .decide_and_apply_quarantine(
                 &mut artifact,
@@ -5237,22 +5245,25 @@ impl IngestUseCase {
         //    instant, the live content-level age evidence, and the
         //    referenced-tree-descendant carve-out's `now -
         //    effective_duration`. The carve-out uses the same shared
-        //    predicate and lookup
-        //    (`resolve_referenced_tree_descendant_fail_safe`) with the
-        //    same fail-safe-on-lookup-error posture (a failed lookup
-        //    degrades to "not a descendant" = the full window, never the
-        //    zero window).
+        //    resolver (`resolve_released_parent_trust_fail_safe`) — so
+        //    the same conditional-on-inherited-trust condition and the
+        //    same fail-safe-on-lookup-error posture: a failed topology
+        //    lookup degrades to "not a descendant" and a failed parent
+        //    read to "that parent is not released", both of which mean
+        //    the full window, never the zero window.
         //
         //    Sharing the derivation is what makes the invariant hold:
         //    one artifact in one repository gets ONE quarantine window,
         //    whether its row was minted by `ingest_inner` (the leader of
         //    a pull-through coalesce), by a coalesced follower
         //    re-registering here, or by a cross-repo mount. Both inputs
-        //    are caller-independent — the carve-out is TOPOLOGY-based
-        //    ("is this content already a `content_references` target of
-        //    some other already-ingested artifact in THIS repo") and the
-        //    age evidence is content-level. Anything caller-dependent
-        //    would make the hold depend on which racer won the dedup.
+        //    are caller-independent — the carve-out reads the repo's
+        //    own topology ("is this content already a
+        //    `content_references` target of some other already-ingested
+        //    artifact in THIS repo") and those parents' own statuses,
+        //    and the age evidence is content-level. Anything
+        //    caller-dependent would make the hold depend on which racer
+        //    won the dedup.
         //
         //    The trusted-upstream source is absent on this path: it mints
         //    a per-repo row over content already in CAS with no upstream
@@ -5566,24 +5577,28 @@ impl IngestUseCase {
 
         if gate.quarantined {
             // The descendant carve-out, evaluated exactly as
-            // `ingest_inner` evaluates it. The probe is a TOPOLOGY
-            // question — "is this content already a `content_references`
+            // `ingest_inner` evaluates it — both halves: the TOPOLOGY
+            // question ("is this content already a `content_references`
             // target of some OTHER already-ingested artifact in this
-            // repository" — and `is_referenced_tree_descendant` filters
-            // `primary_content` / `metadata_blob` out as self-referential,
-            // so it answers the same whether or not this artifact's own
-            // edges are written yet. That is what lets the mint (whose
+            // repository") and the TRUST question ("is at least one of
+            // those referencing parents `Released`"). Neither is a fact
+            // about the minting path, which is what lets the mint (whose
             // edges ride the commit this feeds) and a catch-up (whose row
-            // has carried its edges since its mint) share it.
+            // has carried its edges since its mint) share the resolver:
+            // `is_referenced_tree_descendant` filters `primary_content` /
+            // `metadata_blob` out as self-referential, so the topology
+            // answers the same whether or not this artifact's own edges
+            // are written yet.
             //
             // Both probes are skipped entirely when an explicit anchor is
             // supplied: the override wins absolutely, so they could only
-            // spend two round-trips on values nothing reads.
-            let (is_referenced_descendant, first_seen_at) = match quarantine_anchor_override {
+            // spend round-trips on values nothing reads.
+            let (inherits_released_parent_trust, first_seen_at) = match quarantine_anchor_override {
                 Some(_) => (false, None),
                 None => (
-                    resolve_referenced_tree_descendant_fail_safe(
+                    resolve_released_parent_trust_fail_safe(
                         &*self.content_references,
+                        &*self.artifacts,
                         repository_id,
                         artifact_id,
                         &artifact.sha256_checksum,
@@ -5626,7 +5641,7 @@ impl IngestUseCase {
                 explicit_override: quarantine_anchor_override,
                 first_seen_at,
                 trusted_upstream_published_at: None,
-                is_referenced_descendant,
+                inherits_released_parent_trust,
             });
             let anchor = derived.anchor;
             anchor_source = derived.source;
@@ -7592,7 +7607,7 @@ mod tests {
         let repo_id = repo.id;
         let (
             uc,
-            _artifacts,
+            artifacts,
             _lifecycle,
             _storage,
             repos,
@@ -7608,14 +7623,14 @@ mod tests {
         policies.insert(required);
 
         // A `content_references` row naming these bytes as a member of an
-        // already-ingested parent makes this ingest a referenced-tree
-        // descendant, whose carve-out anchors the window so it is already
-        // over.
+        // already-ingested RELEASED parent makes this ingest a
+        // trust-inheriting referenced-tree descendant, whose carve-out
+        // anchors the window so it is already over.
         let content: &[u8] = b"held-descendant-bytes";
         let target_hash: ContentHash = sha256_of(content).parse().unwrap();
         content_references
             .insert(ContentReference {
-                source_artifact_id: Uuid::new_v4(),
+                source_artifact_id: seed_released_parent(&artifacts, repo_id),
                 target_content_hash: target_hash,
                 kind: "oci_index_member".into(),
                 metadata: serde_json::Value::Null,
@@ -7656,7 +7671,7 @@ mod tests {
     async fn ingest_quarantine_survives_a_failed_clearance_read() {
         let repo = pypi_repository();
         let repo_id = repo.id;
-        let (uc, _artifacts, _lifecycle, _storage, repos, policies, _jobs, content_refs, events) =
+        let (uc, artifacts, _lifecycle, _storage, repos, policies, _jobs, content_refs, events) =
             make_scan_gated_use_case_with_content_references();
         repos.insert(repo);
         let mut required = global_scan_policy();
@@ -7664,12 +7679,13 @@ mod tests {
         required.provenance_mode = ProvenanceMode::Required;
         policies.insert(required);
 
-        // Descendant carve-out → the derived window is already over, which
-        // is the only state that reaches the clearance read at all.
+        // Descendant carve-out off a released parent → the derived window
+        // is already over, which is the only state that reaches the
+        // clearance read at all.
         let content: &[u8] = b"descendant-with-a-broken-event-store";
         content_refs
             .insert(ContentReference {
-                source_artifact_id: Uuid::new_v4(),
+                source_artifact_id: seed_released_parent(&artifacts, repo_id),
                 target_content_hash: sha256_of(content).parse().unwrap(),
                 kind: "oci_index_member".into(),
                 metadata: serde_json::Value::Null,
@@ -14301,6 +14317,40 @@ mod tests {
         artifacts.insert(a);
     }
 
+    /// Seed an already-ingested parent in `repo_id` at `status` and
+    /// return its id, for use as a `content_references` row's
+    /// `source_artifact_id`.
+    ///
+    /// The descendant carve-out is conditional on inherited trust
+    /// (ADR 0007): the window is waived only for a target of which at
+    /// least one referencing parent is itself `Released`. So a test about
+    /// the waived window has to put a real parent row behind the edge,
+    /// and a test about the full window states the parent's status
+    /// instead of leaving the row absent.
+    ///
+    /// The parent carries its own checksum and path so it is neither
+    /// age evidence for the descendant nor a path collision with it.
+    fn seed_parent(
+        artifacts: &MockArtifactRepository,
+        repo_id: Uuid,
+        status: QuarantineStatus,
+    ) -> Uuid {
+        let mut parent = sample_artifact(status);
+        parent.repository_id = repo_id;
+        parent.path = format!("parents/{}/manifest.json", parent.id);
+        parent.sha256_checksum = sha256_of(format!("parent-manifest-{}", parent.id).as_bytes())
+            .parse()
+            .expect("valid sha256 hex");
+        let id = parent.id;
+        artifacts.insert(parent);
+        id
+    }
+
+    /// [`seed_parent`] at the one status that grants the carve-out.
+    fn seed_released_parent(artifacts: &MockArtifactRepository, repo_id: Uuid) -> Uuid {
+        seed_parent(artifacts, repo_id, QuarantineStatus::Released)
+    }
+
     /// Build the ProtocolNative request the tests below ingest through,
     /// varying only the two publish-time knobs.
     fn native_req(
@@ -14622,11 +14672,11 @@ mod tests {
             ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
 
-            // An already-ingested parent references this hash — the
-            // carve-out applies.
+            // An already-ingested RELEASED parent references this hash —
+            // the carve-out applies.
             content_refs
                 .insert(ContentReference {
-                    source_artifact_id: Uuid::new_v4(),
+                    source_artifact_id: seed_released_parent(&artifacts, repo_id),
                     target_content_hash: target_hash,
                     kind: "oci_index_member".into(),
                     metadata: serde_json::Value::Null,
@@ -14657,21 +14707,27 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // #46 Item 2 — referenced-tree descendant zero-window carve-out
+    // Referenced-tree descendant zero-window carve-out
     //
-    // A scoped carve-out of ADR 0007 (design doc §4 final shape + §4a): a
-    // `content_references` TARGET (a referenced-tree descendant) gets its
-    // quarantine anchor backdated so the live-computed deadline
-    // (`anchor + duration`) equals `ingested_at` — a zero-length window —
-    // while the RELEASE PREDICATE stays completely untouched (still
-    // requires the descendant's own `ScanSucceeded`/`ScanWaived`
-    // authority; see `record_scan_result_zero_window_descendant_with_findings_still_rejects`
-    // in `quarantine_use_case.rs` for the fail-closed-intact proof). The
-    // four tests below pin: target → zero window; non-target → full
+    // A scoped carve-out of ADR 0007, conditional on inherited trust: a
+    // `content_references` TARGET of which at least one referencing
+    // parent is itself `Released` gets its quarantine anchor backdated so
+    // the live-computed deadline (`anchor + duration`) equals
+    // `ingested_at` — a zero-length window — while the RELEASE PREDICATE
+    // stays completely untouched (still requires the descendant's own
+    // `ScanSucceeded`/`ScanWaived` authority; see
+    // `record_scan_result_zero_window_descendant_with_findings_still_rejects`
+    // in `quarantine_use_case.rs` for the fail-closed-intact proof).
+    //
+    // The first two tests below are the decision, as the two anchors an
+    // operator can observe: released parent → zero window, held parent →
+    // full window. The rest pin the surrounding shape — non-target → full
     // window; the `primary_content`/`metadata_blob` self-reference
     // exclusion (the bug a naive "any kind" check would introduce, since
     // every artifact's own ingest writes a self-targeting
-    // `primary_content` row); and the lookup-failure fail-safe.
+    // `primary_content` row); and the lookup-failure fail-safe. Every arm
+    // and error direction of the resolver itself is driven in
+    // `referenced_descendant.rs`, against the same mocks.
     // ---------------------------------------------------------------------
 
     /// A `content_references` target (an already-ingested parent
@@ -14691,7 +14747,7 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (
                 uc,
-                _artifacts,
+                artifacts,
                 _lifecycle,
                 _storage,
                 repos,
@@ -14702,12 +14758,14 @@ mod tests {
             ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
 
-            // Simulate an already-ingested parent (e.g. an OCI index)
-            // referencing this artifact's hash BEFORE this artifact is
-            // ingested — exactly the shape #46 Item 1 writes.
+            // Simulate an already-ingested, already-RELEASED parent (e.g.
+            // an OCI index an operator released) referencing this
+            // artifact's hash BEFORE this artifact is ingested — exactly
+            // the shape the OCI membership-edge writers produce, plus the
+            // inherited trust the carve-out is conditional on.
             content_refs
                 .insert(ContentReference {
-                    source_artifact_id: Uuid::new_v4(),
+                    source_artifact_id: seed_released_parent(&artifacts, repo_id),
                     target_content_hash: target_hash,
                     kind: "oci_index_member".into(),
                     metadata: serde_json::Value::Null,
@@ -14741,6 +14799,147 @@ mod tests {
                  (between {before:?} and {after:?}) — a zero-length window"
             );
         });
+    }
+
+    /// The other half of the decision, and the same fixture with one
+    /// field changed: the referencing parent is still `Quarantined`, so
+    /// there is no trust to inherit and the descendant keeps the FULL
+    /// window — anchored at `ingested_at`, not backdated.
+    ///
+    /// This is the cold-pull shape. An index and its children are minted
+    /// seconds apart against the same advisory data, with the index's own
+    /// window still running, so the descendant's first-touch scan is not
+    /// "fresher than an assessment the operator already trusted" — there
+    /// is no such assessment. Pre-amendment this artifact was served by
+    /// digest while its own index answered `503`.
+    #[test]
+    fn ingest_direct_held_parent_keeps_the_full_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"child-manifest-of-a-held-index";
+        let target_hash: ContentHash = sha256_of(content).parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (
+                uc,
+                artifacts,
+                _lifecycle,
+                _storage,
+                repos,
+                _policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: seed_parent(
+                        &artifacts,
+                        repo_id,
+                        QuarantineStatus::Quarantined,
+                    ),
+                    target_content_hash: target_hash,
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let artifact = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .unwrap()
+                .artifact;
+            let after = Utc::now();
+
+            assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+            let anchor = artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under Default policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "a descendant of a HELD parent must keep the full window — the anchor \
+                 must be the ingest timestamp, not backdated by a duration: \
+                 {anchor:?} not in [{before:?}, {after:?}]"
+            );
+        });
+    }
+
+    /// The zero-window fire is the one anchor an operator is told about
+    /// on its own line, and the line has to name the condition that
+    /// produced it: `anchor_source = "referenced_descendant"` with a
+    /// message saying a RELEASED referencing parent's trust was
+    /// inherited. Without this the only operator-visible account of the
+    /// carve-out is a message describing the pre-amendment rule.
+    #[test]
+    fn ingest_direct_zero_window_logs_the_inherited_trust_condition() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"logged-descendant-bytes";
+        let target_hash: ContentHash = sha256_of(content).parse().unwrap();
+
+        let (_, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            rt.block_on(async {
+                let (
+                    uc,
+                    artifacts,
+                    _lifecycle,
+                    _storage,
+                    repos,
+                    _policies,
+                    _jobs,
+                    content_refs,
+                    _events,
+                ) = make_scan_gated_use_case_with_content_references();
+                repos.insert(repo);
+                content_refs
+                    .insert(ContentReference {
+                        source_artifact_id: seed_released_parent(&artifacts, repo_id),
+                        target_content_hash: target_hash,
+                        kind: "oci_index_member".into(),
+                        metadata: serde_json::Value::Null,
+                        repository_id: repo_id,
+                        recorded_at: Utc::now(),
+                    })
+                    .await
+                    .unwrap();
+                uc.ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                    .await
+                    .unwrap()
+                    .artifact
+            })
+        });
+
+        let lines: Vec<_> = captured
+            .iter()
+            .filter(|e| {
+                e.target.starts_with("hort_app::use_cases::ingest_use_case")
+                    && e.fields.get("anchor_source").map(String::as_str)
+                        == Some("referenced_descendant")
+            })
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the zero-window fire must be reported exactly once: {captured:#?}"
+        );
+        assert!(
+            lines[0].message().contains("RELEASED"),
+            "the line must say the waiver rests on a released referencing parent, \
+             not merely on being a target: {:#?}",
+            lines[0]
+        );
     }
 
     /// A non-target artifact (no `content_references` row targets its
@@ -17978,7 +18177,7 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (
                 uc,
-                _artifacts,
+                artifacts,
                 _lifecycle,
                 storage,
                 repos,
@@ -17996,10 +18195,11 @@ mod tests {
 
             // Exactly the shape the OCI manifest-PUT path writes for an
             // index's children, and the one the coalesced-follower leg
-            // then registers against.
+            // then registers against — with the index already released,
+            // which is what the carve-out is conditional on.
             content_refs
                 .insert(ContentReference {
-                    source_artifact_id: Uuid::new_v4(),
+                    source_artifact_id: seed_released_parent(&artifacts, repo_id),
                     target_content_hash: hash.clone(),
                     kind: "oci_index_member".into(),
                     metadata: serde_json::Value::Null,
@@ -18036,6 +18236,59 @@ mod tests {
         });
     }
 
+    /// …and the held-parent half of the decision reaches the same answer
+    /// on this path too. The condition is a fact about the repository,
+    /// not about the minting path, so a coalesced follower registering a
+    /// constituent of a still-held index gets the full window exactly as
+    /// the leader's `ingest_inner` would give it.
+    #[test]
+    fn register_by_hash_held_parent_keeps_the_full_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs, _events) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy());
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"child of a held index".to_vec());
+
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: seed_parent(
+                        &artifacts,
+                        repo_id,
+                        QuarantineStatus::Quarantined,
+                    ),
+                    target_content_hash: hash.clone(),
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("registering a constituent of a held parent must succeed");
+            let after = Utc::now();
+
+            let anchor = outcome
+                .artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under a duration>0 policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "a descendant of a HELD parent must keep the full window on the \
+                 registration path too: {anchor:?} not in [{before:?}, {after:?}]"
+            );
+        });
+    }
+
     /// The seed-import cutover's explicit backdated anchor keeps absolute
     /// precedence: a descendant edge must NOT displace it, in either
     /// direction. Pins the `Some(seed_anchor)` arm of the precedence
@@ -18048,7 +18301,7 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (
                 uc,
-                _artifacts,
+                artifacts,
                 _lifecycle,
                 storage,
                 repos,
@@ -18062,9 +18315,12 @@ mod tests {
             let hash: ContentHash = ZERO_HASH.parse().unwrap();
             storage.insert_content(hash.clone(), b"seeded child manifest".to_vec());
 
+            // A released parent, so the carve-out genuinely applies and
+            // the override is beating a live rule rather than an inert
+            // one.
             content_refs
                 .insert(ContentReference {
-                    source_artifact_id: Uuid::new_v4(),
+                    source_artifact_id: seed_released_parent(&artifacts, repo_id),
                     target_content_hash: hash.clone(),
                     kind: "oci_index_member".into(),
                     metadata: serde_json::Value::Null,

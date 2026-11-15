@@ -35,9 +35,15 @@
 //!   ([`AnchorEvidence::trusted_upstream_published_at`]) — attacker-
 //!   assertable, hence per-mapping opt-in and future-skew-clamped here
 //!   before it may compete.
-//! - **The referenced-tree descendant carve-out** — content that is already
-//!   a `content_references` target of another ingested artifact contributes
-//!   `minted_at - window`, i.e. a window that is already over.
+//! - **The referenced-tree descendant carve-out** — content that is a
+//!   `content_references` target of another ingested artifact **at least
+//!   one of whose referencing parents is itself `Released`** contributes
+//!   `minted_at - window`, i.e. a window that is already over. The
+//!   released parent is the "the world has already had this long to look"
+//!   argument here: what the descendant inherits is an assessment the
+//!   operator already trusted. Without one there is nothing to inherit,
+//!   so the carve-out does not apply and the mint instant stands
+//!   (ADR 0007, amended 2026-11-15).
 //!
 //! # The second source never transits repositories
 //!
@@ -106,12 +112,25 @@ pub struct AnchorEvidence {
     /// precisely so an operator can state that this upstream's claims are
     /// worth believing.
     pub trusted_upstream_published_at: Option<DateTime<Utc>>,
-    /// Whether this content is already a `content_references` target of
-    /// some other, already-ingested artifact in this repository (a child
-    /// manifest, a referrer's subject, a config/layer blob). A topology
-    /// fact, hence caller-independent: one artifact in one repository gets
-    /// one window whichever path minted its row.
-    pub is_referenced_descendant: bool,
+    /// Whether this content is a `content_references` target of some
+    /// other, already-ingested artifact in this repository (a child
+    /// manifest, a referrer's subject, a config/layer blob) **of which at
+    /// least one referencing parent is itself `Released`**.
+    ///
+    /// Both halves are required, and the second is what the field is
+    /// named for: the carve-out waives the window only where the
+    /// descendant inherits trust that already exists. A descendant whose
+    /// parents are all still held — the shape of a cold pull, where
+    /// parent and constituents are minted seconds apart against the same
+    /// advisory data — has no earlier trusted assessment to inherit, so
+    /// it keeps the full window (ADR 0007, amended 2026-11-15).
+    ///
+    /// Caller-independent all the same: both the topology and the
+    /// parents' statuses are facts about the repository, not about which
+    /// path minted this row, so one artifact in one repository gets one
+    /// window whichever minting path — or whichever racer in a dedup
+    /// coalesce — created it.
+    pub inherits_released_parent_trust: bool,
 }
 
 /// Which source the derived anchor came from — observability only; the
@@ -128,8 +147,15 @@ pub enum AnchorSource {
     FirstSeen,
     /// [`AnchorEvidence::trusted_upstream_published_at`], post-clamp.
     TrustedUpstreamPublish,
-    /// The [`AnchorEvidence::is_referenced_descendant`] carve-out's
-    /// `minted_at - window`.
+    /// The referenced-tree descendant carve-out's `minted_at - window`,
+    /// i.e. a window that is already over.
+    ///
+    /// Fires only on the carve-out's full condition — a
+    /// `content_references` target with at least one `Released`
+    /// referencing parent, which is what
+    /// [`AnchorEvidence::inherits_released_parent_trust`] carries. A
+    /// descendant whose parents are all held anchors on
+    /// [`Self::Mint`] like anything else.
     ReferencedDescendant,
 }
 
@@ -193,7 +219,7 @@ pub fn derive_quarantine_anchor(evidence: &AnchorEvidence) -> DerivedAnchor {
     // earlier*, where it would silently lengthen a window relative to a
     // rule that already applied.
     let descendant = evidence
-        .is_referenced_descendant
+        .inherits_released_parent_trust
         .then(|| evidence.minted_at - evidence.window);
 
     let mut anchor = evidence.minted_at;
@@ -238,7 +264,7 @@ mod tests {
             explicit_override: None,
             first_seen_at: None,
             trusted_upstream_published_at: None,
-            is_referenced_descendant: false,
+            inherits_released_parent_trust: false,
         }
     }
 
@@ -365,7 +391,7 @@ mod tests {
     #[test]
     fn the_descendant_carve_out_backdates_by_a_full_window() {
         let derived = derive_quarantine_anchor(&AnchorEvidence {
-            is_referenced_descendant: true,
+            inherits_released_parent_trust: true,
             ..bare()
         });
         assert_eq!(derived.anchor, ts(MINT - WINDOW_SECS));
@@ -377,7 +403,7 @@ mod tests {
     #[test]
     fn an_even_earlier_source_beats_the_descendant_carve_out() {
         let derived = derive_quarantine_anchor(&AnchorEvidence {
-            is_referenced_descendant: true,
+            inherits_released_parent_trust: true,
             first_seen_at: Some(ts(MINT - WINDOW_SECS - 1)),
             ..bare()
         });
@@ -391,7 +417,7 @@ mod tests {
     #[test]
     fn the_descendant_carve_out_beats_a_later_age_source() {
         let derived = derive_quarantine_anchor(&AnchorEvidence {
-            is_referenced_descendant: true,
+            inherits_released_parent_trust: true,
             first_seen_at: Some(ts(MINT - 10)),
             ..bare()
         });
@@ -402,7 +428,7 @@ mod tests {
     #[test]
     fn an_ancient_trusted_upstream_value_beats_the_descendant_carve_out() {
         let derived = derive_quarantine_anchor(&AnchorEvidence {
-            is_referenced_descendant: true,
+            inherits_released_parent_trust: true,
             trusted_upstream_published_at: Some(ts(1)),
             ..bare()
         });
@@ -417,7 +443,7 @@ mod tests {
     #[test]
     fn a_zero_window_descendant_ties_with_the_mint_instant() {
         let derived = derive_quarantine_anchor(&AnchorEvidence {
-            is_referenced_descendant: true,
+            inherits_released_parent_trust: true,
             window: Duration::zero(),
             ..bare()
         });
@@ -433,7 +459,7 @@ mod tests {
             explicit_override: Some(ts(MINT - 7)),
             first_seen_at: Some(ts(1)),
             trusted_upstream_published_at: Some(ts(2)),
-            is_referenced_descendant: true,
+            inherits_released_parent_trust: true,
             ..bare()
         });
         assert_eq!(derived.anchor, ts(MINT - 7));
@@ -474,7 +500,7 @@ mod tests {
         let derived = derive_quarantine_anchor(&AnchorEvidence {
             first_seen_at: Some(ts(MINT - 100)),
             trusted_upstream_published_at: Some(ts(MINT - 200)),
-            is_referenced_descendant: true,
+            inherits_released_parent_trust: true,
             ..bare()
         });
         assert_eq!(derived.anchor, ts(MINT - WINDOW_SECS));
@@ -513,7 +539,7 @@ mod tests {
             },
             AnchorEvidence {
                 first_seen_at: Some(ts(MINT + 1)),
-                is_referenced_descendant: true,
+                inherits_released_parent_trust: true,
                 ..bare()
             },
             bare(),

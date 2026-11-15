@@ -29,15 +29,17 @@
 //! release a held child.
 //!
 //! The same holds for the config and layer blobs the handler warms (step 8).
-//! Their anchor is whatever `IngestUseCase` derives, which for a constituent of
-//! a manifest that has already committed its `oci_config` / `oci_layer` edges
-//! includes the **referenced-tree-descendant carve-out** — a window that is
-//! already over. That is not something the warm does: the edge that makes the
-//! blob a descendant is written by the child's own ingest one step earlier, so
-//! a blob a client pulled lazily a day later lands on exactly the same anchor.
-//! What the carve-out removes is the timer and nothing else — the blob still
-//! needs its own clean scan verdict before a byte of it is served, and a warmed
-//! blob is minted `Quarantined` like any other.
+//! Their anchor is whatever `IngestUseCase` derives, and the point is that the
+//! warm does not influence it: the edge that makes the blob a constituent is
+//! written by the child's own ingest one step earlier, so a blob a client
+//! pulled lazily a day later lands on exactly the same anchor. Which anchor
+//! that is depends on the referencing manifest's own state, because the
+//! descendant carve-out waives the window only where at least one referencing
+//! parent is already `Released` (ADR 0007, *The carve-out is conditional on
+//! inherited trust*). On this path the child manifest is minted seconds
+//! earlier and is still held, so a warmed blob takes the **full** window —
+//! and either way the blob needs its own clean scan verdict before a byte of
+//! it is served, and is minted `Quarantined` like any other.
 //!
 //! # Params
 //!
@@ -1297,9 +1299,9 @@ impl OciIndexChildIngestHandler {
     /// Nothing here supplies a quarantine anchor or any window arithmetic:
     /// `ingest_verified` derives each blob's exactly as it would for a lazily
     /// pulled blob of the same manifest. See the module doc's
-    /// *This shortens no quarantine window* for why that is the same answer
-    /// even though a constituent of a committed manifest takes the
-    /// referenced-tree-descendant carve-out.
+    /// *This shortens no quarantine window* for why the warm reaches the same
+    /// answer either way — which anchor that is depends on whether a
+    /// referencing parent is already `Released`, not on the warm.
     async fn warm_child_blobs(
         &self,
         repo: &Repository,
@@ -3819,13 +3821,13 @@ mod tests {
             // a lazily pulled blob of the same manifest would be: the warm
             // supplies no anchor and no window arithmetic, so the anchor is
             // whatever `ingest_verified` derived (ADR 0054) — here the
-            // referenced-tree-descendant carve-out's already-over window,
-            // because the `oci_config` / `oci_layer` edge that makes this
-            // blob a descendant committed in the manifest's own transition
-            // one step earlier. That carve-out removes the *timer* and
-            // nothing else: ADR 0007's release predicate is untouched, so
-            // the blob still needs its own clean scan verdict before a byte
-            // of it is served, which is what this assertion pins.
+            // full window, because the carve-out waives one only where a
+            // referencing parent is already `Released` (ADR 0007) and the
+            // child manifest that references this blob was minted seconds
+            // earlier and is still held. Either way the anchor is not the
+            // warm's business, and ADR 0007's release predicate is
+            // untouched: the blob needs its own clean scan verdict before a
+            // byte of it is served, which is what this assertion pins.
             assert!(matches!(
                 row.quarantine_status,
                 QuarantineStatus::Quarantined
