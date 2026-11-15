@@ -93,6 +93,64 @@ artifact via the existing `ScanSucceeded` authority (or rejects it on
 findings) — this mechanism only gives the scan another chance to
 actually run. It does not release anything on a timer.
 
+## 1a. Reporting one — the five facts that make it decidable
+
+If you are escalating a held or verdict-less artifact rather than
+recovering it yourself, gather these five before you write the report.
+The **reason** for the abstention selects the mitigation path, not the
+artifact's identity — the three causes in §1 are structurally different
+and recover differently, so a report without the reason cannot be acted
+on and costs a round trip to collect it.
+
+1. **Identity — repository key, path or coordinate, and the content
+   digest.** `--output json` carries the digest whole; the table view
+   abbreviates it.
+
+   ```bash
+   hort-cli curation queue --repo <key> --status scan_indeterminate --output json
+   ```
+
+2. **The abstention reason, verbatim.** The worker log line carries both
+   `reason=` and `abstention=`:
+
+   ```
+   trivy adapter: refusing to materialise archive; no scan will run
+     reason="archive entry path is not contained in the workspace"
+     abstention="unusable_archive"
+   ```
+
+   That field separates `unusable_archive` from `no_analyzer_matched`
+   from `incomplete_composition`, and each has a different path. Quote
+   the line per distinct artifact; do not summarise it and do not report
+   a count instead.
+
+3. **The artifact kind** (`oci_blob`, `oci_manifest`, `npm_tarball`,
+   `cargo_crate`, `py_wheel`, `py_sdist`, `maven_jar`, `maven_pom`). It
+   decides whether the artifact gates at all: an abstention gates release
+   unless the kind is a composition constituent, and `oci_blob` is the
+   only constituent — so an image layer does not hold up its image, while
+   everything else holds up itself.
+
+4. **Whether the artifact was ever released.** Two situations look
+   identical from outside and have opposite answers: never assessed
+   (`scan_indeterminate`, not downloadable, exit only via a curator
+   waive) versus already released and a *later* rescan abstained (still
+   served on the existing verdict, not blocked). Read it off the
+   artifact's event stream — is there an `ArtifactReleased`? — or from
+   whether the download answers `200` or `503`/`403`.
+
+5. **The scan job's `last_error` and `attempts`.**
+
+   ```bash
+   hort-cli admin task list --kind scan --status failed --output json
+   ```
+
+   `--output json` is not optional here: the table view does not show the
+   error. And `attempts` equal to the attempt cap is a **terminally dead
+   job**, which is a different defect class from an abstention — the scan
+   never reached a verdict because it never finished, not because there
+   was nothing to assess.
+
 ## 2. The sweep self-heals — once the tick is scheduled
 
 The `cron-rescan-tick` task (the same k8s CronJob / admin-task that
