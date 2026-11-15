@@ -34,7 +34,7 @@ the result instead.
 | kube | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
 | metrics-exporter-prometheus | 0.18.3 | Apache-2.0 | https://github.com/metrics-rs/metrics |
 | pep440_rs | 0.7.3 | Apache-2.0 | https://github.com/konstin/pep440-rs |
-| rpassword | 7.5.4 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
+| rpassword | 7.5.5 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
 | rtoolbox | 0.0.5 | Apache-2.0 | https://github.com/conradkleinespel/rtoolbox |
 | ryu-js | 1.0.2 | Apache-2.0 | https://github.com/boa-dev/ryu-js |
 | ryu | 1.0.23 | Apache-2.0 | https://github.com/dtolnay/ryu |
@@ -3865,7 +3865,7 @@ limitations under the License.
 
 ```
 
-### rpassword 7.5.4 — Apache-2.0
+### rpassword 7.5.5 — Apache-2.0
 
 Repository: https://github.com/conradkleinespel/rpassword
 
