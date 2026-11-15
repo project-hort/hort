@@ -2182,11 +2182,14 @@ impl QuarantineUseCase {
             // next tick and the backstop resumes — so a blob whose parent
             // no longer exists still settles terminally.
             //
-            // The skip set is deliberately narrower than the hold arm's
-            // `is_referenced_descendant`: an artifact an attestation
+            // The skip set is deliberately narrower than what the hold
+            // itself covers, and "held" is not what distinguishes these
+            // rows: an absent attestation holds every shape (ADR 0039
+            // D1/D3). What distinguishes them is whether a verify could
+            // still change the outcome — an artifact an attestation
             // points at (`oci_subject`) or a child *manifest*
-            // (`oci_index_member`) can still be cleared by a verify, so
-            // it keeps the backstop.
+            // (`oci_index_member`) can still be cleared by one, so it
+            // keeps the backstop.
             let provenance_pending = matches!(provenance, ProvenanceClearance::Pending);
             if provenance_pending {
                 // INVARIANT: this lookup PROPAGATES its error, matching

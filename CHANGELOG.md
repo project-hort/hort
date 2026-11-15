@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Migration notice
 
+- **A cold pull of a composed artifact now holds its whole closure for the
+  configured observation window.** A constituent — an index's child manifest, a
+  manifest's config or layer blob — skips the window only while a referencing
+  parent is already released, where before it was deliverable as soon as its own
+  scan finished; on a repository with a long `quarantineDuration`, expect
+  first-time pulls by digest to `503` for that duration.
 - **A `ScanPolicy` that sets `compositeVerdictMode` is refused at apply.**
   The field is retired, including the value `promoted`, which earlier releases
   accepted. Remove the line from every policy document before upgrading, or

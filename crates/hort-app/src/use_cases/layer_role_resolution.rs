@@ -153,7 +153,7 @@ const MAX_NOMINATING_MANIFESTS: usize = 16;
 /// CAS read — degrades to [`LayerRole::Unknown`], because the only
 /// outcome that changes behaviour is a resolved negative and a failed read
 /// is not one. That direction is the inverse of
-/// [`resolve_referenced_tree_descendant_fail_safe`](crate::use_cases::referenced_descendant)'s
+/// [`resolve_released_parent_trust_fail_safe`](crate::use_cases::referenced_descendant)'s
 /// and for the same underlying rule: each degrades to the answer that
 /// does not act.
 pub(crate) async fn resolve_layer_role(

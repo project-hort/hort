@@ -120,7 +120,10 @@
 //! `oci_layer` / `oci_index_member` are kinds the
 //! referenced-tree-descendant predicate counts, so an edge naming a blob
 //! the repository does not hold would let that blob's own later ingest see
-//! itself already referenced and take the zero-window quarantine carve-out.
+//! itself already referenced and — once the manifest that wrote the edge
+//! is released, which is the ordinary end of a clean scan — take the
+//! zero-window quarantine carve-out (the carve-out is conditional on a
+//! `Released` referencing parent; ADR 0007).
 //! The resolution of the declared references therefore runs **before** the
 //! mint and the membership claims are built only from a complete one; a
 //! manifest referencing blobs the client has not pushed yet is still minted

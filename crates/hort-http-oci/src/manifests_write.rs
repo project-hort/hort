@@ -1669,7 +1669,9 @@ fn subject_content_reference_claim(
 /// ingest transition. The ordering worry that kept them outside it — that a
 /// claim made before the blob-existence gate could name a blob the
 /// repository does not hold, and so hand the blob's own later ingest a
-/// zero-window quarantine carve-out it did not earn — is answered by
+/// zero-window quarantine carve-out it did not earn once this manifest is
+/// released (ADR 0007's carve-out needs a `Released` referencing parent,
+/// which a clean scan of this manifest ordinarily produces) — is answered by
 /// *resolving first and claiming second*: the caller builds this set only
 /// from a [`ResolvedReferences::Complete`] resolution, and the
 /// unknown-blob 400 still answers after the mint, so the committed-manifest
@@ -1727,9 +1729,10 @@ pub(crate) fn membership_claims(
 /// `oci_layer` / `oci_index_member` row is a tree edge that
 /// `hort_app`'s referenced-tree-descendant predicate counts, so a row
 /// naming a blob the repository does not hold would let that blob's own
-/// later ingest see itself already referenced and take the zero-window
-/// quarantine carve-out — an observation window shortened on the strength
-/// of an edge written for content that did not exist. Resolving before the
+/// later ingest see itself already referenced and — once this manifest is
+/// released — take the zero-window quarantine carve-out: an observation
+/// window shortened on the strength of an edge written for content that
+/// did not exist. Resolving before the
 /// mint removes the possibility rather than mitigating it: on the
 /// unknown-blob path there is no membership claim to be wrong about.
 ///
@@ -1743,7 +1746,8 @@ pub(crate) fn membership_claims(
 /// descendant predicate: `is_referenced_tree_descendant` counts every
 /// kind outside `{primary_content, metadata_blob}`, `oci_subject`
 /// included. So a referrer for an absent subject does set the zero-window
-/// carve-out for that subject's own later ingest. That is the pre-existing
+/// carve-out for that subject's own later ingest, from the moment the
+/// referrer itself is released. That is the pre-existing
 /// shape of the Referrers flow and resolving the membership claims before
 /// the mint neither introduces nor repairs it; the two are gated
 /// differently because the push each one refuses is different, not
@@ -2859,11 +2863,14 @@ fn check_child_against_descriptor(
 /// single-image manifest. `target =` each declared child/blob digest.
 ///
 /// **Register by digest, no existence check — and that is the mechanism,
-/// not an omission.** A proxy descendant's edge is what gives it the
-/// zero-window quarantine carve-out on its own later ingest (ADR 0007,
-/// `referenced_descendant.rs`): the target-check reads exactly these kinds,
-/// and before these edges were written at all, every proxy descendant's
-/// check missed and took the full observation window. The hosted PUT path
+/// not an omission.** A proxy descendant's edge is what makes it eligible
+/// for the zero-window quarantine carve-out on its own later ingest
+/// (ADR 0007, `referenced_descendant.rs`): the target-check reads exactly
+/// these kinds, and before these edges were written at all, every proxy
+/// descendant's check missed and took the full observation window. The
+/// edge is necessary and not sufficient — the carve-out also needs this
+/// manifest to be `Released`, so on a cold pull the whole closure is held
+/// for the window and the edge pays off on the next touch. The hosted PUT path
 /// gates its claims on in-repo resolution because ADR 0043 makes it
 /// reject an unknown-blob manifest in the same breath; a pull-through
 /// manifest's constituents legitimately are not here yet — the worker
@@ -4415,8 +4422,9 @@ mod tests {
     /// `oci_index_member` are tree-edge kinds that the
     /// referenced-tree-descendant predicate counts, so a claim naming a
     /// blob the repository does not hold would hand that blob's own later
-    /// ingest the zero-window quarantine carve-out on the strength of an
-    /// edge written for content that did not exist. Resolving before the
+    /// ingest the zero-window quarantine carve-out — once this manifest is
+    /// released — on the strength of an edge written for content that did
+    /// not exist. Resolving before the
     /// mint removes the possibility instead of mitigating it: there is no
     /// membership claim on this path to be wrong about. The `oci_subject`
     /// claim is deliberately NOT gated this way — a referrer for a subject

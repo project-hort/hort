@@ -4,7 +4,7 @@ metadata:
   name: oci-proxy-quarantine-e2e
 spec:
   name: "OCI Proxy Quarantine E2E"
-  description: "Hosted OCI repo with a 24h-quarantining ScanPolicy and a Docker Hub upstream mapping (pull-through, exactly as oci-mirror-e2e); used by scripts/native-tests/scenarios/quarantine/proxy-multiarch-zero-window.sh to prove the #46 Item 2 referenced-tree-descendant zero-window carve-out fires for a proxy-pulled multi-arch index's child manifest."
+  description: "Hosted OCI repo with a 24h-quarantining ScanPolicy and a Docker Hub upstream mapping (pull-through, exactly as oci-mirror-e2e); used by scripts/native-tests/scenarios/quarantine/proxy-multiarch-zero-window.sh to prove a proxy-pulled multi-arch index's child manifest keeps its full observation window while the index referencing it is still held."
   format: oci
   type: hosted
   storage:

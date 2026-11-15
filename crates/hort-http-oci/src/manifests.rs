@@ -2184,9 +2184,10 @@ async fn finalise_manifest_pull(
 /// creates its per-repo row, not only for the leg that fetched it from
 /// upstream. Those edges are what the referenced-tree-descendant
 /// target-check reads, so a row without them silently loses the
-/// descendant carve-out (its constituents get a full observation window
-/// instead of inheriting the parent's) and loses the GC keepalive on
-/// every blob it references.
+/// descendant carve-out — where it would have applied at all, which
+/// since ADR 0007's *conditional on inherited trust* amendment means
+/// where a referencing parent is already `Released` — and loses the GC
+/// keepalive on every blob it references, which it loses either way.
 ///
 /// The pull-through's fetch closure runs at most once per coalescing
 /// window, and that window is keyed by content hash alone — it is
