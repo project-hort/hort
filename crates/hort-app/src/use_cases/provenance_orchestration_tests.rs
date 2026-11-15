@@ -2326,6 +2326,7 @@ impl ProvenancePort for InterleavingProvenancePort {
                         negligible: 0,
                     },
                     findings_blob: Some("f".repeat(64).parse().unwrap()),
+                    findings_blob_retained: None,
                     assessment: ScanAssessment::Analysed,
                 }),
                 correlation_id: Uuid::new_v4(),

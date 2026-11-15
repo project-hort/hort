@@ -1118,6 +1118,7 @@ fn scan_completed_event(artifact_id: Uuid, global_pos: u64) -> PersistedEvent {
                 negligible: 0,
             },
             findings_blob: None,
+            findings_blob_retained: None,
             assessment: ScanAssessment::Analysed,
         }),
         correlation_id: Uuid::new_v4(),

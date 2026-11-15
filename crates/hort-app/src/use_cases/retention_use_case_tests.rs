@@ -226,6 +226,7 @@ fn scan_completed(artifact_id: Uuid) -> DomainEvent {
             negligible: 0,
         },
         findings_blob: None,
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     })
 }

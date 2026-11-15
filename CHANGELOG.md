@@ -160,6 +160,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A rescan that finds very many new vulnerabilities no longer leaves the
   artifact without a verdict: the audit event now records the most severe new
   findings plus the true total, instead of being too large to store.
+- A scan of an artifact with very many findings now records a verdict instead
+  of failing at the attempt cap. Such an artifact is re-evaluated on its
+  severity counts, so a CVE exclusion cannot release it — it stays rejected
+  until its findings fit or a curator waives it (#441).
 - An image layer or archive whose members carry absolute paths is now scanned
   instead of being held unassessed as an unusable archive.
 - The Maven transitive-prefetch cascade now warms a BOM a POM imports through

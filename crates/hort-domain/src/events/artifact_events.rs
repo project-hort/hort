@@ -1,5 +1,3 @@
-use std::cmp::Ordering;
-
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -10,8 +8,9 @@ use crate::error::{DomainError, DomainResult};
 use crate::ports::provenance::{ProvenanceHoldReason, ProvenanceRejectReason, SignerIdentity};
 use crate::retention::{ExpirationReason, HeldStateEntry};
 use crate::types::checksum::HashAlgorithm;
-use crate::types::finding::severity_tier;
-use crate::types::{ArtifactCoords, ContentHash, Finding};
+use crate::types::{
+    largest_fitting_prefix, ordered_most_severe_first, ArtifactCoords, ContentHash, Finding,
+};
 
 use super::validation::{validate_json, validate_optional_string, validate_string};
 use super::{DomainEvent, MAX_EVENT_JSON_BYTES};
@@ -327,6 +326,8 @@ impl std::fmt::Display for ScanAssessment {
 /// - `assessment == NotApplicable` implies `finding_count == 0` — there
 ///   was no surface to assess, so a finding attributed to it could not
 ///   have come from anywhere.
+/// - `findings_blob_retained`, when set, is at least 1, is strictly
+///   below `finding_count`, and comes with a blob — see that field.
 ///
 /// # `findings_blob` layout
 ///
@@ -336,6 +337,10 @@ impl std::fmt::Display for ScanAssessment {
 /// `StoragePort::get(hash)`. hort-cli and the admin UI typically render
 /// the inline `severity_summary` and only fetch the blob when an
 /// operator drills into per-finding detail.
+///
+/// The blob holds every finding of the scan **unless
+/// `findings_blob_retained` says otherwise**; the aggregates beside it
+/// are always of the complete set.
 ///
 /// # Schema evolution
 ///
@@ -360,6 +365,50 @@ pub struct ScanCompleted {
     /// invariant and the `#[serde(default)]` rationale.
     #[serde(default)]
     pub findings_blob: Option<ContentHash>,
+    /// The number of findings `findings_blob` holds when it holds only
+    /// the **most severe** of this scan's findings; `None` when it holds
+    /// all `finding_count` of them.
+    ///
+    /// A finding set is unbounded and the blob is capped
+    /// (`QuarantineUseCase::persist_findings_blob` in `hort-app` is the
+    /// single CAS write site and holds the cap). Before this field, a
+    /// set whose serialisation exceeded the cap was refused and the scan
+    /// that produced it ended with no verdict at all — worst for
+    /// precisely the artifacts with the most findings, and measured
+    /// rather than hypothetical: twelve scan jobs died terminally inside
+    /// one 71-minute window on a running instance, with blobs from 1.3x
+    /// to 2.3x the cap.
+    ///
+    /// **The aggregates do not move.** `finding_count` and
+    /// `severity_summary` are of the complete set whatever this field
+    /// says, so the true total always rides the event and a threshold
+    /// walk over the counts is unaffected by a short blob. What this
+    /// field adds is the one thing the counts cannot say: whether the
+    /// per-finding evidence behind them is all of it.
+    ///
+    /// **A reader must not decide a CVE-level question from a blob this
+    /// field marks.** The retained findings are the most severe, so they
+    /// answer every *threshold* question the complete set would; they do
+    /// not answer "is every finding here excluded by this operator's
+    /// exclusion list", because a dropped finding names a CVE nothing in
+    /// the blob mentions. `hort-app`'s `scan_history::FindingsEvidence`
+    /// is where that refusal is made structural — see
+    /// [`Self::findings_blob_is_complete`], which is the only place the
+    /// "absent means complete" reading is spelled.
+    ///
+    /// `#[serde(default, skip_serializing_if = …)]` rather than a bare
+    /// `#[serde(default)]`, for the reason spelled out on
+    /// [`Self::assessment`]: the chain verifier re-derives a stored
+    /// payload's canonical bytes by deserialising and re-serialising it,
+    /// so a field that always writes a key makes every event appended
+    /// before it existed re-serialise to bytes it was never hashed with
+    /// — a `HashMismatch` indistinguishable from tampering. A complete
+    /// blob writes no key and so is byte-identical to what it was before
+    /// this field. Absent ⇒ complete is also sound for every event
+    /// written before the field existed: an over-cap blob could never
+    /// have been stored, so a stored blob was the whole set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub findings_blob_retained: Option<u32>,
     /// Whether this scan examined a package surface or recorded that
     /// there was none to examine. See [`ScanAssessment`].
     ///
@@ -383,6 +432,17 @@ pub struct ScanCompleted {
 }
 
 impl ScanCompleted {
+    /// Whether `findings_blob` holds every finding this scan recorded.
+    ///
+    /// Stated once here so that no reader re-states the "absent means
+    /// complete" half of [`Self::findings_blob_retained`] and gets it
+    /// half right — the half that fails open is reading a short blob as
+    /// the whole set.
+    #[must_use]
+    pub fn findings_blob_is_complete(&self) -> bool {
+        self.findings_blob_retained.is_none()
+    }
+
     pub fn validate(&self) -> DomainResult<()> {
         validate_string("scanner", &self.scanner, MAX_SCANNER_LEN)?;
         self.severity_summary.validate()?;
@@ -409,6 +469,35 @@ impl ScanCompleted {
                 ));
             }
             _ => {}
+        }
+        // Invariant: a retained count describes a blob that exists and
+        // is genuinely short of the complete set. `Some(n)` means "there
+        // were more than these n": one at or above `finding_count` is
+        // not a short blob, it is two disagreeing statements about the
+        // same scan, and `None` is the only spelling of a complete one.
+        // Zero is excluded separately — an empty array is not evidence,
+        // and the write site refuses the one input shape that would
+        // produce it rather than storing it.
+        if let Some(retained) = self.findings_blob_retained {
+            if self.findings_blob.is_none() {
+                return Err(DomainError::Validation(
+                    "ScanCompleted has findings_blob_retained but no findings_blob".into(),
+                ));
+            }
+            if retained == 0 {
+                return Err(DomainError::Validation(
+                    "ScanCompleted.findings_blob_retained must be at least 1; a blob \
+                     holding no findings is not evidence"
+                        .into(),
+                ));
+            }
+            if retained >= self.finding_count {
+                return Err(DomainError::Validation(format!(
+                    "ScanCompleted.findings_blob_retained ({retained}) must be below the {} \
+                     findings recorded; a complete blob records no retained count",
+                    self.finding_count
+                )));
+            }
         }
         // Invariant: "nothing to assess" cannot carry a finding. A
         // finding attributed to an artifact with no package surface has
@@ -487,9 +576,11 @@ impl SeveritySummary {
 /// overhead for this payload's shape even if the datum is stored
 /// uncompressed. What the reserve costs is retained findings, and those
 /// are the cheapest thing in this payload to give up: the complete set
-/// is written to `scan_findings` and to the CAS findings blob in the
-/// same transaction, and this event records the *transition*, not the
-/// evidence.
+/// is written to `scan_findings` in the same transaction, and this event
+/// records the *transition*, not the evidence. (The CAS findings blob is
+/// bounded the same way and by the same order — see
+/// [`ScanCompleted::findings_blob_retained`] — so it is not the second
+/// complete copy it once was.)
 const BECAME_VULNERABLE_RESERVED_BYTES: usize = 8 * 1024;
 
 /// The serialised-envelope budget
@@ -586,31 +677,22 @@ impl ArtifactBecameVulnerable {
     /// ranking private to it.
     ///
     /// **Order before filling**, so that what survives is what
-    /// matters: severity tier ascending (`Critical` first) under the
-    /// one ranking — `types::finding::severity_tier`, shared with
-    /// `highest_severity`, the alias-group tie-break and
-    /// `merge_findings` (crate-private, so not linkable here) — then
-    /// `cvss_score` descending with `None` last, then `purl`, then
-    /// `vulnerability_id`. A prefix of the *input* order could drop
-    /// every `Critical` and keep a pile of `Low`, which for an event
-    /// whose subject is "this artifact became vulnerable" is backwards.
-    /// The three tie-breaks are what make the retained set a function
-    /// of the findings rather than of the order they arrived in:
-    /// `(purl, vulnerability_id)` is the identity key
-    /// [`compute_added_findings`](crate::policy::scan_delta::compute_added_findings)
-    /// keys its output on, so those four keys are a total order over
-    /// any set it produces.
+    /// matters: [`ordered_most_severe_first`] puts the findings in the
+    /// one order a retained set may be a prefix of, severity tier first.
+    /// A prefix of the *input* order could drop every `Critical` and
+    /// keep a pile of `Low`, which for an event whose subject is "this
+    /// artifact became vulnerable" is backwards. That order is shared
+    /// with the CAS findings-blob fill rather than stated here — see
+    /// [`most_severe_first`](crate::types::most_severe_first) for the keys
+    /// and for why the two fills must agree.
     ///
-    /// **The fill is measured, not estimated.** A cap on the *count*
-    /// would not bound the bytes — `title`, `references` and
-    /// `fixed_versions` are variable-length, and the measured payloads
-    /// ranged from 1.1× to 19× the cap — so the retained count is
-    /// bisected against the real
-    /// [`stored_payload_envelope`](super::stored_payload_envelope) at
-    /// `O(log n)` serialisations, which makes it exact rather than
-    /// conservative. The complete list is measured first and returned
-    /// untouched when it fits, so nothing is dropped and no total is
-    /// recorded unless the payload genuinely has no complete form.
+    /// **The fill is measured, not estimated**, through
+    /// [`largest_fitting_prefix`] against the real
+    /// [`stored_payload_envelope`](super::stored_payload_envelope), so
+    /// the retained count is exact rather than conservative. The
+    /// complete list is measured first and returned untouched when it
+    /// fits, so nothing is dropped and no total is recorded unless the
+    /// payload genuinely has no complete form.
     ///
     /// Returns [`DomainError::Validation`] when `new_findings` is empty
     /// or holds a finding [`Finding::validate`] rejects, and when the
@@ -629,7 +711,7 @@ impl ArtifactBecameVulnerable {
     ) -> DomainResult<Self> {
         let mut event = Self {
             artifact_id,
-            new_findings: Self::by_descending_severity(new_findings),
+            new_findings: ordered_most_severe_first(new_findings),
             previously_clean_at,
             truncated_from_total: None,
         };
@@ -640,25 +722,18 @@ impl ArtifactBecameVulnerable {
         }
         // Every probe below carries the total, so the envelope's
         // non-findings bytes are identical across them and its size is
-        // strictly increasing in the retained count — which is what
-        // makes the bisection exact. The complete form is measured
-        // above rather than as `retained == total` because it carries
-        // no total and so is not a member of this family: dropping a
-        // finding to pay for the key it adds would be a truncation the
-        // payload did not need.
+        // strictly increasing in the retained count — which is the
+        // monotonicity `largest_fitting_prefix` requires, and what makes
+        // the bisection exact. The complete form is measured above
+        // rather than as `retained == total` because it carries no total
+        // and so is not a member of this family: dropping a finding to
+        // pay for the key it adds would be a truncation the payload did
+        // not need, which is also why the fill below searches
+        // `1..=total - 1`.
         let recorded_total = Some(total as u32);
-        let mut low = 1;
-        let mut high = total - 1;
-        let mut retained = 0;
-        while low <= high {
-            let mid = low + (high - low) / 2;
-            if event.fits_budget(mid, recorded_total) {
-                retained = mid;
-                low = mid + 1;
-            } else {
-                high = mid - 1;
-            }
-        }
+        let retained = largest_fitting_prefix(total - 1, |retained| {
+            event.fits_budget(retained, recorded_total)
+        });
         if retained == 0 {
             return Err(DomainError::Validation(format!(
                 "ArtifactBecameVulnerable: the most severe of {total} new findings exceeds the \
@@ -727,73 +802,6 @@ impl ArtifactBecameVulnerable {
         })
         .stored_envelope_len()
             <= BECAME_VULNERABLE_ENVELOPE_BUDGET
-    }
-
-    /// `findings` ordered most-severe-first under
-    /// [`Self::most_severe_first`].
-    fn by_descending_severity(findings: &[Finding]) -> Vec<Finding> {
-        let mut ordered = findings.to_vec();
-        // Stable, so the comparator's four keys are all that decides:
-        // a residual tie — two findings sharing the identity key the
-        // delta function dedups on — keeps input order rather than
-        // being permuted by an unstable sort's pivot choice.
-        ordered.sort_by(Self::most_severe_first);
-        ordered
-    }
-
-    /// The total order the retained set is a prefix of: severity tier
-    /// ascending (`Critical` first), then `cvss_score` descending with
-    /// `None` last, then `purl`, then `vulnerability_id`.
-    ///
-    /// **The severity tier is the first key, and nothing may be promoted
-    /// above it.** The tier is the only axis a policy decision reads —
-    /// [`finding_exceeds_threshold`](crate::policy::threshold::finding_exceeds_threshold)
-    /// is a comparison of `Finding::severity` against the configured
-    /// maximum allowed threat level and consults no other field — so
-    /// leading with it is what makes the short list answer the policy's
-    /// question the same way the complete set would: whatever exceeded a
-    /// threshold before the truncation still exceeds it after, for every
-    /// threshold. `cvss_score` is a *within-tier* preference, chosen
-    /// because the better-scored finding is the better audit record of
-    /// two equals, and that is the whole of its authority.
-    ///
-    /// Promote the score above the tier and a CVSS 9.8 `High` sorts
-    /// ahead of an unscored `Critical`: the sort is still total, every
-    /// tie-break still fires, and a truncation then drops the only
-    /// `Critical` while keeping a pile of `High`s — an audit record of
-    /// "this artifact became vulnerable" that a reader asking "was
-    /// anything critical?" gets the wrong answer from. Every existing
-    /// test still passes under that edit, which is why the case is
-    /// pinned on its own (`the_tier_outranks_the_score`) and the
-    /// property stated in general
-    /// (`the_retained_set_answers_every_threshold_as_the_complete_set_does`),
-    /// both in this module's tests.
-    fn most_severe_first(a: &Finding, b: &Finding) -> Ordering {
-        severity_tier(a.severity)
-            .cmp(&severity_tier(b.severity))
-            .then_with(|| Self::by_descending_score(a.cvss_score, b.cvss_score))
-            .then_with(|| a.purl.cmp(&b.purl))
-            .then_with(|| a.vulnerability_id.cmp(&b.vulnerability_id))
-    }
-
-    /// `cvss_score` descending, an absent score ordered after every
-    /// present one — a finding whose backend published no score is not
-    /// evidence of a low one, but it is the weaker audit record of two
-    /// and so yields the retained slot.
-    ///
-    /// Compared with [`f32::total_cmp`] and not `partial_cmp`: a `NaN`
-    /// score makes every `partial_cmp` answer `None`, and a comparator
-    /// that reports "equal" for a pair it cannot order is not
-    /// transitive. `sort_by` on an inconsistent comparator may return
-    /// an arbitrary permutation, which is the one thing an audit record
-    /// must not depend on.
-    fn by_descending_score(a: Option<f32>, b: Option<f32>) -> Ordering {
-        match (a, b) {
-            (Some(a), Some(b)) => b.total_cmp(&a),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        }
     }
 }
 
@@ -2667,8 +2675,11 @@ mod provenance_rejected_wire_tests {
 
 #[cfg(test)]
 mod became_vulnerable_bounded_tests {
+    use std::cmp::Ordering;
+
     use super::*;
     use crate::policy::threshold::finding_exceeds_threshold;
+    use crate::types::most_severe_first;
     use crate::types::{ComponentRelation, FindingStatement, SeverityBasis};
 
     fn ts() -> DateTime<Utc> {
@@ -2869,32 +2880,12 @@ mod became_vulnerable_bounded_tests {
         );
     }
 
-    /// Every arm of the score comparator, including the pair that is
-    /// genuinely equal — `(None, None)` must fall through to `purl`
-    /// rather than deciding.
+    /// Two unscored findings fall through to the remaining keys rather
+    /// than being left in arrival order. Every arm of the score
+    /// comparator itself is pinned where the comparator lives
+    /// (`types::finding::the_score_orders_descending_with_absent_last`).
     #[test]
     fn absent_scores_fall_through_to_the_remaining_keys() {
-        assert_eq!(
-            ArtifactBecameVulnerable::by_descending_score(Some(1.0), Some(2.0)),
-            Ordering::Greater
-        );
-        assert_eq!(
-            ArtifactBecameVulnerable::by_descending_score(Some(2.0), Some(1.0)),
-            Ordering::Less
-        );
-        assert_eq!(
-            ArtifactBecameVulnerable::by_descending_score(Some(1.0), None),
-            Ordering::Less
-        );
-        assert_eq!(
-            ArtifactBecameVulnerable::by_descending_score(None, Some(1.0)),
-            Ordering::Greater
-        );
-        assert_eq!(
-            ArtifactBecameVulnerable::by_descending_score(None, None),
-            Ordering::Equal
-        );
-
         let event = build(&[
             finding(SeverityThreshold::Low, None, "pkg:npm/b@1", "CVE-2"),
             finding(SeverityThreshold::Low, None, "pkg:npm/a@1", "CVE-1"),
@@ -2976,7 +2967,7 @@ mod became_vulnerable_bounded_tests {
         let input = mixed_corpus(200);
         let event = build(&input);
         let retained = event.new_findings.len();
-        let ordered = ArtifactBecameVulnerable::by_descending_severity(&input);
+        let ordered = ordered_most_severe_first(&input);
         let probe = ArtifactBecameVulnerable {
             artifact_id: Uuid::nil(),
             new_findings: ordered,
@@ -3058,7 +3049,8 @@ mod became_vulnerable_bounded_tests {
 
     // -- the policy-relevant axis ------------------------------------------
 
-    /// The invariant stated on [`ArtifactBecameVulnerable::most_severe_first`]:
+    /// The invariant stated on
+    /// [`most_severe_first`](crate::types::most_severe_first):
     /// the severity tier outranks `cvss_score`, so a well-scored `High`
     /// never sorts ahead of a `Critical`.
     ///
@@ -3084,7 +3076,7 @@ mod became_vulnerable_bounded_tests {
         );
 
         assert_eq!(
-            ArtifactBecameVulnerable::most_severe_first(&critical, &high),
+            most_severe_first(&critical, &high),
             Ordering::Less,
             "the comparator must order the lower-scored Critical ahead of the \
              higher-scored High"

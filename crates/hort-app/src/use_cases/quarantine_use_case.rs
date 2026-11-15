@@ -40,8 +40,8 @@ use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::sbom::Sbom;
 use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::{
-    highest_severity, severity_label, severity_summary_from_findings, ArtifactCoords, ArtifactKind,
-    ContentHash, Finding,
+    highest_severity, largest_fitting_prefix, ordered_most_severe_first, severity_label,
+    severity_summary_from_findings, ArtifactCoords, ArtifactKind, ContentHash, Finding,
 };
 use tokio::io::AsyncReadExt;
 
@@ -337,7 +337,92 @@ fn build_scan_findings_rows(
 /// Cap on the serialised `findings_blob` byte length. This consumer is
 /// the single CAS write site for the findings blob, so this cap is the
 /// canonical enforcement point. 8 MiB.
+///
+/// **It bounds the blob; it does not refuse the scan.** A finding set is
+/// unbounded, so for a large enough one there is no complete blob — and
+/// refusing to write one ended the scan with no verdict at all, worst
+/// for precisely the artifacts with the most findings (measured: twelve
+/// jobs dead at the attempt cap inside one 71-minute window, blobs of
+/// 10.9 to 19.5 MB against this 8 MiB). So
+/// [`QuarantineUseCase::persist_findings_blob`] fills the blob with the
+/// most severe findings that fit and records how many it kept on
+/// `ScanCompleted.findings_blob_retained`; raising the cap would only
+/// move the artifact that does not fit it.
 const FINDINGS_BLOB_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The on-disk bytes of a findings blob: a JSON array of the
+/// already-serialised findings, ordered by their complete JSON value.
+///
+/// Sorting on the serialised bytes keeps distinct findings distinct and
+/// makes the blob hash independent of the scanner's arrival order. It is
+/// deliberately **not** the severity order the *selection* uses:
+/// *which* findings a bounded blob holds is a severity question
+/// ([`hort_domain::types::most_severe_first`]), and what order they then
+/// sit in is a determinism one.
+///
+/// One function, because it is both what the fill measures and what the
+/// write stores. An arithmetic estimate beside it — "two brackets plus
+/// the separators plus the element lengths" — would be a second voice
+/// about the same bytes, and the whole reason the fill measures rather
+/// than counts is that a finding's own length is not knowable from its
+/// count.
+fn findings_blob_bytes(serialised: &[Vec<u8>]) -> Vec<u8> {
+    let mut elements: Vec<&[u8]> = serialised.iter().map(Vec::as_slice).collect();
+    elements.sort_unstable();
+    let mut json = Vec::with_capacity(elements.iter().map(|e| e.len() + 1).sum::<usize>() + 1);
+    json.push(b'[');
+    for (index, finding) in elements.iter().enumerate() {
+        if index > 0 {
+            json.push(b',');
+        }
+        json.extend_from_slice(finding);
+    }
+    json.push(b']');
+    json
+}
+
+/// The CAS findings blob one scan recorded, as
+/// [`QuarantineUseCase::persist_findings_blob`] wrote it.
+///
+/// The two halves travel together because they are one fact about one
+/// blob, and the half that fails open is the one a caller can forget:
+/// a `ContentHash` on its own says nothing about whether the blob behind
+/// it is the whole finding set, and a reader handed a short blob as a
+/// complete one decides a CVE-level question over a subset. Returning
+/// the pair is what makes the `ScanCompleted` field impossible to leave
+/// unset at the one site that builds the event.
+struct FindingsBlob {
+    hash: ContentHash,
+    /// `Some(n)` when the blob holds only the `n` most severe findings
+    /// of the scan; `None` when it holds all of them. Lands verbatim on
+    /// [`ScanCompleted::findings_blob_retained`].
+    retained: Option<u32>,
+}
+
+/// What the prior `ScanCompleted`'s blob can tell this scan about which
+/// of its findings are **new** —
+/// [`QuarantineUseCase::hydrate_prior_findings`]'s answer.
+///
+/// Two variants rather than a `Vec<Finding>`, because a baseline that
+/// holds only its most severe findings is not a baseline that found
+/// fewer things, and `compute_added_findings` cannot tell those apart:
+/// it keys on `(purl, vulnerability_id)` and reports everything in the
+/// current scan whose key the baseline does not carry, so a short
+/// baseline reports findings as new that the prior scan had. On a set
+/// large enough to be bounded that is most of them, on every rescan,
+/// forever — and `ArtifactBecameVulnerable.previously_clean_at` asserts
+/// the artifact "was provably clean of these specific findings" from
+/// that point, which a short baseline cannot prove. An append-only
+/// audit record that claims an unproven transition is worse than one
+/// with a logged gap, so the gap is what this variant buys.
+enum PriorFindings {
+    /// Every finding the prior scan recorded: the blob held all of them,
+    /// or the prior scan was clean and recorded none.
+    Complete(Vec<Finding>),
+    /// The prior scan recorded more findings than its blob holds, so
+    /// which findings it had cannot be established from it.
+    Incomplete,
+}
 
 /// Wire string for the `ingest_source` label.
 /// Mirrors the `IngestSource` enum (`Direct` / `Proxied`). Returns
@@ -1196,9 +1281,12 @@ impl QuarantineUseCase {
     ///    hydrate its findings from CAS.
     /// 5. Compute `new_findings` via
     ///    [`compute_added_findings`] — feeds
-    ///    `ArtifactBecameVulnerable.new_findings`.
-    /// 6. Serialise `findings` to JSON, enforce 8 MiB cap, write to
-    ///    CAS via [`StoragePort::put`] → `findings_blob` hash.
+    ///    `ArtifactBecameVulnerable.new_findings`. Skipped when the
+    ///    prior scan's blob was bounded, which cannot answer it (see
+    ///    [`PriorFindings`]).
+    /// 6. Serialise `findings` to JSON, fill a blob up to the 8 MiB cap
+    ///    most-severe-first, write to CAS via [`StoragePort::put`] →
+    ///    `findings_blob` hash + `findings_blob_retained`.
     /// 7. Build the event batch:
     ///    - `ScanCompleted` always.
     ///    - `PolicyEvaluated` always — exactly one per verdict,
@@ -1382,22 +1470,47 @@ impl QuarantineUseCase {
         let outcome =
             evaluate_scan_result(&coords, kind, &findings, policy.as_ref(), &exclusions, now);
 
-        let prior_findings: Vec<Finding> = match prior.as_ref() {
+        let prior_findings = match prior.as_ref() {
             Some((event, _ts)) => self.hydrate_prior_findings(event).await?,
-            None => Vec::new(),
+            None => PriorFindings::Complete(Vec::new()),
         };
-        let new_findings = compute_added_findings(&prior_findings, &findings);
+        // An empty delta is what a caller downstream reads as "no
+        // transition to report": `maybe_push_became_vulnerable` appends
+        // nothing and the metric does not fire. That is the right answer
+        // for an unestablishable transition as well as for an absent
+        // one, and the log line is what tells the two apart — see
+        // `PriorFindings::Incomplete` for why the alternative is an
+        // audit record that claims the artifact was clean of findings it
+        // may well have had.
+        let new_findings = match &prior_findings {
+            PriorFindings::Complete(prior) => compute_added_findings(prior, &findings),
+            PriorFindings::Incomplete => {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    "prior scan's findings_blob holds only its most severe findings, so which \
+                     findings are new since it cannot be established; no \
+                     artifact_became_vulnerable for this scan",
+                );
+                Vec::new()
+            }
+        };
 
-        // Step 6 — serialise + size-cap-check + CAS write.
-        let blob_hash = self.persist_findings_blob(&findings).await?;
+        // Step 6 — serialise + bound to the cap + CAS write.
+        let blob = self.persist_findings_blob(&findings).await?;
 
         // Step 7 — assemble ScanCompleted (validate before persist).
+        // `finding_count` and `severity_summary` are of the COMPLETE set
+        // whatever the blob holds, so the true total rides the event and
+        // a threshold walk over the counts is unaffected by a bounded
+        // blob; `findings_blob_retained` is the only thing that says the
+        // per-finding evidence behind them is short.
         let scan_event = ScanCompleted {
             artifact_id,
             scanner,
             finding_count,
             severity_summary: severity.clone(),
-            findings_blob: blob_hash.clone(),
+            findings_blob: blob.as_ref().map(|b| b.hash.clone()),
+            findings_blob_retained: blob.as_ref().and_then(|b| b.retained),
             assessment,
         };
         scan_event.validate()?;
@@ -1560,15 +1673,26 @@ impl QuarantineUseCase {
 
     /// Hydrate the per-finding `Vec<Finding>` referenced by a prior
     /// `ScanCompleted`. A prior with `findings_blob = None`
-    /// (clean scan) returns `vec![]`. A prior with
+    /// (clean scan) returns an empty complete set. A prior with
     /// `findings_blob = Some(_)` reads the blob from CAS and
     /// deserialises. Surfaces a clean Validation error if the blob
     /// is absent or malformed (a `findings_blob = Some(_)`
     /// pointing at missing CAS content is corruption — fail loud).
-    async fn hydrate_prior_findings(&self, prior: &ScanCompleted) -> AppResult<Vec<Finding>> {
+    ///
+    /// A prior whose blob holds only its most severe findings
+    /// ([`ScanCompleted::findings_blob_is_complete`]) returns
+    /// [`PriorFindings::Incomplete`] **without reading it**: the one
+    /// question this hydration serves is "which findings are new since
+    /// the prior scan", a short baseline cannot answer it, and the bytes
+    /// would only invite an answer over a subset. See
+    /// [`PriorFindings`] for what the caller does with that.
+    async fn hydrate_prior_findings(&self, prior: &ScanCompleted) -> AppResult<PriorFindings> {
         let Some(blob_hash) = prior.findings_blob.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(PriorFindings::Complete(Vec::new()));
         };
+        if !prior.findings_blob_is_complete() {
+            return Ok(PriorFindings::Incomplete);
+        }
         let mut reader = self.storage.get(blob_hash).await?;
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.map_err(|e| {
@@ -1579,46 +1703,74 @@ impl QuarantineUseCase {
                 "prior findings_blob {blob_hash} malformed: {e}"
             )))
         })?;
-        Ok(findings)
+        Ok(PriorFindings::Complete(findings))
     }
 
-    /// Serialise `findings` to JSON, enforce the 8 MiB cap, and write
-    /// to CAS. Returns `None` when `findings.is_empty()` (clean scans
+    /// Write the per-finding blob for `findings` to CAS, holding as many
+    /// of them as [`FINDINGS_BLOB_MAX_BYTES`] fits, **most severe
+    /// first**. Returns `None` when `findings.is_empty()` (clean scans
     /// never allocate a blob — clean scans have no findings to store).
-    async fn persist_findings_blob(&self, findings: &[Finding]) -> AppResult<Option<ContentHash>> {
+    ///
+    /// **Order before filling**, so that what survives is what matters:
+    /// [`ordered_most_severe_first`] is the one order a retained set may
+    /// be a prefix of, shared with
+    /// [`ArtifactBecameVulnerable::retaining_most_severe`] so the
+    /// retained evidence and the retained audit record cannot disagree
+    /// about the same scan. Leading with the severity tier is what makes
+    /// the short blob answer every *threshold* question the complete set
+    /// would — see [`hort_domain::types::most_severe_first`] for why
+    /// nothing may be promoted above it.
+    ///
+    /// **The fill is measured, not estimated**, through
+    /// [`largest_fitting_prefix`] against [`findings_blob_bytes`] — the
+    /// bytes this function then stores. A cap on the *count* would not
+    /// bound the bytes: `title`, `references` and `fixed_versions` are
+    /// variable-length, and the blobs measured on a running instance ran
+    /// from 1.3x to 2.3x this cap. The probes differ only in how many
+    /// findings they carry, which is the monotonicity the bisection
+    /// needs: the array's length is its elements' lengths plus one
+    /// separator each, so it is strictly increasing in the retained
+    /// count whatever order the elements are stored in.
+    ///
+    /// Returns [`DomainError::Validation`] for the one input shape no
+    /// retained set can represent: a single finding that exceeds the cap
+    /// on its own. That is a different defect from the one this fill
+    /// exists for — `Finding`'s `references` and `fixed_versions`
+    /// entries carry no per-entry length cap, so one finding can be
+    /// arbitrarily large, and the fix for it is a per-entry cap on
+    /// `Finding` rather than a smaller blob here.
+    async fn persist_findings_blob(&self, findings: &[Finding]) -> AppResult<Option<FindingsBlob>> {
         if findings.is_empty() {
             return Ok(None);
         }
-        // Each finding's complete JSON value is its sort key. This keeps
-        // distinct findings distinct and makes the blob hash independent
-        // of the scanner's arrival order.
-        let mut serialized = findings
+        let serialised = ordered_most_severe_first(findings)
             .iter()
             .map(serde_json::to_vec)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| AppError::Storage(format!("serialise findings_blob failed: {e}")))?;
-        serialized.sort_unstable();
-        let mut json = Vec::new();
-        json.push(b'[');
-        for (index, finding) in serialized.iter().enumerate() {
-            if index > 0 {
-                json.push(b',');
-            }
-            json.extend_from_slice(finding);
-        }
-        json.push(b']');
-        if json.len() > FINDINGS_BLOB_MAX_BYTES {
+        let total = serialised.len();
+        let retained = largest_fitting_prefix(total, |retained| {
+            findings_blob_bytes(&serialised[..retained]).len() <= FINDINGS_BLOB_MAX_BYTES
+        });
+        if retained == 0 {
             return Err(AppError::Domain(DomainError::Validation(format!(
-                "findings_blob {} bytes exceeds {} byte cap",
-                json.len(),
+                "findings_blob: the most severe of {total} findings exceeds the {} byte \
+                 cap on its own",
                 FINDINGS_BLOB_MAX_BYTES,
             ))));
         }
+        let json = findings_blob_bytes(&serialised[..retained]);
         let put_result = self
             .storage
             .put(Box::new(std::io::Cursor::new(json)))
             .await?;
-        Ok(Some(put_result.hash))
+        Ok(Some(FindingsBlob {
+            hash: put_result.hash,
+            // A complete blob records no retained count: `None` is the
+            // only spelling of "all of them", and the event's validator
+            // refuses a count that does not describe a short blob.
+            retained: (retained < total).then_some(retained as u32),
+        }))
     }
 
     /// Append an `ArtifactBecameVulnerable` event when a prior
@@ -3151,6 +3303,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
@@ -3210,6 +3363,7 @@ mod tests {
                 } else {
                     None
                 },
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
@@ -3458,6 +3612,7 @@ mod tests {
                 negligible: 0,
             },
             findings_blob: None,
+            findings_blob_retained: None,
             assessment: ScanAssessment::Analysed,
         });
         lifecycle
@@ -3541,6 +3696,7 @@ mod tests {
                     .parse()
                     .expect("static valid SHA-256 hex"),
             ),
+            findings_blob_retained: None,
             assessment: ScanAssessment::Analysed,
         });
         let err = lifecycle
@@ -8875,6 +9031,7 @@ spec:
                     negligible: 0,
                 },
                 findings_blob: None,
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
@@ -12009,75 +12166,389 @@ spec:
         );
     }
 
-    /// `record_scan_result` is the single
-    /// CAS write site for the findings blob (the orchestrator-side
-    /// duplicate write was removed). The 8 MiB cap from
-    /// `FINDINGS_BLOB_MAX_BYTES` enforces here, in `persist_findings_blob`.
-    /// This test pins the cap path: a finding set whose JSON-serialised
-    /// representation exceeds the cap returns `DomainError::Validation`
-    /// rather than persisting the oversize blob.
+    // ---- the findings blob is bounded, and a bounded one says so ---------
+    //
+    // `record_scan_result` is the single CAS write site for the findings
+    // blob, so `FINDINGS_BLOB_MAX_BYTES` is enforced here, in
+    // `persist_findings_blob`. A finding set is unbounded, so for a
+    // large enough one there is no complete blob — and refusing to
+    // write one ended the scan with no verdict at all, worst for
+    // precisely the artifacts with the most findings.
+
+    /// A finding at every length `Finding::validate` permits — a
+    /// 1024-byte title, 32 references of 256 bytes, 32 fixed versions —
+    /// so its serialisation is a little over 10 KB and a corpus can be
+    /// built just past the cap without a magic number. This is also the
+    /// shape the measured defect had: runaway scanner output at the
+    /// per-field caps, times several hundred findings.
     ///
-    /// Migrated from `scan_orchestration_tests::run_scan_returns_failed_when_blob_exceeds_size_cap`,
-    /// which exercised an orchestrator-side cap that no longer exists.
+    /// `index` separates the identity keys; `severity` and `cvss_score`
+    /// are what the retained order turns on.
+    fn bulky_finding(
+        index: usize,
+        severity: SeverityThreshold,
+        cvss_score: Option<f32>,
+    ) -> Finding {
+        Finding {
+            purl: format!("pkg:npm/p{index:06}@1"),
+            vulnerability_id: format!("CVE-2026-{index:06}"),
+            severity,
+            cvss_score,
+            title: "t".repeat(1024),
+            fixed_versions: (0..32).map(|i| format!("{i:032}")).collect(),
+            source_scanner: "trivy".into(),
+            references: (0..32)
+                .map(|i| format!("https://example.test/{i}{}", "r".repeat(230)))
+                .collect(),
+            aliases: vec![],
+            informational_class: None,
+            severity_basis: hort_domain::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
+            statement: hort_domain::types::FindingStatement::Unstated,
+            advisory_published_at: None,
+        }
+    }
+
+    /// `count` bulky `High` findings, descending `cvss_score` so the
+    /// within-tier key is exercised, plus one trailing `Critical`
+    /// carrying the LOWEST score in the set.
+    ///
+    /// The corpus bites on purpose: the only finding that exceeds a
+    /// `Critical` threshold arrives **last**, so a prefix of the arrival
+    /// order drops it, and it carries the lowest score, so any order
+    /// that let the score outrank the tier drops it too.
+    fn over_cap_corpus(count: usize) -> Vec<Finding> {
+        let mut findings: Vec<Finding> = (0..count)
+            .map(|i| bulky_finding(i, SeverityThreshold::High, Some(9.9 - (i as f32) / 1000.0)))
+            .collect();
+        findings.push(bulky_finding(
+            999_999,
+            SeverityThreshold::Critical,
+            Some(0.1),
+        ));
+        findings
+    }
+
+    /// The complete set's serialised blob, for the "this corpus is the
+    /// defect's shape" precondition each test below states before
+    /// invoking the use case.
+    fn complete_blob_len(findings: &[Finding]) -> usize {
+        let serialised: Vec<Vec<u8>> = findings
+            .iter()
+            .map(|f| serde_json::to_vec(f).unwrap())
+            .collect();
+        findings_blob_bytes(&serialised).len()
+    }
+
+    /// The one `ScanCompleted` of the one committed batch.
+    fn committed_scan_completed(lifecycle: &Arc<MockArtifactLifecycle>) -> ScanCompleted {
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1, "exactly one commit");
+        let (_saved, batch, _metadata) = &transitions[0];
+        let scans: Vec<ScanCompleted> = batch
+            .events
+            .iter()
+            .filter_map(|e| match &e.event {
+                DomainEvent::ScanCompleted(scan) => Some(scan.clone()),
+                _ => None,
+            })
+            .collect();
+        let shape: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            scans.len(),
+            1,
+            "exactly one ScanCompleted per scan result, got {shape:?}",
+        );
+        scans.into_iter().next().expect("checked above")
+    }
+
+    /// The `Vec<Finding>` behind a `ScanCompleted.findings_blob`, read
+    /// back through the port the production readers use.
+    async fn read_blob(
+        storage: &Arc<MockStoragePort>,
+        scan: &ScanCompleted,
+    ) -> (Vec<u8>, Vec<Finding>) {
+        let hash = scan
+            .findings_blob
+            .as_ref()
+            .expect("a scan with findings records a blob");
+        let port: Arc<dyn StoragePort> = storage.clone();
+        let mut reader = port.get(hash).await.expect("the blob was written");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.expect("blob reads");
+        let findings: Vec<Finding> = serde_json::from_slice(&bytes).expect("blob deserialises");
+        (bytes, findings)
+    }
+
+    /// **The defect.** A finding set whose complete serialisation
+    /// exceeds the cap produces a blob that is *written*, a verdict that
+    /// is *recorded*, and a marker that tells a reader the blob is short
+    /// — where it previously produced `DomainError::Validation`, burned
+    /// the attempt budget and left the artifact with no verdict at all.
+    ///
+    /// The aggregates are of the COMPLETE set: `finding_count` is the
+    /// true total and the severity counts are untouched, so a threshold
+    /// walk over them is unaffected by the bounded blob.
     #[tokio::test]
-    async fn record_scan_result_returns_validation_error_when_findings_blob_exceeds_size_cap() {
-        let (uc, artifacts, _events, _lifecycle, repositories, _projections) = make_use_case();
+    async fn record_scan_result_bounds_an_over_cap_findings_blob_and_records_the_true_total() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
 
-        // Build ~1000 max-size findings. Each finding carries a 1024-byte
-        // title, a 512-byte purl, a 128-byte vulnerability_id, 32 references
-        // of 256 bytes, and 32 fixed_versions of 32 bytes. JSON-serialised
-        // size is well over 9 KiB per finding, so 1000 entries clear the
-        // 8 MiB cap with margin.
-        let max_purl = "p".repeat(512);
-        let max_vuln = "v".repeat(128);
-        let max_title = "t".repeat(1024);
-        let mut refs = Vec::with_capacity(32);
-        for _ in 0..32 {
-            refs.push("r".repeat(256));
-        }
-        let mut fixed = Vec::with_capacity(32);
-        for _ in 0..32 {
-            fixed.push("f".repeat(32));
-        }
-        let mut findings: Vec<Finding> = Vec::with_capacity(1000);
-        for i in 0..1000u32 {
-            findings.push(Finding {
-                purl: format!("{max_purl}{i:04}")[..512].to_string(),
-                vulnerability_id: format!("{max_vuln}{i:04}")[..128].to_string(),
-                severity: SeverityThreshold::High,
-                cvss_score: Some(7.5),
-                title: max_title.clone(),
-                fixed_versions: fixed.clone(),
-                source_scanner: "trivy".into(),
-                references: refs.clone(),
-                aliases: vec![],
-                informational_class: None,
-                severity_basis: hort_domain::types::SeverityBasis::Assessed,
-                component_relation: ComponentRelation::NotEstablished,
-                statement: hort_domain::types::FindingStatement::Unstated,
-                advisory_published_at: None,
-            });
-        }
-        // Sanity: confirm we cleared the cap before invoking the use case.
-        let serialised_len = serde_json::to_vec(&findings).unwrap().len();
+        let findings = over_cap_corpus(1000);
+        let total = findings.len();
+        let complete_len = complete_blob_len(&findings);
         assert!(
-            serialised_len > FINDINGS_BLOB_MAX_BYTES,
-            "test fixture must exceed the 8 MiB cap; got {serialised_len} bytes"
+            complete_len > FINDINGS_BLOB_MAX_BYTES,
+            "the corpus must be the defect's shape; measured {complete_len} bytes against \
+             the {FINDINGS_BLOB_MAX_BYTES} byte cap"
         );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("an over-cap finding set must still record a verdict");
+
+        let scan = committed_scan_completed(&lifecycle);
+        assert_eq!(
+            scan.finding_count, total as u32,
+            "the recorded total is the complete set's, whatever the blob holds"
+        );
+        assert_eq!(scan.severity_summary.critical, 1);
+        assert_eq!(scan.severity_summary.high, total as u32 - 1);
+        let retained = scan
+            .findings_blob_retained
+            .expect("a bounded blob records how many findings it holds");
+        assert!(
+            retained >= 1 && (retained as usize) < total,
+            "{retained} retained of {total}: a bounded blob holds some but not all"
+        );
+        assert!(!scan.findings_blob_is_complete());
+        scan.validate()
+            .expect("the event the scan path built is valid");
+
+        let (bytes, decoded) = read_blob(&storage, &scan).await;
+        assert!(
+            bytes.len() <= FINDINGS_BLOB_MAX_BYTES,
+            "the written blob must fit the cap; got {} bytes",
+            bytes.len()
+        );
+        assert_eq!(
+            decoded.len(),
+            retained as usize,
+            "the recorded retained count must be what the blob actually holds"
+        );
+        assert!(
+            decoded
+                .iter()
+                .any(|f| f.severity == SeverityThreshold::Critical),
+            "the trailing, lowest-scored Critical must survive a truncation that \
+             dropped Highs ahead of it"
+        );
+    }
+
+    /// The retained count is the largest one that fits — the fill is a
+    /// measurement, not a guess. One more finding in the retained order
+    /// would cross the cap.
+    #[tokio::test]
+    async fn the_retained_blob_is_as_large_as_the_cap_allows() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, _storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let findings = over_cap_corpus(1000);
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("record_scan_result");
+
+        let retained = committed_scan_completed(&lifecycle)
+            .findings_blob_retained
+            .expect("bounded") as usize;
+        let serialised: Vec<Vec<u8>> = ordered_most_severe_first(&findings)
+            .iter()
+            .map(|f| serde_json::to_vec(f).unwrap())
+            .collect();
+        assert!(
+            findings_blob_bytes(&serialised[..retained]).len() <= FINDINGS_BLOB_MAX_BYTES,
+            "the retained prefix must fit"
+        );
+        assert!(
+            findings_blob_bytes(&serialised[..retained + 1]).len() > FINDINGS_BLOB_MAX_BYTES,
+            "retaining one more finding must exceed the cap"
+        );
+    }
+
+    /// **The property the retained order exists for**, over the blob the
+    /// use case actually wrote: for *every* [`SeverityThreshold`], if
+    /// the complete set contains a finding that exceeds it, so does the
+    /// retained set.
+    ///
+    /// Asserted through
+    /// [`finding_exceeds_threshold`](hort_domain::policy::threshold::finding_exceeds_threshold)
+    /// itself — the function a policy decision actually calls — so this
+    /// test and the policy cannot drift.
+    #[tokio::test]
+    async fn the_retained_blob_answers_every_threshold_as_the_complete_set_does() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let findings = over_cap_corpus(1000);
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("record_scan_result");
+
+        let scan = committed_scan_completed(&lifecycle);
+        assert!(
+            scan.findings_blob_retained.is_some(),
+            "the corpus is bounded"
+        );
+        let (_bytes, decoded) = read_blob(&storage, &scan).await;
+        assert!(
+            decoded.len() < findings.len(),
+            "the blob is genuinely short"
+        );
+
+        for threshold in [
+            SeverityThreshold::Critical,
+            SeverityThreshold::High,
+            SeverityThreshold::Medium,
+            SeverityThreshold::Low,
+        ] {
+            use hort_domain::policy::threshold::finding_exceeds_threshold;
+
+            let complete_exceeds = findings
+                .iter()
+                .any(|f| finding_exceeds_threshold(f.severity, threshold));
+            let retained_exceeds = decoded
+                .iter()
+                .any(|f| finding_exceeds_threshold(f.severity, threshold));
+            assert_eq!(
+                complete_exceeds, retained_exceeds,
+                "threshold {threshold:?}: the retained blob must answer every threshold \
+                 the way the complete set does",
+            );
+        }
+    }
+
+    /// A set that fits is not truncated, records no retained count, and
+    /// is **not reordered away from the documented order**: the blob's
+    /// elements are sorted by their complete JSON value, which is what
+    /// keeps the blob hash independent of the scanner's arrival order.
+    ///
+    /// The corpus's severity order and its byte order disagree, so a
+    /// blob written in the selection order would fail this.
+    #[tokio::test]
+    async fn record_scan_result_leaves_a_fitting_findings_blob_complete_and_byte_ordered() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        // `z` is the most severe and sorts LAST by bytes; `a` is the
+        // least severe and sorts first.
+        let findings = vec![
+            bulky_finding(1, SeverityThreshold::Low, Some(1.0)),
+            bulky_finding(3, SeverityThreshold::Critical, Some(9.0)),
+            bulky_finding(2, SeverityThreshold::Medium, Some(5.0)),
+        ];
+        let complete_len = complete_blob_len(&findings);
+        assert!(
+            complete_len <= FINDINGS_BLOB_MAX_BYTES,
+            "this corpus must fit; measured {complete_len} bytes"
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("record_scan_result");
+
+        let scan = committed_scan_completed(&lifecycle);
+        assert_eq!(
+            scan.findings_blob_retained, None,
+            "a complete blob records no retained count"
+        );
+        assert!(scan.findings_blob_is_complete());
+
+        let (bytes, decoded) = read_blob(&storage, &scan).await;
+        assert_eq!(decoded.len(), 3, "nothing was dropped");
+        let mut serialised: Vec<Vec<u8>> = decoded
+            .iter()
+            .map(|f| serde_json::to_vec(f).unwrap())
+            .collect();
+        serialised.sort_unstable();
+        assert_eq!(
+            bytes,
+            findings_blob_bytes(&serialised),
+            "the blob's elements are ordered by their serialisation, not by severity \
+             and not by arrival"
+        );
+        assert_eq!(
+            decoded[0].vulnerability_id, "CVE-2026-000001",
+            "the byte order puts the least severe finding first, which is exactly why \
+             the severity order is the SELECTION order and not the stored one"
+        );
+    }
+
+    /// The one input shape no retained set can represent: a single
+    /// finding that exceeds the cap on its own. A `Finding`'s
+    /// `references` entries carry no per-entry length cap, so one
+    /// finding can be arbitrarily large — and that is a different
+    /// defect, whose fix is a per-entry cap on `Finding` rather than a
+    /// smaller blob here. Until then the scan fails loudly instead of
+    /// storing an empty array and calling it evidence.
+    #[tokio::test]
+    async fn record_scan_result_refuses_one_finding_that_exceeds_the_cap_on_its_own() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let mut huge = bulky_finding(1, SeverityThreshold::Critical, Some(9.8));
+        huge.references = vec!["r".repeat(FINDINGS_BLOB_MAX_BYTES + 1)];
+        huge.validate()
+            .expect("no per-entry length cap exists on references; this finding is valid");
 
         let err = uc
             .record_scan_result(
                 artifact_id,
                 "trivy".into(),
-                findings,
+                vec![huge],
                 ScanAssessment::Analysed,
                 TEST_SCAN_KIND,
                 None,
             )
             .await
-            .expect_err("oversize findings blob must surface as an error");
+            .expect_err("a single finding over the cap has no representable blob");
         match err {
             AppError::Domain(DomainError::Validation(msg)) => {
                 assert!(
@@ -12091,5 +12562,168 @@ spec:
             }
             other => panic!("expected Domain(Validation), got {other:?}"),
         }
+        assert_eq!(
+            storage.put_call_count(),
+            0,
+            "nothing is written when no retained set can represent the input"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "the refusal happens before the commit"
+        );
+    }
+
+    // ---- a bounded PRIOR blob cannot establish a transition -------------
+
+    /// A prior `ScanCompleted` at position 1 whose blob holds only
+    /// `retained` of its `finding_count` findings, preceded by the
+    /// genesis event so the pairing resolves a non-`NoStream` version.
+    fn seed_prior_scan(
+        events: &Arc<MockEventStore>,
+        artifact_id: Uuid,
+        finding_count: u32,
+        retained: Option<u32>,
+    ) {
+        let stream_id = StreamId::artifact(artifact_id);
+        let prior = PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: stream_id.clone(),
+            stream_position: 1,
+            global_position: 2,
+            event: DomainEvent::ScanCompleted(ScanCompleted {
+                artifact_id,
+                scanner: "trivy".into(),
+                finding_count,
+                severity_summary: SeveritySummary {
+                    critical: 0,
+                    high: finding_count,
+                    medium: 0,
+                    low: 0,
+                    negligible: 0,
+                },
+                findings_blob: Some(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .parse()
+                        .expect("static valid SHA-256 hex"),
+                ),
+                findings_blob_retained: retained,
+                assessment: ScanAssessment::Analysed,
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        };
+        events.set_stream(
+            &stream_id,
+            vec![dummy_persisted_event(&stream_id, artifact_id, 0), prior],
+        );
+    }
+
+    /// **The third reader of the blob, and the one the bound changes.**
+    /// `ArtifactBecameVulnerable` fires only when the current findings
+    /// contain pairs absent from the prior scan — and a prior blob
+    /// holding only its most severe findings cannot establish absence.
+    /// Every finding it dropped would read as new, on every rescan,
+    /// forever, and the event's `previously_clean_at` would assert the
+    /// artifact was "provably clean of these specific findings" when it
+    /// was not.
+    ///
+    /// So no event: an append-only audit record with a logged gap beats
+    /// one that claims an unproven transition.
+    ///
+    /// The prior blob **is** seeded in CAS, and holds a finding the
+    /// current scan does not report — so a path that read it would
+    /// compute a non-empty delta and append the event, which is the
+    /// shape `a_complete_prior_blob_still_appends_became_vulnerable`
+    /// below pins. The unread `get_call_count` is the other half: the
+    /// answer comes from the record, not from up to 8 MiB nobody may
+    /// decide over.
+    #[tokio::test]
+    async fn a_bounded_prior_blob_appends_no_became_vulnerable() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        seed_prior_scan(&events, artifact_id, 2, Some(1));
+        storage.insert_content(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .expect("static valid SHA-256 hex"),
+            serde_json::to_vec(&vec![bulky_finding(7, SeverityThreshold::High, Some(7.5))])
+                .unwrap(),
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            vec![bulky_finding(42, SeverityThreshold::High, Some(7.5))],
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("the scan still records its verdict");
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (_saved, batch, _metadata) = &transitions[0];
+        let shape: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert!(
+            !shape.contains(&"ArtifactBecameVulnerable"),
+            "a transition that cannot be established must not be claimed; got {shape:?}",
+        );
+        assert_eq!(
+            storage.get_call_count(),
+            0,
+            "a bounded prior blob is answered from the record, not from a read of up to \
+             8 MiB nobody may decide over"
+        );
+    }
+
+    /// The other half, so the suppression above is not simply "this path
+    /// never fires": the same shape with a COMPLETE prior blob does
+    /// append the event. The prior blob is seeded in CAS and holds a
+    /// finding the current scan no longer reports, so the delta is
+    /// genuinely non-empty.
+    #[tokio::test]
+    async fn a_complete_prior_blob_still_appends_became_vulnerable() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        seed_prior_scan(&events, artifact_id, 1, None);
+        let prior_findings = vec![bulky_finding(7, SeverityThreshold::High, Some(7.5))];
+        storage.insert_content(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .expect("static valid SHA-256 hex"),
+            serde_json::to_vec(&prior_findings).unwrap(),
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            vec![bulky_finding(42, SeverityThreshold::High, Some(7.5))],
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("record_scan_result");
+
+        let transitions = lifecycle.committed_transitions();
+        let (_saved, batch, _metadata) = &transitions[0];
+        let became = batch
+            .events
+            .iter()
+            .find_map(|e| match &e.event {
+                DomainEvent::ArtifactBecameVulnerable(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("a complete prior baseline establishes the transition");
+        assert_eq!(became.new_findings.len(), 1);
+        assert_eq!(became.new_findings[0].vulnerability_id, "CVE-2026-000042");
     }
 }

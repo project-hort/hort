@@ -1517,6 +1517,7 @@ fn event_type_scan_completed() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     });
     assert_eq!(e.event_type(), "ScanCompleted");
@@ -1868,6 +1869,7 @@ fn serde_roundtrip_scan_completed() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     });
     let json = serde_json::to_string(&event).unwrap();
@@ -2318,6 +2320,7 @@ fn validate_scan_completed_finding_count_mismatch() {
         finding_count: 999,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     };
     let err = e.validate().unwrap_err();
@@ -2332,6 +2335,7 @@ fn validate_scan_completed_valid() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     };
     assert!(e.validate().is_ok());
@@ -2359,6 +2363,7 @@ fn scan_completed_validate_rejects_findings_blob_set_with_zero_findings() {
             negligible: 0,
         },
         findings_blob: Some(hash()),
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     };
     let err = e.validate().unwrap_err();
@@ -2376,6 +2381,7 @@ fn scan_completed_validate_rejects_finding_count_positive_with_no_findings_blob(
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: None,
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     };
     let err = e.validate().unwrap_err();
@@ -2399,6 +2405,7 @@ fn scan_completed_validate_accepts_zero_findings_with_no_blob() {
             negligible: 0,
         },
         findings_blob: None,
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     };
     assert!(e.validate().is_ok());
@@ -2412,6 +2419,7 @@ fn scan_completed_validate_accepts_positive_findings_with_blob() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     };
     assert!(e.validate().is_ok());
@@ -2451,6 +2459,7 @@ fn scan_completed_round_trips_with_findings_blob_some() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     };
     let json = serde_json::to_string(&event).unwrap();
@@ -2463,6 +2472,188 @@ fn scan_completed_round_trips_with_findings_blob_some() {
     let back: ScanCompleted = serde_json::from_str(&json).unwrap();
     assert_eq!(event, back);
     assert_eq!(back.findings_blob, Some(hash()));
+}
+
+// ---------------------------------------------------------------------------
+// ScanCompleted.findings_blob_retained invariant
+//
+// `Some(n)` means "the blob holds only the n most severe of the
+// `finding_count` findings this scan recorded". A count that does not
+// describe a short blob is two disagreeing statements about one scan,
+// and `None` is the only spelling of a complete one.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn scan_completed_validate_accepts_a_retained_count_below_the_finding_count() {
+    let e = ScanCompleted {
+        artifact_id: id(),
+        scanner: "trivy".into(),
+        finding_count: 3,
+        severity_summary: sample_severity_summary(),
+        findings_blob: Some(hash()),
+        findings_blob_retained: Some(2),
+        assessment: ScanAssessment::Analysed,
+    };
+    assert!(e.validate().is_ok());
+    assert!(
+        !e.findings_blob_is_complete(),
+        "a recorded retained count is what 'the blob is short' is spelled as",
+    );
+}
+
+/// A retained count with no blob behind it describes nothing. The only
+/// producer returns the hash and the count together for exactly this
+/// reason, so this shape is one no path can reach — which is why the
+/// validator is where it is refused.
+#[test]
+fn scan_completed_validate_rejects_a_retained_count_with_no_blob() {
+    let e = ScanCompleted {
+        artifact_id: id(),
+        scanner: "trivy".into(),
+        finding_count: 0,
+        severity_summary: SeveritySummary {
+            critical: 0,
+            high: 0,
+            medium: 0,
+            low: 0,
+            negligible: 0,
+        },
+        findings_blob: None,
+        findings_blob_retained: Some(1),
+        assessment: ScanAssessment::Analysed,
+    };
+    let err = e.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("findings_blob_retained"),
+        "error should mention findings_blob_retained, got: {err}"
+    );
+}
+
+/// Zero retained is an empty JSON array, which is not evidence of
+/// anything. The write site refuses the one input shape that would
+/// produce it — a single finding over the cap on its own — rather than
+/// storing it.
+#[test]
+fn scan_completed_validate_rejects_a_zero_retained_count() {
+    let e = ScanCompleted {
+        artifact_id: id(),
+        scanner: "trivy".into(),
+        finding_count: 3,
+        severity_summary: sample_severity_summary(),
+        findings_blob: Some(hash()),
+        findings_blob_retained: Some(0),
+        assessment: ScanAssessment::Analysed,
+    };
+    let err = e.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("at least 1"),
+        "error should say a blob must hold at least one finding, got: {err}"
+    );
+}
+
+/// Both halves of "must be below `finding_count`": equal is a complete
+/// blob wearing a truncation marker, and above it is a blob holding
+/// findings the scan did not record.
+#[test]
+fn scan_completed_validate_rejects_a_retained_count_that_is_not_short() {
+    for retained in [3u32, 4] {
+        let e = ScanCompleted {
+            artifact_id: id(),
+            scanner: "trivy".into(),
+            finding_count: 3,
+            severity_summary: sample_severity_summary(),
+            findings_blob: Some(hash()),
+            findings_blob_retained: Some(retained),
+            assessment: ScanAssessment::Analysed,
+        };
+        let err = e.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("must be below"),
+            "retained {retained}: error should say the count must be below the \
+             finding count, got: {err}"
+        );
+    }
+}
+
+/// A complete blob records no count, and that is the reading every event
+/// written before the field existed gets: an over-cap blob could never
+/// have been stored, so a stored blob was the whole set.
+#[test]
+fn scan_completed_findings_blob_is_complete_when_no_count_is_recorded() {
+    let e = ScanCompleted {
+        artifact_id: id(),
+        scanner: "trivy".into(),
+        finding_count: 3,
+        severity_summary: sample_severity_summary(),
+        findings_blob: Some(hash()),
+        findings_blob_retained: None,
+        assessment: ScanAssessment::Analysed,
+    };
+    assert!(e.findings_blob_is_complete());
+}
+
+/// **The chain-hash half.** A complete blob writes no
+/// `findings_blob_retained` key, so a `ScanCompleted` appended before
+/// the field existed re-serialises to the bytes it was hashed with —
+/// without `skip_serializing_if` the verifier would report a
+/// `HashMismatch` on every such stream, indistinguishable from
+/// tampering. Mirrors `assessment`.
+#[test]
+fn scan_completed_complete_blob_writes_no_retained_key() {
+    let complete = ScanCompleted {
+        artifact_id: Uuid::nil(),
+        scanner: "trivy".into(),
+        finding_count: 3,
+        severity_summary: sample_severity_summary(),
+        findings_blob: Some(hash()),
+        findings_blob_retained: None,
+        assessment: ScanAssessment::Analysed,
+    };
+    let raw: serde_json::Value = serde_json::to_value(&complete).unwrap();
+    assert!(
+        raw.get("findings_blob_retained").is_none(),
+        "a complete blob must leave no trace on the wire; got {raw}"
+    );
+
+    let truncated = ScanCompleted {
+        findings_blob_retained: Some(2),
+        ..complete.clone()
+    };
+    let raw: serde_json::Value = serde_json::to_value(&truncated).unwrap();
+    assert_eq!(raw["findings_blob_retained"], serde_json::json!(2));
+
+    // Round-trip identity in both directions (absent ⇒ None ⇒ absent;
+    // present ⇒ Some ⇒ present).
+    for event in [complete, truncated] {
+        let json = serde_json::to_string(&event).unwrap();
+        let back: ScanCompleted = serde_json::from_str(&json).unwrap();
+        assert_eq!(event, back);
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+}
+
+/// Forward-compat: a persisted payload with no `findings_blob_retained`
+/// key deserialises as a complete blob.
+#[test]
+fn scan_completed_deserialises_old_shape_without_findings_blob_retained() {
+    let raw = serde_json::json!({
+        "artifact_id": "00000000-0000-0000-0000-000000000000",
+        "scanner": "trivy",
+        "finding_count": 3,
+        "severity_summary": {
+            "critical": 0,
+            "high": 0,
+            "medium": 1,
+            "low": 2,
+            "negligible": 0
+        },
+        "findings_blob": VALID_HASH,
+    })
+    .to_string();
+    let parsed: ScanCompleted = serde_json::from_str(&raw).unwrap();
+    assert_eq!(parsed.findings_blob_retained, None);
+    assert!(parsed.findings_blob_is_complete());
+    parsed.validate().unwrap();
 }
 
 #[test]
@@ -2479,6 +2670,7 @@ fn scan_completed_round_trips_with_findings_blob_none() {
             negligible: 0,
         },
         findings_blob: None,
+        findings_blob_retained: None,
         assessment: ScanAssessment::Analysed,
     };
     let json = serde_json::to_string(&event).unwrap();
@@ -2607,6 +2799,7 @@ fn scan_completed_round_trips_not_applicable() {
             negligible: 0,
         },
         findings_blob: None,
+        findings_blob_retained: None,
         assessment: ScanAssessment::NotApplicable,
     };
     let json = serde_json::to_string(&event).unwrap();
@@ -2631,6 +2824,7 @@ fn validate_rejects_not_applicable_with_findings() {
         finding_count: 3,
         severity_summary: sample_severity_summary(),
         findings_blob: Some(hash()),
+        findings_blob_retained: None,
         assessment: ScanAssessment::NotApplicable,
     };
     let err = e.validate().unwrap_err();
