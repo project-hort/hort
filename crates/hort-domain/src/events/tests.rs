@@ -2669,6 +2669,7 @@ fn artifact_became_vulnerable_round_trips_through_serde() {
         artifact_id: Uuid::new_v4(),
         new_findings: vec![sample_finding()],
         previously_clean_at: Utc::now(),
+        truncated_from_total: None,
     };
     let wrapped = DomainEvent::ArtifactBecameVulnerable(event.clone());
     let json = serde_json::to_string(&wrapped).unwrap();
@@ -2688,6 +2689,7 @@ fn artifact_became_vulnerable_validate_rejects_empty_new_findings() {
         artifact_id: id(),
         new_findings: vec![],
         previously_clean_at: Utc::now(),
+        truncated_from_total: None,
     };
     let err = e.validate().unwrap_err();
     assert!(matches!(err, DomainError::Validation(_)));
@@ -2705,6 +2707,7 @@ fn artifact_became_vulnerable_validate_propagates_finding_validation_failure() {
         artifact_id: id(),
         new_findings: vec![bad],
         previously_clean_at: Utc::now(),
+        truncated_from_total: None,
     };
     let err = e.validate().unwrap_err();
     assert!(matches!(err, DomainError::Validation(_)));
@@ -2721,6 +2724,7 @@ fn artifact_became_vulnerable_validate_accepts_single_valid_finding() {
         artifact_id: id(),
         new_findings: vec![sample_finding()],
         previously_clean_at: Utc::now(),
+        truncated_from_total: None,
     };
     e.validate().unwrap();
 }
@@ -2731,6 +2735,7 @@ fn event_type_for_artifact_became_vulnerable_returns_canonical_name() {
         artifact_id: Uuid::nil(),
         new_findings: vec![sample_finding()],
         previously_clean_at: Utc::now(),
+        truncated_from_total: None,
     });
     assert_eq!(e.event_type(), "ArtifactBecameVulnerable");
 }

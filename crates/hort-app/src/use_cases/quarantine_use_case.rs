@@ -1642,12 +1642,18 @@ impl QuarantineUseCase {
         let Some(previously_clean_at) = previously_clean_at else {
             return Ok(false);
         };
-        let event = ArtifactBecameVulnerable {
+        // The domain constructor, not a struct literal: `new_findings`
+        // is unbounded and the stored envelope is capped, so a literal
+        // built here could be an event the append path refuses — which
+        // ended the scans of the most vulnerable artifacts in the fleet
+        // with no verdict at all. It orders by severity before filling
+        // to the budget and records the true total when it drops
+        // anything, and it validates what it returns.
+        let event = ArtifactBecameVulnerable::retaining_most_severe(
             artifact_id,
-            new_findings: new_findings.to_vec(),
+            new_findings,
             previously_clean_at,
-        };
-        event.validate()?;
+        )?;
         events_vec.push(EventToAppend::new(DomainEvent::ArtifactBecameVulnerable(
             event,
         )));

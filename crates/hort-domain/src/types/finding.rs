@@ -693,8 +693,14 @@ pub fn highest_severity(findings: &[Finding]) -> Option<SeverityThreshold> {
 /// Numeric tier where `0 = Critical` and `3 = Low`. Lower number =
 /// higher severity. Internal helper for [`highest_severity`], the
 /// alias-group winner tie-break in
-/// [`super::alias_group::collapse_alias_groups`], and the
-/// `merge_findings` collision policy in `hort-app::scan_orchestration`.
+/// [`super::alias_group::collapse_alias_groups`], the `merge_findings`
+/// collision policy in `hort-app::scan_orchestration`, and the
+/// most-severe-first order in
+/// [`ArtifactBecameVulnerable::retaining_most_severe`](crate::events::ArtifactBecameVulnerable::retaining_most_severe),
+/// which decides which findings survive a payload the event store
+/// cannot hold whole — the one consumer whose answer is *what gets
+/// written*, which is why it calls this rather than re-typing the
+/// order beside the construction.
 pub(crate) fn severity_tier(s: SeverityThreshold) -> u8 {
     match s {
         SeverityThreshold::Critical => 0,

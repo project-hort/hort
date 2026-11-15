@@ -825,14 +825,43 @@ impl DomainEvent {
         Self::envelope_exceeds_cap(&super::stored_payload_envelope(self)).is_none()
     }
 
+    /// The serialised size of this event's stored payload envelope —
+    /// the exact number [`Self::validate_serialized`] compares against
+    /// [`MAX_EVENT_JSON_BYTES`].
+    ///
+    /// A producer that fills a payload *to* a budget needs the size
+    /// rather than the yes/no of [`Self::fits_storage_cap`]: it is
+    /// bisecting on how much of a variable-length collection it can
+    /// keep, and the answer has to be measured against the bytes the
+    /// store will hold. The one caller is
+    /// [`ArtifactBecameVulnerable::retaining_most_severe`](super::ArtifactBecameVulnerable::retaining_most_severe),
+    /// which fills below the cap by a deliberate reserve and so cannot
+    /// ask the cap's own question.
+    ///
+    /// Crate-internal: it is not a storage *rule*, only the measurement
+    /// the rules are stated in, and a caller outside this crate wanting
+    /// to know whether an event is storable wants
+    /// [`Self::fits_storage_cap`].
+    pub(crate) fn stored_envelope_len(&self) -> usize {
+        Self::envelope_len(&super::stored_payload_envelope(self))
+    }
+
     /// The cap comparison itself, stated once: `Some(size)` when
     /// `stored_envelope` serialises past [`MAX_EVENT_JSON_BYTES`] (the
     /// size the refusal message reports), `None` when it fits. Shared
     /// by the refusal and the question above so the two can never
     /// answer differently.
     fn envelope_exceeds_cap(stored_envelope: &serde_json::Value) -> Option<usize> {
-        let size = stored_envelope.to_string().len();
+        let size = Self::envelope_len(stored_envelope);
         (size > MAX_EVENT_JSON_BYTES).then_some(size)
+    }
+
+    /// The size measurement itself, stated once: the length of
+    /// `stored_envelope`'s serialised text. The cap's refusal and the
+    /// budget-filling producer above both go through it, so the number
+    /// one of them enforces is the number the other fills to.
+    fn envelope_len(stored_envelope: &serde_json::Value) -> usize {
+        stored_envelope.to_string().len()
     }
 }
 
@@ -1014,6 +1043,7 @@ pub(crate) mod tests {
                     advisory_published_at: None,
                 }],
                 previously_clean_at: Utc::now(),
+                truncated_from_total: None,
             }),
             DomainEvent::ArtifactReleased(ArtifactReleased {
                 artifact_id: Uuid::nil(),

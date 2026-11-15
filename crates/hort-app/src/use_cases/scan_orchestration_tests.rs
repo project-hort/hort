@@ -1971,6 +1971,103 @@ async fn record_outcome_completed_with_prior_clean_emits_artifact_became_vulnera
     assert_eq!(storage.put_call_count(), 1);
 }
 
+/// **A rescan that finds more new vulnerabilities than one event can
+/// hold still records a verdict.** The `ArtifactBecameVulnerable`
+/// payload carries findings in full, so a large enough delta serialised
+/// past the event store's 64 KB cap, the append was refused, and
+/// `record_outcome` failed — terminally, after every retry — for
+/// precisely the artifacts with the most findings. The event now holds
+/// the most severe findings that fit plus the true total, and the
+/// complete set is still written to CAS and to `scan_findings`.
+#[tokio::test]
+async fn record_outcome_completed_with_a_delta_past_the_event_cap_still_records_a_verdict() {
+    let (uc, jobs, events, storage, artifacts, repositories, _policy) = make_uc(
+        vec!["trivy".into()],
+        HashMap::new(),
+        Arc::new(MockAdvisory::ok(vec![])),
+    );
+    let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+    let job = sample_scan_job(artifact_id, 1);
+
+    let stream_id = StreamId::artifact(artifact_id);
+    events.set_stream(
+        &stream_id,
+        vec![persisted_scan_completed(
+            &stream_id,
+            0,
+            artifact_id,
+            None,
+            0,
+            SeveritySummary {
+                critical: 0,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+        )],
+    );
+
+    // ~1.3 KB each, so the complete payload is several times the cap.
+    // The one Critical arrives last — a prefix of the input order would
+    // have dropped it and kept 200 Lows.
+    let mut new_findings: Vec<Finding> = (0..200)
+        .map(|i| {
+            let mut f = finding(
+                &format!("pkg:npm/p{i:04}@1.0.0"),
+                &format!("CVE-2026-{i:04}"),
+                SeverityThreshold::Low,
+            );
+            f.title = "t".repeat(1024);
+            f
+        })
+        .collect();
+    new_findings.push(finding(
+        "pkg:npm/zzz@1.0.0",
+        "CVE-2026-9999",
+        SeverityThreshold::Critical,
+    ));
+
+    let outcome = ScanRunOutcome::Completed {
+        kind: TEST_SCAN_KIND,
+        assessment: ScanAssessment::Analysed,
+        scanner: "trivy".into(),
+        findings: new_findings.clone(),
+        sbom: None,
+    };
+
+    let disposition = uc
+        .record_outcome(&job, outcome)
+        .await
+        .expect("an over-cap delta must not fail the scan");
+
+    assert_eq!(disposition, ScanRowDisposition::Completed);
+    assert_no_row_write(&jobs);
+    let batches = events.appended_batches();
+    let event = batches
+        .iter()
+        .flat_map(|b| b.events.iter())
+        .find_map(|e| match &e.event {
+            DomainEvent::ArtifactBecameVulnerable(p) => Some(p.clone()),
+            _ => None,
+        })
+        .expect("ArtifactBecameVulnerable must be appended");
+
+    assert_eq!(event.truncated_from_total, Some(201));
+    assert_eq!(event.total_new_findings(), 201);
+    assert!(event.new_findings.len() < 201);
+    assert_eq!(
+        event
+            .new_findings
+            .first()
+            .map(|f| f.vulnerability_id.clone()),
+        Some("CVE-2026-9999".to_string()),
+        "the Critical that arrived last is the finding that survives"
+    );
+    // The evidence is unaffected: the complete set still lands in CAS.
+    assert_eq!(storage.put_call_count(), 1);
+}
+
 #[tokio::test]
 async fn record_outcome_completed_with_prior_partial_overlap_emits_only_new_findings() {
     let (uc, jobs, events, storage, artifacts, repositories, _policy) = make_uc(
