@@ -1122,7 +1122,7 @@ prefetch:warm:internal:
 # warm sit inert while the build it protects keeps failing.
 warm:base-images:
   stage: test
-  image: quay.io/buildah/stable:v1.43
+  image: quay.io/buildah/stable:v1.45
   tags:
     - platform
   needs: []
@@ -1346,7 +1346,7 @@ warm:base-images:
 # making those jobs optional through a narrower needs list.
 base-images:preflight:
   stage: base-images-ready
-  image: quay.io/buildah/stable:v1.43
+  image: quay.io/buildah/stable:v1.45
   tags:
     - platform
   needs: []
@@ -1648,7 +1648,7 @@ security:cargo-deny:
 # no `allow_failure` at all.
 security:base-image-scan:
   stage: security
-  image: quay.io/buildah/stable:v1.43
+  image: quay.io/buildah/stable:v1.45
   tags:
     - platform
   needs: []
@@ -2035,7 +2035,7 @@ quality:site-build:
   # pins these jobs to the runner that holds the mirror secret.
   tags:
     - platform
-  image: quay.io/buildah/stable:v1.43
+  image: quay.io/buildah/stable:v1.45
   variables:
     # No STORAGE_DRIVER here on purpose: the runner owns the container store,
     # so the runner picks the driver. The `platform` tag above pins these jobs
