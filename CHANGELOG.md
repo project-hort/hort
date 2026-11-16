@@ -152,16 +152,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- An artifact returning to the observation window — a superseded absent verdict,
-  a re-evaluation, a provenance-misrejection repair, or a scan that produced no
-  composition — now begins it where hort can first prove the content was
-  published, so content hort has held for longer than its repository's
-  `quarantineDuration` is releasable immediately instead of waiting out a window
-  measured from its own ingest (#444).
-- A re-scan that supersedes an absent verdict no longer restarts the
-  observation window, so an artifact that has long outlived its repository's
-  `quarantineDuration` is released instead of being withheld for another full
-  duration on every tick (#443).
+- An artifact that returns to the observation window now begins it where hort
+  can first prove the content was published, not at the moment of the re-scan.
+  Content hort has held for longer than its repository's `quarantineDuration`
+  is therefore released, instead of waiting out a fresh window again on every
+  tick (#443, #444).
 - The rescan sweep no longer re-enqueues a scan for the same artifacts on every
   tick when their scan reaches no verdict — an image whose constituent the
   upstream no longer serves, or an artifact no configured backend can analyse.
