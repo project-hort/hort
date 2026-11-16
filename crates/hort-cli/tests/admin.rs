@@ -1,6 +1,6 @@
 //! Integration tests for `hort-cli admin task` subcommands.
 //!
-//! Ten test scenarios:
+//! Twelve test scenarios:
 //!
 //! 1. `task_invoke_posts_to_correct_url_for_kind`
 //! 2. `task_invoke_with_params_file_sends_body`
@@ -12,6 +12,8 @@
 //! 8. `task_get_for_known_id_prints_full_row`
 //! 9. `task_get_for_unknown_id_returns_error`
 //! 10. `task_invoke_with_invalid_params_file_returns_clear_error`
+//! 11. `task_get_table_bounds_an_unbounded_result_summary`
+//! 12. `task_get_json_stays_lossless_at_every_size`
 //!
 //! # Env-lock discipline
 //!
@@ -682,4 +684,157 @@ async fn task_invoke_without_idempotency_key_omits_header() {
     .expect("invoke must succeed");
 
     m.assert_async().await;
+}
+
+// ---------------------------------------------------------------------------
+// Test 11 — task_get_table_bounds_an_unbounded_result_summary
+// ---------------------------------------------------------------------------
+
+/// A task row whose `result_summary` is a `retention-evaluate` dry-run
+/// preview carrying `sample_rows` sample entries — the shape whose
+/// `groups`/`sample` arrays have no bound.
+fn task_row_json_with_summary(task_id: &str, sample_rows: usize) -> String {
+    let sample: Vec<serde_json::Value> = (0..sample_rows)
+        .map(|i| {
+            serde_json::json!({
+                "artifact_id": format!("11111111-0000-0000-0000-{i:012}"),
+                "repository_key": "npm-proxy",
+                "name": format!("some-package-{i}"),
+                "version": "1.3.0",
+                "age_seconds": 98_765 + i,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "id": task_id,
+        "kind": "retention-evaluate",
+        "status": "completed",
+        "priority": 0,
+        "trigger_source": "api",
+        "attempts": 1,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:04:00Z",
+        "completed_at": "2026-01-01T00:04:00Z",
+        "result_summary": {
+            "mode": "dry_run",
+            "coverage": "complete",
+            "evaluated": 1_200,
+            "expired": 812,
+            "preview": { "rows": 812, "sample": sample },
+        },
+    })
+    .to_string()
+}
+
+/// Serve `body` as the task row for `task_id` and return what
+/// `admin task get` wrote in `output` mode.
+async fn task_get_output(task_id: &str, body: &str, output: OutputFormat) -> String {
+    let mut server = Server::new_async().await;
+    let m = server
+        .mock("GET", format!("/api/v1/admin/tasks/{task_id}").as_str())
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let mut output_buf = Vec::new();
+    hort_cli::admin::task_get::run_with_output(
+        test_client(&server.url()),
+        TaskGetArgs {
+            task_job_id: task_id.to_string(),
+        },
+        output,
+        &mut output_buf,
+    )
+    .await
+    .expect("task get must succeed at any payload size");
+
+    m.assert_async().await;
+    String::from_utf8(output_buf).expect("utf8")
+}
+
+/// The reported crash: `admin task get` on a finished dry run. The table
+/// must render, bounded, and name the form that shows the whole value.
+#[tokio::test]
+async fn task_get_table_bounds_an_unbounded_result_summary() {
+    {
+        let _g = lock_env();
+        clear_env();
+    }
+
+    let task_id = "33333333-3333-3333-3333-333333333333";
+    let body = task_row_json_with_summary(task_id, 4_000);
+    assert!(
+        body.len() > 100_000,
+        "the fixture must be the size the crash was reported at, got {}",
+        body.len()
+    );
+
+    let output = task_get_output(task_id, &body, OutputFormat::Table).await;
+
+    // Every bounded field is still there whole.
+    assert!(output.contains(task_id), "{output}");
+    assert!(output.contains("retention-evaluate"), "{output}");
+    assert!(output.contains("2026-01-01T00:04:00Z"), "{output}");
+    // The unbounded one is cut, says so, and says how to read the rest.
+    assert!(
+        output.contains("TRUNCATED"),
+        "the cut must be unmissable:\n{output}"
+    );
+    assert!(
+        output.contains(&format!("hort-cli admin task get {task_id} --output json")),
+        "the cell must name the lossless command for this job:\n{output}"
+    );
+    assert!(
+        output.len() < body.len() / 10,
+        "the table must be readable output, not a transcription: {} bytes for a \
+         {}-byte row",
+        output.len(),
+        body.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 12 — task_get_json_stays_lossless_at_every_size
+// ---------------------------------------------------------------------------
+
+/// `--output json` is the path the table points at, so it is never cut —
+/// and is byte-for-byte what it always was: the pretty-printed row.
+#[tokio::test]
+async fn task_get_json_stays_lossless_at_every_size() {
+    {
+        let _g = lock_env();
+        clear_env();
+    }
+
+    let task_id = "44444444-4444-4444-4444-444444444444";
+    for sample_rows in [1_usize, 4_000] {
+        let body = task_row_json_with_summary(task_id, sample_rows);
+        let output = task_get_output(task_id, &body, OutputFormat::Json).await;
+
+        // Byte-identical to the unchanged formula: the pretty-printed
+        // row and a trailing newline, with no truncation anywhere in it.
+        let row: hort_cli::admin::TaskRow =
+            serde_json::from_str(&body).expect("the fixture is a task row");
+        assert_eq!(
+            output,
+            format!("{}\n", hort_cli::output::format_json(&row)),
+            "the json path is the pretty-printed row, unchanged \
+             ({sample_rows} sample rows)"
+        );
+        assert!(
+            !output.contains("TRUNCATED"),
+            "the lossless path never cuts ({sample_rows} sample rows)"
+        );
+
+        // And it is lossless against the wire: the whole summary survives.
+        let sent: serde_json::Value = serde_json::from_str(&body).expect("valid json");
+        let printed: serde_json::Value = serde_json::from_str(&output).expect("valid json");
+        assert_eq!(
+            printed["result_summary"], sent["result_summary"],
+            "every byte of the summary is in the json output ({sample_rows} \
+             sample rows)"
+        );
+    }
 }

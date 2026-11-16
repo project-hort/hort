@@ -51,7 +51,7 @@ use super::dto::ProposalComparison;
 use super::preview::{freed_bytes_json, preview_json, proposal_digest_json};
 use super::render::{self, PreviewDelta};
 use super::{
-    read_finished_job, read_later_command, render_still_running, run_sweep, FinishedSweep,
+    read_finished_job, read_later_command_lossless, render_still_running, run_sweep, FinishedSweep,
     RetentionExit, SweepOptions, SweepResult,
 };
 
@@ -257,7 +257,7 @@ pub async fn run_with_io(
                         "last_observed_status": last_status,
                         "waited_seconds": args.sweep.wait_timeout.as_secs(),
                         "note": STARTED,
-                        "read_later_with": read_later_command(&job_id),
+                        "read_later_with": read_later_command_lossless(&job_id),
                     });
                     writeln!(out, "{}", format_json(&doc))?;
                 }
