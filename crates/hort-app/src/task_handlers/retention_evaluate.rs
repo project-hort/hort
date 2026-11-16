@@ -36,6 +36,34 @@
 //! in dry-run mode. No new metrics are introduced; the handler returns
 //! `result_summary` JSON only.
 //!
+//! # One repository, or every one
+//!
+//! An invocation may name a repository
+//! (`hort_domain::events::task_invocation_repository_scope` reads it out
+//! of the params), and the run then evaluates only that repository's
+//! artifact rows. That is what lets a destructive authority held for one
+//! repository run retention for it: the enqueue gate asks
+//! `authorize(actor, DestroyContent, Some(repository_id))` for a scoped
+//! invocation, and this handler reads the scope back through the **same
+//! domain call**, so the repository the run was authorized for and the
+//! repository it evaluates cannot be two different repositories.
+//!
+//! The scope bounds *which artifact rows are evaluated* and nothing
+//! else. Content is shared across repositories by construction — that is
+//! what CAS is — so the one way a scoped run could reach past its
+//! boundary is a blob a second repository still references. It does not:
+//! this sweep only appends `ArtifactExpired`, and the bytes go in the
+//! separate purge stage behind a refcount check over
+//! `content_references` (visible as `blobs_kept` / `blobs_deferred` in
+//! that sweep's summary). A dry run reports the same thing through
+//! `preview.freed_bytes`, whose simulation asks the same question: a
+//! hash another repository's live artifact points at is not reclaimable
+//! and contributes nothing to the figure.
+//!
+//! An unscoped invocation — the shipped CronJob's `{}` body — is the
+//! instance-wide sweep and behaves exactly as it did before the scope
+//! existed, including its rotation (below).
+//!
 //! # Cross-tick rotation
 //!
 //! One run evaluates at most `MAX_BATCHES_PER_TICK * BATCH_SIZE`
@@ -87,6 +115,17 @@
 //!   same decision it would have reached earlier. The same bound covers
 //!   a policy activated mid-pass: it reaches the artifacts behind the
 //!   cursor on the following pass.
+//!
+//! **The rotation position is the instance-wide sweep's own state.** A
+//! scoped run neither resumes from it nor advances it: it walks its
+//! repository from the beginning every time and writes the position back
+//! exactly as it read it. Resuming from it would leave every artifact
+//! below it in the scoped repository unreachable until the instance-wide
+//! pass wrapped; advancing it would move the window the instance-wide
+//! execution is working through. One run's stride
+//! (`MAX_BATCHES_PER_TICK * BATCH_SIZE`) covers a repository at any size
+//! a deployment holds, and a scoped run that does reach the cap reports
+//! `partial` coverage rather than claiming it saw everything.
 //!
 //! **A dry run is an observation and leaves the rotation where it found
 //! it.** `dry_run` takes no per-UTC-day single-flight claim (ADR 0028),
@@ -155,6 +194,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use hort_domain::error::DomainResult;
+use hort_domain::events::task_invocation_repository_scope;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::retention_candidate_reader::RetentionCandidateReader;
 use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
@@ -443,11 +483,50 @@ impl TaskHandler for RetentionEvaluateHandler {
                 Err(message) => return Ok(TaskOutcome::fail(message, false)),
             };
 
+            // **The single resolution of the repository scope** — one
+            // call to the domain's one reader of the convention, which
+            // is literally the same call
+            // `TaskUseCase::authorize_kind` made to decide which
+            // repository the destructive authority was asked about, and
+            // the same call `DestructiveTaskReauthorizer` made before
+            // this handler was reached. Nothing else in this run reads
+            // the params for a repository, so the repository this run
+            // was authorized for and the repository it evaluates are
+            // one value.
+            //
+            // An unreadable scope fails the run without a retry: the
+            // params are fixed on the row, so a retry reaches the same
+            // dead end, and the one thing this must not do is treat it
+            // as the instance-wide sweep.
+            let scope = match task_invocation_repository_scope(self.kind(), params) {
+                Ok(scope) => scope,
+                Err(err) => return Ok(TaskOutcome::fail(err.to_string(), false)),
+            };
+
             // Read before the policy check, so that an execution's own
             // walk is the only thing that ever moves the sweep's
             // position: every other completing path below writes back
             // the value read here unchanged.
-            let resume_after = self.read_cursor().await;
+            let persisted_cursor = self.read_cursor().await;
+
+            // The rotation position belongs to the **instance-wide**
+            // sweep, and a scoped run is not that sweep: it starts at
+            // the beginning of its own repository every time and writes
+            // the position back exactly as it read it (see
+            // `next_cursor` below). Resuming from the instance-wide
+            // position instead would leave every artifact below it in
+            // the scoped repository unreachable until the instance-wide
+            // pass happened to wrap, and advancing it would move the
+            // window the instance-wide execution is working through —
+            // the same reason a dry run echoes it. One run's stride
+            // covers a repository at any size a deployment holds, and a
+            // run that does hit the cap reports `partial` coverage
+            // rather than claiming it saw everything.
+            let resume_after = if scope.is_some() {
+                None
+            } else {
+                persisted_cursor
+            };
 
             let policies = match self.policies.list_active().await {
                 Ok(p) => p,
@@ -468,8 +547,9 @@ impl TaskHandler for RetentionEvaluateHandler {
                     result_summary: json!({
                         "policies": 0,
                         "mode": mode.as_str(),
+                        "repository_id": scope,
                         "coverage": "complete",
-                        "cursor": resume_after,
+                        "cursor": persisted_cursor,
                         "evaluated": 0,
                         "expired": 0,
                         "already_expired": 0,
@@ -544,7 +624,7 @@ impl TaskHandler for RetentionEvaluateHandler {
             for _ in 0..self.max_batches_per_tick {
                 let rows = match self
                     .candidates
-                    .list_candidates(self.batch_size, cursor, now, &admit_held)
+                    .list_candidates(self.batch_size, cursor, now, &admit_held, scope)
                     .await
                 {
                     Ok(r) => r,
@@ -616,8 +696,13 @@ impl TaskHandler for RetentionEvaluateHandler {
             // do and writes back the position it read, so previewing —
             // which takes no per-UTC-day claim and may happen any number
             // of times — cannot walk the rotation forward.
-            let next_cursor = if mode == RetentionEvaluationMode::DryRun {
-                resume_after
+            // A scoped run echoes the position for the same reason a
+            // dry run does — neither is the instance-wide execution
+            // whose progress the position records, and an operator
+            // reclaiming one repository must be able to do it without
+            // moving or resetting that window.
+            let next_cursor = if mode == RetentionEvaluationMode::DryRun || scope.is_some() {
+                persisted_cursor
             } else if pass_complete {
                 None
             } else {
@@ -630,6 +715,7 @@ impl TaskHandler for RetentionEvaluateHandler {
             // one that re-walked the same page.
             tracing::info!(
                 policies = policies.len(),
+                repository_scope = ?scope,
                 evaluated = total.evaluated,
                 expired = total.expired,
                 already_expired = total.already_expired,
@@ -651,6 +737,11 @@ impl TaskHandler for RetentionEvaluateHandler {
             Ok(TaskOutcome::Completed {
                 result_summary: json!({
                     "mode": mode.as_str(),
+                    // What the run covered, beside what it did. A scoped
+                    // run's totals are about one repository, and a
+                    // reader who cannot tell that from the summary takes
+                    // them for the instance's.
+                    "repository_id": scope,
                     "coverage": if coverage_complete { "complete" } else { "partial" },
                     "cursor": next_cursor,
                     "policies": policies.len(),
@@ -1135,6 +1226,11 @@ mod tests {
         /// *absence* of held candidates has to be able to see what was
         /// requested rather than inferring it from an empty page.
         admitted: Mutex<Vec<Vec<HeldState>>>,
+        /// The repository scope the handler asked for, one entry per
+        /// call. Recorded for the same reason `admitted` is: the
+        /// confinement is the adapter's to apply, so a handler-level
+        /// test can only see it by observing what was asked for.
+        scopes: Mutex<Vec<Option<Uuid>>>,
     }
     impl MockCandidates {
         fn new(pages: Vec<Vec<RetentionCandidateRow>>) -> Self {
@@ -1142,6 +1238,7 @@ mod tests {
                 pages: Mutex::new(pages),
                 err: Mutex::new(None),
                 admitted: Mutex::new(Vec::new()),
+                scopes: Mutex::new(Vec::new()),
             }
         }
         fn failing() -> Self {
@@ -1149,10 +1246,14 @@ mod tests {
                 pages: Mutex::new(Vec::new()),
                 err: Mutex::new(Some(DomainError::Invariant("boom".into()))),
                 admitted: Mutex::new(Vec::new()),
+                scopes: Mutex::new(Vec::new()),
             }
         }
         fn admitted(&self) -> Vec<Vec<HeldState>> {
             self.admitted.lock().unwrap().clone()
+        }
+        fn scopes(&self) -> Vec<Option<Uuid>> {
+            self.scopes.lock().unwrap().clone()
         }
     }
     impl RetentionCandidateReader for MockCandidates {
@@ -1162,8 +1263,10 @@ mod tests {
             _after: Option<Uuid>,
             _now: DateTime<Utc>,
             admit_held: &'a [HeldState],
+            repository_id: Option<Uuid>,
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
             self.admitted.lock().unwrap().push(admit_held.to_vec());
+            self.scopes.lock().unwrap().push(repository_id);
             if let Some(e) = self.err.lock().unwrap().take() {
                 return Box::pin(async move { Err(e) });
             }
@@ -1174,6 +1277,16 @@ mod tests {
                 } else {
                     p.remove(0)
                 }
+            };
+            // The confinement is the adapter's; this double applies it
+            // so a handler test reads the rows a scoped run would
+            // actually be handed rather than every seeded row.
+            let next = match repository_id {
+                None => next,
+                Some(scope) => next
+                    .into_iter()
+                    .filter(|r| r.artifact.repository_id == scope)
+                    .collect(),
             };
             Box::pin(async move { Ok(next) })
         }
@@ -2594,6 +2707,7 @@ mod tests {
             _after: Option<Uuid>,
             _now: DateTime<Utc>,
             _admit_held: &'a [HeldState],
+            _repository_id: Option<Uuid>,
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
             let rows = vec![self.row.clone(); batch_size as usize];
             Box::pin(async move { Ok(rows) })
@@ -2688,6 +2802,7 @@ mod tests {
             after: Option<Uuid>,
             _now: DateTime<Utc>,
             _admit_held: &'a [HeldState],
+            _repository_id: Option<Uuid>,
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
             let page: Vec<RetentionCandidateRow> = self
                 .rows
@@ -3094,5 +3209,418 @@ mod tests {
         );
         assert_eq!(h.batch_size, BATCH_SIZE);
         assert_eq!(h.max_batches_per_tick, MAX_BATCHES_PER_TICK);
+    }
+    // =====================================================================
+    // Repository scope. The run's boundary, and the proof that it holds.
+    // =====================================================================
+
+    /// A candidate row in a named repository, so a scoped run's page can
+    /// be built out of rows from two of them.
+    fn candidate_in(repository_id: Uuid, repository_key: &str) -> RetentionCandidateRow {
+        let mut artifact = art(Uuid::new_v4());
+        artifact.repository_id = repository_id;
+        RetentionCandidateRow {
+            artifact,
+            format: hort_domain::entities::repository::RepositoryFormat::Generic,
+            repository_key: repository_key.into(),
+            resolved_rescan_interval_hours: None,
+            keep_rank: None,
+            tag_targeted: false,
+        }
+    }
+
+    fn scoped(mode: &str, repository_id: Uuid) -> serde_json::Value {
+        json!({ "mode": mode, "repository_id": repository_id.to_string() })
+    }
+
+    /// The scope reaches the enumeration, which is where the confinement
+    /// has to happen: the page is bounded, so a run that fetched every
+    /// repository's rows and filtered afterwards would spend its whole
+    /// budget on rows it discards and could not tell a short page from a
+    /// filtered-empty one.
+    #[tokio::test]
+    async fn a_scoped_run_confines_the_enumeration_to_its_repository() {
+        let repository = Uuid::new_v4();
+        let candidates = Arc::new(MockCandidates::new(vec![vec![]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates.clone(),
+        );
+        let TaskOutcome::Completed { result_summary } = h
+            .run(&scoped("execute", repository), ctx())
+            .await
+            .expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(candidates.scopes(), vec![Some(repository)]);
+        assert_eq!(
+            result_summary["repository_id"],
+            json!(repository.to_string()),
+            "a scoped run's totals are about one repository, and a reader who cannot see \
+             that in the summary takes them for the instance's",
+        );
+    }
+
+    /// An unscoped invocation — the shipped CronJob's body — enumerates
+    /// every repository and says so.
+    #[tokio::test]
+    async fn an_unscoped_run_enumerates_every_repository() {
+        let candidates = Arc::new(MockCandidates::new(vec![vec![]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates.clone(),
+        );
+        let TaskOutcome::Completed { result_summary } = h.run(&json!({}), ctx()).await.expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(candidates.scopes(), vec![None]);
+        assert_eq!(result_summary["repository_id"], serde_json::Value::Null);
+    }
+
+    /// The no-policies short circuit is a completing path like any
+    /// other: it carries the scope, and it echoes the standing rotation
+    /// position rather than the `None` the scoped walk started from.
+    /// Writing the walk's start value here would **reset** the
+    /// instance-wide rotation every time an operator previewed one
+    /// repository with no policy configured.
+    #[tokio::test]
+    async fn the_no_policy_short_circuit_reports_the_scope_and_echoes_the_position() {
+        let repository = Uuid::new_v4();
+        let standing = Uuid::from_u128(42);
+        let jobs = Arc::new(MockJobsRepository::default());
+        jobs.set_last_result_summary_by_kind(
+            "retention-evaluate",
+            json!({ "cursor": cursor_value(standing) }),
+        );
+        let h = handler_with_jobs(
+            Arc::new(MockPolicies::new(vec![])),
+            Arc::new(MockCandidates::new(vec![])),
+            jobs,
+        );
+        let TaskOutcome::Completed { result_summary } = h
+            .run(&scoped("dry_run", repository), ctx())
+            .await
+            .expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(
+            result_summary["repository_id"],
+            json!(repository.to_string())
+        );
+        assert_eq!(
+            result_summary["cursor"],
+            cursor_value(standing),
+            "the standing instance-wide position is echoed, never cleared",
+        );
+    }
+
+    /// An unreadable scope fails the run and does **not** retry: the
+    /// params are fixed on the row, so a retry reaches the same dead
+    /// end. The one outcome this must never have is the instance-wide
+    /// sweep.
+    #[tokio::test]
+    async fn an_unreadable_scope_fails_the_run_rather_than_sweeping_the_instance() {
+        let candidates = Arc::new(MockCandidates::new(vec![vec![candidate_in(
+            Uuid::new_v4(),
+            "npm-proxy",
+        )]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates.clone(),
+        );
+        let outcome = h
+            .run(
+                &json!({ "mode": "execute", "repository_id": "not-a-uuid" }),
+                ctx(),
+            )
+            .await
+            .expect("outcome");
+        let TaskOutcome::Failed { retry, reason } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            !retry,
+            "the params are fixed; a retry reaches the same dead end"
+        );
+        assert!(reason.contains("repository_id"), "{reason}");
+        assert!(
+            candidates.scopes().is_empty(),
+            "the enumeration must never have been asked at all"
+        );
+    }
+
+    /// The rotation position belongs to the instance-wide sweep. A
+    /// scoped run neither resumes from it — which would leave every
+    /// artifact below it in the scoped repository unreachable until the
+    /// instance-wide pass wrapped — nor advances it, which would move
+    /// the window the instance-wide execution is working through.
+    #[tokio::test]
+    async fn a_scoped_run_neither_resumes_from_nor_moves_the_instance_wide_position() {
+        let repository = Uuid::new_v4();
+        let standing = Uuid::from_u128(42);
+        // Three rows over a 2x2 stride: page one is full, page two is
+        // short, so the walk reaches the end inside one run.
+        let candidates = Arc::new(KeysetCandidates::with_rows(3));
+        let jobs = Arc::new(MockJobsRepository::default());
+        jobs.set_last_result_summary_by_kind(
+            "retention-evaluate",
+            json!({ "cursor": cursor_value(standing) }),
+        );
+        let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+        let summary = tick(&h, &jobs, scoped("execute", repository)).await;
+
+        assert_eq!(
+            summary["cursor"],
+            cursor_value(standing),
+            "a scoped run echoes the instance-wide position back unchanged",
+        );
+        assert_eq!(
+            summary["coverage"], "complete",
+            "the scoped walk started at the beginning of its own repository and reached \
+             the end, so it saw everything it claims to have seen — the standing \
+             instance-wide position is not a gap in *its* coverage",
+        );
+        assert_eq!(
+            candidates.take_served().len(),
+            3,
+            "the walk started from the beginning rather than after the standing cursor, \
+             which sits above every id in this corpus",
+        );
+    }
+
+    /// A scoped run that reaches its per-run cap reports `partial`, so
+    /// the honest answer survives for the repository too big to finish
+    /// in one run.
+    #[tokio::test]
+    async fn a_scoped_run_that_hits_the_cap_reports_partial_coverage() {
+        let row = candidate_in(Uuid::new_v4(), "npm-proxy");
+        let repository = row.artifact.repository_id;
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![archived_age_policy()])),
+            Arc::new(FullPageCandidates { row }),
+        );
+        let TaskOutcome::Completed { result_summary } = h
+            .run(&scoped("dry_run", repository), ctx())
+            .await
+            .expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["coverage"], "partial");
+    }
+
+    /// The genesis event every candidate needs in order to reach the
+    /// predicate at all: the evaluator resolves the policy's scope input
+    /// from `ArtifactIngested` and fails safe (no match) without one.
+    fn persisted_ingested(artifact: &Artifact) -> hort_domain::events::PersistedEvent {
+        hort_domain::events::PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(artifact.id),
+            stream_position: 0,
+            global_position: 0,
+            event: hort_domain::events::DomainEvent::ArtifactIngested(
+                hort_domain::events::ArtifactIngested {
+                    artifact_id: artifact.id,
+                    repository_id: artifact.repository_id,
+                    name: artifact.name.clone(),
+                    version: artifact.version.clone(),
+                    sha256: artifact.sha256_checksum.clone(),
+                    size_bytes: artifact.size_bytes,
+                    source: hort_domain::events::IngestSource::Proxied,
+                    metadata: serde_json::Value::Null,
+                    metadata_blob: None,
+                    upstream_published_at: None,
+                },
+            ),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: DateTime::<Utc>::UNIX_EPOCH,
+        }
+    }
+
+    /// A policy whose age bound every `UNIX_EPOCH` candidate clears, so
+    /// the end-to-end run below produces real matches to preview.
+    fn matching_age_policy() -> RetentionPolicy {
+        RetentionPolicy::project(&[hort_domain::retention::RetentionPolicyEvent::Created {
+            held_states: Default::default(),
+            id: Uuid::new_v4(),
+            name: "collect-everything".into(),
+            predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(1),
+            // Instance-wide by scope: what confines the run is the
+            // invocation, not the policy, so only the enumeration's
+            // boundary can keep a repository out of the preview.
+            scope: hort_domain::retention::RetentionScope::AllRepos,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        }])
+        .expect("a one-second age bound is valid")
+    }
+
+    /// A handler over the shared `MockEventStore`, seeded so each
+    /// candidate's stream carries its genesis event. The store
+    /// round-trips and refuses what the production adapter refuses, so
+    /// a corpus it accepts is one a producer could have written.
+    fn previewing_handler(rows: Vec<RetentionCandidateRow>) -> RetentionEvaluateHandler {
+        let events = Arc::new(crate::use_cases::test_support::MockEventStore::new());
+        for row in &rows {
+            events.set_stream(
+                &StreamId::artifact(row.artifact.id),
+                vec![persisted_ingested(&row.artifact)],
+            );
+        }
+        RetentionEvaluateHandler::new(
+            Arc::new(MockPolicies::new(vec![matching_age_policy()])),
+            Arc::new(MockCandidates::new(vec![rows])),
+            Arc::new(RetentionUseCase::new(
+                crate::event_store_publisher::wrap_for_test(events),
+                Arc::new(InertScan),
+            )),
+            Arc::new(InertPreview),
+            Arc::new(InertStorage::default()),
+            Arc::new(MockJobsRepository::default()),
+        )
+    }
+
+    /// **A scoped dry run previews only that repository's groups.**
+    ///
+    /// Driven through `run()` rather than `build_preview` directly, so
+    /// what is asserted is the whole path: the scope resolved once out
+    /// of the params, the enumeration confined by it, the evaluator over
+    /// the rows that survived, and the preview built from those matches.
+    /// Both repositories' artifacts would match the policy, so the
+    /// boundary is the only thing that can keep one of them out of the
+    /// rollup.
+    #[tokio::test]
+    async fn a_scoped_dry_run_previews_only_that_repositorys_groups() {
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        let h = previewing_handler(vec![
+            candidate_in(mine, "npm-proxy"),
+            candidate_in(theirs, "pypi-proxy"),
+        ]);
+
+        let TaskOutcome::Completed { result_summary } =
+            h.run(&scoped("dry_run", mine), ctx()).await.expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        let preview = &result_summary["preview"];
+        assert_eq!(
+            preview["rows"], 1,
+            "one repository's row, not both: {preview}"
+        );
+        let groups = preview["groups"].as_array().expect("groups array");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["repository_id"], json!(mine.to_string()));
+        assert_eq!(groups[0]["repository_key"], json!("npm-proxy"));
+        let sample_repos: BTreeSet<&str> = preview["sample"]
+            .as_array()
+            .expect("sample array")
+            .iter()
+            .map(|row| row["repository_id"].as_str().expect("repository_id"))
+            .collect();
+        assert_eq!(
+            sample_repos,
+            [mine.to_string().as_str()].into_iter().collect(),
+            "the sample names only the scoped repository too",
+        );
+        assert_eq!(result_summary["evaluated"], 1);
+    }
+
+    /// The counter-assertion the test above needs: unscoped, the same
+    /// fixture previews **both** groups. Without it "one group" would
+    /// also hold for a fixture whose second row never matched.
+    #[tokio::test]
+    async fn the_same_fixture_unscoped_previews_both_repositories() {
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        let h = previewing_handler(vec![
+            candidate_in(mine, "npm-proxy"),
+            candidate_in(theirs, "pypi-proxy"),
+        ]);
+
+        let TaskOutcome::Completed { result_summary } = h
+            .run(&json!({ "mode": "dry_run" }), ctx())
+            .await
+            .expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        let preview = &result_summary["preview"];
+        assert_eq!(preview["rows"], 2, "{preview}");
+        assert_eq!(preview["groups"].as_array().expect("groups").len(), 2);
+    }
+
+    /// And the execute side of the same boundary: a scoped execution
+    /// appends `ArtifactExpired` for its own repository's artifact and
+    /// for nothing else. The counts are the handler's visible half of
+    /// what the DB-backed
+    /// `a_scoped_run_cannot_reclaim_content_a_second_repository_references`
+    /// proves over real streams and real `content_references` edges.
+    #[tokio::test]
+    async fn a_scoped_execute_expires_only_its_own_repositorys_artifact() {
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        let rows = vec![
+            candidate_in(mine, "npm-proxy"),
+            candidate_in(theirs, "pypi-proxy"),
+        ];
+        let mine_artifact = rows[0].artifact.id;
+        let theirs_artifact = rows[1].artifact.id;
+        let events = Arc::new(crate::use_cases::test_support::MockEventStore::new());
+        for row in &rows {
+            events.set_stream(
+                &StreamId::artifact(row.artifact.id),
+                vec![persisted_ingested(&row.artifact)],
+            );
+        }
+        let h = RetentionEvaluateHandler::new(
+            Arc::new(MockPolicies::new(vec![matching_age_policy()])),
+            Arc::new(MockCandidates::new(vec![rows])),
+            Arc::new(RetentionUseCase::new(
+                crate::event_store_publisher::wrap_for_test(events.clone()),
+                Arc::new(InertScan),
+            )),
+            Arc::new(InertPreview),
+            Arc::new(InertStorage::default()),
+            Arc::new(MockJobsRepository::default()),
+        );
+
+        let TaskOutcome::Completed { result_summary } =
+            h.run(&scoped("execute", mine), ctx()).await.expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["expired"], 1);
+        assert_eq!(result_summary["evaluated"], 1);
+
+        let appended: Vec<StreamId> = events
+            .appended_batches()
+            .into_iter()
+            .filter(|batch| {
+                batch.events.iter().any(|e| {
+                    matches!(
+                        e.event,
+                        hort_domain::events::DomainEvent::ArtifactExpired(_)
+                    )
+                })
+            })
+            .map(|batch| batch.stream_id)
+            .collect();
+        assert_eq!(
+            appended,
+            vec![StreamId::artifact(mine_artifact)],
+            "exactly one stream gained an ArtifactExpired, and it is the scoped \
+             repository's artifact",
+        );
+        assert!(
+            !appended.contains(&StreamId::artifact(theirs_artifact)),
+            "the other repository's artifact must never be appended to: {appended:?}",
+        );
     }
 }

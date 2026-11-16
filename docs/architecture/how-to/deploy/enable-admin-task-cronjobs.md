@@ -303,9 +303,10 @@ spec:
     # from `hort-cli admin user list` (or the whoami of that session).
     userId: 0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0
   permission: destroy_content
-  # No `repository:` -> global. Admin-task invocation is a global
-  # capability; a repo-scoped destructive grant authorises nothing,
-  # because the gate asks at `repository = None`.
+  # No `repository:` -> global. An instance-wide destructive run is
+  # asked at `repository = None`, and only a repository-less grant
+  # matches that question. See §5.1.1 for the narrower grant that runs
+  # retention for a single repository.
 ```
 
 Two things about this shape are load-bearing, and both are consequences of
@@ -346,6 +347,77 @@ poll by default), and stops a destructive row it has **already** queued
 immediately, because the execution re-check reads the grant repository
 directly — see §5.2.
 
+### 5.1.1 Retention for one repository, without the instance-wide authority
+
+`retention-evaluate` is the one destructive kind a run can be confined
+to: name a repository in the invocation's params and it evaluates only
+that repository's artifacts. The destructive authority is then asked
+about **that** repository, so the grant may be scoped to it:
+
+```yaml
+apiVersion: project-hort.de/v1
+kind: PermissionGrant
+metadata:
+  name: npm-proxy-retention-operator
+spec:
+  subject:
+    kind: user
+    userId: 0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0
+  permission: destroy_content
+  # The repository this authority covers, by key — apply resolves it to
+  # the stored repository id once, here, in the audited diff.
+  repository: npm-proxy
+```
+
+Run it with the repository in the body:
+
+```bash
+cat > /tmp/retention.json <<'JSON'
+{"mode": "dry_run", "repository_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7"}
+JSON
+hort-cli admin task invoke retention-evaluate --params-file /tmp/retention.json
+```
+
+Switch `mode` to `execute` to expire. `hort-cli admin retention
+preview` / `apply` have no repository flag yet and always run
+instance-wide; the `admin task invoke` form above is the way to a scoped
+run today.
+
+Four properties are worth knowing before you ask for this grant:
+
+- **The grant names the repository by key, the invocation by id**, and
+  the asymmetry is deliberate. Apply resolves the key once, in a diff
+  you read, and stores the id. The invocation's authority is checked
+  **twice** — at the `POST` and again before the queued job runs, which
+  may be much later — so naming a key there would mean resolving it
+  twice, and a key is a handle a different repository can be declared
+  under in between. An id resolves to itself. Read it from
+  `hort-cli admin repository list`, or off a dry run's
+  `preview.groups[].repository_id`, which names it beside the key.
+- **It authorizes only the narrow run.** The instance-wide sweep (no
+  `repository_id`) is still asked at `repository = None`, which only a
+  repository-less grant matches, so this grant cannot run it. Neither
+  can it run `retention-purge` or `eventstore-archive`, which sweep the
+  whole instance and refuse a `repository_id` outright (`400`).
+- **It does not reach bytes another repository shares.** Expiry marks
+  rows; the separate purge stage frees a blob only when the last
+  reference to it anywhere is gone, so identical content in a second
+  repository survives.
+- **It needs no linter downgrade** — unlike §5.1's instance-wide form,
+  which does. Both reject rules that block that form are scoped to the
+  **wildcard** (repository-less) case:
+  `direct-user-grant-without-justification` rejects an admin-class
+  `User`-subject grant only when it is repository-less and stays `warn`
+  when it is scoped, and `warn` does not fail apply; and
+  `wildcard-repo-non-admin` fires only on `repository_id IS NULL`, so
+  the `Claims`-subject variant of this grant passes clean too. No rule
+  changed — a shape that was unreachable became reachable.
+
+The rotation is unaffected: a scoped run walks its own repository from
+the beginning each time and writes the instance-wide sweep's saved
+position back untouched. Its `result_summary` carries `repository_id`,
+so a scoped run's figures are never mistaken for the instance's.
+
 ### 5.2 The authority is re-checked again when the job runs
 
 Accepting a destructive invocation does not confer the authority to
@@ -358,9 +430,14 @@ archived — and the row becomes a terminal `failed` job whose
 
 ```text
 destructive task refused at execution: the requester does not hold
-Permission::destroy_content — the grant was revoked before execution, or it
-is bound to a claim this execution cannot re-derive
+Permission::destroy_content instance-wide (a repository-less grant) — the
+grant was revoked before execution, or it is bound to a claim this execution
+cannot re-derive
 ```
+
+The parenthetical names **which scope** was asked about, so a refusal can be
+read against the grant that was supposed to cover it. A run confined to one
+repository (§5.1.1) says `scoped to repository <uuid>` there instead.
 
 Read it off the row or the worker log:
 
@@ -444,9 +521,12 @@ spec:
     kind: serviceAccount
     name: cronjob-tasks
   permission: destroy_content
-  # No `repository:` -> global. The destructive gate asks at
-  # `repository = None`, so a repo-scoped destructive grant authorises
-  # nothing.
+  # No `repository:` -> global, and required here: the CronJob runs the
+  # instance-wide sweeps (`retention-evaluate` with no `repository_id`,
+  # and `retention-purge`, which cannot be confined at all), and those
+  # are asked at `repository = None`, which only a repository-less grant
+  # matches. A repository-scoped grant authorises the narrow run of
+  # §5.1.1 and nothing the chart schedules.
 ```
 
 Unlike §5.1's `kind: user` form this needs **no linter downgrade**: a

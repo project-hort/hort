@@ -74,7 +74,8 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::error::DomainError;
 use hort_domain::events::{
-    task_invocation_destructive_authority, task_kind_is_destructive, Actor, ApiActor, DomainEvent,
+    describe_repository_scope, task_invocation_destructive_authority,
+    task_invocation_repository_scope, task_kind_is_destructive, Actor, ApiActor, DomainEvent,
     StreamId, TaskInvoked, ADMIN_INVOKABLE_TASK_KINDS,
 };
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
@@ -170,6 +171,28 @@ impl TaskUseCase {
     /// before — and a *second* function answering "which authority" beside
     /// one answering "whether" would re-open it one level up.
     ///
+    /// **The destructive authority is asked at the invocation's own
+    /// repository scope.** An invocation that names a repository in its
+    /// params (only `retention-evaluate` can — see
+    /// [`task_invocation_repository_scope`]) is asked
+    /// `authorize(actor, authority, Some(repository_id))`, so a grant
+    /// scoped to that repository authorizes it; an invocation that names
+    /// none is asked with `None` exactly as before. The asymmetry is the
+    /// guarantee rather than an accident of the evaluator: a
+    /// repository-less grant matches either question
+    /// (`RbacEvaluator`'s `None => true` scope arm), and a
+    /// repository-scoped grant matches only the scoped one, so a narrow
+    /// grant can never authorize an instance-wide destruction.
+    ///
+    /// The scope read here is the *same call* the handler makes to
+    /// confine its run, so the repository this gate answers about and
+    /// the repository the run evaluates are one value by construction.
+    /// Factor 1 is deliberately **not** scoped: `AdminTaskInvoke` is
+    /// "may this caller drive admin tasks at all", a question most kinds
+    /// have no repository for, and narrowing it would let a
+    /// repository-scoped `AdminTaskInvoke` grant admit a task invoke it
+    /// does not admit today.
+    ///
     /// Denial is logged at `info!` (audit signal, NOT `err`) naming the
     /// missing authority and returns
     /// `AppError::Domain(DomainError::Forbidden(…))`. Called both at the
@@ -214,6 +237,21 @@ impl TaskUseCase {
         // one is needed at all) is the domain's single answer, shared with
         // the idempotency-key derivation; this gate does not re-derive it.
         let required_authority = task_invocation_destructive_authority(kind, params)?;
+        // …and *over what*. The scope is a second, orthogonal question
+        // about the same params, read through the domain's single
+        // resolution of it — the same call the handler confining the run
+        // makes with its own `kind()`, so the repository this gate
+        // answers about and the repository the run evaluates cannot come
+        // apart. It is deliberately not folded into the authority
+        // answer: a scoped dry run needs no destructive authority and is
+        // still confined, so a scope carried inside `Ok(Some(_))` would
+        // have nowhere to live on the one path that proves the point.
+        //
+        // Unreadable is an error, propagated here before any grant is
+        // consulted: a scope that cannot be read is not an instance-wide
+        // run, and treating it as one would widen an operator's narrow
+        // request into the broadest possible one.
+        let repository_scope = task_invocation_repository_scope(kind, params)?;
         if let Some(authority) = required_authority {
             // Factor 2a — the identity refusal, asked **before** the
             // grants are consulted because it is not a question about
@@ -246,23 +284,38 @@ impl TaskUseCase {
                      ServiceAccount may not hold: {reason}"
                 ))));
             }
-            if !rbac.authorize(actor, authority, None) {
+            // Factor 2b — the authority, asked at the invocation's own
+            // scope. `user_grants_authorize`'s `None => true` arm means
+            // a repository-less grant still covers a scoped run, so
+            // nothing an operator holds today stops working; what is new
+            // is that a grant scoped to *this* repository now matches.
+            //
+            // An instance-wide invocation keeps asking with `None`, and
+            // the asymmetry is the whole guarantee: a repository-scoped
+            // grant does not match a `None` question, so a narrow grant
+            // can never authorize the broad action. Asking per
+            // repository and accepting any single match would hand every
+            // scoped grant holder the instance.
+            if !rbac.authorize(actor, authority, repository_scope) {
                 tracing::info!(
                     actor_user_id = %actor.user_id,
                     kind,
                     required_permission = %authority,
+                    repository_scope = ?repository_scope,
                     "TaskUseCase authz denied — destructive task kind requires its \
                      destructive permission in addition to Permission::AdminTaskInvoke",
                 );
                 return Err(AppError::Domain(DomainError::Forbidden(format!(
                     "destructive task kind {kind:?} requires Permission::{authority} \
-                     in addition to Permission::AdminTaskInvoke"
+                     {scope} in addition to Permission::AdminTaskInvoke",
+                    scope = describe_repository_scope(repository_scope),
                 ))));
             }
             tracing::info!(
                 actor_user_id = %actor.user_id,
                 kind,
                 granted_permission = %authority,
+                repository_scope = ?repository_scope,
                 "destructive admin task authorized (Permission::AdminTaskInvoke + the \
                  invocation's destructive permission)",
             );
@@ -2465,6 +2518,223 @@ mod tests {
         assert!(
             !msg.contains("matched no pending row"),
             "branch 3 must not claim the row was claimed — nothing is executing; got {msg}"
+        );
+    }
+
+    // -- The destructive authority is asked at the invocation's scope ---
+
+    /// An evaluator granting `AdminTaskInvoke` globally plus
+    /// `DestroyContent` scoped to exactly one repository — the grant
+    /// shape this change makes able to authorize something, and the one
+    /// the apply linter accepts without a downgrade.
+    fn rbac_with_destroy_content_on(repository_id: Uuid) -> Arc<ArcSwap<RbacEvaluator>> {
+        let mut scoped = claim_grant(&["destructive"], Permission::DestroyContent);
+        scoped.repository_id = Some(repository_id);
+        let evaluator = RbacEvaluator::new(vec![
+            claim_grant(&["task-admin"], Permission::AdminTaskInvoke),
+            scoped,
+        ]);
+        Arc::new(ArcSwap::from_pointee(evaluator))
+    }
+
+    fn scope_use_case(rbac: Arc<ArcSwap<RbacEvaluator>>) -> TaskUseCase {
+        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
+        let events: Arc<EventStorePublisher> =
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
+        TaskUseCase::new(jobs, events, rbac)
+    }
+
+    fn scoped_execute(repository_id: Uuid) -> serde_json::Value {
+        serde_json::json!({
+            "mode": "execute",
+            "repository_id": repository_id.to_string(),
+        })
+    }
+
+    /// The whole point: a `destroy_content` grant scoped to one
+    /// repository authorizes an execute confined to that repository.
+    /// Before the gate asked at the invocation's scope this grant could
+    /// authorize nothing at all.
+    #[test]
+    fn a_repository_scoped_grant_authorizes_a_run_confined_to_that_repository() {
+        let repository = Uuid::new_v4();
+        let use_case = scope_use_case(rbac_with_destroy_content_on(repository));
+        assert!(use_case
+            .authorize_kind(
+                &caller_with_destructive_grants(),
+                "retention-evaluate",
+                &scoped_execute(repository),
+            )
+            .is_ok());
+    }
+
+    /// A grant for repository A does not authorize a run confined to
+    /// repository B. The scope is compared, not merely carried.
+    #[test]
+    fn a_grant_for_another_repository_refuses_a_scoped_execute() {
+        let granted = Uuid::new_v4();
+        let asked_about = Uuid::new_v4();
+        let use_case = scope_use_case(rbac_with_destroy_content_on(granted));
+        let err = use_case
+            .authorize_kind(
+                &caller_with_destructive_grants(),
+                "retention-evaluate",
+                &scoped_execute(asked_about),
+            )
+            .expect_err("a grant on a different repository authorizes nothing here");
+        let AppError::Domain(DomainError::Forbidden(message)) = err else {
+            panic!("expected Forbidden, got {err:?}");
+        };
+        assert!(
+            message.contains(&asked_about.to_string()),
+            "the refusal must name the repository that was asked about so an operator can \
+             tell it from the one they hold: {message}"
+        );
+    }
+
+    /// The asymmetry, which is the guarantee rather than an accident: an
+    /// instance-wide execute keeps asking at `None`, and a
+    /// repository-scoped grant does not match a `None` question. A
+    /// narrow grant must never authorize the broad action.
+    #[test]
+    fn a_repository_scoped_grant_refuses_the_instance_wide_execute() {
+        let use_case = scope_use_case(rbac_with_destroy_content_on(Uuid::new_v4()));
+        for params in [
+            serde_json::json!({ "mode": "execute" }),
+            // The shipped CronJob's body — an absent mode is execute,
+            // and an absent repository is the instance.
+            serde_json::json!({}),
+            serde_json::json!({ "mode": "execute", "repository_id": null }),
+        ] {
+            let err = use_case
+                .authorize_kind(
+                    &caller_with_destructive_grants(),
+                    "retention-evaluate",
+                    &params,
+                )
+                .expect_err("params {params} must stay refused to a scoped grant");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Forbidden(_))),
+                "params {params}: expected Forbidden, got {err:?}",
+            );
+        }
+    }
+
+    /// The other half of the scope rule: a repository-less grant covers
+    /// every repository, so nothing an operator holds today stops
+    /// working when they start naming one.
+    #[test]
+    fn a_repository_less_grant_covers_a_scoped_run_too() {
+        let use_case = scope_use_case(rbac_with_task_invoke_and_destructive());
+        let actor = caller_with_destructive_grants();
+        assert!(use_case
+            .authorize_kind(
+                &actor,
+                "retention-evaluate",
+                &scoped_execute(Uuid::new_v4())
+            )
+            .is_ok());
+        assert!(use_case
+            .authorize_kind(&actor, "retention-evaluate", &serde_json::json!({}))
+            .is_ok());
+    }
+
+    /// A scoped dry run needs no destructive authority at all — the
+    /// mode split is untouched by the scope. This is also why the scope
+    /// cannot ride inside the authority answer: here there is no
+    /// authority and still a scope.
+    #[test]
+    fn a_scoped_dry_run_still_needs_no_destructive_authority() {
+        let use_case = scope_use_case(rbac_with_task_invoke());
+        assert!(use_case
+            .authorize_kind(
+                &caller_with_task_admin_role(),
+                "retention-evaluate",
+                &serde_json::json!({
+                    "mode": "dry_run",
+                    "repository_id": Uuid::new_v4().to_string(),
+                }),
+            )
+            .is_ok());
+    }
+
+    /// A sweep that cannot be confined is never asked about a
+    /// repository, whatever its params say. `retention-purge` and
+    /// `eventstore-archive` take permissive pass-through bodies, so if
+    /// the gate read the key for them a repository-scoped grant would
+    /// authorize an instance-wide purge.
+    #[test]
+    fn a_scope_in_an_unconfinable_kinds_params_does_not_narrow_the_gate() {
+        let repository = Uuid::new_v4();
+        let use_case = scope_use_case(rbac_with_destroy_content_on(repository));
+        let actor = caller_with_destructive_grants();
+        for kind in ["retention-purge", "eventstore-archive"] {
+            let err = use_case
+                .authorize_kind(
+                    &actor,
+                    kind,
+                    &serde_json::json!({ "repository_id": repository.to_string() }),
+                )
+                .expect_err("an unconfinable sweep still needs a repository-less grant");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Forbidden(_))),
+                "kind {kind:?}: expected Forbidden, got {err:?}",
+            );
+        }
+    }
+
+    /// An unreadable scope is refused before any grant is consulted,
+    /// and as a `Validation` rather than a `Forbidden`: the request is
+    /// malformed, and the one answer it must never get is the
+    /// instance-wide run.
+    #[test]
+    fn an_unreadable_scope_is_refused_rather_than_widened() {
+        let use_case = scope_use_case(rbac_with_task_invoke_and_destructive());
+        for params in [
+            serde_json::json!({ "mode": "execute", "repository_id": "not-a-uuid" }),
+            serde_json::json!({ "mode": "dry_run", "repository_id": 7 }),
+        ] {
+            let err = use_case
+                .authorize_kind(
+                    &caller_with_destructive_grants(),
+                    "retention-evaluate",
+                    &params,
+                )
+                .expect_err("an unreadable scope cannot be authorized");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Validation(_))),
+                "params {params}: expected Validation, got {err:?}",
+            );
+        }
+    }
+
+    /// Factor 1 is deliberately still asked at `None`. A caller holding
+    /// only a repository-scoped `AdminTaskInvoke` could not invoke any
+    /// task before this change and still cannot: narrowing the coarse
+    /// gate would be a widening nobody asked for.
+    #[test]
+    fn the_coarse_gate_is_not_scoped_by_the_invocation() {
+        let repository = Uuid::new_v4();
+        let mut scoped_invoke = claim_grant(&["task-admin"], Permission::AdminTaskInvoke);
+        scoped_invoke.repository_id = Some(repository);
+        let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            scoped_invoke,
+            claim_grant(&["destructive"], Permission::DestroyContent),
+        ])));
+        let use_case = scope_use_case(rbac);
+        let err = use_case
+            .authorize_kind(
+                &caller_with_destructive_grants(),
+                "retention-evaluate",
+                &scoped_execute(repository),
+            )
+            .expect_err("a repository-scoped AdminTaskInvoke grant admits no task invoke");
+        let AppError::Domain(DomainError::Forbidden(message)) = err else {
+            panic!("expected Forbidden, got {err:?}");
+        };
+        assert!(
+            message.contains("AdminTaskInvoke"),
+            "the coarse gate is the one that refused: {message}"
         );
     }
 }
