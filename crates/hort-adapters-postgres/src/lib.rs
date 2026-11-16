@@ -35,6 +35,11 @@ pub mod artifact_repo;
 // share one transaction, so neither can land without the other.
 pub mod authority_lifecycle;
 pub(crate) mod blob_lock;
+// Multi-row `INSERT` arity: PostgreSQL's per-statement bind-parameter
+// limit, and the chunking that keeps a projection write from reaching
+// it. Crate-internal — the limit is a Postgres wire-protocol fact and
+// must not cross the port boundary (ADR 0008).
+pub(crate) mod bulk_insert;
 pub mod claim_mapping_repo;
 // The constituent-deliverability read behind ADR 0062 on the OCI paths:
 // one statement that turns a manifest's closure into the strongest
