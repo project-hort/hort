@@ -595,7 +595,7 @@ rpassword = "7"
 # required so individual consumers can opt back in via `features = [...]`;
 # the v1 consumer (`hort-notifier-nats`) selects `jetstream` +
 # `server_2_10` + `ring`.
-async-nats = { version = "0.51", default-features = false }
+async-nats = { version = "0.52", default-features = false }
 
 # RustSec-maintained CVSS v3.x vector parser/scorer. Consumers:
 # `hort-adapters-scanner-osv` and `hort-adapters-advisory-osv` compute a
