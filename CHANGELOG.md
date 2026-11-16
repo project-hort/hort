@@ -219,6 +219,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   job for an artifact that declares none — only the format's own manifest
   document is walked. Skips are counted on
   `hort_prefetch_cascade_seed_skipped_total{format}` (#421).
+- An admin task's `TaskFailed` audit record is no longer lost when the end of
+  the audit stream is contended — both halves of the invoke/outcome trail now
+  retry the append (#426).
 
 ### Removed
 
