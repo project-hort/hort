@@ -500,7 +500,7 @@ mod tests {
             .expect("seed artifact stream");
 
         let row = PgRetentionCandidateReader::new(pool.clone())
-            .list_candidates(100, None, Utc::now(), &[])
+            .list_candidates(100, None, Utc::now(), &[], None)
             .await
             .expect("candidates")
             .into_iter()
@@ -603,5 +603,193 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(worklist_executed, worklist_before);
+    }
+    /// **Unit 4's proof: a scoped run cannot delete bytes another
+    /// repository still references.**
+    ///
+    /// Content is shared across repositories by construction — that is
+    /// what CAS is — so a blob two repositories point at is the one
+    /// place a run confined to one of them could reach past its
+    /// boundary. It does not, and the test says so over the real SQL on
+    /// both halves rather than over a double that was told the answer:
+    /// the scoped enumeration hands the simulation only its own
+    /// repository's artifact, and the simulation's anti-join over
+    /// `content_references` finds the second repository's surviving edge
+    /// and reports the hash as not reclaimable.
+    ///
+    /// The counter-assertion is what makes the first half mean
+    /// something: over **both** artifact ids the same simulation does
+    /// return the hash, so what kept it is the surviving reference and
+    /// not a query that reclaims nothing.
+    ///
+    /// And the other repository's artifact is untouched — a scoped
+    /// execute appends `ArtifactExpired` to one stream and leaves the
+    /// other stream exactly as it found it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_scoped_run_cannot_reclaim_content_a_second_repository_references() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let mine = seed_repo(&pool).await;
+        let theirs = seed_repo(&pool).await;
+        // Identical content in two repositories: same
+        // `checksum_sha256`, and each with its own `primary_content`
+        // edge pointing at it.
+        let my_artifact = seed_artifact(&pool, mine, SHARED_PRIMARY, "mine").await;
+        let their_artifact = seed_artifact(&pool, theirs, SHARED_PRIMARY, "theirs").await;
+        seed_edge(&pool, mine, my_artifact, "primary_content", SHARED_PRIMARY).await;
+        seed_edge(
+            &pool,
+            theirs,
+            their_artifact,
+            "primary_content",
+            SHARED_PRIMARY,
+        )
+        .await;
+        sqlx::query(
+            "UPDATE artifacts SET created_at = '1970-01-01 00:00:00+00' WHERE id = ANY($1)",
+        )
+        .bind(vec![my_artifact, their_artifact])
+        .execute(&pool)
+        .await
+        .expect("make retention age deterministic");
+
+        let policy_id = Uuid::new_v4();
+        let policy = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+            held_states: Default::default(),
+            id: policy_id,
+            name: format!("scoped-policy-{}", policy_id.simple()),
+            // Instance-wide by scope: what confines the run is the
+            // invocation, not the policy. Both artifacts match it, so
+            // only the enumeration's boundary can keep one of them out.
+            predicate: PolicyPredicate::AgeExceeds(1),
+            scope: RetentionScope::AllRepos,
+            created_at: chrono::DateTime::<Utc>::UNIX_EPOCH,
+        }])
+        .unwrap();
+
+        let event_store = Arc::new(PgEventStore::new(pool.clone()).await.expect("event store"));
+        for (artifact_id, repository_id, name) in [
+            (my_artifact, mine, "mine"),
+            (their_artifact, theirs, "theirs"),
+        ] {
+            event_store
+                .append(AppendEvents {
+                    stream_id: StreamId::artifact(artifact_id),
+                    expected_version: ExpectedVersion::NoStream,
+                    events: vec![EventToAppend::new(DomainEvent::ArtifactIngested(
+                        ArtifactIngested {
+                            artifact_id,
+                            repository_id,
+                            name: name.into(),
+                            version: Some("1.0.0".into()),
+                            sha256: SHARED_PRIMARY.parse().unwrap(),
+                            size_bytes: 1,
+                            source: IngestSource::Proxied,
+                            metadata: serde_json::Value::Null,
+                            metadata_blob: None,
+                            upstream_published_at: None,
+                        },
+                    ))],
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: system_actor(),
+                })
+                .await
+                .expect("seed artifact stream");
+        }
+
+        // The scoped enumeration — the run's boundary.
+        let reader = PgRetentionCandidateReader::new(pool.clone());
+        let scoped_rows = reader
+            .list_candidates(100, None, Utc::now(), &[], Some(mine))
+            .await
+            .expect("scoped candidates");
+        let scoped_ids: Vec<Uuid> = scoped_rows.iter().map(|r| r.artifact.id).collect();
+        assert_eq!(
+            scoped_ids,
+            vec![my_artifact],
+            "the scoped enumeration must not see the other repository's artifact",
+        );
+        let candidates: Vec<RetentionCandidate> = scoped_rows
+            .into_iter()
+            .map(|row| RetentionCandidate {
+                artifact: row.artifact,
+                format: row.format,
+                repository_key: row.repository_key,
+                resolved_rescan_interval_hours: row.resolved_rescan_interval_hours,
+                keep_rank: row.keep_rank,
+                tag_targeted: row.tag_targeted,
+            })
+            .collect();
+
+        // The bytes survive: the simulation over the scoped set alone
+        // reclaims nothing, because the other repository's edge is still
+        // there.
+        let preview = PgRetentionPreview::new(pool.clone());
+        let scoped_simulation = preview
+            .reclaimable_content(&scoped_ids, 100, 100)
+            .await
+            .expect("scoped simulation");
+        assert_eq!(
+            scoped_simulation,
+            RetentionContentSimulation::Exact(Vec::new()),
+            "a run scoped to one repository must not propose deleting bytes the other \
+             repository still references",
+        );
+        let both_simulation = preview
+            .reclaimable_content(&[my_artifact, their_artifact], 100, 100)
+            .await
+            .expect("whole-instance simulation");
+        assert_eq!(
+            both_simulation,
+            RetentionContentSimulation::Exact(vec![SHARED_PRIMARY.parse().unwrap()]),
+            "counter-assertion: with both references in the set the hash IS reclaimable, \
+             so what kept it out above was the surviving reference",
+        );
+
+        // The other repository's artifact is untouched by a scoped
+        // execute: one stream gains `ArtifactExpired`, the other does
+        // not move.
+        let use_case = RetentionUseCase::new(
+            Arc::new(EventStorePublisher::without_broadcast(event_store.clone())),
+            Arc::new(PgRetentionScanReader::new(pool.clone())),
+        );
+        let report = use_case
+            .evaluate_policies_in_mode(
+                Utc::now(),
+                std::slice::from_ref(&policy),
+                &candidates,
+                RetentionEvaluationMode::Execute,
+            )
+            .await
+            .expect("scoped execute");
+        assert_eq!(report.summary.expired, 1);
+
+        let mine_stream = event_store
+            .read_stream(&StreamId::artifact(my_artifact), ReadFrom::Start, 100)
+            .await
+            .unwrap();
+        assert!(
+            mine_stream
+                .iter()
+                .any(|e| matches!(e.event, DomainEvent::ArtifactExpired(_))),
+            "the scoped repository's artifact did expire — otherwise the untouched \
+             assertion below would hold for a run that did nothing at all",
+        );
+        let theirs_stream = event_store
+            .read_stream(&StreamId::artifact(their_artifact), ReadFrom::Start, 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            theirs_stream.len(),
+            1,
+            "the other repository's artifact carries only its ingest event: {theirs_stream:?}",
+        );
+        assert!(matches!(
+            theirs_stream[0].event,
+            DomainEvent::ArtifactIngested(_)
+        ));
     }
 }

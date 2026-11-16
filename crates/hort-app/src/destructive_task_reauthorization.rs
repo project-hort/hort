@@ -37,6 +37,13 @@
 //!   uses, because the worker's composition-root evaluator is
 //!   deliberately empty. Both factors are now one grant model, so the
 //!   live read is the whole of the re-check.
+//! - [`task_invocation_repository_scope`] decides *which repository* the
+//!   destructive permission is asked about — the same single resolution
+//!   the enqueue gate used, reading the same `jobs.params` the handler
+//!   will be handed. The scope living in the params is what makes this
+//!   check see the scope the enqueue was authorized at: there is nothing
+//!   to re-derive, so there is nothing to disagree about. A row that
+//!   names an unreadable scope is refused, not re-checked instance-wide.
 //!
 //! # One authority is refused to a machine identity outright
 //!
@@ -131,7 +138,10 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::entities::user::User;
 use hort_domain::error::DomainError;
-use hort_domain::events::task_invocation_destructive_authority;
+use hort_domain::events::{
+    describe_repository_scope, task_invocation_destructive_authority,
+    task_invocation_repository_scope,
+};
 use hort_domain::ports::jobs_repository::JobRow;
 use hort_domain::ports::permission_grant_repository::PermissionGrantRepository;
 use hort_domain::ports::user_repository::UserRepository;
@@ -223,6 +233,30 @@ impl DestructiveTaskReauthorizer {
             return ReauthorizationVerdict::Authorized;
         };
 
+        // 1b. …and over what. The scope comes out of the row's own
+        //     params through the domain's single resolution of it — the
+        //     same call the enqueue gate made and the same call the
+        //     handler will make to confine its run. That is why the
+        //     scope travels in the params rather than beside them: the
+        //     `POST` and this re-check are different processes minutes
+        //     or hours apart, and the params are the only thing both of
+        //     them see, so a job authorized for one repository cannot be
+        //     re-authorized against another. Unreadable is refused for
+        //     the same reason an unclassifiable row is: the params are
+        //     fixed, so a retry reaches the same dead end, and guessing
+        //     `None` here would re-check a narrow job against the
+        //     broadest possible question.
+        let repository_scope = match task_invocation_repository_scope(&job.kind, params) {
+            Ok(scope) => scope,
+            Err(err) => {
+                return refuse(format!(
+                    "{REFUSAL_PREFIX}: the repository the invocation is confined to could not be \
+                     read from its params ({err}), so the authority it requires cannot be \
+                     checked against the right scope"
+                ));
+            }
+        };
+
         // 2. An unnamed requester has no authority to re-check. Only
         //    `TaskUseCase::enqueue` produces rows of these kinds and it
         //    always passes `Some(actor.user_id)`, so this arm is not
@@ -312,11 +346,12 @@ impl DestructiveTaskReauthorizer {
                  was revoked before execution"
             ));
         }
-        if !rbac.authorize(&principal, required_authority, None) {
+        if !rbac.authorize(&principal, required_authority, repository_scope) {
             return refuse(format!(
                 "{REFUSAL_PREFIX}: the requester does not hold \
-                 Permission::{required_authority} — the grant was revoked before execution, or \
-                 it is bound to a claim this execution cannot re-derive"
+                 Permission::{required_authority} {scope} — the grant was revoked before \
+                 execution, or it is bound to a claim this execution cannot re-derive",
+                scope = describe_repository_scope(repository_scope),
             ));
         }
 
@@ -1044,5 +1079,148 @@ mod tests {
         let mut u = user(id, true, true);
         u.external_id = None;
         assert_eq!(execution_time_principal(&u).external_id, id.to_string());
+    }
+    // -- The re-check sees the scope the enqueue was authorized at -----
+
+    /// A grant scoped to the repository the row's params name survives
+    /// the re-check. Without the scope reaching `authorize` this grant
+    /// authorized the `POST` and then refused its own job at execution,
+    /// which is the worst available shape: accepted, queued, and
+    /// terminally refused with no destructive work possible either way.
+    #[tokio::test]
+    async fn a_repository_scoped_grant_survives_the_re_check_for_that_repository() {
+        let actor = Uuid::new_v4();
+        let repository = Uuid::new_v4();
+        let mut scoped = grant(GrantSubject::User(actor), Permission::DestroyContent);
+        scoped.repository_id = Some(repository);
+        let r = reauthorizer(
+            Some(user(actor, false, true)),
+            vec![invoke_grant(GrantSubject::User(actor)), scoped],
+        );
+        let params = serde_json::json!({
+            "mode": "execute",
+            "repository_id": repository.to_string(),
+        });
+        let row = row("retention-evaluate", Some(actor), params.clone());
+        assert_eq!(
+            r.authorize_execution(&row, &params).await,
+            ReauthorizationVerdict::Authorized,
+        );
+    }
+
+    /// The two checks ask about one repository because they read one
+    /// value out of the row's own params. A grant on a different
+    /// repository is refused here exactly as it is at the `POST`.
+    #[tokio::test]
+    async fn a_grant_for_another_repository_is_refused_at_execution() {
+        let actor = Uuid::new_v4();
+        let granted = Uuid::new_v4();
+        let asked_about = Uuid::new_v4();
+        let mut scoped = grant(GrantSubject::User(actor), Permission::DestroyContent);
+        scoped.repository_id = Some(granted);
+        let r = reauthorizer(
+            Some(user(actor, false, true)),
+            vec![invoke_grant(GrantSubject::User(actor)), scoped],
+        );
+        let params = serde_json::json!({
+            "mode": "execute",
+            "repository_id": asked_about.to_string(),
+        });
+        let row = row("retention-evaluate", Some(actor), params.clone());
+        let ReauthorizationVerdict::Refused { reason } = r.authorize_execution(&row, &params).await
+        else {
+            panic!("a grant on another repository must not authorize this row");
+        };
+        assert!(
+            reason.contains(&asked_about.to_string()),
+            "the refusal names the repository the row was confined to: {reason}"
+        );
+    }
+
+    /// The asymmetry survives the second check too: a scoped grant does
+    /// not re-authorize an instance-wide row.
+    #[tokio::test]
+    async fn a_repository_scoped_grant_does_not_re_authorize_an_instance_wide_row() {
+        let actor = Uuid::new_v4();
+        let mut scoped = grant(GrantSubject::User(actor), Permission::DestroyContent);
+        scoped.repository_id = Some(Uuid::new_v4());
+        let r = reauthorizer(
+            Some(user(actor, false, true)),
+            vec![invoke_grant(GrantSubject::User(actor)), scoped],
+        );
+        let params = serde_json::json!({ "mode": "execute" });
+        let row = row("retention-evaluate", Some(actor), params.clone());
+        let ReauthorizationVerdict::Refused { reason } = r.authorize_execution(&row, &params).await
+        else {
+            panic!("a scoped grant must not authorize the instance-wide sweep");
+        };
+        assert!(reason.contains("instance-wide"), "{reason}");
+    }
+
+    /// A row whose scope cannot be read is refused rather than
+    /// re-checked instance-wide. Only an out-of-band write produces one
+    /// (the typed route parses the field), and the params are fixed on
+    /// the row, so a retry reaches the same dead end.
+    #[tokio::test]
+    async fn an_unreadable_scope_on_the_row_is_refused_not_widened() {
+        let actor = Uuid::new_v4();
+        let r = reauthorizer(
+            Some(user(actor, false, true)),
+            destructive_grants(actor, Permission::DestroyContent),
+        );
+        let params = serde_json::json!({ "mode": "execute", "repository_id": "not-a-uuid" });
+        let row = row("retention-evaluate", Some(actor), params.clone());
+        let ReauthorizationVerdict::Refused { reason } = r.authorize_execution(&row, &params).await
+        else {
+            panic!("an unreadable scope must be refused even to a repository-less grant");
+        };
+        assert!(
+            reason.contains("could not be read"),
+            "the reason says which half failed: {reason}"
+        );
+    }
+
+    /// An unconfinable kind is re-checked instance-wide whatever its
+    /// params carry — the same per-kind dispatch the enqueue gate uses,
+    /// so a `repository_id` written onto a `retention-purge` row cannot
+    /// make a scoped grant re-authorize an instance-wide purge.
+    #[tokio::test]
+    async fn a_scope_on_an_unconfinable_rows_params_does_not_narrow_the_re_check() {
+        let actor = Uuid::new_v4();
+        let repository = Uuid::new_v4();
+        let mut scoped = grant(GrantSubject::User(actor), Permission::DestroyContent);
+        scoped.repository_id = Some(repository);
+        let r = reauthorizer(
+            Some(user(actor, false, true)),
+            vec![invoke_grant(GrantSubject::User(actor)), scoped],
+        );
+        let params = serde_json::json!({ "repository_id": repository.to_string() });
+        let row = row("retention-purge", Some(actor), params.clone());
+        let ReauthorizationVerdict::Refused { reason } = r.authorize_execution(&row, &params).await
+        else {
+            panic!("retention-purge sweeps the instance and needs a repository-less grant");
+        };
+        assert!(reason.contains("instance-wide"), "{reason}");
+    }
+
+    /// A repository-less grant still covers a scoped row, so an
+    /// operator holding the global authority is unaffected by the field
+    /// existing.
+    #[tokio::test]
+    async fn a_repository_less_grant_still_covers_a_scoped_row() {
+        let actor = Uuid::new_v4();
+        let r = reauthorizer(
+            Some(user(actor, false, true)),
+            destructive_grants(actor, Permission::DestroyContent),
+        );
+        let params = serde_json::json!({
+            "mode": "execute",
+            "repository_id": Uuid::new_v4().to_string(),
+        });
+        let row = row("retention-evaluate", Some(actor), params.clone());
+        assert_eq!(
+            r.authorize_execution(&row, &params).await,
+            ReauthorizationVerdict::Authorized,
+        );
     }
 }

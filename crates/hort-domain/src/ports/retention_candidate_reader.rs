@@ -22,6 +22,17 @@
 //! rows — are excluded SQL-side. The result is keyset-paginated by
 //! `artifact.id`.
 //!
+//! **One repository, or every one.** A caller may confine the
+//! enumeration to a single repository
+//! (`repository_id` on
+//! [`RetentionCandidateReader::list_candidates`]), which is how a
+//! destructive authority held for one repository can run retention for
+//! it. `None` is the instance-wide sweep and is unchanged. The scope
+//! bounds *which artifact rows are evaluated* and nothing else: a blob
+//! two repositories reference is still only reclaimable when the last
+//! reference to it anywhere goes away, which the purge path's refcount
+//! check over `content_references` decides, not this enumeration.
+//!
 //! **The admitted set is empty unless some active policy opts in.**
 //! That is not decoration: a widened enumeration is not
 //! decision-inert even when no policy would expire a held artifact,
@@ -39,10 +50,18 @@
 //! `evaluate()` — that function only evaluates the predicate). The
 //! eligibility + idempotency + scan-freshness gates bound the work
 //! (query-on-demand, no premature materialization). The reader still
-//! does no scope SQL pre-filter — it only joins `repositories` to
-//! supply the per-artifact `format` input `RetentionScope::matches`
-//! needs, plus the `key` the operator-facing preview names the
-//! repository by (a single query, no extra round-trip).
+//! does no **policy**-scope SQL pre-filter — it only joins
+//! `repositories` to supply the per-artifact `format` input
+//! `RetentionScope::matches` needs, plus the `key` the operator-facing
+//! preview names the repository by (a single query, no extra
+//! round-trip).
+//!
+//! The `repository_id` argument above is a different thing and does not
+//! soften that: it is the **invocation's** boundary, not a policy's
+//! scope. A policy may cover repositories a scoped run does not
+//! evaluate, and `RetentionScope::matches` still decides per policy and
+//! per artifact inside the confined set — so the two compose as AND and
+//! neither stands in for the other.
 //!
 //! ## `resolved_rescan_interval_hours`
 //!
@@ -249,12 +268,32 @@ pub trait RetentionCandidateReader: Send + Sync {
     /// An admitted held candidate arrives with
     /// [`RetentionCandidateRow::keep_rank`] = `None`: it is not a usable
     /// sibling, so it occupies no `KeepLastN` slot. See the module docs.
+    ///
+    /// `repository_id` confines the enumeration to one repository's
+    /// artifact rows. `None` — the instance-wide sweep, and the shipped
+    /// CronJob's shape — enumerates every repository exactly as before.
+    ///
+    /// The confinement belongs **here** rather than in a filter the
+    /// caller applies to the page it got back, and that is a correctness
+    /// requirement rather than an efficiency one: the page is bounded, so
+    /// a post-filter would spend a scoped run's whole budget on rows it
+    /// then discards, and a page that came back full of other
+    /// repositories' rows and filtered down to nothing is
+    /// indistinguishable from the short page that means "the walk reached
+    /// the end" — which is what tells the caller its pass is complete.
+    ///
+    /// Scoping cannot move a `KeepLastN` rank. The sibling group is
+    /// `(repository_id, name)`, so every member of a ranked group is in
+    /// one repository: a page confined to a repository touches exactly
+    /// the groups it would have touched unconfined, and each of those
+    /// groups is ranked over the same rows.
     fn list_candidates<'a>(
         &'a self,
         batch_size: u32,
         after: Option<Uuid>,
         now: DateTime<Utc>,
         admit_held: &'a [HeldState],
+        repository_id: Option<Uuid>,
     ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>>;
 }
 
@@ -279,15 +318,21 @@ mod tests {
                 _after: Option<Uuid>,
                 _now: DateTime<Utc>,
                 _admit_held: &'a [HeldState],
+                _repository_id: Option<Uuid>,
             ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
                 Box::pin(async { Ok(Vec::new()) })
             }
         }
         let port: Box<dyn RetentionCandidateReader> = Box::new(Stub);
         let out = port
-            .list_candidates(1000, None, Utc::now(), &[])
+            .list_candidates(1000, None, Utc::now(), &[], None)
             .await
             .expect("Ok");
         assert!(out.is_empty());
+        let scoped = port
+            .list_candidates(1000, None, Utc::now(), &[], Some(Uuid::new_v4()))
+            .await
+            .expect("Ok");
+        assert!(scoped.is_empty());
     }
 }

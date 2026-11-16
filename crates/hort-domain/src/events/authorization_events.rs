@@ -922,6 +922,127 @@ pub fn task_invocation_destructive_authority(
         .then_some(authority))
 }
 
+/// The key a [`RETENTION_EVALUATE_TASK_KIND`] invocation spells its
+/// repository scope at — the whole wire convention for the scope, in one
+/// place.
+pub const RETENTION_EVALUATE_REPOSITORY_SCOPE_KEY: &str = "repository_id";
+
+/// The repository an invocation is confined to, or `None` for an
+/// instance-wide one — the **single resolution** both the authorization
+/// of an invocation and the confinement of the run it becomes read.
+///
+/// # Why this is one function and not three readings
+///
+/// The scope decides two things in two different processes: which
+/// repository the destructive-authority gate asks about
+/// (`TaskUseCase::authorize_kind` at the `POST`, and
+/// `DestructiveTaskReauthorizer::authorize_execution` again before the
+/// queued row runs), and which artifact rows the handler evaluates. A
+/// run that authorizes against one repository and then evaluates another
+/// is the one hole scoping could open, so there is exactly one reader of
+/// the convention and all four consumers call it with the `kind` and the
+/// params they have in hand. The scope travels **in the params** for the
+/// same reason: the params are the only thing the `POST` and the worker
+/// both see, so both checks see one scope by construction.
+///
+/// # Why an id rather than a key
+///
+/// A grant's scope is `PermissionGrant.repository_id`, and the evaluator
+/// takes an `Option<Uuid>`, so an id is what the gate compares — nothing
+/// stands between the operator's declaration and the question asked
+/// about it. Two consequences follow, and the second is the decisive
+/// one:
+///
+/// - Both gates are synchronous and zero-I/O. Resolving a
+///   `repositories.key` would put a database read inside the
+///   authorization decision, in two layers, one of which
+///   (`hort-domain`) may not have one at all.
+/// - `repositories.key` is a *mutable, re-usable* operator handle: drop
+///   a repository and declare another under the same key and the
+///   key → id mapping has changed. The two authority checks happen
+///   minutes or hours apart, so a key could legitimately resolve to two
+///   different ids across them — a job authorized for one repository
+///   re-authorized against another, which is the failure this design
+///   has to make impossible rather than test for. An id resolves to
+///   itself.
+///
+/// The operator-facing key is recoverable at the edges, where a lookup
+/// is free: `hort-cli admin repository list` prints both, and a dry
+/// run's `preview.groups` already name `repository_id` beside
+/// `repository_key`.
+///
+/// # Scoping is per kind, and that is load-bearing
+///
+/// Only [`RETENTION_EVALUATE_TASK_KIND`] can confine a run, so every
+/// other `kind` answers `Ok(None)` whatever its params say.
+/// `retention-purge` and `eventstore-archive` take permissive
+/// pass-through params and sweep the whole instance by construction; if
+/// this function read the key for them, a `repository_id` in such a body
+/// would narrow the *question the gate asks* while the run stayed
+/// instance-wide — a repository-scoped grant authorizing an
+/// instance-wide purge. The dispatch below is what makes that
+/// unreachable rather than merely unintended.
+///
+/// # Reading the value
+///
+/// Absent, or JSON `null`, is `None`: an invocation that names no
+/// repository is instance-wide and behaves exactly as it did before the
+/// scope existed, which is what the shipped CronJob's `{}` body relies
+/// on. A string that parses as a UUID is that repository. **Anything
+/// else is an error** — a non-string, or a string that is not a UUID.
+/// Falling back to `None` there would widen an operator's narrow request
+/// into the broadest possible one, which is the opposite of the
+/// direction a destructive gate may guess in.
+///
+/// An id that parses but names no repository is deliberately *not* an
+/// error here, because answering that needs I/O the gate does not have —
+/// and it does not need to be one: the gate then asks about that id, so
+/// only an unscoped grant (or a grant on that exact id) authorizes it,
+/// and the run evaluates no rows. Unresolvable-as-written widens; naming
+/// an absent repository narrows.
+///
+/// Pure, zero-I/O, total over every `kind`.
+pub fn task_invocation_repository_scope(
+    kind: &str,
+    params: &serde_json::Value,
+) -> DomainResult<Option<Uuid>> {
+    if kind != RETENTION_EVALUATE_TASK_KIND {
+        return Ok(None);
+    }
+    let raw = match params.get(RETENTION_EVALUATE_REPOSITORY_SCOPE_KEY) {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(value) => value,
+    };
+    let Some(text) = raw.as_str() else {
+        return Err(DomainError::Validation(format!(
+            "{RETENTION_EVALUATE_REPOSITORY_SCOPE_KEY} must be a repository UUID string, got \
+             {raw}"
+        )));
+    };
+    Uuid::parse_str(text).map(Some).map_err(|err| {
+        DomainError::Validation(format!(
+            "{RETENTION_EVALUATE_REPOSITORY_SCOPE_KEY} {text:?} is not a repository UUID: {err}"
+        ))
+    })
+}
+
+/// How a [`task_invocation_repository_scope`] answer reads in a refusal
+/// or a log line.
+///
+/// The destructive authority is checked twice — once with a caller to
+/// answer with a `403`, once with only the row and the log — and an
+/// operator correlating the two has to see the same scope phrased the
+/// same way. Two sites spelling it for themselves is how "this needed a
+/// global grant" and "this needed a grant on repository X" come to read
+/// as unrelated failures.
+#[must_use]
+pub fn describe_repository_scope(repository_id: Option<Uuid>) -> String {
+    match repository_id {
+        Some(repository_id) => format!("scoped to repository {repository_id}"),
+        None => "instance-wide (a repository-less grant)".to_owned(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TaskInvoked (admin-endpoint audit)
 // ---------------------------------------------------------------------------
@@ -2276,5 +2397,112 @@ mod tests {
                 "kind {kind:?} must not be classified destructive"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // task_invocation_repository_scope
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn an_invocation_that_names_no_repository_is_instance_wide() {
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({ "mode": "execute" }),
+            serde_json::json!({ "mode": "dry_run", "repository_id": null }),
+        ] {
+            assert_eq!(
+                task_invocation_repository_scope(RETENTION_EVALUATE_TASK_KIND, &params)
+                    .expect("total"),
+                None,
+                "params {params} must stay instance-wide",
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_repository_is_the_scope_in_every_mode() {
+        let repository = Uuid::new_v4();
+        for mode in ["execute", "dry_run"] {
+            let params = serde_json::json!({
+                "mode": mode,
+                "repository_id": repository.to_string(),
+            });
+            assert_eq!(
+                task_invocation_repository_scope(RETENTION_EVALUATE_TASK_KIND, &params)
+                    .expect("a UUID string resolves"),
+                Some(repository),
+                "mode {mode:?}: the scope is read the same way whether or not the \
+                 invocation is destructive — a dry run is confined too",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_scope_is_an_error_and_never_a_fall_back_to_instance_wide() {
+        for raw in [
+            serde_json::json!({ "repository_id": "not-a-uuid" }),
+            serde_json::json!({ "repository_id": "" }),
+            serde_json::json!({ "repository_id": 7 }),
+            serde_json::json!({ "repository_id": [] }),
+            serde_json::json!({ "repository_id": { "key": "npm-proxy" } }),
+        ] {
+            let err = task_invocation_repository_scope(RETENTION_EVALUATE_TASK_KIND, &raw)
+                .expect_err("an unreadable scope must not resolve");
+            assert!(
+                matches!(err, DomainError::Validation(_)),
+                "params {raw}: expected a Validation error, got {err:?}",
+            );
+        }
+    }
+
+    /// The dispatch is what stops a `repository_id` in a permissive
+    /// pass-through body from narrowing the question the gate asks about
+    /// a sweep that cannot be confined. Walks the whole destructive set
+    /// so a fourth kind cannot quietly inherit a scope it does not
+    /// honour.
+    #[test]
+    fn only_retention_evaluate_can_be_scoped() {
+        let params = serde_json::json!({ "repository_id": Uuid::new_v4().to_string() });
+        for kind in DESTRUCTIVE_TASK_KINDS
+            .iter()
+            .chain(["noop", "scan", "bogus-kind", ""].iter())
+        {
+            let scope = task_invocation_repository_scope(kind, &params).expect("total");
+            if *kind == RETENTION_EVALUATE_TASK_KIND {
+                assert!(scope.is_some(), "retention-evaluate reads its own scope");
+            } else {
+                assert_eq!(
+                    scope, None,
+                    "kind {kind:?} sweeps the instance, so a repository_id in its params \
+                     must not narrow the authority question asked about it",
+                );
+            }
+        }
+    }
+
+    /// The error arm is per kind too: an unreadable scope on a kind that
+    /// has none is not this function's business, and refusing it there
+    /// would reject bodies that have always been accepted.
+    #[test]
+    fn an_unreadable_scope_on_an_unscopable_kind_is_not_read_at_all() {
+        let params = serde_json::json!({ "repository_id": "not-a-uuid" });
+        for kind in ["retention-purge", "eventstore-archive", "noop"] {
+            assert_eq!(
+                task_invocation_repository_scope(kind, &params).expect("not read"),
+                None,
+            );
+        }
+    }
+
+    #[test]
+    fn the_scope_key_is_the_one_the_reader_uses() {
+        let repository = Uuid::new_v4();
+        let params = serde_json::json!({
+            RETENTION_EVALUATE_REPOSITORY_SCOPE_KEY: repository.to_string(),
+        });
+        assert_eq!(
+            task_invocation_repository_scope(RETENTION_EVALUATE_TASK_KIND, &params).expect("total"),
+            Some(repository),
+        );
     }
 }

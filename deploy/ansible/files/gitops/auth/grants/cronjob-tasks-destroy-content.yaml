@@ -47,6 +47,10 @@ spec:
     kind: serviceAccount
     name: cronjob-tasks
   permission: destroy_content
-  # No `repository:` -> global. Admin-task invocation is a global
-  # capability and the destructive gate asks at `repository = None`, so a
-  # repo-scoped destructive grant would authorise nothing.
+  # No `repository:` -> global, and required here: this identity runs the
+  # instance-wide sweeps (retention-evaluate with no repository_id, and
+  # retention-purge, which cannot be confined at all), which are asked at
+  # `repository = None`. Only a repository-less grant matches that
+  # question. A repository-scoped destroy_content grant authorises a
+  # retention-evaluate run confined to that one repository and nothing
+  # the schedule drives.

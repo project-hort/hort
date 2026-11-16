@@ -55,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `destroy_content` / `destroy_record` can be granted for a single repository:
+  `retention-evaluate` accepts a `repository_id` in its params and then
+  evaluates only that repository, authorized against a repository-scoped grant
+  (#447).
 - `api_tokens` rows record which issuance path minted them (`issued_via`, also
   on the token-list response); rows predating the column read `unknown` (#271).
 - New default-on daily `api-token-retention-sweep` deletes rows over 90 days past

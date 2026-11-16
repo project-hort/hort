@@ -81,7 +81,9 @@ how it is shaped. Who holds it is a grant, and a grant is gitops the operator
 writes.
 
 **It does not loosen the apply linter, and that is a decision rather than an
-omission.** Destructive task authority must be **global** — the gate asks at
+omission.** *(Amended 2026-11-16 — the "must be global" half below is
+superseded for a scoped invocation; see the amendment at the end of this
+section.)* Destructive task authority must be **global** — the gate asks at
 `repository = None` — and the linter rejects every *humanly reachable* shape
 of such a grant: a global `User`-subject grant of an admin-class permission
 trips `direct-user-grant-without-justification`, and a global `Claims`-subject
@@ -107,6 +109,64 @@ while its holder is still an admin. A destructive grant bound to **any other
 claim** is accepted at the API and refused at execution, every time. The rule
 is therefore that only an **identity-reachable** destructive authority survives
 the wait — not, as an earlier formulation had it, only an admin's.
+
+### Amendment 2026-11-16 — the gate asks at the invocation's scope, so the authority is scopable
+
+**What changed.** The paragraph above says destructive task authority "must be
+**global** — the gate asks at `repository = None`". That is no longer the whole
+rule. An invocation that confines itself to one repository is asked
+`authorize(actor, authority, Some(repository_id))`, so a `destroy_content`
+grant scoped to that repository authorizes it. An invocation that confines
+itself to nothing is asked at `None`, exactly as before.
+
+**What did not change, and is the guarantee rather than a side effect.** The
+asymmetry is deliberate. `RbacEvaluator`'s scope rule matches a repository-less
+grant to either question and a repository-scoped grant only to the scoped one,
+so an instance-wide destruction still requires a repository-less grant: a
+narrow grant can never authorize a broad action. The alternative shape — asking
+per repository and accepting any single match — would hand every scoped grant
+holder the instance, and is not an implementation detail anyone may
+"simplify" into.
+
+**What is scopable is one kind, and that is structural.** Only
+`retention-evaluate` can confine a run, because it is the only destructive kind
+whose sweep has a repository dimension at all; `retention-purge` collects every
+retired artifact and `eventstore-archive` seals a stream. The reader of the
+scope (`hort_domain::events::task_invocation_repository_scope`) therefore
+dispatches on the kind and answers `None` for every other one, whatever its
+params say. Without that dispatch, a `repository_id` in one of those kinds'
+permissive pass-through bodies would narrow the *question the gate asks* while
+the run stayed instance-wide — a repository-scoped grant authorizing an
+instance-wide purge. The two kinds additionally refuse the field on the invoke
+itself (`TaskParams::validate` → `400`), so a holder of the repository-less
+authority cannot believe they confined a sweep that cannot be confined.
+
+**The scope travels in the params, and nowhere else.** The authority is checked
+twice — at the `POST` and again before the queued row runs — and the params are
+the only thing both see. One resolution, read by both checks and by the handler
+that confines the run, is what makes "authorized for repository A, evaluated
+repository B" unreachable rather than merely untested. It is also why the scope
+is an **id**: `repositories.key` is a mutable, re-usable handle, so resolving a
+key at two points hours apart could legitimately yield two different ids.
+
+**The lint consequence recorded above is now narrower.** Both reject rules it
+names are scoped to the **wildcard** case: `wildcard-repo-non-admin` fires only
+on `repository_id IS NULL`, and `direct-user-grant-without-justification`
+rejects an admin-class `User`-subject grant only when it is repository-less,
+staying `Warn` when it is scoped — and apply refuses on `Reject` alone. So a
+repository-scoped grant of a destructive permission is lint-clean with no
+downgrade, in **either** subject shape, and that is the first
+humanly-reachable form of this authority that is. Nothing in the rule set
+changed; a form that was unreachable became reachable. The **instance-wide**
+case keeps the consequence this ADR documented, unchanged.
+
+**The reach of a scoped grant.** Its holder can expire artifact rows in one
+repository and nothing else. The bytes are a separate stage behind a refcount
+check over `content_references`, so a blob a second repository still references
+survives a run scoped to the first — the scope bounds which rows are evaluated,
+never what CAS may delete. And `retention-purge` still asks at `None`, so the
+scoped grant does not compose into the instance-wide collection that acts on
+those expiries.
 
 ## Consequences
 

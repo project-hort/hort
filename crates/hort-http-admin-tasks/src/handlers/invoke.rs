@@ -246,6 +246,17 @@ pub async fn invoke<P: TaskParams>(
     // reaches this branch: it costs nothing, it names the dimension the
     // key separates on, and it means a second kind gaining a mode cannot
     // silently collapse two invocations onto one key.
+    //
+    // The repository scope is in the key for exactly that reason, and it
+    // is the same rule applied rather than a new one. The key
+    // single-flights *destroying something*, so two invocations that
+    // would destroy different things must not collapse onto it: without
+    // the segment, a scoped execute for one repository would own the day
+    // for every other scoped execute — and, worse, hand an operator who
+    // then asked for the instance-wide sweep that scoped job's id and a
+    // `200`, so the sweep they asked for never ran and nothing said so.
+    // An unscoped invocation appends no segment, which keeps every key
+    // the shipped CronJob has ever derived byte-identical.
     let db_idempotency_key: Option<IdempotencyKey> =
         if hort_domain::events::task_invocation_destructive_authority(P::KIND, &params_value)?
             .is_some()
@@ -256,6 +267,17 @@ pub async fn invoke<P: TaskParams>(
                 format!("cron:{}:{}:{utc_today}", P::KIND, mode.as_str())
             } else {
                 format!("cron:{}:{utc_today}", P::KIND)
+            };
+            // Read through the one domain reader of the scope, the same
+            // call the authorization gate above made, so the key cannot
+            // separate on a different repository from the one the
+            // invocation was authorized for.
+            let derived = match hort_domain::events::task_invocation_repository_scope(
+                P::KIND,
+                &params_value,
+            )? {
+                Some(repository_id) => format!("{derived}:{repository_id}"),
+                None => derived,
             };
             Some(IdempotencyKey::try_from(derived)?)
         } else {

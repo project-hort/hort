@@ -399,6 +399,17 @@ being an admin. Apply it per
 §5.1; without it, `preview` works and `apply` is refused at the execute
 step.
 
+**That authority can be held for one repository instead of the
+instance.** `retention-evaluate` accepts a `repository_id` in its params
+and then evaluates only that repository, and the `destroy_content` check
+is made about *that* repository — so a grant scoped to it is enough. The
+instance-wide run is still asked at `repository = None` and still needs a
+repository-less grant: a narrow grant never authorizes the broad action.
+`preview` and `apply` have no repository flag yet, so the scoped run goes
+through `hort-cli admin task invoke retention-evaluate --params-file`;
+[`enable-admin-task-cronjobs.md`](deploy/enable-admin-task-cronjobs.md)
+§5.1.1 has the grant and the two command lines.
+
 **That authority is checked twice: once when the job is accepted, and
 again when the worker is about to run it.** A destructive job is queued,
 not executed inline, so the second check reads the live authority of the
