@@ -152,6 +152,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `hort-cli admin task get` no longer panics on a job whose `result_summary` or
+  `last_error` is large (a `retention-evaluate` dry run's is), and its table now
+  shows a readable prefix of those two fields naming `--output json` for the
+  whole value (#445).
 - An artifact that returns to the observation window now begins it where hort
   can first prove the content was published, not at the moment of the re-scan.
   Content hort has held for longer than its repository's `quarantineDuration`
