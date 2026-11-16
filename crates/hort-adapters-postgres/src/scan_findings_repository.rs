@@ -4,16 +4,20 @@
 //! Every per-finding row lands inside the same Postgres transaction as
 //! the corresponding `ScanCompleted` event append. The transactional
 //! boundary is owned by
-//! [`crate::artifact_lifecycle::PgArtifactLifecycle::commit_scan_result`];
+//! [`crate::artifact_lifecycle::PgArtifactLifecycle::commit_scan_result_with_score`];
 //! callers that exercise the trait outside that lifecycle path get a
-//! standalone (single-statement) insert here.
+//! standalone transaction here. A batch too large for one statement's
+//! bind-parameter budget is chunked across several statements inside
+//! whichever transaction that is — see [`crate::bulk_insert`].
 
+use sqlx::query_builder::Separated;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 
 use hort_domain::entities::scan_policy::SeverityThreshold;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::scan_findings_repository::{ScanFindingsRepository, ScanFindingsRow};
 
+use crate::bulk_insert::ChunkedInsert;
 use crate::{map_sqlx_error, BoxFuture};
 
 /// PostgreSQL adapter for [`ScanFindingsRepository`].
@@ -44,44 +48,76 @@ pub(crate) fn severity_to_sql(s: SeverityThreshold) -> &'static str {
     }
 }
 
+/// The projection's columns, in the order [`bind_finding`] binds them.
+///
+/// This list is the single source of the insert's arity: the
+/// `INSERT INTO … (…)` prefix is rendered from it and the number of rows
+/// one statement may carry is derived from it, so adding a column here
+/// moves both. A row count written down beside the bind closure would
+/// not move, and would then be wrong only for the scans with the most
+/// findings.
+const FINDINGS_COLUMNS: &[&str] = &[
+    "artifact_id",
+    "scan_id",
+    "purl",
+    "vulnerability_id",
+    "severity",
+    "cvss_score",
+    "source_scanner",
+    "title",
+    "detected_at",
+    "fixed_versions",
+    "informational_class",
+    "advisory_published_at",
+];
+
+/// The chunked `scan_findings` insert. A finding-rich image assesses
+/// tens of thousands of findings, and twelve bind parameters a row
+/// reaches PostgreSQL's per-statement parameter limit well inside that
+/// range; past it the statement is refused outright, which — since the
+/// rows share the scan's transaction — discards the verdict too and
+/// leaves the artifact reading as if the scan had found nothing.
+const FINDINGS_INSERT: ChunkedInsert = ChunkedInsert::new("scan_findings", FINDINGS_COLUMNS);
+
+/// Bind one finding row, in [`FINDINGS_COLUMNS`] order.
+fn bind_finding(mut b: Separated<'_, Postgres, &'static str>, row: &ScanFindingsRow) {
+    b.push_bind(row.artifact_id)
+        .push_bind(row.scan_id)
+        .push_bind(&row.purl)
+        .push_bind(&row.vulnerability_id)
+        .push_bind(severity_to_sql(row.severity))
+        .push_bind(row.cvss_score)
+        .push_bind(&row.source_scanner)
+        .push_bind(&row.title)
+        .push_bind(row.detected_at)
+        .push_bind(&row.fixed_versions)
+        .push_bind(row.informational_class.as_deref())
+        .push_bind(row.advisory_published_at);
+}
+
+/// The statement for one chunk of findings. The production build, shared
+/// with the arity test so a column whose `push_bind` nobody added fails
+/// without a database.
+fn findings_statement(chunk: &[ScanFindingsRow]) -> QueryBuilder<Postgres> {
+    FINDINGS_INSERT.statement(chunk, bind_finding)
+}
+
 /// Insert a batch of scan findings into the projection table within
-/// `tx`. Used by `PgArtifactLifecycle::commit_scan_result` to keep the
+/// `tx`. Used by `PgArtifactLifecycle::commit_scan_result_with_score` to keep the
 /// rows in the same transaction as the event append + artifact state
 /// mutation + `last_scan_at` write.
 ///
-/// Empty input returns `Ok(())` without issuing a query — the
-/// no-findings fast path on a clean scan must not generate stray SQL.
+/// A batch larger than one statement's parameter budget is split across
+/// several statements on `tx` — the caller's connection — so the whole
+/// set still lands with that transaction or not at all. Empty input
+/// returns `Ok(())` without issuing a query: the no-findings fast path
+/// on a clean scan must not generate stray SQL.
 pub(crate) async fn insert_findings_in_tx(
     tx: &mut sqlx::PgConnection,
     rows: &[ScanFindingsRow],
 ) -> DomainResult<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "INSERT INTO scan_findings (\
-            artifact_id, scan_id, purl, vulnerability_id, severity, \
-            cvss_score, source_scanner, title, detected_at, fixed_versions, \
-            informational_class, advisory_published_at\
-        ) ",
-    );
-    qb.push_values(rows, |mut b, row| {
-        b.push_bind(row.artifact_id)
-            .push_bind(row.scan_id)
-            .push_bind(&row.purl)
-            .push_bind(&row.vulnerability_id)
-            .push_bind(severity_to_sql(row.severity))
-            .push_bind(row.cvss_score)
-            .push_bind(&row.source_scanner)
-            .push_bind(&row.title)
-            .push_bind(row.detected_at)
-            .push_bind(&row.fixed_versions)
-            .push_bind(row.informational_class.as_deref())
-            .push_bind(row.advisory_published_at);
-    });
-    let query = qb.build();
-    query
-        .execute(&mut *tx)
+    FINDINGS_INSERT
+        .execute_chunked(tx, rows, findings_statement)
         .await
         .map_err(|e| map_sqlx_error(&e, "scan_findings", ""))?;
     Ok(())
@@ -108,6 +144,7 @@ impl ScanFindingsRepository for PgScanFindingsRepository {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bulk_insert::PG_MAX_BIND_PARAMS;
     use chrono::{DateTime, Utc};
     use hort_domain::ports::retention_scan_reader::RetentionScanReader;
     use hort_domain::retention::{
@@ -536,5 +573,139 @@ mod tests {
             .bind(repo_id)
             .execute(&pool)
             .await;
+    }
+
+    /// A per-test database. The batch the limit tests below write is
+    /// thousands of rows wide, so it gets a database of its own rather
+    /// than the shared target the round-trip tests above use.
+    async fn maybe_pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        let pool = crate::test_support::isolated_db_from(&url).await?;
+        crate::test_support::migrate_or_panic(&pool).await;
+        Some(pool)
+    }
+
+    /// One finding, distinguishable by `vulnerability_id` — which is
+    /// part of the projection's primary key, so a batch built from
+    /// distinct `n` is a batch the table accepts whole.
+    fn finding_row(artifact_id: Uuid, scan_id: Uuid, n: usize) -> ScanFindingsRow {
+        ScanFindingsRow {
+            artifact_id,
+            scan_id,
+            purl: format!("pkg:npm/limit-{n}@1.0.0"),
+            vulnerability_id: format!("CVE-LIMIT-{n}"),
+            severity: SeverityThreshold::Medium,
+            cvss_score: Some(5.0),
+            source_scanner: "trivy".into(),
+            title: format!("finding {n}"),
+            detected_at: Utc::now(),
+            fixed_versions: Vec::new(),
+            informational_class: None,
+            advisory_published_at: None,
+        }
+    }
+
+    /// The statement binds exactly one placeholder per column per row,
+    /// and names every column it declares.
+    ///
+    /// This is the check that survives a thirteenth column: add one to
+    /// [`FINDINGS_COLUMNS`] without a matching `push_bind` in
+    /// [`bind_finding`] and the rendered placeholder count stops
+    /// matching the declared column count — a statement Postgres would
+    /// reject, and whose real arity the chunk size derived from the list
+    /// no longer describes. No database needed.
+    #[test]
+    fn the_findings_statement_binds_one_placeholder_per_column_per_row() {
+        let artifact_id = Uuid::new_v4();
+        let scan_id = Uuid::new_v4();
+        let rows = [
+            finding_row(artifact_id, scan_id, 1),
+            finding_row(artifact_id, scan_id, 2),
+        ];
+        let expected = rows.len() * FINDINGS_COLUMNS.len();
+        let sql = findings_statement(&rows).into_string();
+
+        assert_eq!(
+            sql.matches('$').count(),
+            expected,
+            "{} rows x {} columns should bind {expected} parameters: {sql}",
+            rows.len(),
+            FINDINGS_COLUMNS.len()
+        );
+        assert!(sql.contains(&format!("${expected}")), "{sql}");
+        assert!(!sql.contains(&format!("${}", expected + 1)), "{sql}");
+        for column in FINDINGS_COLUMNS {
+            assert!(sql.contains(column), "prefix omits {column}: {sql}");
+        }
+    }
+
+    /// A full statement stays inside the bind-parameter limit, and one
+    /// row more would not — so the chunk size is the largest one the
+    /// wire protocol admits, derived rather than written down.
+    #[test]
+    fn the_findings_chunk_is_the_largest_the_parameter_limit_admits() {
+        let budget = FINDINGS_INSERT.rows_per_statement();
+        assert!(budget >= 1, "a statement must carry at least one row");
+        assert!(budget * FINDINGS_COLUMNS.len() <= PG_MAX_BIND_PARAMS);
+        assert!((budget + 1) * FINDINGS_COLUMNS.len() > PG_MAX_BIND_PARAMS);
+    }
+
+    /// One finding more than a single statement can bind still lands in
+    /// full.
+    ///
+    /// The `+ 1` is the whole test: a batch of exactly the budget
+    /// crosses no statement boundary and would pass against the
+    /// unchunked insert too. Before the chunking the server refused the
+    /// oversized statement outright, and because these rows share the
+    /// scan's transaction with the `ScanCompleted` append, the refusal
+    /// discarded the verdict as well — the artifact with the most
+    /// findings read as the one with none.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_findings_batch_past_one_statement_lands_in_full() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo_id = seed_repo(&pool).await;
+        let artifact_id = seed_artifact(&pool, repo_id).await;
+        let scan_id = Uuid::new_v4();
+        let wanted = FINDINGS_INSERT.rows_per_statement() + 1;
+        let rows: Vec<ScanFindingsRow> = (0..wanted)
+            .map(|n| finding_row(artifact_id, scan_id, n))
+            .collect();
+
+        PgScanFindingsRepository::new(pool.clone())
+            .insert_batch(&rows)
+            .await
+            .expect("a batch past one statement's bind budget must still insert");
+
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM scan_findings WHERE artifact_id = $1 AND scan_id = $2",
+        )
+        .bind(artifact_id)
+        .bind(scan_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
+        assert_eq!(
+            usize::try_from(stored).expect("row count fits a usize"),
+            wanted
+        );
+
+        // The last row specifically: a dropped tail chunk would still
+        // leave a plausible-looking count if the batch had been
+        // truncated anywhere else.
+        let tail: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM scan_findings \
+             WHERE artifact_id = $1 AND scan_id = $2 AND vulnerability_id = $3",
+        )
+        .bind(artifact_id)
+        .bind(scan_id)
+        .bind(format!("CVE-LIMIT-{}", wanted - 1))
+        .fetch_one(&pool)
+        .await
+        .expect("tail query");
+        assert_eq!(tail, 1, "the last chunk's final row is missing");
+        // No cleanup: the database is this test's own and is swept.
     }
 }

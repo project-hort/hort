@@ -156,6 +156,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A scan that assesses very many findings now records its verdict and all of its
+  finding rows; such a scan previously left the artifact reading as if it had no
+  findings at all (#441).
 - `hort-cli admin task get` no longer panics on a job whose `result_summary` or
   `last_error` is large (a `retention-evaluate` dry run's is), and its table now
   shows a readable prefix of those two fields naming `--output json` for the
