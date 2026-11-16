@@ -303,11 +303,10 @@ fn finish(row: TaskRow, deduplicated: bool) -> Result<FinishedSweep> {
 /// Render the "the job is still running" outcome in both output modes.
 ///
 /// Never reports a result: it says what the CLI last saw, names the job,
-/// and names the command that reads it later. Both the human hint and the
-/// `read_later_with` wire field name the **lossless** form, because what
-/// is being waited for is a document: the table form bounds the cell it
-/// renders, so a reader sent there — person or script — would have to
-/// discover `--output json` for itself to see the whole value.
+/// and names the command that reads it later. The human hint names the
+/// lossless form of that command, because what is being waited for is a
+/// document; `read_later_with` is a wire field and stays the bare
+/// command, so the two spellings below are deliberate.
 ///
 /// This is the only place either subcommand renders that hint — `apply`
 /// calls it for both of its timeout points.
@@ -327,7 +326,7 @@ pub fn render_still_running(
             "last_observed_status": last_status,
             "waited_seconds": waited.as_secs(),
             "note": note,
-            "read_later_with": read_later_command_lossless(job_id),
+            "read_later_with": read_later_command(job_id),
         })),
         OutputFormat::Table => format!(
             "THE JOB IS STILL RUNNING — no result was seen\n  \
@@ -497,10 +496,7 @@ mod tests {
         // The wire field is unchanged: `--output json` is the lossless
         // path and its documents are a contract, so the flag the human
         // hint gained does not reach this value.
-        assert_eq!(
-            parsed["read_later_with"],
-            "hort-cli admin task get job-7 --output json"
-        );
+        assert_eq!(parsed["read_later_with"], "hort-cli admin task get job-7");
         assert_eq!(parsed["note"], "the execution was started");
     }
 

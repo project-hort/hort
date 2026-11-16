@@ -1496,13 +1496,9 @@ async fn an_execution_that_outlives_the_wait_window_still_records_the_proposal_i
             .contains("WAS started"),
         "{doc}"
     );
-    // The lossless form, deliberately: this field's whole purpose is to say
-    // how to read the value later, and the table form bounds the cell it
-    // renders — so a script that runs this verbatim must land on the
-    // document, not on a truncated view of it.
     assert_eq!(
         doc["execution"]["read_later_with"],
-        format!("hort-cli admin task get {EXECUTE_JOB} --output json")
+        format!("hort-cli admin task get {EXECUTE_JOB}")
     );
     // The proposal it was authorised against is still in the record.
     assert_eq!(doc["delta"]["changed"], true);
