@@ -1467,13 +1467,12 @@ impl ProvenanceOrchestrationUseCase {
         is_constituent: bool,
         hold_at_version: HoldAtVersion,
     ) -> AppResult<ProvenanceRunOutcome> {
-        // Defense-in-depth bounded requeue (issue #90). A `NoAttestation`
-        // verdict under `Required` with a `None` `quarantine_window_start`
-        // on an artifact whose status is STILL `None` is the exact
-        // symptom of the ingest TOCTOU this issue fixed: the artifact may
-        // be mid-transition to `Quarantined` by a commit that just hasn't
+        // Defense-in-depth bounded requeue. A `NoAttestation` verdict
+        // under `Required` on an artifact whose status is STILL `None` is
+        // the exact symptom of an ingest TOCTOU: the artifact may be
+        // mid-transition to `Quarantined` by a commit that just hasn't
         // landed yet (or a residual race in some other/future dual-commit
-        // path — `IngestUseCase::ingest_inner` itself now commits
+        // path — `IngestUseCase::ingest_inner` itself commits
         // `ArtifactIngested` + `ArtifactQuarantined` atomically, so a job
         // IT enqueues can no longer observe this shape). Requeueing runs
         // the verify again once the (expected, imminent) quarantine commit
@@ -1483,9 +1482,20 @@ impl ProvenanceOrchestrationUseCase {
         // steady-state PERMISSIVE artifact (`quarantine_duration_secs ==
         // 0`) shows this exact shape too, but FOREVER (it is never
         // quarantined), and must not requeue indefinitely.
+        //
+        // The status is the whole of the state question: a `None`-status
+        // artifact carries no `quarantine_window_start`, because no
+        // transition writes a window without moving the status and none
+        // returns an artifact to `None`
+        // (`hort_domain::entities::quarantine_transitions`'s
+        // `no_transition_returns_an_artifact_to_the_none_status`, and the
+        // entity's `every_anchor_write_leaves_the_artifact_quarantined`).
+        // Conjoining the anchor read beside it said nothing the status
+        // does not, and it made `quarantine_window_start` carry a second
+        // meaning — "this artifact was never quarantined" — beside its
+        // real one, "a window is in force since".
         if mode == ProvenanceMode::Required
             && artifact.quarantine_status == QuarantineStatus::None
-            && artifact.quarantine_window_start.is_none()
             && matches!(
                 verdict.outcome,
                 hort_domain::ports::provenance::ProvenanceOutcome::NoAttestation
@@ -1496,9 +1506,9 @@ impl ProvenanceOrchestrationUseCase {
             tracing::info!(
                 artifact_id = %artifact.id,
                 backend = %backend,
-                "provenance: NoAttestation×Required on a None-status, anchor-less, \
+                "provenance: NoAttestation×Required on a None-status, \
                  recently-ingested artifact — requeueing instead of terminal reject \
-                 (bounded defense-in-depth, issue #90)",
+                 (bounded defense-in-depth)",
             );
             crate::metrics::emit_provenance_verify(
                 backend,

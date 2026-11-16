@@ -17,9 +17,7 @@ use hort_domain::events::{
 };
 use hort_domain::policy::curation::{evaluate_curation, CurationOutcome};
 use hort_domain::policy::effective_quarantine_deadline;
-use hort_domain::policy::quarantine_anchor::{
-    derive_quarantine_anchor, AnchorEvidence, AnchorSource, DerivedAnchor,
-};
+use hort_domain::policy::quarantine_anchor::{AnchorSource, DerivedAnchor};
 use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -50,8 +48,8 @@ use crate::use_cases::multi_hash::{
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
+use crate::use_cases::quarantine_anchor_assembly::{derive_mint_anchor, MintEvidence};
 use crate::use_cases::quarantine_hold::{resolve_transient_hold, TransientHold};
-use crate::use_cases::referenced_descendant::resolve_released_parent_trust_fail_safe;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_unpaired_append_version,
     ArtifactAtVersion, OverCapStream, UnpairedAppend, EVENT_APPEND_RETRY_ATTEMPTS,
@@ -509,37 +507,6 @@ fn actor_to_uploaded_by(actor: &ApiActor) -> Option<Uuid> {
         None
     } else {
         Some(actor.user_id)
-    }
-}
-
-/// Read the live content-level age evidence for `sha256` — the earliest
-/// moment hort itself observed these bytes in any of its own repositories
-/// (ADR 0054). One indexed `MIN(created_at)` per quarantining mint; both
-/// minting paths call it so they cannot derive different anchors for the
-/// same content.
-///
-/// **Fail-safe**: a port error resolves to `None`, exactly as "hort holds
-/// no such observation" does. The two are deliberately indistinguishable
-/// to the caller, because they warrant the same answer — the derivation
-/// falls back on the mint instant and holds the content for a full window.
-/// Inventing an earlier instant for content whose age hort cannot vouch
-/// for would shorten a security window on no evidence; standing on the
-/// mint instant can only hold content longer than the truth justifies.
-async fn read_content_age_evidence(
-    artifacts: &dyn ArtifactRepository,
-    sha256: &ContentHash,
-) -> Option<DateTime<Utc>> {
-    match artifacts.first_seen_for_checksum(sha256).await {
-        Ok(evidence) => evidence,
-        Err(e) => {
-            tracing::warn!(
-                sha256 = %sha256,
-                error = %e,
-                "content age-evidence read failed; anchoring the quarantine window on \
-                 the mint instant (a full window, never a shorter one)"
-            );
-            None
-        }
     }
 }
 
@@ -3166,24 +3133,26 @@ impl IngestUseCase {
     /// excluded. The parents' statuses are I/O, so the whole condition is
     /// resolved by
     /// [`crate::use_cases::referenced_descendant::resolve_released_parent_trust_fail_safe`],
-    /// which `register_by_hash_inner`'s identical carve-out also calls:
-    /// the two minting paths cannot drift, and both lookups degrade
-    /// toward the FULL window on error. This lookup does NOT depend on
-    /// this ingest's OWN `content_references` rows — those are resolved
+    /// which the shared mint assembly calls on behalf of both minting
+    /// paths: the two cannot drift, and both lookups degrade toward the
+    /// FULL window on error. That lookup does NOT depend on this
+    /// ingest's OWN `content_references` rows — those are resolved
     /// further down and committed by the transition itself, so nothing
-    /// this ingest claims is visible here. It only ever matches rows
+    /// this ingest claims is visible to it. It only ever matches rows
     /// written by OTHER, already-ingested artifacts.
     ///
     /// Resolves the quarantine-window anchor (`quarantine_window_start`)
-    /// as the MINIMUM of the applicable age sources (ADR 0054), in the one
-    /// shared pure function `register_by_hash_inner` also calls — which is
-    /// what makes the two minting paths derive identically. Every source
-    /// is a "the world has already had this long to look" argument, so
-    /// the honest composition is the earliest deadline any applicable
-    /// rule would set on its own; see
-    /// `hort_domain::policy::quarantine_anchor` for the full rationale,
-    /// including why the descendant carve-out composes rather than
-    /// overrides. The sources assembled:
+    /// as the MINIMUM of the applicable age sources (ADR 0054), through
+    /// [`crate::use_cases::quarantine_anchor_assembly::derive_mint_anchor`]
+    /// — the one place a mint's evidence is assembled, which
+    /// `register_by_hash_inner` also calls and which is what makes the
+    /// two minting paths derive identically. Every source is a "the world
+    /// has already had this long to look" argument, so the honest
+    /// composition is the earliest deadline any applicable rule would set
+    /// on its own; see `hort_domain::policy::quarantine_anchor` for the
+    /// full rationale, including why the descendant carve-out composes
+    /// rather than overrides. The sources, and what this function
+    /// contributes to each:
     ///
     /// - The ingest instant, unconditional — so a missing or unreadable
     ///   source degrades to a FULL window, never a shorter one.
@@ -3247,30 +3216,26 @@ impl IngestUseCase {
             return Ok(None);
         }
 
-        let inherits_released_parent_trust = resolve_released_parent_trust_fail_safe(
-            &*self.content_references,
+        let derived = derive_mint_anchor(
             &*self.artifacts,
-            repository_id,
-            artifact.id,
-            &artifact.sha256_checksum,
+            &*self.content_references,
+            MintEvidence {
+                minted_at: now,
+                window_secs: effective_duration_secs,
+                // `ingest_inner` never carries the seed-import override
+                // (the request field is destructured away above and
+                // threaded to `register_by_hash` instead).
+                explicit_override: None,
+                trusted_upstream_published_at: trust_upstream_publish_time
+                    .then_some(upstream_published_at)
+                    .flatten(),
+                repository_id,
+                artifact_id: artifact.id,
+                sha256: &artifact.sha256_checksum,
+            },
         )
         .await;
-
-        let derived = derive_quarantine_anchor(&AnchorEvidence {
-            minted_at: now,
-            window: chrono::Duration::seconds(effective_duration_secs),
-            // `ingest_inner` never carries the seed-import override (the
-            // request field is destructured away above and threaded to
-            // `register_by_hash` instead).
-            explicit_override: None,
-            first_seen_at: read_content_age_evidence(&*self.artifacts, &artifact.sha256_checksum)
-                .await,
-            trusted_upstream_published_at: trust_upstream_publish_time
-                .then_some(upstream_published_at)
-                .flatten(),
-            inherits_released_parent_trust,
-        });
-        let anchor = derived.anchor;
+        let anchor = derived.anchor();
 
         let quarantine_event = artifact.quarantine(anchor).map_err(|e| {
             (
@@ -3696,14 +3661,15 @@ impl IngestUseCase {
         format: String,
         repo_key: &str,
     ) {
-        let Some(DerivedAnchor {
-            anchor,
-            source: anchor_source,
-            upstream_clamp_fired,
-        }) = quarantine_fired
-        else {
+        let Some(derived) = quarantine_fired else {
             return;
         };
+        let DerivedAnchor {
+            source: anchor_source,
+            upstream_clamp_fired,
+            ..
+        } = derived;
+        let anchor = derived.anchor();
 
         if policy_source_is_default {
             tracing::info!(
@@ -5576,45 +5542,26 @@ impl IngestUseCase {
         let mut events: Vec<EventToAppend> = Vec::new();
 
         if gate.quarantined {
-            // The descendant carve-out, evaluated exactly as
-            // `ingest_inner` evaluates it — both halves: the TOPOLOGY
-            // question ("is this content already a `content_references`
-            // target of some OTHER already-ingested artifact in this
-            // repository") and the TRUST question ("is at least one of
-            // those referencing parents `Released`"). Neither is a fact
-            // about the minting path, which is what lets the mint (whose
-            // edges ride the commit this feeds) and a catch-up (whose row
-            // has carried its edges since its mint) share the resolver:
-            // `is_referenced_tree_descendant` filters `primary_content` /
-            // `metadata_blob` out as self-referential, so the topology
-            // answers the same whether or not this artifact's own edges
-            // are written yet.
-            //
-            // Both probes are skipped entirely when an explicit anchor is
-            // supplied: the override wins absolutely, so they could only
-            // spend round-trips on values nothing reads.
-            let (inherits_released_parent_trust, first_seen_at) = match quarantine_anchor_override {
-                Some(_) => (false, None),
-                None => (
-                    resolve_released_parent_trust_fail_safe(
-                        &*self.content_references,
-                        &*self.artifacts,
-                        repository_id,
-                        artifact_id,
-                        &artifact.sha256_checksum,
-                    )
-                    .await,
-                    read_content_age_evidence(&*self.artifacts, &artifact.sha256_checksum).await,
-                ),
-            };
-
-            // The SAME derivation `ingest_inner` runs, over the same
+            // The SAME assembly `ingest_inner` runs, over the same
             // sources — which is what makes the leader/follower asymmetry
             // disappear as a property of the model rather than as a patch
             // at each call site. A follower minting its row over
             // already-resident CAS content reads the same content-level
             // age evidence the leader read, so the two agree on the
             // anchor whichever of them won the dedup race.
+            //
+            // That includes the descendant carve-out's two halves — the
+            // TOPOLOGY question ("is this content already a
+            // `content_references` target of some OTHER already-ingested
+            // artifact in this repository") and the TRUST question ("is
+            // at least one of those referencing parents `Released`").
+            // Neither is a fact about the minting path, which is what
+            // lets the mint (whose edges ride the commit this feeds) and
+            // a catch-up (whose row has carried its edges since its mint)
+            // share one resolver: `is_referenced_tree_descendant` filters
+            // `primary_content` / `metadata_blob` out as
+            // self-referential, so the topology answers the same whether
+            // or not this artifact's own edges are written yet.
             //
             // It is also why a catch-up does not punish content that has
             // been resident for weeks with a fresh full window: the row's
@@ -5632,18 +5579,26 @@ impl IngestUseCase {
             // transit this model forbids — the opt-in is a per-mapping
             // trust statement, and an untrusted mirror's claim must not
             // shorten a repository proxying the genuine upstream.
-            let derived = derive_quarantine_anchor(&AnchorEvidence {
-                minted_at: now,
-                window: chrono::Duration::seconds(gate.effective_duration_secs),
-                // The seed-import cutover's backdated anchor. Absolute
-                // precedence: an explicit anchor is never overridden by a
-                // derived one, in either direction.
-                explicit_override: quarantine_anchor_override,
-                first_seen_at,
-                trusted_upstream_published_at: None,
-                inherits_released_parent_trust,
-            });
-            let anchor = derived.anchor;
+            let derived = derive_mint_anchor(
+                &*self.artifacts,
+                &*self.content_references,
+                MintEvidence {
+                    minted_at: now,
+                    window_secs: gate.effective_duration_secs,
+                    // The seed-import cutover's backdated anchor. Absolute
+                    // precedence: an explicit anchor is never overridden by
+                    // a derived one, in either direction — and it skips
+                    // both of the assembly's own probes, which could only
+                    // spend round-trips on values nothing reads.
+                    explicit_override: quarantine_anchor_override,
+                    trusted_upstream_published_at: None,
+                    repository_id,
+                    artifact_id,
+                    sha256: &artifact.sha256_checksum,
+                },
+            )
+            .await;
+            let anchor = derived.anchor();
             anchor_source = derived.source;
             let quarantine_event = artifact.quarantine(anchor)?;
             events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(

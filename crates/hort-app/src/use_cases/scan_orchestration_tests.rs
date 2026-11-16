@@ -58,6 +58,7 @@ use hort_domain::types::{
 };
 
 use super::*;
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 use crate::use_cases::test_support::*;
 
@@ -797,6 +798,12 @@ fn make_uc_with_refs(
         content_refs.clone(),
         storage.clone(),
         jobs.clone(),
+        Arc::new(QuarantineAnchorResolver::new(
+            artifacts.clone(),
+            content_refs.clone(),
+            policy_projections.clone(),
+            Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+        )),
     ));
 
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
@@ -2573,6 +2580,12 @@ fn make_uc_with_lifecycle(
         content_refs.clone(),
         storage.clone(),
         jobs.clone(),
+        Arc::new(QuarantineAnchorResolver::new(
+            artifacts.clone(),
+            content_refs.clone(),
+            policy_projections.clone(),
+            Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+        )),
     ));
 
     let config = ScanOrchestrationConfig::defaults_for_worker("test-worker");
@@ -5387,6 +5400,12 @@ mod metrics_emission_tests {
                 content_refs.clone(),
                 storage.clone(),
                 jobs.clone(),
+                Arc::new(QuarantineAnchorResolver::new(
+                    artifacts.clone(),
+                    content_refs.clone(),
+                    policy_projections.clone(),
+                    Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+                )),
             )
             .with_include_repository_label(false),
         );

@@ -204,6 +204,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         PolicyReEvaluationHandler::new(Arc::new(use_case))
     }

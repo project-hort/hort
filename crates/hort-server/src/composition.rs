@@ -80,6 +80,7 @@ use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
 use hort_app::use_cases::list_deliverability::ListDeliverabilityUseCase;
 use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
+use hort_app::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
 use hort_app::use_cases::ref_use_case::RefUseCase;
@@ -2887,6 +2888,18 @@ pub async fn build_app_context(
     // expiry backstop. Single Arc shared with `IngestUseCase` +
     // `TaskUseCase` + `ManualRescanUseCase` below.
     let jobs_repo = Arc::new(PgJobsRepository::new(db.clone()));
+    // The one quarantine-anchor assembly every hold path shares (ADR
+    // 0054): the artifact's age evidence, resolved from the ports rather
+    // than from whatever instant the run that took the hold happened to
+    // observe. Threaded into every use case below that returns an
+    // artifact to the hold, so one artifact gets one anchor whichever
+    // path puts it there.
+    let anchor_resolver = Arc::new(QuarantineAnchorResolver::new(
+        artifact_repo.clone(),
+        content_references.clone(),
+        policy_projections.clone(),
+        repository_upstream_mappings.clone(),
+    ));
     let quarantine_use_case = Arc::new(
         QuarantineUseCase::new(
             artifact_repo.clone(),
@@ -2904,6 +2917,7 @@ pub async fn build_app_context(
             // final `provenance-verify` for Required + Pending + expired
             // candidates via this handle.
             jobs_repo.clone(),
+            anchor_resolver.clone(),
         )
         // Inject the upstream-index cache
         // invalidator. The post-`record_scan_result` Reject-branch
@@ -3601,6 +3615,7 @@ pub async fn build_app_context(
             // re-evaluation pass use, because that kind is an input to the
             // verdict it re-derives (ADR 0064 D2).
             hort_formats::compiled_in_format_handlers(),
+            anchor_resolver.clone(),
         )
         // Inject the upstream-index cache
         // invalidator. The post-`block_one` hook calls it best-effort
@@ -3621,6 +3636,7 @@ pub async fn build_app_context(
             artifact_repo.clone(),
             lifecycle.clone(),
             curation_queue_repo,
+            anchor_resolver.clone(),
         ));
 
     // `PolicyUseCase` for the HTTP exclusion
@@ -3661,6 +3677,8 @@ pub async fn build_app_context(
         // the scan run uses, so the re-derived verdict reads the row's
         // role the way the scan read it (ADR 0064 D2).
         hort_formats::compiled_in_format_handlers(),
+        // The same anchor assembly every other hold path above takes.
+        anchor_resolver.clone(),
     ));
 
     // `WheelMetadataUseCase`. Composed over the

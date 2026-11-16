@@ -32,6 +32,7 @@ use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInva
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::ingest_use_case::{CLEARANCE_TRIGGER_SOURCE, PROVENANCE_VERIFY_KIND};
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::referenced_descendant::is_parent_gated_blob_constituent;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use hort_domain::ports::repository_repository::RepositoryRepository;
@@ -498,6 +499,15 @@ pub struct QuarantineUseCase {
     /// (see the call site) — for them the enqueued verify is
     /// state-neutral by construction.
     jobs: Arc<dyn JobsRepository>,
+    /// The one place a re-entry's quarantine anchor is assembled
+    /// ([`QuarantineAnchorResolver`]). Both this use case's hold paths
+    /// need it: `handle_non_rejecting_verdict`'s
+    /// `supersede_absent_verdict`, and
+    /// [`Self::hold_for_unproduced_composition`], which used to take
+    /// `paired.artifact().created_at` directly — the mint instant is
+    /// *one* candidate inside the derivation, and reading it here was a
+    /// second rule for deciding an anchor sitting beside the first.
+    anchor_resolver: Arc<QuarantineAnchorResolver>,
 }
 
 /// Shared read-only context threaded into the
@@ -570,6 +580,7 @@ impl QuarantineUseCase {
         content_references: Arc<dyn ContentReferenceIndex>,
         storage: Arc<dyn StoragePort>,
         jobs: Arc<dyn JobsRepository>,
+        anchor_resolver: Arc<QuarantineAnchorResolver>,
     ) -> Self {
         Self {
             artifacts,
@@ -582,6 +593,7 @@ impl QuarantineUseCase {
             include_repository_label: true,
             upstream_index_cache_invalidator: None,
             jobs,
+            anchor_resolver,
         }
     }
 
@@ -746,7 +758,8 @@ impl QuarantineUseCase {
         // design — the two events are deliberately distinct.
         let returned_to_hold = if artifact.quarantine_status == QuarantineStatus::ScanIndeterminate
         {
-            let quarantined = artifact.supersede_absent_verdict()?;
+            let derived = self.anchor_resolver.derive_for_re_entry(artifact).await;
+            let quarantined = artifact.supersede_absent_verdict(derived)?;
             tracing::info!(
                 artifact_id = %ctx.artifact_id,
                 correlation_id = %ctx.correlation_id,
@@ -2726,11 +2739,15 @@ impl QuarantineUseCase {
     ///   and has no window to fall back into. One `ArtifactQuarantined`
     ///   is appended and the status transitions, because leaving it alone
     ///   would serve an image whose filesystem nothing assessed. The
-    ///   window anchor is the artifact's own `created_at`, its ingest
-    ///   instant — the domain's documented default for the anchor, and
-    ///   the conservative choice of the two (a later anchor is a longer
-    ///   remaining window; ADR 0054's content-level evidence only ever
-    ///   moves it earlier). The
+    ///   window anchor is **derived**, through the one assembly every
+    ///   other hold path uses
+    ///   ([`QuarantineAnchorResolver::derive_for_re_entry`]): the row's
+    ///   own ingest instant is the unconditional candidate inside that
+    ///   derivation, and ADR 0054's content-level evidence may move the
+    ///   result earlier. Reading `created_at` here instead — which this
+    ///   method used to do — was a second rule for deciding an anchor
+    ///   sitting beside the first, and it anchored this population later
+    ///   than the evidence warranted. The
     ///   deadline is not a release authority in any case: with no
     ///   `ScanCompleted` on the stream the timer release's fail-closed
     ///   predicate refuses however long ago the window elapsed.
@@ -2804,7 +2821,18 @@ impl QuarantineUseCase {
         // that would take a stream sitting exactly on it past.
         refuse_append_past_cap(paired.stream_id(), paired.stream_len(), 1)?;
         let repository_id = paired.artifact().repository_id;
-        let window_start = paired.artifact().created_at;
+        // Composed with the artifact's stored window rather than read
+        // raw, even though the status check above means there is none (a
+        // `None`-status artifact carries no window — see
+        // `quarantine_transitions::tests::no_transition_returns_an_artifact_to_the_none_status`
+        // and the entity's `every_anchor_write_leaves_the_artifact_quarantined`).
+        // The composed form is the one that cannot lengthen a window if
+        // that invariant ever stops holding, and it costs nothing.
+        let window_start = self
+            .anchor_resolver
+            .derive_for_re_entry(paired.artifact())
+            .await
+            .re_entry_anchor(paired.artifact().quarantine_window_start);
         let event_payload = paired.artifact_mut().quarantine(window_start)?;
         let artifact = paired.into_artifact();
 
@@ -3039,6 +3067,12 @@ mod tests {
             content_references.clone(),
             storage.clone(),
             jobs,
+            Arc::new(QuarantineAnchorResolver::new(
+                artifacts.clone(),
+                content_references.clone(),
+                projections.clone(),
+                Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+            )),
         );
         (
             uc,
@@ -3117,6 +3151,12 @@ mod tests {
             content_references.clone(),
             storage.clone(),
             jobs.clone(),
+            Arc::new(QuarantineAnchorResolver::new(
+                artifacts.clone(),
+                content_references.clone(),
+                projections.clone(),
+                Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+            )),
         );
         (
             uc,
@@ -10672,6 +10712,50 @@ spec:
             1,
             "none → quarantined is the same count bump every other entry into the \
              hold makes"
+        );
+    }
+
+    /// **The anchor is derived, not read off `created_at`.** This site
+    /// used to take `paired.artifact().created_at` directly — a second
+    /// rule for deciding an anchor, standing beside
+    /// `derive_quarantine_anchor` and blind to every source but one. With
+    /// an earlier observation of the same bytes in another repository,
+    /// ADR 0054's content-level evidence moves the anchor there, and the
+    /// hold this method takes is already elapsed instead of starting a
+    /// fresh full window on content hort has held for months.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_anchors_on_the_content_age_evidence() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
+        let artifact = artifacts.get(artifact_id).expect("artifact");
+        // The same content, held in another repository since long before
+        // this row was minted.
+        let mut older = artifact.clone();
+        older.id = Uuid::new_v4();
+        older.repository_id = Uuid::new_v4();
+        older.created_at = artifact.created_at - chrono::Duration::days(90);
+        artifacts.insert(older.clone());
+
+        uc.hold_for_unproduced_composition(artifact_id, "upstream:timeout".into())
+            .await
+            .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _metadata) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_window_start,
+            Some(older.created_at),
+            "the window begins where hort can prove the bytes were already              published, not at the instant this row happened to be minted"
+        );
+        assert_eq!(
+            batch.events[0].event,
+            DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: older.created_at,
+            }),
+            "and the event announcing the hold carries the same anchor the row does"
         );
     }
 

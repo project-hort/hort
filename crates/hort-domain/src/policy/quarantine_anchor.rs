@@ -58,6 +58,26 @@
 //! untrusted mirror shorten the window of a repository proxying the genuine
 //! upstream.
 //!
+//! # One way in, one way out
+//!
+//! [`DerivedAnchor`]'s anchor is a **private field**, so the only way to
+//! obtain one is to call [`derive_quarantine_anchor`] over declared
+//! [`AnchorEvidence`]. That is deliberate and is the module's second job.
+//! The three methods on
+//! [`Artifact`](crate::entities::artifact::Artifact) that re-enter the
+//! hold — `supersede_absent_verdict`, `re_evaluate`'s re-quarantine arm
+//! and `repair_provenance_misrejection` — take a `DerivedAnchor` rather
+//! than a `DateTime<Utc>` for exactly this reason: a bare instant
+//! parameter accepts a wall-clock reading taken at the moment of the
+//! hold, which renews a window that must never renew, and a source scan
+//! cannot see a clock that arrives through an argument. The type is what
+//! closes that route; the scan
+//! (`crates/hort-app/tests/quarantine_anchor_is_artifact_time.rs`) is
+//! defence-in-depth behind it.
+//!
+//! Re-entry composes rather than re-deciding: see
+//! [`DerivedAnchor::re_entry_anchor`].
+//!
 //! # Missing evidence is not earlier evidence
 //!
 //! Absent age evidence — no prior observation, or a failed read of it —
@@ -160,12 +180,28 @@ pub enum AnchorSource {
 }
 
 /// The derived anchor plus what an operator needs to explain it.
+///
+/// **Only [`derive_quarantine_anchor`] can produce one.** The anchor
+/// itself is a private field read through [`Self::anchor`], which makes a
+/// literal `DerivedAnchor { .. }` a compile error outside this module —
+/// there is no other constructor and no `Default`. That is the whole
+/// reason the type exists rather than the three re-entry methods on
+/// [`Artifact`](crate::entities::artifact::Artifact) taking a bare
+/// `DateTime<Utc>`: an anchor parameter of that shape accepts a
+/// wall-clock reading taken at the moment of the hold, which is the
+/// defect those methods carried, and no source scan can see a clock that
+/// arrives through an argument. The two other fields stay public — they
+/// are observability, and nothing decides an anchor from them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DerivedAnchor {
     /// The instant to stamp as `quarantine_window_start`. The deadline is
     /// never stored — consumers compute it live via
     /// [`effective_quarantine_deadline`](super::effective_quarantine_deadline).
-    pub anchor: DateTime<Utc>,
+    ///
+    /// Private: see the type's own docs. [`Self::anchor`] reads it at a
+    /// mint, where there is no existing window; [`Self::re_entry_anchor`]
+    /// composes it with one.
+    anchor: DateTime<Utc>,
     /// The winning source.
     pub source: AnchorSource,
     /// Whether the future-skew clamp fired on
@@ -174,6 +210,42 @@ pub struct DerivedAnchor {
     /// physically impossible. Reported whether or not the clamped value
     /// went on to win, because the claim itself is the operator signal.
     pub upstream_clamp_fired: bool,
+}
+
+impl DerivedAnchor {
+    /// The derived anchor, for a caller that is **minting** the artifact
+    /// row and therefore has no existing window to compose with.
+    #[must_use]
+    pub const fn anchor(self) -> DateTime<Utc> {
+        self.anchor
+    }
+
+    /// The anchor to stamp when an artifact **re-enters** the hold:
+    /// `min(existing window, derived anchor)`.
+    ///
+    /// This is not a second rule beside the derivation — it is the
+    /// derivation's own direction applied to a row that already carries a
+    /// window. ADR 0054's evidence moves an anchor **earlier and never
+    /// later**, so "keep the window the artifact already has" is the case
+    /// `derived >= existing`, and "the content turned out to be older than
+    /// the row knew" is the case `derived < existing`. Taking the minimum
+    /// states both at once, and it cannot lengthen a window: an artifact
+    /// that has been serving for months never answers `503` for a fresh
+    /// full `quarantineDuration` because a later pass looked at it.
+    ///
+    /// `None` — the permissive-ingest population, downloadable under
+    /// `quarantineDuration: 0` and holding no window at all — resolves to
+    /// the derived anchor, whose unconditional `minted_at` candidate is
+    /// the row's own ingest instant. That is where the old
+    /// `unwrap_or(self.created_at)` fallback went: inside the derivation,
+    /// as the `minted_at` evidence it always was.
+    #[must_use]
+    pub fn re_entry_anchor(self, existing_window_start: Option<DateTime<Utc>>) -> DateTime<Utc> {
+        match existing_window_start {
+            Some(existing) => existing.min(self.anchor),
+            None => self.anchor,
+        }
+    }
 }
 
 /// Derive the quarantine-window anchor from the applicable age sources.
@@ -271,7 +343,7 @@ mod tests {
     #[test]
     fn no_evidence_resolves_to_the_mint_instant() {
         let derived = derive_quarantine_anchor(&bare());
-        assert_eq!(derived.anchor, ts(MINT));
+        assert_eq!(derived.anchor(), ts(MINT));
         assert_eq!(derived.source, AnchorSource::Mint);
         assert!(!derived.upstream_clamp_fired);
     }
@@ -282,7 +354,7 @@ mod tests {
             first_seen_at: Some(ts(MINT - 5_000)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT - 5_000));
+        assert_eq!(derived.anchor(), ts(MINT - 5_000));
         assert_eq!(derived.source, AnchorSource::FirstSeen);
     }
 
@@ -295,7 +367,7 @@ mod tests {
             first_seen_at: Some(ts(MINT + 5)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT));
+        assert_eq!(derived.anchor(), ts(MINT));
         assert_eq!(derived.source, AnchorSource::Mint);
     }
 
@@ -307,7 +379,7 @@ mod tests {
             first_seen_at: Some(ts(MINT)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT));
+        assert_eq!(derived.anchor(), ts(MINT));
         assert_eq!(derived.source, AnchorSource::Mint);
     }
 
@@ -321,7 +393,7 @@ mod tests {
             trusted_upstream_published_at: Some(ts(1)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(1));
+        assert_eq!(derived.anchor(), ts(1));
         assert_eq!(derived.source, AnchorSource::TrustedUpstreamPublish);
         assert!(!derived.upstream_clamp_fired);
     }
@@ -332,7 +404,7 @@ mod tests {
             trusted_upstream_published_at: Some(ts(MINT + 100_000)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT));
+        assert_eq!(derived.anchor(), ts(MINT));
         assert!(derived.upstream_clamp_fired);
         // The clamped value ties with the mint instant, so the mint keeps
         // the attribution — the upstream claim moved nothing.
@@ -345,7 +417,7 @@ mod tests {
             trusted_upstream_published_at: Some(ts(MINT)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT));
+        assert_eq!(derived.anchor(), ts(MINT));
         assert!(!derived.upstream_clamp_fired);
         assert_eq!(derived.source, AnchorSource::Mint);
     }
@@ -357,7 +429,7 @@ mod tests {
             trusted_upstream_published_at: Some(ts(MINT - 9_000)),
             ..bare()
         });
-        assert_eq!(upstream_earlier.anchor, ts(MINT - 9_000));
+        assert_eq!(upstream_earlier.anchor(), ts(MINT - 9_000));
         assert_eq!(
             upstream_earlier.source,
             AnchorSource::TrustedUpstreamPublish
@@ -368,7 +440,7 @@ mod tests {
             trusted_upstream_published_at: Some(ts(MINT - 1_000)),
             ..bare()
         });
-        assert_eq!(first_seen_earlier.anchor, ts(MINT - 9_000));
+        assert_eq!(first_seen_earlier.anchor(), ts(MINT - 9_000));
         assert_eq!(first_seen_earlier.source, AnchorSource::FirstSeen);
     }
 
@@ -384,7 +456,7 @@ mod tests {
             first_seen_at: Some(ts(MINT - 10)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT - 10));
+        assert_eq!(derived.anchor(), ts(MINT - 10));
         assert_eq!(derived.source, AnchorSource::FirstSeen);
     }
 
@@ -394,7 +466,7 @@ mod tests {
             inherits_released_parent_trust: true,
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT - WINDOW_SECS));
+        assert_eq!(derived.anchor(), ts(MINT - WINDOW_SECS));
         assert_eq!(derived.source, AnchorSource::ReferencedDescendant);
     }
 
@@ -407,7 +479,7 @@ mod tests {
             first_seen_at: Some(ts(MINT - WINDOW_SECS - 1)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT - WINDOW_SECS - 1));
+        assert_eq!(derived.anchor(), ts(MINT - WINDOW_SECS - 1));
         assert_eq!(derived.source, AnchorSource::FirstSeen);
     }
 
@@ -421,7 +493,7 @@ mod tests {
             first_seen_at: Some(ts(MINT - 10)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT - WINDOW_SECS));
+        assert_eq!(derived.anchor(), ts(MINT - WINDOW_SECS));
         assert_eq!(derived.source, AnchorSource::ReferencedDescendant);
     }
 
@@ -432,7 +504,7 @@ mod tests {
             trusted_upstream_published_at: Some(ts(1)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(1));
+        assert_eq!(derived.anchor(), ts(1));
         assert_eq!(derived.source, AnchorSource::TrustedUpstreamPublish);
     }
 
@@ -447,7 +519,7 @@ mod tests {
             window: Duration::zero(),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT));
+        assert_eq!(derived.anchor(), ts(MINT));
         assert_eq!(derived.source, AnchorSource::Mint);
     }
 
@@ -462,7 +534,7 @@ mod tests {
             inherits_released_parent_trust: true,
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT - 7));
+        assert_eq!(derived.anchor(), ts(MINT - 7));
         assert_eq!(derived.source, AnchorSource::Override);
     }
 
@@ -475,7 +547,7 @@ mod tests {
             first_seen_at: Some(ts(MINT - 500_000)),
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT));
+        assert_eq!(derived.anchor(), ts(MINT));
         assert_eq!(derived.source, AnchorSource::Override);
     }
 
@@ -503,7 +575,7 @@ mod tests {
             inherits_released_parent_trust: true,
             ..bare()
         });
-        assert_eq!(derived.anchor, ts(MINT - WINDOW_SECS));
+        assert_eq!(derived.anchor(), ts(MINT - WINDOW_SECS));
         assert_eq!(derived.source, AnchorSource::ReferencedDescendant);
     }
 
@@ -522,8 +594,89 @@ mod tests {
             trusted_upstream_published_at: Some(ts(MINT - 3)),
             ..bare()
         });
-        assert_eq!(a.anchor, b.anchor);
-        assert_eq!(a.anchor, ts(MINT - 4));
+        assert_eq!(a.anchor(), b.anchor());
+        assert_eq!(a.anchor(), ts(MINT - 4));
+    }
+
+    // -- re-entry composition ------------------------------------------
+
+    /// The existing window wins when the derivation is not earlier —
+    /// which is the ordinary case, and is why "keep the window the
+    /// artifact already has" needed no separate rule.
+    #[test]
+    fn re_entry_keeps_an_existing_window_the_derivation_does_not_beat() {
+        let derived = derive_quarantine_anchor(&bare());
+        assert_eq!(
+            derived.re_entry_anchor(Some(ts(MINT - 50_000))),
+            ts(MINT - 50_000)
+        );
+    }
+
+    /// …and the derived anchor wins when the content turned out to be
+    /// older than the row knew: ADR 0054's evidence moves an anchor
+    /// earlier, so a re-entry has to be able to take it.
+    #[test]
+    fn re_entry_takes_the_derived_anchor_when_it_is_earlier() {
+        let derived = derive_quarantine_anchor(&AnchorEvidence {
+            first_seen_at: Some(ts(MINT - 90_000)),
+            ..bare()
+        });
+        assert_eq!(
+            derived.re_entry_anchor(Some(ts(MINT - 10))),
+            ts(MINT - 90_000)
+        );
+    }
+
+    /// The population the old `unwrap_or(created_at)` fallback existed
+    /// for: no window at all. The derivation's unconditional `minted_at`
+    /// candidate answers it, which is where that fallback went.
+    #[test]
+    fn re_entry_with_no_existing_window_resolves_to_the_derived_anchor() {
+        let derived = derive_quarantine_anchor(&bare());
+        assert_eq!(derived.re_entry_anchor(None), ts(MINT));
+        assert_eq!(derived.re_entry_anchor(None), derived.anchor());
+    }
+
+    /// Equal is not a change — stated explicitly because `min` makes the
+    /// two cases indistinguishable and a reader should not have to
+    /// re-derive that.
+    #[test]
+    fn re_entry_is_idempotent_on_an_equal_anchor() {
+        let derived = derive_quarantine_anchor(&bare());
+        assert_eq!(derived.re_entry_anchor(Some(ts(MINT))), ts(MINT));
+    }
+
+    /// A re-entry can never lengthen a window, whatever the evidence —
+    /// the property the three entity methods stand on. An artifact whose
+    /// evidence is months old keeps an elapsed window instead of
+    /// answering `503` for a fresh full duration.
+    #[test]
+    fn re_entry_never_moves_an_anchor_later() {
+        for existing in [ts(1), ts(MINT - 1), ts(MINT), ts(MINT + 10_000)] {
+            for evidence in [
+                bare(),
+                AnchorEvidence {
+                    first_seen_at: Some(ts(MINT - 400_000)),
+                    ..bare()
+                },
+                AnchorEvidence {
+                    inherits_released_parent_trust: true,
+                    ..bare()
+                },
+                AnchorEvidence {
+                    explicit_override: Some(ts(MINT + 500)),
+                    ..bare()
+                },
+            ] {
+                let derived = derive_quarantine_anchor(&evidence);
+                assert!(
+                    derived.re_entry_anchor(Some(existing)) <= existing,
+                    "re-entry moved the anchor later: existing={existing}, \
+                     derived={:?}",
+                    derived
+                );
+            }
+        }
     }
 
     /// The derived anchor never lands after the mint instant, whatever the
@@ -544,7 +697,7 @@ mod tests {
             },
             bare(),
         ] {
-            assert!(derive_quarantine_anchor(&evidence).anchor <= ts(MINT));
+            assert!(derive_quarantine_anchor(&evidence).anchor() <= ts(MINT));
         }
     }
 }

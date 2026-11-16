@@ -7344,13 +7344,26 @@ impl ContentReferenceIndex for MockContentReferenceIndex {
 /// trait methods — see those docstrings.
 pub struct MockRepositoryUpstreamMappingRepository {
     entries: Mutex<HashMap<(Uuid, String), RepositoryUpstreamMapping>>,
+    /// Failure-injection for `list_for_repository`. Arms once, clears
+    /// after the first call — the same one-shot pattern the other
+    /// `fail_next_*` hooks in this file use. Used to pin the fail-safe
+    /// posture of the quarantine-anchor derivation: an unreadable
+    /// mapping set must leave the upstream publish claim out of the
+    /// minimum (a full window), never admit it unchecked.
+    next_list_for_repository_error: Mutex<Option<DomainError>>,
 }
 
 impl MockRepositoryUpstreamMappingRepository {
     pub fn new() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            next_list_for_repository_error: Mutex::new(None),
         }
+    }
+
+    /// Arm the next `list_for_repository` call to fail with `err`.
+    pub fn fail_next_list_for_repository(&self, err: DomainError) {
+        *self.next_list_for_repository_error.lock().unwrap() = Some(err);
     }
 
     pub fn entry_count(&self) -> usize {
@@ -7425,6 +7438,9 @@ impl RepositoryUpstreamMappingRepository for MockRepositoryUpstreamMappingReposi
         &self,
         repository_id: Uuid,
     ) -> BoxFuture<'_, DomainResult<Vec<RepositoryUpstreamMapping>>> {
+        if let Some(err) = self.next_list_for_repository_error.lock().unwrap().take() {
+            return Box::pin(async move { Err(err) });
+        }
         let mut out: Vec<RepositoryUpstreamMapping> = self
             .entries
             .lock()
@@ -11628,4 +11644,39 @@ pub mod tracing_capture {
         let events = std::mem::take(&mut *captured.lock().unwrap_or_else(PoisonError::into_inner));
         (outcome, events)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Quarantine-anchor assembly
+// ---------------------------------------------------------------------------
+
+/// A [`QuarantineAnchorResolver`] over four **empty** ports — for tests
+/// whose subject is not the quarantine anchor.
+///
+/// With no artifact rows, no `content_references` rows, no active
+/// `ScanPolicy` and no upstream mapping, the derivation has no source
+/// that can beat its unconditional mint-instant candidate, so every
+/// re-entry resolves to the artifact's own `created_at`. Composed with
+/// whatever window the artifact already carries, that is the
+/// conservative answer and exactly the one the retired
+/// `unwrap_or(self.created_at)` fallback produced — so a fixture that
+/// uses this resolver asserts the same anchor behaviour it asserted
+/// before the evidence became derivable.
+///
+/// A test whose subject **is** the anchor must not use this: build
+/// [`QuarantineAnchorResolver::new`] over the mocks it seeds, so the
+/// evidence it writes is the evidence the derivation reads.
+///
+/// [`QuarantineAnchorResolver`]: crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver
+/// [`QuarantineAnchorResolver::new`]: crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver::new
+pub fn anchor_resolver_without_evidence(
+) -> Arc<crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver> {
+    Arc::new(
+        crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver::new(
+            Arc::new(MockArtifactRepository::new()),
+            Arc::new(MockContentReferenceIndex::new()),
+            Arc::new(MockPolicyProjectionRepository::new()),
+            Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+        ),
+    )
 }

@@ -37,6 +37,18 @@
 //! `paired.artifact().created_at` and said why. One population, two
 //! contradictory anchors, and a comment is not a check.
 //!
+//! Replacing the clock with `created_at` closed the renewal, and left a
+//! **second rule for deciding an anchor** standing beside
+//! `derive_quarantine_anchor`: `created_at` is the derivation's own
+//! `minted_at` evidence, so a fallback that reaches for it outside the
+//! derivation is the same decision taken twice, in two places, with only
+//! one of them reading the rest of the evidence. All three methods now
+//! take a `DerivedAnchor` and stamp
+//! `DerivedAnchor::re_entry_anchor(self.quarantine_window_start)` —
+//! `min(existing window, derived anchor)`, which generalises "an existing
+//! window is kept" because ADR 0054's evidence moves an anchor earlier and
+//! never later.
+//!
 //! ## What the scan asks, and of which expressions
 //!
 //! Over `crates/*/src` production code, two kinds of site decide an
@@ -55,7 +67,8 @@
 //! function, resolved to a fixed point, which is the reach
 //! `db_tests_are_serialized` already demonstrates for helper chains. That
 //! reach is the one that matters here: all three defect sites read their
-//! anchor out of a local binding (`let anchor = …;`) rather than inline.
+//! anchor out of a local binding (`let anchor = …;`) rather than inline,
+//! and all three still do.
 //!
 //! ## Why the scope is derived rather than exempted
 //!
@@ -105,14 +118,25 @@
 //! evidence does not.
 //!
 //! The paired half of that, and the reason the parameter boundary is a
-//! close rather than a gap: `supersede_absent_verdict` and
-//! `repair_provenance_misrejection` **no longer take a `now` parameter at
-//! all**. A wall-clock reading cannot reach their anchor through an
-//! argument any more, so the only way back to the defect is a clock read
-//! written inside the function — which is exactly what this scan rejects.
-//! `re_evaluate` keeps `now` for its deadline comparison, and that is the
-//! one site where the guard and the signature do not between them forbid
-//! every route; its anchor expression is still read here.
+//! close rather than a gap: **the type closes it.** The three methods
+//! that re-enter the hold take a
+//! [`DerivedAnchor`](hort_domain::policy::DerivedAnchor), whose anchor is
+//! a private field, so the only way to obtain one is to call
+//! `derive_quarantine_anchor` over declared
+//! [`AnchorEvidence`](hort_domain::policy::AnchorEvidence). A caller
+//! cannot hand any of them a bare instant, which is what a scan over
+//! expressions structurally cannot see — a clock arriving through an
+//! argument is invisible to it, and handing a `DateTime<Utc>` parameter
+//! back would be a silent reversal no guard here could catch.
+//! `re_evaluate` keeps `now` for its deadline comparison and that is now
+//! harmless: `now` has no route to the anchor, because the anchor comes
+//! out of a type `now` cannot build.
+//!
+//! The companion guard on the assembly side is
+//! `anchor_evidence_is_assembled_once`, which holds that `AnchorEvidence`
+//! is built at exactly two places. Together: one rule, two assembly
+//! sites, one type out, and this scan as defence-in-depth behind all
+//! three.
 //!
 //! ## Counter-assertions
 //!
@@ -128,8 +152,8 @@
 //!   renamed field or method cannot empty the scan silently.
 //! * [`re_introducing_a_clock_read_fails_the_scan`] — a mutation over
 //!   **real on-disk source**, not a planted fixture: put `Utc::now()` back
-//!   where it was and watch four sites report, two of them reached only
-//!   through the local binding.
+//!   where it was and watch six sites report, every one of them reached
+//!   only through the local binding.
 //!
 //! ## Blind spots — read these before trusting a green run
 //!
@@ -141,8 +165,9 @@
 //! * **An anchor arriving as a function parameter or a struct field**
 //!   (`ctx.now`) is not followed either. For the ingest path that is the
 //!   right answer (above); for a future method it is a real gap, and the
-//!   thing that closes it is not widening this scan but declining to take
-//!   a clock parameter — which is why Unit 1 removed the two that existed.
+//!   thing that closes it is not widening this scan but declining to
+//!   accept an instant at all — which is what the `DerivedAnchor`
+//!   parameter type does for the three methods that re-enter the hold.
 //! * **A `quarantine_window_start` shorthand struct initialiser** is read
 //!   as the local binding of the same name it is, so it is covered only
 //!   when that `let` is in the same function.
@@ -708,20 +733,35 @@ fn the_scan_still_finds_every_domain_anchor_write() {
             ),
             (
                 "re_evaluate".to_string(),
+                "assignment",
+                "Some(anchor)".to_string()
+            ),
+            (
+                "re_evaluate".to_string(),
                 "field-init",
-                "self.quarantine_window_start.unwrap_or(self.created_at)".to_string()
+                "anchor".to_string()
+            ),
+            (
+                "repair_provenance_misrejection".to_string(),
+                "assignment",
+                "Some(anchor)".to_string()
             ),
             (
                 "repair_provenance_misrejection".to_string(),
                 "field-init",
-                "self.quarantine_window_start.unwrap_or(self.created_at)".to_string()
+                "anchor".to_string()
             ),
         ],
         "the entity's anchor writes are the sites the defect lived at. \
          `supersede_absent_verdict`, `re_evaluate` and \
-         `repair_provenance_misrejection` each re-enter the hold, and each must take \
-         the artifact's existing window or its ingest instant — never a clock. If this \
-         list has shrunk, the scan stopped reading one of them"
+         `repair_provenance_misrejection` each re-enter the hold, and each must stamp \
+         `DerivedAnchor::re_entry_anchor` over the window the artifact already \
+         carries — never a clock, and never a second rule of its own. Each writes the \
+         anchor twice, on the row and on the event, because a `Quarantined` row with a \
+         NULL anchor is invisible to the release-candidacy query and a row whose \
+         anchor disagrees with the event that announced it describes a window no \
+         reader can confirm. If this list has shrunk, the scan stopped reading one of \
+         them"
     );
 }
 
@@ -765,7 +805,7 @@ fn the_scan_reads_a_real_corpus() {
                 "crates/hort-app/src/use_cases/quarantine_use_case.rs".to_string(),
                 2
             ),
-            ("crates/hort-domain/src/entities/artifact.rs".to_string(), 6),
+            ("crates/hort-domain/src/entities/artifact.rs".to_string(), 8),
             (
                 "crates/hort-domain/src/retention/held_state_entry.rs".to_string(),
                 1
@@ -788,11 +828,20 @@ fn the_scan_reads_a_real_corpus() {
 /// Over a clean tree the classifier and a broken classifier agree on the
 /// verdict and differ only in what they read, so nothing else here can
 /// tell them apart. One substitution exercises both halves of the
-/// predicate at once, which is why it is the one chosen: the expression
-/// appears three times in the entity, and at `supersede_absent_verdict`
-/// it is the initialiser of the `let anchor` the two sites there read —
-/// so two of the four reports are direct hits and two are reached only
-/// through the local binding.
+/// predicate at once, which is why it is the one chosen: the composed
+/// stamp appears three times in the entity, once per method that
+/// re-enters the hold, and each time as the initialiser of the `let
+/// anchor` that method's two anchor writes read. So **all six** reports
+/// are reached only through the local binding — if any is missing, the
+/// scan is not following a binding and the defect's actual shape would
+/// pass it.
+///
+/// The substituted expression is the `Option` the composition takes, not
+/// the whole call: a clock reading smuggled in as "the window the
+/// artifact already carries" is precisely the shape the retired
+/// `unwrap_or(now)` fallback had, and `min(now, derived)` would still
+/// pick the derived anchor, so the *defect* here is the clock reaching
+/// the expression at all rather than the value it produces.
 #[test]
 fn re_introducing_a_clock_read_fails_the_scan() {
     let root = workspace_root();
@@ -812,18 +861,15 @@ fn re_introducing_a_clock_read_fails_the_scan() {
             .collect::<Vec<_>>()
     );
 
-    let fallback = "self.quarantine_window_start.unwrap_or(self.created_at)";
+    let composed = "derived.re_entry_anchor(self.quarantine_window_start)";
     assert_eq!(
-        source.matches(fallback).count(),
+        source.matches(composed).count(),
         3,
-        "the mutation substitutes the ingest-instant fallback, so the entity must \
-         still spell it the way this test does — once as the `let anchor` initialiser \
-         and once in each of the two event literals"
+        "the mutation substitutes the re-entry composition, so the entity must still \
+         spell it the way this test does — once per method that re-enters the hold, as \
+         the initialiser of that method's `let anchor`"
     );
-    let mutated = source.replace(
-        fallback,
-        "self.quarantine_window_start.unwrap_or(Utc::now())",
-    );
+    let mutated = source.replace(composed, "derived.re_entry_anchor(Some(Utc::now()))");
 
     let reported: Vec<(String, SiteKind)> = anchor_sites(rel, &mutated)
         .into_iter()
@@ -836,16 +882,21 @@ fn re_introducing_a_clock_read_fails_the_scan() {
         vec![
             ("supersede_absent_verdict".to_string(), SiteKind::Assignment),
             ("supersede_absent_verdict".to_string(), SiteKind::FieldInit),
+            ("re_evaluate".to_string(), SiteKind::Assignment),
             ("re_evaluate".to_string(), SiteKind::FieldInit),
+            (
+                "repair_provenance_misrejection".to_string(),
+                SiteKind::Assignment
+            ),
             (
                 "repair_provenance_misrejection".to_string(),
                 SiteKind::FieldInit
             ),
         ],
-        "re-introducing the clock read must report all four sites. The two in \
-         `supersede_absent_verdict` are reached ONLY through the `let anchor` binding, \
-         so if they are missing the scan is not following a local binding and the \
-         defect's actual shape would pass it"
+        "re-introducing the clock read must report all six sites, every one of them \
+         reached ONLY through the `let anchor` binding. A short list means the scan \
+         stopped following a local binding, which is the one reach the defect's actual \
+         shape needed"
     );
 }
 

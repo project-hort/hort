@@ -13,7 +13,7 @@ use crate::events::{
     DomainEvent, ProvenanceRejected, ProvenanceVerified, RejectionReason, ReleaseReason,
     ScanIndeterminate,
 };
-use crate::policy::ScanOutcome;
+use crate::policy::{DerivedAnchor, ScanOutcome};
 use crate::ports::provenance::{
     ProvenanceOutcome, ProvenanceRejectReason, ProvenanceVerdict, SignerIdentity,
 };
@@ -1033,31 +1033,30 @@ impl Artifact {
     /// partition of the policy verdict, exactly as it already is between
     /// `record_clean_scan` and `reject_from_scan`.
     ///
-    /// The observation-window anchor is **restored, not restarted**, and
-    /// either way it is the artifact's own time evidence: the window the
-    /// artifact already carries when it has one — an artifact that
-    /// reached `ScanIndeterminate` from `Quarantined` keeps the window
-    /// that was already running, which is the window the release gate
-    /// reads — and its ingest instant, [`Self::created_at`], otherwise.
-    /// The population with no window is the one that reached the state
-    /// from `None` under `quarantineDuration: 0`; `created_at` is never
-    /// absent for it, so the requirement the fallback exists for is still
-    /// met — a `Quarantined` artifact with no anchor is one no
-    /// release-candidacy query can see, and the method must not produce a
-    /// hold that nothing can decide. It is the same anchor
-    /// `QuarantineUseCase::hold_for_unproduced_composition` already takes
-    /// for the same population, and the conservative of the two choices
-    /// available here: a later anchor is a longer remaining window, and
-    /// ADR 0054's content-level evidence only ever moves an anchor
-    /// earlier than the ingest instant. A quarantine begins where hort
+    /// The observation-window anchor is **restored, not restarted**:
+    /// `min(existing window, derived anchor)`, via
+    /// [`DerivedAnchor::re_entry_anchor`]. A quarantine begins where hort
     /// can prove the artifact was already published, so the anchor is a
     /// property of the artifact and not of the run that happens to look
-    /// at it — which is why this method reads no clock at all.
+    /// at it — which is why `derived` is a [`DerivedAnchor`] rather than
+    /// an instant this method could read off a clock. An artifact that
+    /// reached `ScanIndeterminate` from `Quarantined` keeps the window
+    /// that was already running unless the content-level evidence has
+    /// since moved earlier; the population with no window — the one that
+    /// reached the state from `None` under `quarantineDuration: 0` —
+    /// takes the derived anchor, whose unconditional `minted_at`
+    /// candidate is this row's own ingest instant. Either way a
+    /// `Quarantined` artifact never leaves here anchor-less, which it
+    /// must not: no release-candidacy query can see such a row, so the
+    /// method would otherwise produce a hold nothing can decide.
     ///
     /// Refuses with [`DomainError::Invariant`] **without mutating**, so a
     /// caller can record the fresh scan evidence and withhold only the
     /// transition.
-    pub fn supersede_absent_verdict(&mut self) -> DomainResult<ArtifactQuarantined> {
+    pub fn supersede_absent_verdict(
+        &mut self,
+        derived: DerivedAnchor,
+    ) -> DomainResult<ArtifactQuarantined> {
         if quarantine_transitions::allowed_targets(
             QuarantineEvent::SupersedeAbsentVerdict,
             self.quarantine_status,
@@ -1070,7 +1069,7 @@ impl Artifact {
             )));
         }
         self.quarantine_status = QuarantineStatus::Quarantined;
-        let anchor = self.quarantine_window_start.unwrap_or(self.created_at);
+        let anchor = derived.re_entry_anchor(self.quarantine_window_start);
         self.quarantine_window_start = Some(anchor);
         Ok(ArtifactQuarantined {
             artifact_id: self.id,
@@ -2046,7 +2045,16 @@ impl Artifact {
     /// `provenance` and `curation` are verified facts the application
     /// layer computes from the live provenance state / curation rules and
     /// passes in (mirroring the [`ProvenanceClearance`] param on
-    /// [`Self::release`]); the domain stays pure (no I/O).
+    /// [`Self::release`]); the domain stays pure (no I/O). `derived` is
+    /// the same shape for the artifact's age evidence: the application
+    /// layer owns the reads ADR 0054's sources need, and the
+    /// re-quarantine arm stamps
+    /// [`DerivedAnchor::re_entry_anchor`] over it. A
+    /// [`DerivedAnchor`] can only come from
+    /// [`derive_quarantine_anchor`](crate::policy::derive_quarantine_anchor),
+    /// so no wall-clock reading can reach the anchor through this
+    /// parameter — `now` is for the deadline comparison below and
+    /// nothing else.
     ///
     /// **(c) gates the whole method; (b) gates only the release arm.**
     /// The asymmetry is not a judgement about which axis matters more —
@@ -2084,6 +2092,7 @@ impl Artifact {
         now: DateTime<Utc>,
         provenance: ProvenanceClearance,
         curation: CurationClearance,
+        derived: DerivedAnchor,
     ) -> DomainResult<DomainEvent> {
         if quarantine_transitions::allowed_targets(
             QuarantineEvent::ReEvaluate,
@@ -2137,11 +2146,18 @@ impl Artifact {
             // conjunct is already settled above, because that release
             // cannot ask it.
             self.rejection_reason = None;
+            // The re-quarantine preserves the original anchor — the
+            // observation window is unchanged, not restarted.
+            let anchor = derived.re_entry_anchor(self.quarantine_window_start);
+            // On the row as well as on the event, because the two must
+            // agree: a `Quarantined` row whose anchor is NULL is invisible
+            // to the release-candidacy query (`quarantine_window_start IS
+            // NOT NULL`), and a row whose anchor disagrees with the event
+            // that announced it describes a window no reader can confirm.
+            self.quarantine_window_start = Some(anchor);
             Ok(DomainEvent::ArtifactQuarantined(ArtifactQuarantined {
                 artifact_id: self.id,
-                // The re-quarantine preserves the original anchor — the
-                // observation window is unchanged, not restarted.
-                quarantine_window_start: self.quarantine_window_start.unwrap_or(self.created_at),
+                quarantine_window_start: anchor,
             }))
         } else {
             // (b) The release arm additionally requires provenance to
@@ -2293,10 +2309,17 @@ impl Artifact {
     /// rejection to the next reader. (For this population the column is
     /// already `None`; the assignment states the invariant rather than
     /// relying on the field's incoming value.)
+    ///
+    /// `derived` is the artifact's age evidence, resolved by the
+    /// application layer and composed with the existing window by
+    /// [`DerivedAnchor::re_entry_anchor`] — the same shape as
+    /// `terminal_record` and `provenance`, and for the same reason: the
+    /// evidence needs I/O and the domain does none.
     pub fn repair_provenance_misrejection(
         &mut self,
         terminal_record: TerminalRejectionRecord,
         provenance: ProvenanceRejectionEvidence,
+        derived: DerivedAnchor,
     ) -> DomainResult<ArtifactQuarantined> {
         if quarantine_transitions::allowed_targets(
             QuarantineEvent::RepairProvenanceMisrejection,
@@ -2361,11 +2384,20 @@ impl Artifact {
 
         self.quarantine_status = QuarantineStatus::Quarantined;
         self.rejection_reason = None;
+        // The original anchor — the observation window is restored,
+        // not restarted.
+        let anchor = derived.re_entry_anchor(self.quarantine_window_start);
+        // On the row as well as on the event — see
+        // [`Self::re_evaluate`]'s re-quarantine arm for why they must
+        // agree. The population this repair reaches is exactly the one
+        // where it matters: a `Rejected` artifact can carry no window at
+        // all (`reject_from_scan` is admissible from `None` under
+        // `quarantineDuration: 0`), and leaving the row NULL would hand
+        // the release sweep an artifact its candidacy query cannot see.
+        self.quarantine_window_start = Some(anchor);
         Ok(ArtifactQuarantined {
             artifact_id: self.id,
-            // The original anchor — the observation window is restored,
-            // not restarted.
-            quarantine_window_start: self.quarantine_window_start.unwrap_or(self.created_at),
+            quarantine_window_start: anchor,
         })
     }
 
@@ -2787,6 +2819,38 @@ mod tests {
 
     const VALID_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+    /// A [`DerivedAnchor`] resolving to exactly `at`.
+    ///
+    /// Built through [`derive_quarantine_anchor`] because that is the
+    /// only way to build one at all — the type's anchor is private, so a
+    /// test reaches an anchor by the same route production does and
+    /// cannot hand the entity an instant nothing derived.
+    fn derived_at(at: DateTime<Utc>) -> DerivedAnchor {
+        crate::policy::derive_quarantine_anchor(&crate::policy::AnchorEvidence {
+            minted_at: at,
+            window: chrono::Duration::zero(),
+            explicit_override: None,
+            first_seen_at: None,
+            trusted_upstream_published_at: None,
+            inherits_released_parent_trust: false,
+        })
+    }
+
+    /// The anchor a re-entry on `a` derives when the mint instant is the
+    /// only applicable evidence — the unconditional candidate, and
+    /// therefore the answer the application layer reaches whenever hort
+    /// holds no earlier observation of these bytes.
+    ///
+    /// Production cannot stamp a window *later* than the row's own
+    /// `created_at`: the mint derivation's unconditional candidate is
+    /// that instant, and every other source only moves the result
+    /// earlier. So on an artifact that already carries a window this
+    /// helper is the "the derivation is not earlier" direction, and
+    /// [`derived_at`] with an earlier instant is the other one.
+    fn derived_from_mint(a: &Artifact) -> DerivedAnchor {
+        derived_at(a.created_at)
+    }
+
     fn sample_artifact() -> Artifact {
         Artifact {
             id: Uuid::nil(),
@@ -3020,6 +3084,83 @@ mod tests {
         ));
     }
 
+    /// **The other half of "a `None`-status artifact carries no
+    /// window".** Every entity method that writes
+    /// `quarantine_window_start` leaves the status `Quarantined` — so a
+    /// window and a `None` status cannot coexist, and a reader asking
+    /// "was this artifact ever quarantined?" gets the same answer from
+    /// either field.
+    ///
+    /// The four writers are exhaustive by census, not by assumption: the
+    /// structural guard
+    /// `crates/hort-app/tests/quarantine_anchor_is_artifact_time.rs::the_scan_still_finds_every_domain_anchor_write`
+    /// enumerates every anchor write in this file, and a fifth would have
+    /// to be added there before it could land here unnoticed. The `None`
+    /// side is pinned by
+    /// `quarantine_transitions::tests::no_transition_returns_an_artifact_to_the_none_status`:
+    /// no event moves a quarantined artifact back to `None`, so the
+    /// window these methods stamp outlives nothing that could reset the
+    /// status under it.
+    #[test]
+    fn every_anchor_write_leaves_the_artifact_quarantined() {
+        // 1. `quarantine` — the mint path's writer.
+        let mut minted = sample_artifact();
+        minted
+            .quarantine(minted.created_at)
+            .expect("`None` is a quarantine source state");
+        assert!(minted.quarantine_window_start.is_some());
+        assert_eq!(minted.quarantine_status, QuarantineStatus::Quarantined);
+
+        // 2. `supersede_absent_verdict`.
+        let mut superseded = scan_indeterminate_artifact();
+        superseded.quarantine_window_start = None;
+        superseded
+            .supersede_absent_verdict(derived_from_mint(&superseded))
+            .expect("a reached verdict is admissible from scan_indeterminate");
+        assert!(superseded.quarantine_window_start.is_some());
+        assert_eq!(superseded.quarantine_status, QuarantineStatus::Quarantined);
+
+        // 3. `re_evaluate`'s re-quarantine arm.
+        let mut requarantined = rejected_artifact();
+        requarantined.quarantine_window_start = None;
+        requarantined.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
+        let (prov, cur) = clears();
+        requarantined
+            .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&requarantined))
+            .expect("an in-window scan-clearable rejection re-quarantines");
+        assert!(requarantined.quarantine_window_start.is_some());
+        assert_eq!(
+            requarantined.quarantine_status,
+            QuarantineStatus::Quarantined
+        );
+
+        // 4. `repair_provenance_misrejection`.
+        let mut repaired = stranded_artifact();
+        repaired.quarantine_window_start = None;
+        repaired
+            .repair_provenance_misrejection(
+                TerminalRejectionRecord::Absent,
+                ProvenanceRejectionEvidence::Contradicted,
+                derived_from_mint(&repaired),
+            )
+            .expect("the three-conjunct state is exactly what this repairs");
+        assert!(repaired.quarantine_window_start.is_some());
+        assert_eq!(repaired.quarantine_status, QuarantineStatus::Quarantined);
+
+        // The release arm is the counter-case that makes the statement
+        // non-vacuous: it is the one `re_evaluate` outcome that does NOT
+        // stamp an anchor, and it does not leave a `None` status either.
+        let mut released = rejected_artifact();
+        released.quarantine_window_start = None;
+        released.quarantine_deadline = None;
+        let (prov, cur) = clears();
+        released
+            .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&released))
+            .expect("an elapsed window with both conjuncts clear releases");
+        assert_eq!(released.quarantine_status, QuarantineStatus::Released);
+        assert!(released.quarantine_window_start.is_none());
+    }
+
     // -- State machine: supersede_absent_verdict ----------------------------
     //
     // ADR 0007, "A reached verdict supersedes an absent one": the
@@ -3032,12 +3173,17 @@ mod tests {
         let mut a = scan_indeterminate_artifact();
         let anchor = Utc::now() - chrono::Duration::days(3);
         a.quarantine_window_start = Some(anchor);
-        // Distinct from the anchor, so the assertions below cannot pass
-        // on a method that reached for the fallback instead.
-        a.created_at = Utc::now() - chrono::Duration::days(30);
+        // Distinct from the anchor, and LATER than it, which is the only
+        // ordering production can produce: the mint derivation's
+        // unconditional candidate is this instant and every other source
+        // only moves the result earlier, so a stored window is never
+        // after the row's own ingest instant. Distinct is what makes the
+        // assertions below fail for a method that stamped the derived
+        // anchor instead of composing it with the window already running.
+        a.created_at = anchor + chrono::Duration::hours(1);
 
         let event = a
-            .supersede_absent_verdict()
+            .supersede_absent_verdict(derived_from_mint(&a))
             .expect("a reached verdict is admissible from scan_indeterminate");
 
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
@@ -3049,11 +3195,34 @@ mod tests {
         assert_eq!(a.quarantine_window_start, Some(anchor));
         assert_ne!(
             event.quarantine_window_start, a.created_at,
-            "an artifact that carries a window keeps it — the ingest instant is \
-             the fallback for the population that has none, not a replacement"
+            "an artifact that carries a window keeps it — the mint instant is \
+             one candidate inside the derivation, not a replacement for the \
+             window already in force"
         );
         // Never `Released`: the release decision stays with the gate.
         assert!(!a.is_downloadable());
+    }
+
+    /// The other direction, and the reason the stamp is a `min` rather
+    /// than "keep whatever is stored": ADR 0054's content-level evidence
+    /// can move an anchor **earlier** after the row was stamped — hort
+    /// ingests the same bytes into a second repository and discovers it
+    /// has held them for months, or an operator enables an upstream's
+    /// `trust_upstream_publish_time`. A re-entry takes that anchor.
+    #[test]
+    fn supersede_absent_verdict_takes_an_earlier_derived_anchor() {
+        let mut a = scan_indeterminate_artifact();
+        let stored = Utc::now() - chrono::Duration::hours(2);
+        a.quarantine_window_start = Some(stored);
+        a.created_at = stored;
+        let older = Utc::now() - chrono::Duration::days(90);
+
+        let event = a
+            .supersede_absent_verdict(derived_at(older))
+            .expect("a reached verdict is admissible from scan_indeterminate");
+
+        assert_eq!(event.quarantine_window_start, older);
+        assert_eq!(a.quarantine_window_start, Some(older));
     }
 
     /// The one population with no anchor — it reached
@@ -3075,7 +3244,9 @@ mod tests {
         a.quarantine_window_start = None;
         a.created_at = Utc::now() - chrono::Duration::days(30);
 
-        let event = a.supersede_absent_verdict().expect("admissible");
+        let event = a
+            .supersede_absent_verdict(derived_from_mint(&a))
+            .expect("admissible");
 
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
         assert_eq!(event.quarantine_window_start, a.created_at);
@@ -3097,7 +3268,7 @@ mod tests {
             let before = a.quarantine_status;
             let before_anchor = a.quarantine_window_start;
             let err = a
-                .supersede_absent_verdict()
+                .supersede_absent_verdict(derived_from_mint(&a))
                 .expect_err("only scan_indeterminate is admissible");
             match err {
                 DomainError::Invariant(msg) => assert!(
@@ -3708,6 +3879,7 @@ mod tests {
             Utc::now(),
             ProvenanceClearance::NotRequired,
             CurationClearance::Cleared,
+            derived_from_mint(&a),
         );
         assert!(matches!(result, Err(DomainError::Invariant(_))));
         assert_eq!(a.quarantine_status, QuarantineStatus::Rejected);
@@ -4051,6 +4223,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::NotRequired,
                 CurationClearance::Cleared,
+                derived_from_mint(&a),
             )
             .expect_err("a policy re-evaluation never clears a curator's block");
         assert!(matches!(err, DomainError::Invariant(_)));
@@ -4072,6 +4245,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::Cleared,
                 CurationClearance::Cleared,
+                derived_from_mint(&a),
             )
             .expect_err("a scan re-judgement never clears a provenance disproof");
         assert!(matches!(err, DomainError::Invariant(_)));
@@ -5009,6 +5183,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::Cleared,
                 CurationClearance::Cleared,
+                derived_from_mint(&a),
             )
             .expect_err("a provenance rejection is not scan-clearable");
         assert!(matches!(err, DomainError::Invariant(_)));
@@ -5571,7 +5746,8 @@ mod tests {
             a.re_evaluate(
                 Utc::now(),
                 ProvenanceClearance::NotRequired,
-                CurationClearance::Cleared
+                CurationClearance::Cleared,
+                derived_from_mint(&a),
             ),
             Err(DomainError::Invariant(_))
         ));
@@ -5608,7 +5784,9 @@ mod tests {
         a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
         let now = Utc::now();
         let (prov, cur) = clears();
-        let event = a.re_evaluate(now, prov, cur).unwrap();
+        let event = a
+            .re_evaluate(now, prov, cur, derived_from_mint(&a))
+            .unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
         assert!(matches!(event, DomainEvent::ArtifactQuarantined(_)));
         // The re-quarantine clears the scan reason — the artifact is now
@@ -5622,7 +5800,9 @@ mod tests {
         a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
         let now = Utc::now();
         let (prov, cur) = clears();
-        let event = a.re_evaluate(now, prov, cur).unwrap();
+        let event = a
+            .re_evaluate(now, prov, cur, derived_from_mint(&a))
+            .unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
         assert_eq!(a.rejection_reason, None);
         match event {
@@ -5639,7 +5819,9 @@ mod tests {
         let now = Utc::now();
         a.quarantine_deadline = Some(now);
         let (prov, cur) = clears();
-        let event = a.re_evaluate(now, prov, cur).unwrap();
+        let event = a
+            .re_evaluate(now, prov, cur, derived_from_mint(&a))
+            .unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
         assert!(matches!(event, DomainEvent::ArtifactReleased(_)));
     }
@@ -5649,7 +5831,9 @@ mod tests {
         let mut a = rejected_artifact();
         a.quarantine_deadline = None;
         let (prov, cur) = clears();
-        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
+        let event = a
+            .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a))
+            .unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
         assert!(matches!(event, DomainEvent::ArtifactReleased(_)));
     }
@@ -5670,7 +5854,9 @@ mod tests {
         // ...but the computed deadline is still in the future.
         a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(18));
         let (prov, cur) = clears();
-        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
+        let event = a
+            .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a))
+            .unwrap();
         assert_eq!(
             a.quarantine_status,
             QuarantineStatus::Quarantined,
@@ -5697,19 +5883,50 @@ mod tests {
         let mut a = rejected_artifact();
         let anchor = Utc::now() - chrono::Duration::hours(6);
         a.quarantine_window_start = Some(anchor);
-        a.created_at = Utc::now() - chrono::Duration::days(30);
+        // After the anchor — see the note in
+        // `supersede_absent_verdict_from_scan_indeterminate_returns_to_the_hold`
+        // on why that is the only ordering production reaches.
+        a.created_at = anchor + chrono::Duration::hours(1);
         a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(18));
         let (prov, cur) = clears();
 
-        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
+        let event = a
+            .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a))
+            .unwrap();
 
         match event {
             DomainEvent::ArtifactQuarantined(e) => {
                 assert_eq!(e.quarantine_window_start, anchor);
                 assert_ne!(
                     e.quarantine_window_start, a.created_at,
-                    "the ingest instant is the fallback, not a replacement"
+                    "the mint instant is one candidate inside the derivation, not a \
+                     replacement for the window already in force"
                 );
+            }
+            other => panic!("expected ArtifactQuarantined, got {other:?}"),
+        }
+    }
+
+    /// The `min`'s other direction on the re-quarantine arm — see
+    /// `supersede_absent_verdict_takes_an_earlier_derived_anchor` for
+    /// why a stored anchor is not the end of the question.
+    #[test]
+    fn re_evaluate_re_quarantine_takes_an_earlier_derived_anchor() {
+        let mut a = rejected_artifact();
+        let stored = Utc::now() - chrono::Duration::hours(6);
+        a.quarantine_window_start = Some(stored);
+        a.created_at = stored;
+        a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(18));
+        let older = Utc::now() - chrono::Duration::days(90);
+        let (prov, cur) = clears();
+
+        let event = a
+            .re_evaluate(Utc::now(), prov, cur, derived_at(older))
+            .unwrap();
+
+        match event {
+            DomainEvent::ArtifactQuarantined(e) => {
+                assert_eq!(e.quarantine_window_start, older);
             }
             other => panic!("expected ArtifactQuarantined, got {other:?}"),
         }
@@ -5723,9 +5940,15 @@ mod tests {
         a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(18));
         let (prov, cur) = clears();
 
-        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
+        let event = a
+            .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a))
+            .unwrap();
 
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
+        // On the row too: a `Quarantined` artifact whose anchor is NULL
+        // is invisible to the release-candidacy query, so the arm would
+        // otherwise trade one dead end for another.
+        assert_eq!(a.quarantine_window_start, Some(a.created_at));
         match event {
             DomainEvent::ArtifactQuarantined(e) => {
                 assert_eq!(e.quarantine_window_start, a.created_at);
@@ -5739,7 +5962,7 @@ mod tests {
         let mut a = sample_artifact();
         let (prov, cur) = clears();
         assert!(matches!(
-            a.re_evaluate(Utc::now(), prov, cur),
+            a.re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a)),
             Err(DomainError::Invariant(_))
         ));
     }
@@ -5749,7 +5972,7 @@ mod tests {
         let mut a = quarantined_artifact();
         let (prov, cur) = clears();
         assert!(matches!(
-            a.re_evaluate(Utc::now(), prov, cur),
+            a.re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a)),
             Err(DomainError::Invariant(_))
         ));
     }
@@ -5759,7 +5982,7 @@ mod tests {
         let mut a = released_artifact();
         let (prov, cur) = clears();
         assert!(matches!(
-            a.re_evaluate(Utc::now(), prov, cur),
+            a.re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a)),
             Err(DomainError::Invariant(_))
         ));
     }
@@ -5788,7 +6011,9 @@ mod tests {
             // Elapsed window — would release under the old reason-blind path.
             a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
             let (prov, cur) = clears();
-            let err = a.re_evaluate(Utc::now(), prov, cur).unwrap_err();
+            let err = a
+                .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a))
+                .unwrap_err();
             assert!(
                 matches!(err, DomainError::Invariant(_)),
                 "reason {reason:?} must be ineligible"
@@ -5815,6 +6040,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::Pending,
                 CurationClearance::Cleared,
+                derived_from_mint(&a),
             )
             .unwrap_err();
         assert!(matches!(err, DomainError::Invariant(_)));
@@ -5837,6 +6063,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::NotRequired,
                 CurationClearance::Blocked,
+                derived_from_mint(&a),
             )
             .unwrap_err();
         assert!(matches!(err, DomainError::Invariant(_)));
@@ -5858,7 +6085,9 @@ mod tests {
         for (prov, cur) in blocking {
             let mut a = rejected_artifact();
             a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
-            let err = a.re_evaluate(Utc::now(), prov, cur).unwrap_err();
+            let err = a
+                .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a))
+                .unwrap_err();
             assert!(
                 matches!(err, DomainError::Invariant(_)),
                 "({prov:?}, {cur:?}) must block release"
@@ -5874,7 +6103,12 @@ mod tests {
             let mut a = rejected_artifact();
             a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
             assert!(a
-                .re_evaluate(Utc::now(), prov, CurationClearance::Cleared)
+                .re_evaluate(
+                    Utc::now(),
+                    prov,
+                    CurationClearance::Cleared,
+                    derived_from_mint(&a)
+                )
                 .is_ok());
             assert_eq!(a.quarantine_status, QuarantineStatus::Released);
         }
@@ -5895,6 +6129,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::Pending,
                 CurationClearance::Cleared,
+                derived_from_mint(&a),
             )
             .unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
@@ -5919,6 +6154,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::NotRequired,
                 CurationClearance::Blocked,
+                derived_from_mint(&a),
             )
             .unwrap_err();
         assert!(
@@ -5945,6 +6181,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::NotRequired,
                 CurationClearance::Cleared,
+                derived_from_mint(&a),
             )
             .unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
@@ -6284,7 +6521,7 @@ mod tests {
         a.quarantine_deadline = Some(Utc::now() - chrono::Duration::hours(1));
         let (prov, cur) = clears();
         let event = a
-            .re_evaluate(Utc::now(), prov, cur)
+            .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a))
             .expect("a ScanPolicyRetroactive rejection is scan-clearable");
         assert_eq!(a.quarantine_status, QuarantineStatus::Released);
         assert_eq!(a.rejection_reason, None);
@@ -6305,7 +6542,9 @@ mod tests {
         a.rejection_reason = Some(RejectionReason::ScanPolicyRetroactive);
         a.quarantine_deadline = Some(Utc::now() + chrono::Duration::hours(12));
         let (prov, cur) = clears();
-        let event = a.re_evaluate(Utc::now(), prov, cur).unwrap();
+        let event = a
+            .re_evaluate(Utc::now(), prov, cur, derived_from_mint(&a))
+            .unwrap();
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
         assert!(matches!(event, DomainEvent::ArtifactQuarantined(_)));
         assert_eq!(a.rejection_reason, None);
@@ -6612,13 +6851,17 @@ mod tests {
     fn repair_returns_a_stranded_artifact_to_the_hold_and_preserves_the_anchor() {
         let mut a = stranded_artifact();
         let anchor = a.quarantine_window_start.expect("fixture sets the anchor");
-        a.created_at = Utc::now() - chrono::Duration::days(30);
+        // After the anchor — see the note in
+        // `supersede_absent_verdict_from_scan_indeterminate_returns_to_the_hold`
+        // on why that is the only ordering production reaches.
+        a.created_at = anchor + chrono::Duration::minutes(30);
         let now = Utc::now();
 
         let event = a
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
                 ProvenanceRejectionEvidence::Contradicted,
+                derived_from_mint(&a),
             )
             .expect("the three-conjunct state is exactly what this repairs");
 
@@ -6631,8 +6874,30 @@ mod tests {
         assert_ne!(event.quarantine_window_start, now);
         assert_ne!(
             event.quarantine_window_start, a.created_at,
-            "the ingest instant is the fallback, not a replacement"
+            "the mint instant is one candidate inside the derivation, not a \
+             replacement for the window already in force"
         );
+    }
+
+    /// The `min`'s other direction for the repair — see
+    /// `supersede_absent_verdict_takes_an_earlier_derived_anchor`.
+    #[test]
+    fn repair_takes_an_earlier_derived_anchor() {
+        let mut a = stranded_artifact();
+        let stored = a.quarantine_window_start.expect("fixture sets the anchor");
+        a.created_at = stored;
+        let older = Utc::now() - chrono::Duration::days(90);
+
+        let event = a
+            .repair_provenance_misrejection(
+                TerminalRejectionRecord::Absent,
+                ProvenanceRejectionEvidence::Contradicted,
+                derived_at(older),
+            )
+            .expect("the three-conjunct state is exactly what this repairs");
+
+        assert_eq!(event.quarantine_window_start, older);
+        assert_eq!(a.quarantine_window_start, Some(older));
     }
 
     /// A stranded artifact with no stored anchor still produces a
@@ -6652,9 +6917,15 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
                 ProvenanceRejectionEvidence::Contradicted,
+                derived_from_mint(&a),
             )
             .expect("an absent anchor is not a reason to refuse the repair");
         assert_eq!(event.quarantine_window_start, a.created_at);
+        // And on the row: this is the population where it matters most —
+        // the repair's whole purpose is to hand the artifact back to the
+        // release sweep, whose candidacy query filters
+        // `quarantine_window_start IS NOT NULL`.
+        assert_eq!(a.quarantine_window_start, Some(a.created_at));
     }
 
     /// **The negative test that matters.** A genuinely disproven
@@ -6674,6 +6945,7 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Present,
                 ProvenanceRejectionEvidence::Contradicted,
+                derived_from_mint(&a),
             )
             .expect_err("a real terminal rejection is not repairable");
 
@@ -6696,6 +6968,7 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::CorruptionTombstone,
                 ProvenanceRejectionEvidence::Contradicted,
+                derived_from_mint(&a),
             )
             .expect_err("corrupt bytes are a genuine terminal condemnation");
         assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6717,6 +6990,7 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Present,
                 ProvenanceRejectionEvidence::Contradicted,
+                derived_from_mint(&a),
             )
             .expect_err("a scan rejection is a real verdict");
         assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6738,6 +7012,7 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
                 ProvenanceRejectionEvidence::NeverTerminal,
+                derived_from_mint(&a),
             )
             .expect("a verdict that may never be terminal is repairable on its own terms");
 
@@ -6779,6 +7054,7 @@ mod tests {
                 .repair_provenance_misrejection(
                     TerminalRejectionRecord::Absent,
                     ProvenanceRejectionEvidence::Disproved(reason),
+                    derived_from_mint(&a),
                 )
                 .expect_err("a positive disproof is entitled to be terminal");
             assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6801,6 +7077,7 @@ mod tests {
         a.repair_provenance_misrejection(
             TerminalRejectionRecord::Absent,
             ProvenanceRejectionEvidence::NeverTerminal,
+            derived_from_mint(&a),
         )
         .expect("the Unsigned reason is the one D1 forbids from being terminal");
         assert_eq!(a.quarantine_status, QuarantineStatus::Quarantined);
@@ -6820,6 +7097,7 @@ mod tests {
             .repair_provenance_misrejection(
                 TerminalRejectionRecord::Absent,
                 ProvenanceRejectionEvidence::NoVerdict,
+                derived_from_mint(&a),
             )
             .expect_err("no evidence, no repair");
         assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6873,6 +7151,7 @@ mod tests {
                 .repair_provenance_misrejection(
                     TerminalRejectionRecord::Absent,
                     ProvenanceRejectionEvidence::Contradicted,
+                    derived_from_mint(&a),
                 )
                 .unwrap_err();
             assert!(matches!(err, DomainError::Invariant(_)), "got {err:?}");
@@ -6895,6 +7174,7 @@ mod tests {
         a.repair_provenance_misrejection(
             TerminalRejectionRecord::Absent,
             ProvenanceRejectionEvidence::Contradicted,
+            derived_from_mint(&a),
         )
         .expect("repair succeeds");
         let err = a
@@ -6902,6 +7182,7 @@ mod tests {
                 Utc::now(),
                 ProvenanceClearance::Cleared,
                 CurationClearance::Cleared,
+                derived_from_mint(&a),
             )
             .expect_err("re_evaluate is Rejected-only");
         assert!(err.to_string().contains("cannot re-evaluate artifact"));

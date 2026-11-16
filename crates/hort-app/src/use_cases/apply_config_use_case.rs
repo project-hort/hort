@@ -3272,6 +3272,7 @@ mod tests {
             Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
             Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         ));
         // OidcIssuer / ServiceAccount gitops surface mocks.
         let oidc_issuers =
@@ -3378,6 +3379,7 @@ mod tests {
             Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
             Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         ));
         let oidc_issuers =
             Arc::new(crate::use_cases::test_support::MockOidcIssuerRepository::new());
@@ -6563,6 +6565,7 @@ mod tests {
                 Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
                 Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
                 HashMap::new(),
+                crate::use_cases::test_support::anchor_resolver_without_evidence(),
             )),
             h.artifacts.clone(),
             h.lifecycle.clone(),

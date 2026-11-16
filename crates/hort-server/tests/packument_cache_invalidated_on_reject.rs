@@ -74,8 +74,8 @@ use hort_app::event_store_publisher::EventStorePublisher;
 use hort_app::use_cases::curation_use_case::{BlockTarget, CurationUseCase};
 use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
 use hort_app::use_cases::test_support::{
-    sample_artifact, MockArtifactRepository, MockCurationRuleRepository,
-    MockPolicyProjectionRepository, MockRepositoryRepository,
+    anchor_resolver_without_evidence, sample_artifact, MockArtifactRepository,
+    MockCurationRuleRepository, MockPolicyProjectionRepository, MockRepositoryRepository,
     MockRepositoryUpstreamMappingRepository, MockStoragePort,
 };
 use hort_app::use_cases::upstream_index_cache_invalidator::AppUpstreamIndexCacheInvalidator;
@@ -269,6 +269,7 @@ fn build_curation_use_case_with_invalidator(
         Arc::new(MockCurationRuleRepository::new()),
         Arc::new(MockStoragePort::new()),
         hort_formats::compiled_in_format_handlers(),
+        anchor_resolver_without_evidence(),
     )
     .with_upstream_index_cache_invalidator(invalidator)
 }
