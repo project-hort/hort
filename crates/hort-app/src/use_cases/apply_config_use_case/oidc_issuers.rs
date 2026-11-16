@@ -399,6 +399,7 @@ mod tests {
             Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
             Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         ));
         let uc = ApplyConfigUseCase::new(
             h.repos.clone(),

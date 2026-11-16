@@ -118,6 +118,10 @@ pub mod patch_candidate_use_case;
 // Shared active-scan-policy resolver (issue #76, item 1/2) — extracted
 // from seven private, byte-identical copies. See module docs.
 pub(crate) mod policy_resolution;
+// The two — and only two — places an `AnchorEvidence` is assembled: one
+// for a row being minted, one for an artifact re-entering the hold. See
+// the module docs.
+pub mod quarantine_anchor_assembly;
 // The one place the application layer asks an artifact's own format
 // handler what its bytes are. Four verdict-adjacent call sites need the
 // answer and all four must get the same one for a given row; see the

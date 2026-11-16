@@ -49,6 +49,7 @@ use hort_domain::types::ContentHash;
 use sha2::Digest;
 
 use super::*;
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 use crate::use_cases::test_support::*;
 
@@ -1138,6 +1139,12 @@ async fn timer_release_is_granted_over(f: &Fixture, stream: Vec<PersistedEvent>)
         f.content_references.clone(),
         f.storage.clone(),
         Arc::new(MockJobsRepository::new()),
+        Arc::new(QuarantineAnchorResolver::new(
+            f.artifacts.clone(),
+            f.content_references.clone(),
+            f.projections.clone(),
+            Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+        )),
     );
     !quarantine_uc
         .release_expired(vec![f.artifact_id])
@@ -1932,13 +1939,17 @@ async fn required_unsigned_missing_window_start_holds_like_any_other_unsigned() 
 }
 
 // ---------------------------------------------------------------------------
-// issue #90 — bounded requeue defense-in-depth. Required + unsigned + a
-// `None`-status, anchor-less, RECENTLY-INGESTED artifact must NOT resolve
-// terminally: this is the exact shape a job racing the (now-atomic)
-// ingest+quarantine commit would have observed pre-fix. Past the grace
-// window the SAME shape (permissive `quarantine_duration_secs == 0`, which
-// never quarantines — a legitimate permanent `None`-status steady state)
-// still resolves to the pre-existing terminal behavior.
+// Bounded requeue defense-in-depth. Required + unsigned + a `None`-status,
+// RECENTLY-INGESTED artifact must NOT resolve terminally: this is the exact
+// shape a job racing the (now-atomic) ingest+quarantine commit would have
+// observed before that commit became atomic. Past the grace window the SAME
+// shape (permissive `quarantine_duration_secs == 0`, which never
+// quarantines — a legitimate permanent `None`-status steady state) still
+// resolves to the pre-existing terminal behavior.
+//
+// The `None` status is the whole of the state question; the predicate does
+// not also read `quarantine_window_start`, and
+// `requeue_does_not_consult_the_quarantine_anchor` below is what holds that.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1978,6 +1989,56 @@ async fn required_unsigned_none_status_young_artifact_requeues_instead_of_reject
         saved.quarantine_status,
         QuarantineStatus::None,
         "status must be untouched by the requeue"
+    );
+}
+
+/// **The predicate reads the status, not the anchor.** A `None`-status
+/// artifact carrying a window is a state no production path produces — no
+/// transition writes a window without moving the status, and none returns
+/// an artifact to `None` (pinned in `hort-domain` by
+/// `quarantine_transitions::tests::no_transition_returns_an_artifact_to_the_none_status`
+/// and `artifact::tests::every_anchor_write_leaves_the_artifact_quarantined`).
+/// So the requeue must not depend on the difference: the conjunct that did
+/// said nothing the status does not, and it made
+/// `quarantine_window_start` carry a second meaning ("this artifact was
+/// never quarantined") beside its real one ("a window is in force since").
+///
+/// Constructing the impossible state is the point — it is the only way to
+/// observe whether the conjunct is still there. Put the conjunct back and
+/// this test fails while
+/// `required_unsigned_none_status_young_artifact_requeues_instead_of_rejecting`
+/// stays green, which is why both are here.
+#[tokio::test]
+async fn requeue_does_not_consult_the_quarantine_anchor() {
+    let port = Arc::new(MockProvenancePort::cosign_returning(
+        ProvenanceVerdict::no_attestation(),
+    ));
+    let f = build(
+        RepositoryFormat::Oci,
+        None,
+        vec![],
+        vec![port.clone() as Arc<dyn ProvenancePort>],
+    );
+    seed_required_policy_with_duration(&f, 24 * 3600);
+    let mut artifact = f.artifacts.get(f.artifact_id).unwrap();
+    artifact.quarantine_status = QuarantineStatus::None;
+    artifact.created_at = chrono::Utc::now();
+    // The column set on a `None`-status row — the shape the removed
+    // conjunct was the only reader of.
+    artifact.quarantine_window_start = Some(artifact.created_at);
+    f.artifacts.insert(artifact);
+
+    let outcome = f.uc.verify_artifact(f.artifact_id).await.expect("Ok");
+    assert_eq!(
+        outcome,
+        ProvenanceRunOutcome::RequeuedNoAnchor,
+        "the bounded requeue is gated on the `None` status and the artifact's age; a \
+         stamped window must not change the verdict, or `quarantine_window_start` is \
+         back to meaning two things at once",
+    );
+    assert!(
+        f.lifecycle.committed_transitions().is_empty(),
+        "the bounded-requeue guard must short-circuit before any commit"
     );
 }
 
@@ -2528,6 +2589,12 @@ async fn verify_artifact_interleaved_with_concurrent_reject_does_not_resurrect_a
         Arc::new(MockContentReferenceIndex::new()),
         Arc::new(MockStoragePort::new()),
         Arc::new(MockJobsRepository::new()),
+        Arc::new(QuarantineAnchorResolver::new(
+            artifacts.clone(),
+            Arc::new(MockContentReferenceIndex::new()),
+            Arc::new(MockPolicyProjectionRepository::new()),
+            Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+        )),
     );
     let released = quarantine_uc
         .release_expired(vec![artifact_id])

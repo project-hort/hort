@@ -104,8 +104,9 @@ use hort_app::use_cases::policy_use_case::{
 };
 use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
 use hort_app::use_cases::test_support::{
-    sample_artifact, MockArtifactRepository, MockCurationRuleRepository, MockJobsRepository,
-    MockPolicyProjectionRepository, MockRepositoryRepository, MockStoragePort,
+    anchor_resolver_without_evidence, sample_artifact, MockArtifactRepository,
+    MockCurationRuleRepository, MockJobsRepository, MockPolicyProjectionRepository,
+    MockRepositoryRepository, MockStoragePort,
 };
 use hort_app::use_cases::CallerPrivileges;
 use hort_domain::entities::artifact::{Artifact, ArtifactMetadata, QuarantineStatus};
@@ -294,6 +295,7 @@ fn build_curation_use_case(
         Arc::new(MockCurationRuleRepository::new()),
         Arc::new(MockStoragePort::new()),
         hort_formats::compiled_in_format_handlers(),
+        anchor_resolver_without_evidence(),
     )
 }
 
@@ -335,6 +337,7 @@ fn build_policy_use_case(
         curation_rules,
         jobs,
         hort_formats::compiled_in_format_handlers(),
+        anchor_resolver_without_evidence(),
     )
 }
 

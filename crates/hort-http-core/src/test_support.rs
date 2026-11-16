@@ -57,6 +57,7 @@ use hort_app::use_cases::policy_use_case::PolicyUseCase;
 use hort_app::use_cases::prefetch_use_case::PrefetchUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
 use hort_app::use_cases::provenance_misrejection_repair::ProvenanceMisrejectionRepairUseCase;
+use hort_app::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
 use hort_app::use_cases::ref_use_case::RefUseCase;
@@ -1454,6 +1455,22 @@ pub fn build_mock_ctx_with_label_flag(
     // seed.
     let policy_projections = Arc::new(MockPolicyProjectionRepository::new());
     seed_permissive_global_policy_for_tests(&policy_projections);
+    // Hoisted above its own consumers (the resolver and the upstream
+    // use cases further down) so ONE mapping mock serves both — a
+    // handler test seeds `mocks.repository_upstream_mappings` once and
+    // every reader of the `trust_upstream_publish_time` opt-in sees it.
+    let repository_upstream_mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
+    // ONE quarantine-anchor resolver over the harness's own ports,
+    // shared by every use case that returns an artifact to the hold —
+    // exactly as the composition root wires it. Sharing matters: a test
+    // that seeds age evidence through `mocks.artifacts` must see the
+    // same evidence whichever hold path it drives.
+    let anchor_resolver = Arc::new(QuarantineAnchorResolver::new(
+        artifacts.clone(),
+        content_references.clone(),
+        policy_projections.clone(),
+        repository_upstream_mappings.clone(),
+    ));
     let ingest_use_case = Arc::new(IngestUseCase::new(
         storage.clone(),
         lifecycle.clone(),
@@ -1515,6 +1532,7 @@ pub fn build_mock_ctx_with_label_flag(
         storage.clone(),
         // S4 provenance expiry backstop shares the same `jobs` mock.
         jobs.clone(),
+        anchor_resolver.clone(),
     ));
     let promotion_use_case = Arc::new(PromotionUseCase::new(
         artifacts.clone(),
@@ -1552,7 +1570,6 @@ pub fn build_mock_ctx_with_label_flag(
         content_references.clone(),
         repository_access_use_case.clone(),
     ));
-    let repository_upstream_mappings = Arc::new(MockRepositoryUpstreamMappingRepository::new());
     let upstream_resolver = Arc::new(MockUpstreamResolver::new());
     let upstream_proxy = Arc::new(MockUpstreamProxy::new());
     let upstream_proxy_port: Arc<dyn UpstreamProxy> = upstream_proxy.clone();
@@ -1786,6 +1803,7 @@ pub fn build_mock_ctx_with_label_flag(
         curation_rules.clone(),
         storage.clone(),
         HashMap::new(),
+        anchor_resolver.clone(),
     ));
 
     // Admin-gated one-shot repair of the artifacts stranded `Rejected`
@@ -1798,6 +1816,7 @@ pub fn build_mock_ctx_with_label_flag(
             artifacts.clone(),
             lifecycle.clone(),
             curation_queue.clone(),
+            anchor_resolver.clone(),
         ));
 
     // `PolicyUseCase` wired with the same ports
@@ -1825,6 +1844,7 @@ pub fn build_mock_ctx_with_label_flag(
         // tests can assert the enqueue.
         jobs.clone(),
         HashMap::new(),
+        anchor_resolver.clone(),
     ));
 
     // `WheelMetadataUseCase` composed over the

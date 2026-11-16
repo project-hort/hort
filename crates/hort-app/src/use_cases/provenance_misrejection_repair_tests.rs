@@ -30,7 +30,9 @@ use hort_domain::ports::curation_queue_repository::CurationQueueEntry;
 use hort_domain::ports::provenance::{ProvenanceRejectReason, SignerIdentity};
 use hort_domain::types::ContentHash;
 
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
+use crate::use_cases::test_support::MockRepositoryUpstreamMappingRepository;
 use crate::use_cases::test_support::{
     api_actor, persisted_artifact_rejected, persisted_scan_completed, queue_entry_for,
     sample_artifact, MockArtifactLifecycle, MockArtifactRepository, MockContentReferenceIndex,
@@ -61,6 +63,15 @@ fn build() -> Fixture {
         artifacts.clone(),
         lifecycle.clone(),
         queue.clone(),
+        // The fixture's OWN artifact repository, so the age-evidence read
+        // the repair's anchor derivation makes sees the rows the test
+        // wrote rather than an empty store.
+        Arc::new(QuarantineAnchorResolver::new(
+            artifacts.clone(),
+            Arc::new(MockContentReferenceIndex::new()),
+            Arc::new(MockPolicyProjectionRepository::new()),
+            Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+        )),
     );
     Fixture {
         uc,
@@ -290,6 +301,12 @@ fn ordinary_sweep(
         Arc::new(MockContentReferenceIndex::new()),
         Arc::new(MockStoragePort::new()),
         Arc::new(MockJobsRepository::new()),
+        Arc::new(QuarantineAnchorResolver::new(
+            f.artifacts.clone(),
+            Arc::new(MockContentReferenceIndex::new()),
+            Arc::new(MockPolicyProjectionRepository::new()),
+            Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+        )),
     )
 }
 

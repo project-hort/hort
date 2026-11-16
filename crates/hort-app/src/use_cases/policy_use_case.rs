@@ -91,6 +91,7 @@ use crate::metrics::{
     PolicyEvaluationResult, PolicyReEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::release_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::scan_kind_resolution::scan_kind_of;
@@ -407,6 +408,11 @@ pub struct PolicyUseCase {
     /// [`scan_kind_of`] so this pass and the scan run cannot answer
     /// differently about one row.
     handlers: HashMap<String, Arc<dyn FormatHandler>>,
+    /// The one place a re-entry's quarantine anchor is assembled. The
+    /// re-evaluation pass's re-quarantine arm takes a hold, and the
+    /// instant that hold begins at is the artifact's own age evidence
+    /// (ADR 0054), not the instant this pass happened to run.
+    anchor_resolver: Arc<QuarantineAnchorResolver>,
 }
 
 impl PolicyUseCase {
@@ -421,6 +427,7 @@ impl PolicyUseCase {
         curation_rules: Arc<dyn CurationRuleRepository>,
         jobs: Arc<dyn JobsRepository>,
         handlers: HashMap<String, Arc<dyn FormatHandler>>,
+        anchor_resolver: Arc<QuarantineAnchorResolver>,
     ) -> Self {
         Self {
             events,
@@ -432,6 +439,7 @@ impl PolicyUseCase {
             curation_rules,
             jobs,
             handlers,
+            anchor_resolver,
         }
     }
 
@@ -2466,10 +2474,18 @@ impl PolicyUseCase {
         // because `re_evaluate` is on the entity, not the pure
         // helper. Boundary precision is per-second; the pass usually
         // completes inside that window.
+        // The anchor the re-quarantine arm would stamp — the artifact's
+        // own age evidence, assembled in the one place every hold path
+        // assembles it. Resolved before the call because the entity does
+        // no I/O; which arm consumes it is `re_evaluate`'s decision.
+        let derived = self
+            .anchor_resolver
+            .derive_for_re_entry(paired.artifact())
+            .await;
         let companion_event =
             match paired
                 .artifact_mut()
-                .re_evaluate(Utc::now(), provenance, curation)
+                .re_evaluate(Utc::now(), provenance, curation, derived)
             {
                 Ok(e) => e,
                 Err(e) => {
@@ -3776,6 +3792,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections)
     }
@@ -3810,6 +3827,7 @@ mod tests {
             curation_rules,
             jobs.clone(),
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, jobs)
     }
@@ -3862,6 +3880,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }
@@ -3910,6 +3929,7 @@ mod tests {
             curation_rules.clone(),
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (
             uc,
@@ -3957,6 +3977,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }
@@ -4055,6 +4076,7 @@ mod tests {
             curation_rules,
             jobs,
             handlers,
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }
@@ -5795,6 +5817,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
 
         let err = uc
@@ -10274,6 +10297,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }

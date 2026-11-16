@@ -152,6 +152,7 @@ use hort_domain::ports::provenance::ProvenanceRejectReason;
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::release_clearance::provenance_clearance_from;
 use crate::use_cases::{refuse_append_past_cap, ArtifactAtVersion, OverCapStream};
 
@@ -286,6 +287,11 @@ pub struct ProvenanceMisrejectionRepairUseCase {
     artifacts: Arc<dyn ArtifactRepository>,
     lifecycle: Arc<dyn ArtifactLifecyclePort>,
     curation_queue: Arc<dyn CurationQueueRepository>,
+    /// The one place a re-entry's quarantine anchor is assembled. The
+    /// repair returns the artifact to `Quarantined`, so it takes a hold,
+    /// and the anchor that hold begins at is the artifact's own age
+    /// evidence rather than anything this pass knows (ADR 0054).
+    anchor_resolver: Arc<QuarantineAnchorResolver>,
 }
 
 impl ProvenanceMisrejectionRepairUseCase {
@@ -294,12 +300,14 @@ impl ProvenanceMisrejectionRepairUseCase {
         artifacts: Arc<dyn ArtifactRepository>,
         lifecycle: Arc<dyn ArtifactLifecyclePort>,
         curation_queue: Arc<dyn CurationQueueRepository>,
+        anchor_resolver: Arc<QuarantineAnchorResolver>,
     ) -> Self {
         Self {
             events,
             artifacts,
             lifecycle,
             curation_queue,
+            anchor_resolver,
         }
     }
 
@@ -433,14 +441,23 @@ impl ProvenanceMisrejectionRepairUseCase {
             return Ok(false);
         }
 
+        // The anchor the repair's hold begins at — the artifact's own age
+        // evidence, assembled in the one place every hold path assembles
+        // it. Resolved before the dry-run branch so the probe below asks
+        // the domain the same question the real run asks: a dry run that
+        // reports a set the real run would refuse is worse than no
+        // report, and the derivation is read-only.
+        let derived = self
+            .anchor_resolver
+            .derive_for_re_entry(paired.artifact())
+            .await;
+
         if dry_run {
-            // The domain guard is still consulted — a dry run that
-            // reports a set the real run would refuse is worse than no
-            // report. `repair_provenance_misrejection` takes `&mut self`,
-            // so this runs against a throwaway clone and the loaded
-            // artifact is discarded either way.
+            // `repair_provenance_misrejection` takes `&mut self`, so this
+            // runs against a throwaway clone and the loaded artifact is
+            // discarded either way.
             let mut probe = paired.artifact().clone();
-            probe.repair_provenance_misrejection(terminal_record, provenance)?;
+            probe.repair_provenance_misrejection(terminal_record, provenance, derived)?;
             return Ok(true);
         }
 
@@ -455,7 +472,7 @@ impl ProvenanceMisrejectionRepairUseCase {
         let previous_status = paired.artifact().quarantine_status;
         let quarantined = paired
             .artifact_mut()
-            .repair_provenance_misrejection(terminal_record, provenance)
+            .repair_provenance_misrejection(terminal_record, provenance, derived)
             .map_err(AppError::Domain)?;
         let new_status = paired.artifact().quarantine_status;
         let artifact = paired.into_artifact();

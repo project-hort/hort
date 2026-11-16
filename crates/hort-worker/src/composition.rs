@@ -103,6 +103,7 @@ use hort_app::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::prefetch_use_case::PrefetchUseCase;
 use hort_app::use_cases::provenance_orchestration::ProvenanceOrchestrationUseCase;
+use hort_app::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::scan_orchestration::{ScanOrchestrationConfig, ScanOrchestrationUseCase};
 use hort_app::use_cases::seed_import_use_case::SeedImportUseCase;
@@ -506,6 +507,17 @@ pub async fn build_app_context(
     //    transaction), so the use case no longer holds a separate
     //    `ScanFindingsRepository` handle.
     // -----------------------------------------------------------------
+    // The one quarantine-anchor assembly every hold path shares (ADR
+    // 0054). Built here because the first consumer is immediately below;
+    // the mapping repo it reads for the `trust_upstream_publish_time`
+    // opt-in is the same adapter the prefetch handlers take further down.
+    let anchor_resolver = Arc::new(QuarantineAnchorResolver::new(
+        artifacts.clone(),
+        content_references.clone(),
+        policy_projections.clone(),
+        Arc::new(PgRepositoryUpstreamMappingRepo::new(pool.clone())),
+    ));
+
     let quarantine = Arc::new(QuarantineUseCase::new(
         artifacts.clone(),
         event_publisher.clone(),
@@ -518,6 +530,7 @@ pub async fn build_app_context(
         // final `provenance-verify` for Required + Pending + expired
         // candidates via the shared `jobs` adapter.
         jobs.clone(),
+        anchor_resolver.clone(),
     ));
 
     // -----------------------------------------------------------------
@@ -1278,6 +1291,11 @@ pub async fn build_app_context(
             // stored findings reads the row's role the way the scan run
             // read it (ADR 0064 D2).
             handlers.clone(),
+            // The same anchor assembly the quarantine use case above
+            // takes: the pass's re-quarantine arm returns an artifact to
+            // the hold, and one artifact gets one anchor whichever path
+            // puts it there.
+            anchor_resolver.clone(),
         ));
         dispatcher.register(
             Arc::new(hort_app::task_handlers::PolicyReEvaluationHandler::new(

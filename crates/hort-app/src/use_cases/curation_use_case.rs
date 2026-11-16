@@ -71,6 +71,7 @@ use crate::metrics::{
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::release_clearance::resolve_curation_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::scan_kind_resolution::scan_kind_of;
@@ -452,6 +453,11 @@ pub struct CurationUseCase {
     /// `with_lint_config` on `ApplyConfigUseCase` so the constructor
     /// signature stays unchanged (no port-contract churn).
     upstream_index_cache_invalidator: Option<Arc<dyn UpstreamIndexCacheInvalidator>>,
+    /// The one place a re-entry's quarantine anchor is assembled.
+    /// [`Self::reevaluate`]'s re-quarantine arm takes a hold, and the
+    /// instant that hold begins at is the artifact's own age evidence
+    /// (ADR 0054), not anything this pass observed.
+    anchor_resolver: Arc<QuarantineAnchorResolver>,
 }
 
 impl CurationUseCase {
@@ -473,6 +479,7 @@ impl CurationUseCase {
         curation_rules: Arc<dyn CurationRuleRepository>,
         storage: Arc<dyn StoragePort>,
         handlers: HashMap<String, Arc<dyn FormatHandler>>,
+        anchor_resolver: Arc<QuarantineAnchorResolver>,
     ) -> Self {
         Self {
             events,
@@ -487,6 +494,7 @@ impl CurationUseCase {
             storage,
             handlers,
             upstream_index_cache_invalidator: None,
+            anchor_resolver,
         }
     }
 
@@ -1401,7 +1409,18 @@ impl CurationUseCase {
         }
 
         let previous_status = paired.artifact().quarantine_status;
-        let companion_event = match paired.artifact_mut().re_evaluate(now, provenance, curation) {
+        // The anchor the re-quarantine arm would stamp — the artifact's
+        // own age evidence, assembled in the one place every hold path
+        // assembles it. Resolved before the call because the entity does
+        // no I/O; which arm consumes it is `re_evaluate`'s decision.
+        let derived = self
+            .anchor_resolver
+            .derive_for_re_entry(paired.artifact())
+            .await;
+        let companion_event = match paired
+            .artifact_mut()
+            .re_evaluate(now, provenance, curation, derived)
+        {
             Ok(ev) => ev,
             Err(e) => {
                 let app_err = AppError::Domain(e);
@@ -3026,6 +3045,7 @@ mod tests {
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
             HashMap::new(),
+            anchor_resolver_without_evidence(),
         );
         (uc, artifacts, events, lifecycle)
     }
@@ -3056,6 +3076,7 @@ mod tests {
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
             HashMap::new(),
+            anchor_resolver_without_evidence(),
         );
         (uc, queue_repo)
     }
@@ -3086,6 +3107,7 @@ mod tests {
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
             HashMap::new(),
+            anchor_resolver_without_evidence(),
         );
         (uc, decisions_repo)
     }
@@ -3116,6 +3138,7 @@ mod tests {
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
             HashMap::new(),
+            anchor_resolver_without_evidence(),
         );
         (uc, exclusions_repo)
     }
@@ -4719,6 +4742,7 @@ mod tests {
             Arc::new(MockCurationRuleRepository::new()),
             Arc::new(MockStoragePort::new()),
             HashMap::new(),
+            anchor_resolver_without_evidence(),
         );
         (uc, artifacts, events)
     }
@@ -5548,6 +5572,7 @@ mod tests {
                 curation_rules.clone(),
                 storage.clone(),
                 HashMap::new(),
+                anchor_resolver_without_evidence(),
             );
             (
                 uc,
@@ -7533,6 +7558,7 @@ mod tests {
                 Arc::new(MockCurationRuleRepository::new()),
                 Arc::new(MockStoragePort::new()),
                 HashMap::new(),
+                anchor_resolver_without_evidence(),
             );
             (uc, artifacts, events, lifecycle)
         }

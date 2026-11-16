@@ -761,6 +761,66 @@ mod tests {
     /// reaches exactly `Quarantined` — never `Released`, which is what
     /// keeps the release decision with the ordinary sweep's gate (ADR
     /// 0007, "A reached verdict supersedes an absent one", clause 1).
+    /// **`None` is a start state, never a destination.** No event moves
+    /// an artifact out of a non-`None` status back into `None`, over the
+    /// whole table.
+    ///
+    /// That is half of "a `None`-status artifact carries no window", and
+    /// the half a table can answer. The other half is that every write of
+    /// `quarantine_window_start` moves the status to `Quarantined` —
+    /// pinned beside the writes themselves
+    /// (`artifact.rs::every_anchor_write_leaves_the_artifact_quarantined`),
+    /// and structurally by the anchor-write census in
+    /// `crates/hort-app/tests/quarantine_anchor_is_artifact_time.rs`.
+    /// Together they are why a `None` status is already the stronger
+    /// statement: the provenance orchestrator's bounded requeue used to
+    /// conjoin both (`quarantine_status == None && quarantine_window_start
+    /// .is_none()`), which read as two independent facts about an artifact
+    /// and was one — and made `quarantine_window_start` carry a second
+    /// meaning ("this artifact was never quarantined") beside its real one
+    /// ("a window is in force since").
+    ///
+    /// A `RecordCleanScan`-from-`None` self-loop is not a hit: the status
+    /// it "targets" is the one it came in with, and nothing transitioned.
+    #[test]
+    fn no_transition_returns_an_artifact_to_the_none_status() {
+        let offenders: Vec<String> = QUARANTINE_TRANSITIONS
+            .iter()
+            .filter(|row| row.from != QuarantineStatus::None)
+            .filter(|row| row.to.contains(&QuarantineStatus::None))
+            .map(|row| format!("{:?} from {}", row.event, row.from))
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "no event may return an artifact to the `None` status: a row that already \
+             carries a quarantine window would then read as one that never had one, and \
+             every reader that treats a `None` status as \"never quarantined\" — the \
+             provenance orchestrator's bounded requeue among them — would be answering \
+             about the wrong artifact. {} offending row(s): {}",
+            offenders.len(),
+            offenders.join(", ")
+        );
+
+        // Counter-assertion: the filter is reading a real table, and the
+        // `None` source state really is present in it — so the test
+        // cannot pass by having matched nothing at all.
+        assert!(
+            QUARANTINE_TRANSITIONS
+                .iter()
+                .any(|row| row.from != QuarantineStatus::None),
+            "the table holds no row with a non-`None` source state, so the assertion \
+             above examined an empty set"
+        );
+        assert!(
+            QUARANTINE_TRANSITIONS
+                .iter()
+                .any(|row| row.from == QuarantineStatus::None),
+            "the table holds no `None`-source row, so `QuarantineStatus::None` is not \
+             the variant this test thinks it is"
+        );
+    }
+
     /// Every other source state is `Forbidden`, `Rejected` included:
     /// withdrawing an absent verdict must not withdraw a recorded one.
     #[test]
