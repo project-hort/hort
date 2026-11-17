@@ -43,7 +43,7 @@ jobs:
       - name: Check diagram unit tests
         run: python3 -m unittest discover -s scripts/site/tests -v
       - name: Upload pre-rendered static website
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: hort-sites-with-pre-rendered-diagrams
           path: site/dist/
