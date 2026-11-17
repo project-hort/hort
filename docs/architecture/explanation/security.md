@@ -336,7 +336,7 @@ depending on whether the target is operator-vetted or user-submitted.
 
 | Adapter / surface | Target trust | Checks applied |
 |---|---|---|
-| Upstream artifact/metadata fetch (`hort-adapters-upstream-http`) | Operator-configured upstream (Cargo/npm/PyPI registry mapping) | `check_ssrf_safe` at URL-validation time, a per-hop `is_routable` re-check on every redirect (`build_redirect_policy`), **and** a connect-time `GuardedDnsResolver` (security audit finding INJ-1) that re-runs `is_routable` on every dial-time resolution — closing the TOCTOU window between validation and dial. |
+| Upstream artifact/metadata fetch (`hort-adapters-upstream-http`) | **Both classes.** The operator-configured upstream (Cargo/npm/PyPI registry mapping) *and* the destinations upstream data nominates on top of it: an absolute download URL out of a metadata document, a `WWW-Authenticate` realm. | All three `is_routable` legs apply to the upstream-nominated destination — `check_ssrf_safe` at URL-validation time, a per-hop re-check on every redirect (`build_redirect_policy`), **and** a connect-time `GuardedDnsResolver` (security audit finding INJ-1) that re-runs it on every dial-time resolution, closing the TOCTOU window between validation and dial. A dial of the operator's own `upstream_url` and its own origin carries **none** of the three (`EgressPosture`), and is covered like the OIDC/S3 rows below: TLS validation, cross-origin credential withholding, artifact-layer checksum verification (ADR 0006). The hop cap and the TLS-identity hop binding apply to both. |
 | Webhook delivery (`hort-notifier-webhook`) | User-submitted (any caller with subscription-create privilege) | `WebhookTargetGuard::check` at subscription create-time (IP literal or single-shot DNS resolution), `Policy::limited(0)` (zero redirects — any 3xx is rejected outright), and a connect-time `GuardedDnsResolver` closing the create→deliver DNS-rebind TOCTOU. Operator opt-outs: `HORT_WEBHOOK_ALLOW_NONROUTABLE_TARGETS` (blanket, last resort) and `HORT_WEBHOOK_ALLOWLIST_HOSTS` (targeted, per-host/CIDR). |
 | OIDC discovery / JWKS fetch (`hort-adapters-oidc`) | Operator-configured issuer (deployment-pinned) | Same-host binding (the JWKS fetch is pinned to the issuer's own host, so a compromised discovery document cannot redirect it elsewhere) — no `is_routable` leg. Deliberately dropped: it broke the canonical in-cluster-IdP deployment for negligible benefit given same-host binding is already load-bearing. |
 | S3-compatible storage backend (`hort-adapters-storage`) | Operator-configured endpoint (deployment config) | No connect-time guard; the endpoint is deployment config, not attacker-influenced input. Defence in depth is TLS cert validation (`HORT_EXTRA_CA_BUNDLE`) and artifact-layer content-checksum verification. |
@@ -352,6 +352,17 @@ would only produce false positives against legitimate internal
 targets (in-cluster IdP, private S3-compatible endpoint) for a
 threat that requires the operator's own configuration to already be
 compromised.
+
+**The upstream-http surface sits on both sides of that line**, which
+is why its row splits. `mapping.upstream_url` is deployment config in
+exactly the sense the OIDC and S3 rows mean it — an internal
+Artifactory, an in-cluster verdaccio and an on-prem npm proxy all
+resolve to RFC 1918 / ULA / loopback — so the same false-positive
+argument applies to it unchanged. The absolute URLs and realms
+upstream names on top of it are not, and keep the full treatment. The
+split is by the origin of the URL (`credential_scope`, which the
+credential decision already reads), so it needs no second decision to
+get wrong.
 
 ## Defence in depth
 
