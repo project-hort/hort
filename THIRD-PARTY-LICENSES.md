@@ -314,10 +314,10 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.7 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.8 | MIT | https://github.com/clap-rs/clap |
 | clap_builder | 4.6.7 | MIT | https://github.com/clap-rs/clap |
 | clap_complete | 4.6.11 | MIT | https://github.com/clap-rs/clap |
-| clap_derive | 4.6.7 | MIT | https://github.com/clap-rs/clap |
+| clap_derive | 4.6.8 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
@@ -446,10 +446,10 @@ the result instead.
 | pin-project-lite | 0.2.17 | MIT | https://github.com/taiki-e/pin-project-lite |
 | pin-project | 1.1.12 | MIT | https://github.com/taiki-e/pin-project |
 | portable-atomic | 1.13.1 | MIT | https://github.com/taiki-e/portable-atomic |
-| proc-macro2 | 1.0.106 | MIT | https://github.com/dtolnay/proc-macro2 |
+| proc-macro2 | 1.0.107 | MIT | https://github.com/dtolnay/proc-macro2 |
 | prost-reflect-derive | 0.16.0 | MIT | https://github.com/andrewhickman/prost-reflect |
 | prost-reflect | 0.16.4 | MIT | https://github.com/andrewhickman/prost-reflect |
-| quote | 1.0.45 | MIT | https://github.com/dtolnay/quote |
+| quote | 1.0.47 | MIT | https://github.com/dtolnay/quote |
 | rustix | 1.1.6 | MIT | https://github.com/bytecodealliance/rustix |
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
@@ -464,7 +464,7 @@ the result instead.
 | serde_path_to_error | 0.1.20 | MIT | https://github.com/dtolnay/path-to-error |
 | serde_repr | 0.1.20 | MIT | https://github.com/dtolnay/serde-repr |
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
-| syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
+| syn | 3.0.10 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror-impl | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
@@ -13193,7 +13193,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.7 — MIT
+### clap 4.6.8 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -13274,7 +13274,7 @@ SOFTWARE.
 
 ```
 
-### clap_derive 4.6.7 — MIT
+### clap_derive 4.6.8 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -16897,7 +16897,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### proc-macro2 1.0.106 — MIT
+### proc-macro2 1.0.107 — MIT
 
 Repository: https://github.com/dtolnay/proc-macro2
 
@@ -16990,7 +16990,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### quote 1.0.45 — MIT
+### quote 1.0.47 — MIT
 
 Repository: https://github.com/dtolnay/quote
 
@@ -17455,7 +17455,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### syn 3.0.3 — MIT
+### syn 3.0.10 — MIT
 
 Repository: https://github.com/dtolnay/syn
 
