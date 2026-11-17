@@ -354,6 +354,34 @@ visibly opted out in audited gitops config. CI fails on `reject`.
 > `destroy_content` is **not** in that set — a machine identity may
 > hold it, and the shipped `cronjob-tasks` SA does.
 
+### Declaring the three permissions `admin` does not imply
+
+`read_metrics`, `destroy_content` and `destroy_record` are **admin-orthogonal**:
+an admin principal does not hold them implicitly, so each needs an explicit
+grant. The shape of that grant is constrained, and the constraint is a decision
+rather than an oversight — an authority binds to **one declared identity**, not
+to whoever currently carries a claim, because a claim's holder set is defined by
+the IdP and a group-membership change there would confer the authority silently
+([ADR 0052](../../../adr/0052-scoped-metrics-read-capability.md), carried to the
+destructive permissions by
+[ADR 0067](../../../adr/0067-destructive-authority-is-a-permission-split-by-reversibility.md)).
+
+So a repository-less `Claims` grant of any of the three **rejects**
+(`wildcard-repo-non-admin`), and that cannot be allowlisted away: a single-claim
+grant's opt-out is `singleClaimAllowlist`, and `admin` is a *forbidden*
+allowlist name. What works per permission:
+
+| Permission | Supported declaration |
+|---|---|
+| `read_metrics` | A `serviceAccount`-subject grant, repository-less — see [metrics-scraper-service-account](metrics-scraper-service-account.md). Metrics are instance-wide by nature, so there is no repository-scoped form. |
+| `destroy_content` | Instance-wide: a `serviceAccount`-subject grant (the shipped `cronjob-tasks` SA may hold it — see [enable-admin-task-cronjobs](../deploy/enable-admin-task-cronjobs.md)). Per repository: a repository-scoped grant in **either** subject form, lint-clean with no downgrade, because `retention-evaluate` takes a `repository_id` and confines the run to it. |
+| `destroy_record` | **No lint-clean declaration exists today.** No service account may hold it (`SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS`), and a repository-scoped grant cannot authorize `eventstore-archive`, whose sweep has no repository dimension and whose gate therefore asks at `repository = None`. An operator who needs it takes the audited `PermissionGrantLintConfig` downgrade below, visible in the apply diff. ADR 0067 records that consequence deliberately rather than designing it away. |
+
+> A repository-scoped grant of a permission whose task has **no** repository
+> dimension is accepted at apply and authorizes nothing, because the gate asks
+> at `repository = None`. Today that is every destructive kind except
+> `retention-evaluate`. Scope a grant only where the task is scopable.
+
 **Tuning strictness.** Operators tune the linter **only** through
 explicit, audited gitops config — there is no env var and no global
 `warn` switch (that would re-open the secure-by-default hole). The

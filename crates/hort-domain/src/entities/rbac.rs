@@ -185,7 +185,10 @@ pub const SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS: &[(Permission, &str)] = &[
          download audit, token use — and nothing reconstructs a sealed stream, so no \
          unattended identity is given standing authority over it. Grant `destroy_content` \
          for the retention tasks, which a machine identity may hold, and run \
-         `eventstore-archive` by hand as a human identity that holds `destroy_record`",
+         `eventstore-archive` by hand as a human identity that holds `destroy_record` — \
+         a holder the apply-time linter admits only through its audited downgrade, since \
+         this sweep takes no repository scope to narrow a grant with (see the \
+         claim-based-rbac how-to)",
     ),
 ];
 
