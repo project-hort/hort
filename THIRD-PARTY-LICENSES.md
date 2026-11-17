@@ -130,7 +130,7 @@ the result instead.
 | tempfile | 3.27.0 | MIT | https://github.com/Stebalien/tempfile |
 | xattr | 1.6.1 | MIT | https://github.com/Stebalien/xattr |
 | heck | 0.5.0 | MIT | https://github.com/withoutboats/heck |
-| is_executable | 1.0.5 | MIT | https://github.com/fitzgen/is_executable |
+| is_executable | 1.0.6 | MIT | https://github.com/fitzgen/is_executable |
 | unicode-bidi | 0.3.18 | MIT | https://github.com/servo/unicode-bidi |
 | unicode-normalization | 0.1.25 | MIT | https://github.com/unicode-rs/unicode-normalization |
 | unicode-properties | 0.1.4 | MIT | https://github.com/unicode-rs/unicode-properties |
@@ -316,7 +316,7 @@ the result instead.
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
 | clap | 4.6.8 | MIT | https://github.com/clap-rs/clap |
 | clap_builder | 4.6.7 | MIT | https://github.com/clap-rs/clap |
-| clap_complete | 4.6.11 | MIT | https://github.com/clap-rs/clap |
+| clap_complete | 4.6.12 | MIT | https://github.com/clap-rs/clap |
 | clap_derive | 4.6.8 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -401,12 +401,9 @@ the result instead.
 | windows-strings | 0.5.1 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.52.0 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.59.0 | MIT | https://github.com/microsoft/windows-rs |
-| windows-sys | 0.60.2 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.61.2 | MIT | https://github.com/microsoft/windows-rs |
 | windows-targets | 0.52.6 | MIT | https://github.com/microsoft/windows-rs |
-| windows-targets | 0.53.5 | MIT | https://github.com/microsoft/windows-rs |
 | windows_x86_64_gnu | 0.52.6 | MIT | https://github.com/microsoft/windows-rs |
-| windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
 | tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
 | tokio-util | 0.7.20 | MIT | https://github.com/tokio-rs/tokio |
 | tokio | 1.54.1 | MIT | https://github.com/tokio-rs/tokio |
@@ -7259,7 +7256,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### is_executable 1.0.5 — MIT
+### is_executable 1.0.6 — MIT
 
 Repository: https://github.com/fitzgen/is_executable
 
@@ -13247,7 +13244,7 @@ SOFTWARE.
 
 ```
 
-### clap_complete 4.6.11 — MIT
+### clap_complete 4.6.12 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -15582,32 +15579,6 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### windows-sys 0.60.2 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
 ### windows-sys 0.61.2 — MIT
 
 Repository: https://github.com/microsoft/windows-rs
@@ -15660,59 +15631,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### windows-targets 0.53.5 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
 ### windows_x86_64_gnu 0.52.6 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### windows_x86_64_gnu 0.53.1 — MIT
 
 Repository: https://github.com/microsoft/windows-rs
 
