@@ -180,6 +180,73 @@ ignore = [
     # Re-evaluate when a sigstore release moves off the 0.13 elliptic-curve
     # line, or if any ECDSA SIGNING path is ever added.
     "RUSTSEC-2026-0387",
+
+    # REGISTRY-EXEMPT: RUSTSEC-2026-0543 — build-side acceptance only, with no
+    # registry Exclusion: an Exclusion waives the finding for EVERY registry
+    # consumer (the nuclear option, issue #80). An `unmaintained` notice names
+    # no vulnerable version for a registry consumer to avoid, and the remedy
+    # here is not a version move at all (see below).
+    #
+    # chrono 0.4.45 — unmaintained, announced in chronotope/chrono#1768. The
+    # advisory is INFORMATIONAL: it reports a change in the crate's maintenance
+    # status, not a defect. "All versions are affected" and "no safe upgrade is
+    # available", so no lockfile move clears it and none ever will. Recommended
+    # alternatives are `jiff` and `time`.
+    #
+    # Unlike the entries above, this crate IS compiled into both shipped
+    # binaries, so the acceptance rests on the advisory's informational nature
+    # rather than on unreachability. Two measured facts bound what any remedy
+    # could achieve (`cargo tree -i chrono -e normal`):
+    #   * It is a direct dependency of 28 first-party crates — effectively the
+    #     whole workspace, because `DateTime<Utc>` is the domain's timestamp
+    #     type.
+    #   * Seven THIRD-PARTY parents pull it independently: `sqlx-core 0.9.0`
+    #     and `sqlx-postgres 0.9.0` (the workspace's `chrono` feature, which
+    #     maps `TIMESTAMPTZ`), plus `oauth2 5.0.0`, `openidconnect 4.0.1`,
+    #     `sigstore 0.14.0`, `object_store 0.14.2` and `tough 0.22.0`. So
+    #     migrating hort's own code off chrono would NOT clear this advisory;
+    #     the crate stays in the graph until those dependencies move.
+    #
+    # Why the residual risk is accepted: unmaintained is not vulnerable. The
+    # signal is upstream-controlled and carries no upgrade path by definition —
+    # the same property the `[yanked]` posture at the end of this file is
+    # argued from. chrono 0.4.45 is the current published release, and nothing
+    # in hort's usage (RFC 3339 parsing and formatting, `Utc::now`, the
+    # `TIMESTAMPTZ` mapping) is implicated by a maintenance-status change.
+    # A real defect found in chrono later would arrive as its own advisory ID
+    # and is NOT masked by this entry.
+    #
+    # Removal trigger: the third-party parents above moving off chrono, or a
+    # maintained successor taking over the crate. Not a lockfile change, and
+    # not reachable by a first-party migration alone.
+    "RUSTSEC-2026-0543",
+
+    # REGISTRY-EXEMPT: RUSTSEC-2026-0542 — same reasoning as RUSTSEC-2026-0543
+    # above; build-side acceptance only, no registry Exclusion.
+    #
+    # humantime 2.4.0 — unmaintained, and derivatively so: the advisory's own
+    # text is "because chrono is now unmaintained and humantime wraps chrono,
+    # it is also unmaintained; all versions are affected", pointing at the same
+    # announcement. Informational, no patched version, no safe upgrade.
+    #
+    # Reach (`cargo tree -i humantime -e normal`): three first-party crates —
+    # `hort-config` and `hort-app` parse `ScanPolicy.quarantineDuration` and
+    # `Exclusion.maxArtifactAge` through `humantime::parse_duration`, and
+    # `hort-cli` parses its session/TTL flags the same way — plus the
+    # third-party `object_store 0.14.2`. So, as with chrono, replacing the
+    # first-party parser would not clear the advisory while `object_store`
+    # keeps the crate in the graph.
+    #
+    # Why the residual risk is accepted: the crate parses operator-authored
+    # duration strings from a gitops document into a `std::time::Duration` and
+    # does nothing else — no I/O, no unsafe, no network input. The parse
+    # result is bounded and validated by the consumer
+    # (`validate_scan_policy`), so a parser defect cannot widen a quarantine
+    # window past its own checked bound.
+    #
+    # Removal trigger: the same as RUSTSEC-2026-0543 — this advisory exists
+    # only because chrono's does.
+    "RUSTSEC-2026-0542",
 ]
 
 # Yanked-crate posture — surfaced, but non-blocking. Mirrors `deny.toml`'s
