@@ -24,6 +24,30 @@
 //! `GuardedDnsResolver` in the `hort-notifier-webhook` crate that already
 //! solved the same threat class for user-submitted webhook URLs.
 //!
+//! # Scope: the clients that dial a destination hort did not configure
+//!
+//! The guard is bound to the `reqwest::Client`s built with
+//! [`crate::EgressPosture::UpstreamNominated`] — the ones that carry a
+//! dial to a host *upstream data* named: an absolute URL out of a
+//! packument / index / sdist listing, or a realm out of a
+//! `WWW-Authenticate` header. It is **not** bound to the clients that
+//! dial `mapping.upstream_url` and its own origin.
+//!
+//! That boundary is the threat model, not a concession to it. Every
+//! paragraph above is about a host an attacker can make resolve
+//! differently over time; the operator's own upstream is a destination
+//! they declared, and an internal Artifactory, an in-cluster verdaccio
+//! and an on-prem npm proxy all resolve to RFC 1918 / ULA / loopback.
+//! Bound there, this guard refuses the supported topology at connect
+//! time and reports it as a content error — while the code's other half
+//! trusts the same target, since `resolve_artifact_url` composes a
+//! relative path onto `upstream_url` without calling
+//! [`crate::check_ssrf_safe`] at all. The layers that cover an
+//! operator-configured destination instead are listed on
+//! [`crate::EgressPosture::OperatorConfigured`]; which client a request
+//! runs on is decided by `credential_scope`, so no new decision stands
+//! between the two.
+//!
 //! # IP-literal hosts bypass the resolver (and that is correct)
 //!
 //! hyper-util's connector parses IP-literal hosts (`127.0.0.1`,
@@ -99,8 +123,9 @@ pub(crate) fn addr_is_dialable(addr: SocketAddr, allowlist: &[SocketAddr]) -> bo
 }
 
 /// Connect-time guarded resolver bound to the upstream-http artifact /
-/// metadata / manifest `reqwest::Client`(s) at the two `Client::builder()`
-/// sites in this crate (see module docs for the scoping rationale).
+/// metadata / manifest `reqwest::Client`(s) that dial an
+/// upstream-nominated destination — [`crate::EgressPosture`] selects
+/// which those are (see module docs for the scoping rationale).
 ///
 /// On every resolve reqwest performs before a connect, this:
 /// 1. resolves `name` via `tokio::net::lookup_host` (same primitive

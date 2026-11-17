@@ -30,9 +30,13 @@ configured upstream registry into local CAS, with three auth strategies
 
 ## Rules
 
-- `reqwest::Client::builder()` only, never `Client::new()` (ADR 0010) — the
-  base client is built via `base_client_builder`, with
+- `reqwest::Client::builder()` only, never `Client::new()` (ADR 0010) — every
+  client in the crate is built through `upstream_client_builder`, with
   `.use_preconfigured_tls(rustls_config)` for the mTLS/cert-pinning path.
 - SSRF/DNS-rebind defense: routability classification lives in the shared
   `hort-net-egress` crate and is consumed here (`GuardedDnsResolver`), not
-  duplicated locally.
+  duplicated locally. It applies to the clients that dial a destination
+  upstream data nominated — a metadata-supplied absolute URL, a
+  `WWW-Authenticate` realm — and not to the clients that dial
+  `mapping.upstream_url` and its own origin, which an operator declared
+  (`EgressPosture`).

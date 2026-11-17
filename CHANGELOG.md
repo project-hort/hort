@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An upstream mapping whose host resolves to a private or loopback address —
+  an internal registry or in-cluster mirror — is no longer refused at connect;
+  a download URL taken from upstream metadata still is (#422).
+
 ## [0.17.5] - 2026-11-17
 
 ### Security
