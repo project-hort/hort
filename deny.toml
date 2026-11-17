@@ -72,6 +72,21 @@ ignore = [
     # 0.7.6 instead of being covered here. See `.cargo/audit.toml` for the
     # full rationale and the re-evaluation trigger.
     "RUSTSEC-2026-0387",
+
+    # chrono 0.4.45 — unmaintained (chronotope/chrono#1768). Informational:
+    # a maintenance-status change, not a defect. All versions affected, no
+    # safe upgrade. Compiled into both binaries, and seven third-party
+    # parents (sqlx-core, sqlx-postgres, oauth2, openidconnect, sigstore,
+    # object_store, tough) pull it independently, so a first-party migration
+    # would not clear it. See `.cargo/audit.toml` for the full rationale.
+    "RUSTSEC-2026-0543",
+
+    # humantime 2.4.0 — unmaintained because it wraps chrono (same
+    # announcement). Parses operator-authored duration strings into
+    # `std::time::Duration` and does nothing else; `object_store 0.14.2`
+    # keeps it in the graph regardless of hort's own parser. See
+    # `.cargo/audit.toml` for the full rationale.
+    "RUSTSEC-2026-0542",
 ]
 
 # ===========================================================================

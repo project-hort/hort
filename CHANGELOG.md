@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.5] - 2026-11-17
+
+### Security
+
+- Accepted the informational `unmaintained` advisories for `chrono`
+  (RUSTSEC-2026-0543) and `humantime` (RUSTSEC-2026-0542) — neither reports a
+  defect, all versions are affected, and no upgrade exists (#448).
+
 ## [0.17.4] - 2026-11-17
 
 ### Migration notice
