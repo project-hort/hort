@@ -387,9 +387,25 @@ impl RbacEvaluator {
         // hold one of them, and holding one does not imply admin
         // authority. Every other permission keeps the short-circuit
         // unchanged. An orthogonal permission falls through to the ordinary
-        // grant scan below, identical to a non-admin principal — a grant on
-        // the `admin` claim (or on any claim/user the admin also carries)
-        // still authorizes it there.
+        // grant scan below, identical to a non-admin principal.
+        //
+        // **Which grant actually authorizes it there is narrower than the
+        // scan.** The evaluator would honour a repository-less grant on the
+        // `admin` claim, but no operator can declare one: the apply-time
+        // linter rejects a repository-less `Claims` grant of a non-`Admin`
+        // permission (`wildcard-repo-non-admin`), a single-claim grant needs
+        // an allowlist entry, and `admin` is a *forbidden* allowlist name.
+        // That is a decision, not a gap — an authority binds to one declared
+        // identity rather than to whoever currently carries a claim, because
+        // the IdP defines a claim's holders and a group membership change
+        // there would confer it silently (ADR 0052, carried to the
+        // destructive permissions by ADR 0067). So the shapes an operator can
+        // actually declare are a `serviceAccount`-subject grant for the
+        // instance-wide case, or — for a permission whose task takes a
+        // repository scope — a repository-scoped grant in either subject
+        // form. Do not read this fall-through as an invitation to declare the
+        // repository-less claims form; see
+        // `docs/architecture/how-to/operate/claim-based-rbac.md`.
         if !permission.is_admin_orthogonal() && principal.claims.iter().any(|c| c == "admin") {
             // B1 (ADR 0036): a cap-bound native token (Pat/ServiceAccount) carrying
             // the admin claim MUST also carry a cap — `authenticate_pat` always
