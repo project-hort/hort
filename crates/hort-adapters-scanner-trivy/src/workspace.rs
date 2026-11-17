@@ -46,7 +46,8 @@
 //! | `CargoCrate`                  | gzip-tar extracted into the workspace    | `fs`       | the evidence a `.crate` can carry is `Cargo.lock`, read by every target; `fs` keeps the pre-build `Cargo.toml` side readable too |
 //! | `PySdist`                     | gzip-tar extracted into the workspace    | `rootfs`   | an sdist's `*.egg-info/PKG-INFO` is a post-build egg: Image and Rootfs targets only |
 //! | `PyWheel`                     | ZIP extracted into the workspace         | `rootfs`   | a wheel's `*.dist-info/METADATA` is post-build: Image and Rootfs targets only |
-//! | `OciBlob` (a tar layer)       | tar/gzip-tar extracted as a root filesystem | `rootfs` | a layer *is* a root filesystem; only that target reads its OS package database |
+//! | `OciBlob` (a tar layer, role not `NotAnImageLayer`) | tar/gzip-tar extracted as a root filesystem | `rootfs` | a layer *is* a root filesystem; only that target reads its OS package database |
+//! | `OciBlob` (role `NotAnImageLayer`) | nothing — not even a CAS read     | —          | no manifest here composes an image from these bytes, so they are not a filesystem; see *Only a layer is a filesystem* below |
 //! | `OciBlob` (JSON, or no bytes) | nothing — no scanner invocation          | —          | an image config carries no package surface |
 //! | `OciBlob` (unidentifiable)    | nothing — the blob is refused            | —          | unknown bytes are not an absence of package surface; see *Fail-closed* below |
 //! | `OciManifest`                 | nothing — no scanner invocation          | —          | a manifest carries no package surface |
@@ -93,6 +94,30 @@
 //!   blob is recognised as a JSON document or as empty, never inferred
 //!   from "it did not look like an archive" ([`sniff_container`]).
 //!
+//! # Only a layer is a filesystem
+//!
+//! The `rootfs` row above is scoped by the **declared role**
+//! ([`LayerRole`]) and not by the container shape, and that is ADR 0064
+//! D6 rather than an optimisation. A package-vulnerability finding is a
+//! statement about an installed package tree that runs; a blob no image
+//! is composed from has none, so a finding read out of one is "a
+//! statement about nothing", and hort produced one only because every
+//! tar-shaped blob was materialised as a root filesystem — *"correct for
+//! an image layer, a coincidence for anything else"*. An OCI artifact's
+//! payload layer (a Helm chart, an SBOM attachment) is the measured case:
+//! a gzip-tar, indistinguishable here from a layer, and not a filesystem.
+//!
+//! The role arrives resolved. Deciding it reads the registry's manifests
+//! and their own bytes, which is the application layer's job (the same
+//! division ADR 0064 D1 draws for the composition itself: the decision
+//! there, the mechanism here), and this adapter has no catalog to ask.
+//! What it does with the answer is the whole of this module's part:
+//! [`LayerRole::NotAnImageLayer`] stops before the CAS read, and
+//! **nothing else does** — [`LayerRole::Unknown`] takes the
+//! container-decides path exactly as before, because an absent manifest
+//! is not evidence about these bytes and a layer is routinely scanned
+//! before the manifest naming it exists.
+//!
 //! # Fail-closed, not best-effort
 //!
 //! Nothing here degrades. A payload whose entries trip a bound in
@@ -119,7 +144,7 @@ use std::sync::Arc;
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::oci::ImageBudget;
-use hort_domain::ports::scanner::{ComposedImage, NotAnalysable, ScanTarget, ScanUnit};
+use hort_domain::ports::scanner::{ComposedImage, LayerRole, NotAnalysable, ScanTarget, ScanUnit};
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ContentHash};
 use tempfile::{Builder, TempDir};
@@ -326,12 +351,38 @@ enum Plan {
     Relocated { dest: String, mode: ScanMode },
     /// Extract a ZIP into the target directory.
     Zip { mode: ScanMode },
-    /// An OCI blob: the container decides. A tar (plain or gzip) is a
-    /// layer and becomes a root filesystem; anything else is not layer
-    /// content.
+    /// An OCI blob **a manifest declares to be an image layer**, or one
+    /// nothing has said either way about: the container decides. A tar
+    /// (plain or gzip) becomes a root filesystem; anything else is not
+    /// layer content.
     OciBlob,
+    /// An OCI blob hort's own manifests positively declare **not** to be
+    /// an image layer — an artifact manifest's payload layer, or a blob
+    /// named only as an image config.
+    ///
+    /// A separate arm from [`Self::NotApplicable`] even though both end
+    /// the materialisation the same way, because the two are different
+    /// statements and the log line has to be able to tell them apart: a
+    /// manifest's bytes have no package surface *by construction*, while
+    /// these bytes may be an archive full of files and simply are not a
+    /// root filesystem (ADR 0064 D6 — a package finding read out of one
+    /// is "a statement about nothing").
+    NotAnImageLayer,
     /// Nothing a scanner can analyse.
     NotApplicable,
+}
+
+impl Plan {
+    /// Whether this plan spawns no scanner at all — so the caller skips
+    /// the CAS read as well as the invocation.
+    ///
+    /// The two no-invocation arms are deliberately not one value (see
+    /// [`Self::NotAnImageLayer`]), and this is the predicate that keeps
+    /// every site reading "is there anything to do?" off one answer
+    /// rather than matching the pair by hand.
+    fn spawns_nothing(&self) -> bool {
+        matches!(self, Self::NotApplicable | Self::NotAnImageLayer)
+    }
 }
 
 /// Whether this adapter has a materialisation for `kind` at all — the
@@ -343,6 +394,14 @@ enum Plan {
 /// never drift: a kind that maps to [`Plan::NotApplicable`] is a kind no
 /// scanner invocation is attempted for, which is exactly the kind this
 /// predicate must call unanalysable.
+///
+/// This is a statement about the **kind**, so it is taken under the role
+/// that asks nothing of the registry ([`LayerRole::Unknown`]). A format's
+/// place in the capability map must not depend on what some other
+/// artifact declares about one row: `oci` is analysable because an image
+/// layer is a shape this adapter materialises, and it stays analysable on
+/// a day when every OCI blob in a repository happens to be an artifact
+/// manifest's payload.
 fn kind_is_materialisable(kind: ArtifactKind) -> bool {
     match kind {
         ArtifactKind::MavenJar
@@ -351,10 +410,11 @@ fn kind_is_materialisable(kind: ArtifactKind) -> bool {
         | ArtifactKind::CargoCrate
         | ArtifactKind::PySdist
         | ArtifactKind::PyWheel
-        // An OCI blob that is a layer becomes a root filesystem; one
-        // that is not (the image config) yields `NotApplicable` at
-        // sniff time. The format is analysable because the first shape
-        // exists, and that is what a per-format answer can say.
+        // An OCI blob a manifest declares to be an image layer becomes a
+        // root filesystem; one declared otherwise, or one whose container
+        // excludes a package surface, yields `NotApplicable`. The format
+        // is analysable because the first shape exists, and that is what
+        // a per-format answer can say.
         | ArtifactKind::OciBlob => true,
         ArtifactKind::OciManifest | ArtifactKind::Other => false,
     }
@@ -420,12 +480,19 @@ pub(crate) fn format_is_analysable(format: &str) -> bool {
 /// coverage matrix, which is the authority on which target runs which
 /// analyzer.
 ///
-/// Takes the kind and the coords rather than the whole
+/// Takes the kind, the coords and the layer role rather than the whole
 /// [`ScanTarget`](hort_domain::ports::scanner::ScanTarget) because the
 /// table is about one blob: a composed image is materialised from its own
 /// resolved description (see [`crate::oci_layout`]) and never reaches
 /// here.
-fn plan_for(kind: ArtifactKind, coords: &ArtifactCoords) -> Plan {
+///
+/// `role` is read on exactly one kind, and that is the kind axis of
+/// ADR 0064 D6: an OCI blob is the only row whose filesystem belongs to
+/// a composition, so it is the only row where "is presenting these bytes
+/// as a root filesystem a statement about anything?" is a question at
+/// all. Every other kind's materialisation is a statement about its own
+/// bytes and the role is `Unknown` by construction.
+fn plan_for(kind: ArtifactKind, coords: &ArtifactCoords, role: LayerRole) -> Plan {
     match kind {
         // A Java archive is a post-build artifact, claimed only by the
         // Image and Rootfs targets.
@@ -458,7 +525,21 @@ fn plan_for(kind: ArtifactKind, coords: &ArtifactCoords) -> Plan {
         ArtifactKind::PyWheel => Plan::Zip {
             mode: ScanMode::Rootfs,
         },
-        ArtifactKind::OciBlob => Plan::OciBlob,
+        // A layer *is* a root filesystem and only the `rootfs` target
+        // reads its OS package database — but that is true of a layer,
+        // not of every tar-shaped blob. The role is what separates the
+        // two, and it is the manifests' statement rather than the bytes'
+        // shape (ADR 0064 D6). A positively-declared non-layer stops
+        // here, before the CAS read; an undeclared blob keeps the
+        // container-decides path, because an absent manifest is not
+        // evidence about these bytes.
+        ArtifactKind::OciBlob => {
+            if role.permits_rootfs_materialisation() {
+                Plan::OciBlob
+            } else {
+                Plan::NotAnImageLayer
+            }
+        }
         ArtifactKind::OciManifest | ArtifactKind::Other => Plan::NotApplicable,
     }
 }
@@ -776,16 +857,30 @@ async fn materialise_blob(
     content_hash: &ContentHash,
     max_artifact_size: u64,
 ) -> DomainResult<Materialised> {
-    let plan = plan_for(target.kind, target.coords);
-    if plan == Plan::NotApplicable {
-        // No CAS read at all: there is no materialisation for these
-        // bytes, so paying a storage round-trip to write a file nothing
-        // will analyse is pure cost.
+    let plan = plan_for(target.kind, target.coords, target.layer_role);
+    if plan.spawns_nothing() {
+        // No CAS read at all: nothing here will be materialised, so
+        // paying a storage round-trip — and, for a non-layer archive, an
+        // extraction — to build a tree nothing will analyse is pure cost.
+        //
+        // `reason` is why the two arms are separate values. "A manifest
+        // carries no package surface" and "these bytes are not the root
+        // filesystem a package finding would be about" are different
+        // facts, and an operator triaging a blob that got no verdict
+        // needs to know which one they are looking at.
+        let reason = if plan == Plan::NotAnImageLayer {
+            "no manifest this registry holds composes an image from these bytes"
+        } else {
+            "artifact kind carries no analysable surface"
+        };
+        let layer_role = target.layer_role.as_str();
         tracing::debug!(
             scanner = "trivy",
             kind = target.kind.as_str(),
+            layer_role,
             format = target.format,
-            "trivy adapter: artifact kind carries no analysable surface; skipping invocation"
+            reason,
+            "trivy adapter: skipping invocation"
         );
         return Ok(Materialised::Nothing(NotAnalysable::NotApplicable));
     }
@@ -806,7 +901,7 @@ async fn materialise_blob(
     })?;
 
     match plan {
-        Plan::NotApplicable => unreachable!("handled above"),
+        Plan::NotApplicable | Plan::NotAnImageLayer => unreachable!("handled above"),
         Plan::SingleFile { name, mode } => {
             let path = target_dir.join(&name);
             stream_to_file(storage, content_hash, &path, max_artifact_size).await?;
@@ -933,7 +1028,7 @@ fn refusal_of(error: &ExtractError) -> NotAnalysable {
         ExtractError::ExtractedBytesCap { .. }
         | ExtractError::CompressionRatioCap { .. }
         | ExtractError::EntryCap { .. }
-        | ExtractError::UncontainedPath
+        | ExtractError::UncontainedPath { .. }
         | ExtractError::UndecodableEntryName { .. }
         | ExtractError::Malformed(_) => NotAnalysable::UnusableArchive,
     }
@@ -1033,7 +1128,7 @@ fn extract_blocking(
                 )),
             }
         }
-        Plan::SingleFile { .. } | Plan::NotApplicable => {
+        Plan::SingleFile { .. } | Plan::NotApplicable | Plan::NotAnImageLayer => {
             unreachable!("extraction is only reached for archive plans")
         }
     };
@@ -1222,6 +1317,8 @@ async fn stream_to_file(
 mod tests {
     use super::*;
 
+    use crate::extract::UncontainedComponent;
+
     use std::io::Cursor;
     use std::io::Write as _;
 
@@ -1247,6 +1344,18 @@ mod tests {
         /// absence — the two must not reach the same outcome, since only
         /// one of them can change on a later attempt.
         Broken,
+        /// Yield the bytes for every hash **but one**, whose read fails
+        /// as an absence; and the same with a **backend** failure.
+        ///
+        /// One withheld constituent rather than a storage that fails
+        /// every read: a composition none of whose constituents is
+        /// readable cannot tell "a partial layout was refused" from
+        /// "there was nothing to assemble at all", so a change that let
+        /// a partial layout out as assembled would leave such a test
+        /// passing.
+        AllButAbsent(Vec<u8>, ContentHash),
+        /// See [`Get::AllButAbsent`].
+        AllButBroken(Vec<u8>, ContentHash),
     }
 
     struct StubStorage(Get);
@@ -1260,7 +1369,7 @@ mod tests {
         }
         fn get(
             &self,
-            _hash: &ContentHash,
+            hash: &ContentHash,
         ) -> BoxFuture<'_, DomainResult<Box<dyn AsyncRead + Send + Unpin>>> {
             enum Served {
                 Bytes(Vec<u8>),
@@ -1272,6 +1381,20 @@ mod tests {
                 Get::NotFound => Served::Absent,
                 Get::Broken => Served::Broken,
                 Get::Forbidden => panic!("this artifact kind must not cost a CAS read"),
+                Get::AllButAbsent(b, withheld) => {
+                    if hash == withheld {
+                        Served::Absent
+                    } else {
+                        Served::Bytes(b.clone())
+                    }
+                }
+                Get::AllButBroken(b, withheld) => {
+                    if hash == withheld {
+                        Served::Broken
+                    } else {
+                        Served::Bytes(b.clone())
+                    }
+                }
             };
             Box::pin(async move {
                 match served {
@@ -1336,6 +1459,47 @@ mod tests {
                 manifest_media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
             },
         )
+    }
+
+    /// A two-layer composition whose four constituents have **distinct**
+    /// digests, so a storage stub can withhold exactly one of them.
+    /// [`sample_composed_image`] deliberately reuses one hash throughout,
+    /// which is what makes it useless for that.
+    fn distinct_composed_image() -> ComposedImage {
+        use hort_domain::oci::{ImageLayout, ImageLayoutLayer, OCI_IMAGE_MANIFEST_MEDIA_TYPE};
+        let digest = |seed: char| -> ContentHash {
+            std::iter::repeat_n(seed, 64)
+                .collect::<String>()
+                .parse()
+                .expect("synthetic sha256")
+        };
+        ComposedImage::new(
+            digest('a'),
+            ImageLayout {
+                config: digest('c'),
+                layers: vec![
+                    ImageLayoutLayer {
+                        hash: digest('1'),
+                        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    },
+                    ImageLayoutLayer {
+                        hash: digest('2'),
+                        media_type: "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                    },
+                ],
+                manifest_media_type: OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string(),
+            },
+        )
+    }
+
+    /// [`distinct_composed_image`]'s last layer — the one constituent the
+    /// composition-refusal pins withhold, so what is refused is a layout
+    /// that was already most of the way written.
+    fn last_layer_of_distinct_image() -> ContentHash {
+        std::iter::repeat_n('2', 64)
+            .collect::<String>()
+            .parse()
+            .expect("synthetic sha256")
     }
 
     fn storage_of(bytes: Vec<u8>) -> Arc<dyn StoragePort> {
@@ -1458,11 +1622,13 @@ mod tests {
         buf
     }
 
-    /// Materialise `bytes` for `kind` and return the outcome.
-    async fn materialise_kind(
+    /// Materialise `bytes` for `kind` under `role` and return the
+    /// outcome.
+    async fn materialise_kind_as(
         kind: ArtifactKind,
         coords: &ArtifactCoords,
         bytes: Vec<u8>,
+        role: LayerRole,
     ) -> DomainResult<Materialised> {
         let storage = storage_of(bytes);
         let hash = sample_hash();
@@ -1471,8 +1637,22 @@ mod tests {
             format: "maven",
             coords,
             kind,
+            layer_role: role,
         };
         materialise(&storage, &target, u64::MAX).await
+    }
+
+    /// Materialise `bytes` for `kind` and return the outcome.
+    ///
+    /// [`LayerRole::Unknown`] is the role every non-OCI kind carries and
+    /// the role a freshly-pushed OCI layer carries, so it is the right
+    /// default for every test whose subject is not the role itself.
+    async fn materialise_kind(
+        kind: ArtifactKind,
+        coords: &ArtifactCoords,
+        bytes: Vec<u8>,
+    ) -> DomainResult<Materialised> {
+        materialise_kind_as(kind, coords, bytes, LayerRole::Unknown).await
     }
 
     fn expect_ready(m: Materialised) -> (ScanWorkspace, ScanMode) {
@@ -1497,14 +1677,14 @@ mod tests {
     fn plan_per_kind_matches_the_materialisation_table() {
         let c = coords("g:a", Some("1.0"), "g/a/1.0/a-1.0.jar");
         assert_eq!(
-            plan_for(ArtifactKind::MavenJar, &c),
+            plan_for(ArtifactKind::MavenJar, &c, LayerRole::Unknown),
             Plan::SingleFile {
                 name: "a-1.0.jar".to_string(),
                 mode: ScanMode::Rootfs,
             }
         );
         assert_eq!(
-            plan_for(ArtifactKind::MavenPom, &c),
+            plan_for(ArtifactKind::MavenPom, &c, LayerRole::Unknown),
             Plan::SingleFile {
                 name: "pom.xml".to_string(),
                 mode: ScanMode::Fs,
@@ -1513,7 +1693,8 @@ mod tests {
         assert_eq!(
             plan_for(
                 ArtifactKind::NpmTarball,
-                &coords("lodash", Some("4.17.21"), "")
+                &coords("lodash", Some("4.17.21"), ""),
+                LayerRole::Unknown
             ),
             Plan::Relocated {
                 dest: "node_modules/lodash".to_string(),
@@ -1521,24 +1702,85 @@ mod tests {
             }
         );
         assert_eq!(
-            plan_for(ArtifactKind::CargoCrate, &c),
+            plan_for(ArtifactKind::CargoCrate, &c, LayerRole::Unknown),
             Plan::GzipTar { mode: ScanMode::Fs }
         );
         assert_eq!(
-            plan_for(ArtifactKind::PySdist, &c),
+            plan_for(ArtifactKind::PySdist, &c, LayerRole::Unknown),
             Plan::GzipTar {
                 mode: ScanMode::Rootfs
             }
         );
         assert_eq!(
-            plan_for(ArtifactKind::PyWheel, &c),
+            plan_for(ArtifactKind::PyWheel, &c, LayerRole::Unknown),
             Plan::Zip {
                 mode: ScanMode::Rootfs
             }
         );
-        assert_eq!(plan_for(ArtifactKind::OciBlob, &c), Plan::OciBlob);
-        assert_eq!(plan_for(ArtifactKind::OciManifest, &c), Plan::NotApplicable);
-        assert_eq!(plan_for(ArtifactKind::Other, &c), Plan::NotApplicable);
+        // The OCI blob is the one row whose plan reads the role as well
+        // as the kind (ADR 0064 D6): a declared image layer and a blob
+        // nothing has spoken about both take the container-decides path,
+        // and only a positively-declared non-layer stops.
+        for role in [LayerRole::ImageLayer, LayerRole::Unknown] {
+            assert_eq!(
+                plan_for(ArtifactKind::OciBlob, &c, role),
+                Plan::OciBlob,
+                "{role}: an absent declaration is not evidence that these bytes are \
+                 not a layer"
+            );
+        }
+        assert_eq!(
+            plan_for(ArtifactKind::OciBlob, &c, LayerRole::NotAnImageLayer),
+            Plan::NotAnImageLayer
+        );
+        assert_eq!(
+            plan_for(ArtifactKind::OciManifest, &c, LayerRole::Unknown),
+            Plan::NotApplicable
+        );
+        assert_eq!(
+            plan_for(ArtifactKind::Other, &c, LayerRole::Unknown),
+            Plan::NotApplicable
+        );
+    }
+
+    /// **Criterion 9, at the plan table** — the role is read on the OCI
+    /// blob and on nothing else.
+    ///
+    /// Asserted over every other kind under every role rather than over
+    /// the interesting pair, because the scoping is the claim: ADR 0064
+    /// decides the OCI image and says of every other format "not decided
+    /// here", so a kind that started reading the role would take a
+    /// decision nobody took — and it would do so silently, since the
+    /// materialisation would simply stop happening.
+    #[test]
+    fn only_the_oci_blobs_plan_depends_on_the_layer_role() {
+        let c = coords("g:a", Some("1.0"), "g/a/1.0/a-1.0.jar");
+        for kind in [
+            ArtifactKind::MavenJar,
+            ArtifactKind::MavenPom,
+            ArtifactKind::NpmTarball,
+            ArtifactKind::CargoCrate,
+            ArtifactKind::PySdist,
+            ArtifactKind::PyWheel,
+            ArtifactKind::OciManifest,
+            ArtifactKind::Other,
+        ] {
+            let baseline = plan_for(kind, &c, LayerRole::Unknown);
+            for role in [LayerRole::ImageLayer, LayerRole::NotAnImageLayer] {
+                assert_eq!(
+                    plan_for(kind, &c, role),
+                    baseline,
+                    "{kind} must not read the layer role: ADR 0064 scopes the \
+                     composition to the OCI image"
+                );
+            }
+        }
+        assert_ne!(
+            plan_for(ArtifactKind::OciBlob, &c, LayerRole::NotAnImageLayer),
+            plan_for(ArtifactKind::OciBlob, &c, LayerRole::Unknown),
+            "the OCI blob is the kind the role decides, so the two must differ \
+             here or the scan above is vacuous"
+        );
     }
 
     /// The whole point of this item: the subcommand a kind is scanned
@@ -1550,7 +1792,11 @@ mod tests {
     #[test]
     fn scan_mode_per_kind_follows_the_coverage_matrix() {
         let c = coords("g:a", Some("1.0"), "g/a/1.0/a-1.0.jar");
-        let subcommand_of = |kind| match plan_for(kind, &c) {
+        // Taken under the role that asks nothing of the registry, which
+        // is what makes this a statement about the kind: the mode a kind
+        // is scanned with is a property of its bytes, and the role
+        // decides only whether the scan happens at all.
+        let subcommand_of = |kind| match plan_for(kind, &c, LayerRole::Unknown) {
             Plan::SingleFile { mode, .. }
             | Plan::GzipTar { mode }
             | Plan::Relocated { mode, .. }
@@ -1558,7 +1804,7 @@ mod tests {
             // An OCI blob that turns out to be a layer is always a root
             // filesystem; one that does not is never scanned.
             Plan::OciBlob => Some(ScanMode::Rootfs.subcommand()),
-            Plan::NotApplicable => None,
+            Plan::NotApplicable | Plan::NotAnImageLayer => None,
         };
         for (kind, expected) in [
             // Post-build artifacts: Image and Rootfs targets only.
@@ -1600,7 +1846,7 @@ mod tests {
         ] {
             assert_eq!(
                 kind_is_materialisable(kind),
-                plan_for(kind, &c) != Plan::NotApplicable,
+                !plan_for(kind, &c, LayerRole::Unknown).spawns_nothing(),
                 "{kind}: the capability answer must follow the plan table"
             );
         }
@@ -1634,7 +1880,7 @@ mod tests {
             let materialisable: Vec<ArtifactKind> = kinds
                 .iter()
                 .copied()
-                .filter(|k| plan_for(*k, &c) != Plan::NotApplicable)
+                .filter(|k| !plan_for(*k, &c, LayerRole::Unknown).spawns_nothing())
                 .collect();
             assert!(
                 !materialisable.is_empty(),
@@ -2043,6 +2289,37 @@ mod tests {
         );
     }
 
+    /// At the adapter boundary: an OCI layer whose member names are
+    /// absolute — the pax-header member `/PaxHeaders.0`, the root member
+    /// `/`, then an ordinary package database. This shape used to answer
+    /// `UnusableArchive`, which holds the layer and every image binding
+    /// it without anything ever having been examined, so what the test
+    /// pins is that the layer reaches a scan at all.
+    ///
+    /// `gzip_tar` writes the header's name field directly, which is the
+    /// only way to build this fixture: `Header::set_path` refuses an
+    /// absolute name, and a real archiver handed an absolute path writes
+    /// one anyway.
+    #[tokio::test]
+    async fn oci_layer_with_absolute_member_names_extracts_instead_of_holding() {
+        let c = coords("library/alpine", None, "blobs/sha256:aa");
+        let bytes = gzip_tar(&[
+            ("/PaxHeaders.0", b""),
+            ("/", b""),
+            ("/lib/apk/db/installed", b"P:musl\n"),
+        ]);
+        let m = materialise_kind(ArtifactKind::OciBlob, &c, bytes)
+            .await
+            .expect("absolute member names must not refuse the archive");
+        let (ws, mode) = expect_ready(m);
+        assert_eq!(mode, ScanMode::Rootfs);
+        assert_eq!(
+            std::fs::read(ws.dir().join("lib/apk/db/installed")).expect("read the package db"),
+            b"P:musl\n",
+            "the absolute member lands under the scan root, not at the path it spells"
+        );
+    }
+
     /// The raw payload is never a scan target: it is written beside the
     /// directory Trivy is pointed at, and removed once extracted.
     #[tokio::test]
@@ -2138,6 +2415,7 @@ mod tests {
                 format: "oci",
                 coords: &c,
                 kind,
+                layer_role: LayerRole::Unknown,
             };
             let m = materialise(&storage, &target, u64::MAX)
                 .await
@@ -2163,6 +2441,7 @@ mod tests {
             format: "oci",
             coords: &c,
             kind: ArtifactKind::OciManifest,
+            layer_role: LayerRole::Unknown,
         };
         let m = materialise(&storage, &target, u64::MAX)
             .await
@@ -2184,6 +2463,7 @@ mod tests {
             format: "oci",
             coords: &c,
             kind: ArtifactKind::OciManifest,
+            layer_role: LayerRole::Unknown,
         };
         let r = materialise(&storage, &target, u64::MAX).await;
         let Err(e) = r else {
@@ -2195,6 +2475,60 @@ mod tests {
             rendered.contains("object store returned 503"),
             "the backend's own words survive: {rendered}"
         );
+    }
+
+    /// **The structural half of the guarantee the `image`-mode
+    /// empty-report reading rests on.** The adapter reads an empty Trivy
+    /// report over a composed image as a completed fact about the image,
+    /// and that is only available because a composition is handed to the
+    /// scanner **whole or not at all**. This is the "not at all" half,
+    /// over both refusal classes, in the one form a partial layout
+    /// cannot satisfy: `Ready` is never reached, so there is no workspace
+    /// for the scanner to report nothing over.
+    ///
+    /// Beside the two tests above rather than folded into them. Each of
+    /// those asserts *which* outcome a refusal becomes, and either would
+    /// still pass if a refusal were produced **and** a tree handed over
+    /// as well; this is what makes that unrepresentable.
+    #[tokio::test]
+    async fn a_refused_composition_never_hands_over_a_workspace() {
+        let image = distinct_composed_image();
+        let c = coords("library/nginx", None, "manifests/sha256:aa");
+        let target = ScanTarget {
+            unit: ScanUnit::Image(&image),
+            format: "oci",
+            coords: &c,
+            kind: ArtifactKind::OciManifest,
+            layer_role: LayerRole::Unknown,
+        };
+        let bytes = b"constituent bytes".to_vec();
+        for (label, get) in [
+            (
+                "an absent constituent",
+                Get::AllButAbsent(bytes.clone(), last_layer_of_distinct_image()),
+            ),
+            (
+                "a failed constituent read",
+                Get::AllButBroken(bytes.clone(), last_layer_of_distinct_image()),
+            ),
+        ] {
+            let storage: Arc<dyn StoragePort> = Arc::new(StubStorage(get));
+            match materialise(&storage, &target, u64::MAX).await {
+                Ok(Materialised::Ready { mode, .. }) => panic!(
+                    "{label} handed the scanner a {mode:?} workspace; an empty report over \
+                     one of those reads as a completed fact about the image"
+                ),
+                // Which refusal it is, and that it gates, is the two
+                // tests above; here it only has to be an abstention
+                // rather than a materialised tree.
+                Ok(Materialised::Nothing(why)) => assert!(
+                    why.gates_release(ArtifactKind::OciManifest),
+                    "{label}: a composition that was never assembled is a filesystem that \
+                     went unassessed, so its abstention holds the manifest"
+                ),
+                Err(_) => {}
+            }
+        }
     }
 
     /// An OCI config blob is JSON, not a layer: no package surface, and
@@ -2210,6 +2544,81 @@ mod tests {
         .await
         .expect("materialise");
         assert_eq!(expect_nothing(&m), NotAnalysable::NotApplicable);
+    }
+
+    /// **Criterion 9, direction one.** A tar-shaped blob hort's own
+    /// manifests say is *not* an image layer is no longer materialised as
+    /// a root filesystem — and the bytes are not even fetched.
+    ///
+    /// The payload here is the shape that made the old behaviour wrong: a
+    /// gzip-tar carrying an OS package database, which is exactly what a
+    /// Helm chart layer or any other OCI artifact's payload looks like to
+    /// a container sniffer. Under the old table it became a `rootfs` and
+    /// a package inventory was read out of a tree nothing runs —
+    /// ADR 0064 D6's "statement about nothing".
+    ///
+    /// `Get::Forbidden` is what makes the second half assertable: it
+    /// panics on a `get`, so the test proves the extraction was not
+    /// merely discarded after the download. That is the "work spent
+    /// producing it" half of the defect.
+    #[tokio::test]
+    async fn a_tar_blob_that_is_not_an_image_layer_is_not_materialised_as_a_rootfs() {
+        let storage: Arc<dyn StoragePort> = Arc::new(StubStorage(Get::Forbidden));
+        let hash = sample_hash();
+        let c = coords("library/nginx", None, "blobs/sha256:aa");
+        let target = ScanTarget {
+            unit: ScanUnit::Blob(&hash),
+            format: "oci",
+            coords: &c,
+            kind: ArtifactKind::OciBlob,
+            layer_role: LayerRole::NotAnImageLayer,
+        };
+        let m = materialise(&storage, &target, u64::MAX)
+            .await
+            .expect("a declared non-layer is a no-verdict, not an error");
+        assert_eq!(
+            expect_nothing(&m),
+            NotAnalysable::NotApplicable,
+            "a blob no image is composed from carries no installed package tree, so \
+             the absence is of a surface and not of an assessment"
+        );
+        assert!(
+            !expect_nothing(&m).gates_release(ArtifactKind::OciBlob),
+            "and it must not hold the blob: there is nothing for a hold to wait on"
+        );
+    }
+
+    /// **Criterion 9, direction two.** An image layer still is
+    /// materialised as a root filesystem — same payload, same bytes, only
+    /// the manifests' declaration differs.
+    ///
+    /// Run as a table over the two roles that permit it, because
+    /// `LayerRole::Unknown` is the role every layer of every hosted push
+    /// carries at the moment its own scan runs (blobs first, manifest
+    /// last). If that row stopped extracting, ADR 0064 D2's layer
+    /// evidence scan would quietly disappear for the whole push
+    /// population.
+    #[tokio::test]
+    async fn an_image_layer_is_still_materialised_as_a_rootfs() {
+        let c = coords("library/nginx", None, "blobs/sha256:aa");
+        let layer = gzip_tar(&[("var/lib/dpkg/status", b"Package: zlib1g\n")]);
+        for role in [LayerRole::ImageLayer, LayerRole::Unknown] {
+            let m = materialise_kind_as(ArtifactKind::OciBlob, &c, layer.clone(), role)
+                .await
+                .expect("materialise");
+            let (ws, mode) = expect_ready(m);
+            assert_eq!(
+                mode,
+                ScanMode::Rootfs,
+                "{role}: a layer is a root filesystem and only that target reads \
+                 its OS package database"
+            );
+            assert_eq!(
+                std::fs::read(ws.dir().join("var/lib/dpkg/status")).expect("read"),
+                b"Package: zlib1g\n",
+                "{role}: the package database has to be where the analyzer looks"
+            );
+        }
     }
 
     /// An empty blob holds no package surface, and that is provable
@@ -2256,13 +2665,75 @@ mod tests {
              (ADR 0064 D2) — `NotApplicable` would release an unassessed root filesystem"
         );
         assert!(
-            expect_nothing(&m).gates_release(
-                ArtifactKind::OciBlob,
-                hort_domain::entities::scan_policy::CompositeVerdictMode::Promoted
-            ),
-            "and it gates even under a promoted composite verdict: the decoder-inventory \
-             exemption needs a container that was positively identified"
+            expect_nothing(&m).gates_release(ArtifactKind::OciBlob),
+            "and it gates even on a constituent, whose composition carries the \
+             filesystem verdict: the decoder-inventory exemption needs a container \
+             that was positively identified"
         );
+    }
+
+    /// **A non-filesystem payload on the constituent path carries no
+    /// package surface, and that is read off its own bytes.** A cosign
+    /// `simplesigning` signature payload, an in-toto statement, a
+    /// Sigstore bundle and an SPDX or CycloneDX document are — by the
+    /// specification each of their media types names — JSON documents,
+    /// and a JSON document is one of the shapes [`sniff_container`]
+    /// identifies *positively* as excluding a package surface. So none
+    /// of them is ever materialised as an archive, with or without a
+    /// manifest naming it: no hold, no extraction, no refusal about
+    /// bytes that were never an archive.
+    ///
+    /// Taken under [`LayerRole::Unknown`], which is the role every such
+    /// blob carries at its own first scan — on a hosted push the blobs
+    /// are ingested, and their scans enqueued, before the manifest that
+    /// names them exists — so this is the answer with nothing declared
+    /// about the bytes at all. Where a manifest *is* readable the
+    /// resolver reaches the same outcome one stage earlier and for a
+    /// different reason (`hort_app`'s layer-role resolution: a manifest
+    /// declaring a non-filesystem payload layer is not an image, so
+    /// nothing it names is an image layer).
+    #[tokio::test]
+    async fn a_non_filesystem_payload_blob_carries_no_package_surface() {
+        let c = coords("library/nginx", None, "blobs/sha256:aa");
+        for (shape, payload) in [
+            (
+                "cosign simplesigning",
+                br#"{"critical":{"identity":{"docker-reference":"library/nginx"},"image":{"docker-manifest-digest":"sha256:aa"},"type":"cosign container image signature"},"optional":null}"#
+                    .to_vec(),
+            ),
+            (
+                "in-toto statement",
+                br#"{"_type":"https://in-toto.io/Statement/v1","subject":[],"predicateType":"https://slsa.dev/provenance/v1"}"#
+                    .to_vec(),
+            ),
+            (
+                "sigstore bundle",
+                br#"{"mediaType":"application/vnd.dev.sigstore.bundle.v0.3+json","verificationMaterial":{}}"#
+                    .to_vec(),
+            ),
+            (
+                "spdx json",
+                br#"{"spdxVersion":"SPDX-2.3","SPDXID":"SPDXRef-DOCUMENT","packages":[]}"#.to_vec(),
+            ),
+            (
+                "cyclonedx json",
+                br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#.to_vec(),
+            ),
+        ] {
+            let m = materialise_kind(ArtifactKind::OciBlob, &c, payload)
+                .await
+                .expect("a document is not a refusal");
+            assert_eq!(
+                expect_nothing(&m),
+                NotAnalysable::NotApplicable,
+                "a {shape} payload is a document, not an archive: there is no filesystem in \
+                 it for an analyzer to have claimed"
+            );
+            assert!(
+                !expect_nothing(&m).gates_release(ArtifactKind::OciBlob),
+                "{shape}: nothing for a hold to wait on"
+            );
+        }
     }
 
     /// **The mapping table, by value.** Every `ExtractError` variant
@@ -2283,7 +2754,14 @@ mod tests {
                 compressed: 7,
             },
             ExtractError::EntryCap { cap: 1 },
-            ExtractError::UncontainedPath,
+            ExtractError::UncontainedPath {
+                index: 2,
+                component: UncontainedComponent::ParentDir,
+            },
+            ExtractError::UncontainedPath {
+                index: 0,
+                component: UncontainedComponent::Prefix,
+            },
             ExtractError::UndecodableEntryName { index: 0 },
             // The undecidable case, deliberately on this side: the
             // readers behind it report "no decoder for this" and "a
@@ -2307,20 +2785,23 @@ mod tests {
 
         // And what the two now do, asserted here as a pair as well,
         // because the mapping is what an operator sees: on a constituent
-        // whose composition carries the filesystem verdict the missing
-        // decoder stops holding the layer, while the hostile archive — a
+        // the composition carries the filesystem verdict, so the missing
+        // decoder does not hold the layer, while the hostile archive — a
         // statement about these bytes — holds it either way
         // (ADR 0064 D2). This adapter decides the *reason*; where each
         // reason lands is `NotAnalysable::gates_release`'s.
         let kind = ArtifactKind::OciBlob;
-        let promoted = hort_domain::entities::scan_policy::CompositeVerdictMode::Promoted;
         assert!(
-            refusal_of(&ExtractError::UncontainedPath).gates_release(kind, promoted),
+            refusal_of(&ExtractError::UncontainedPath {
+                index: 0,
+                component: UncontainedComponent::ParentDir,
+            })
+            .gates_release(kind),
             "an entry that tried to escape the workspace is about these bytes"
         );
         assert!(
             !refusal_of(&ExtractError::UnsupportedContainer { container: "zstd" })
-                .gates_release(kind, promoted),
+                .gates_release(kind),
             "a container this adapter cannot decode is a statement about hort; the \
              composition that reads these bytes carries the verdict"
         );
@@ -2419,6 +2900,7 @@ mod tests {
             format: "maven",
             coords: &c,
             kind: ArtifactKind::MavenJar,
+            layer_role: LayerRole::Unknown,
         };
         match materialise(&storage, &target, 16).await {
             Err(DomainError::Invariant(msg)) => {
@@ -2445,6 +2927,7 @@ mod tests {
             format: "maven",
             coords: &c,
             kind: ArtifactKind::MavenJar,
+            layer_role: LayerRole::Unknown,
         };
         let m = materialise(&storage, &target, 32)
             .await
@@ -2466,6 +2949,7 @@ mod tests {
             format: "maven",
             coords: &c,
             kind: ArtifactKind::MavenJar,
+            layer_role: LayerRole::Unknown,
         };
         let r = materialise(&storage, &target, u64::MAX).await;
         assert!(matches!(r, Err(DomainError::NotFound { .. })), "{r:?}");

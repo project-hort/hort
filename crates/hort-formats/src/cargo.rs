@@ -27,7 +27,7 @@ use hort_domain::types::{
 
 use crate::publish_identity::IdentityCheck;
 use crate::range_resolvers::resolve_semver_range_max;
-use crate::sbom_helpers::{build_subject_component, strip_version_constraint};
+use crate::sbom_helpers::{build_subject_component, strip_version_constraint, subject_only};
 
 /// Cargo format handler (RFC 2789 sparse registry).
 ///
@@ -781,19 +781,6 @@ impl PayloadSbom for CargoFormatHandler {
     }
 }
 
-/// A BOM that names the artifact under scan and claims nothing about its
-/// dependencies — the honest degradation whenever the resolve is unknown.
-fn subject_only(subject: SbomComponent, resolution: SbomResolution) -> PayloadSbomExtraction {
-    PayloadSbomExtraction {
-        sbom: Some(Sbom {
-            subject: Some(subject),
-            components: Vec::new(),
-        }),
-        resolution,
-        skipped_non_registry: 0,
-    }
-}
-
 /// cargo's [`VersionDiscovery`] participation — 6 of 8 members
 /// (`extract_upstream_versions`, `upstream_metadata_path`,
 /// `extract_dependency_specs`, `resolve_range_max`,
@@ -879,6 +866,23 @@ impl VersionDiscovery for CargoFormatHandler {
     /// trait-level default used to supply.
     fn upstream_metadata_accept(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// The `.crate` tarball, which for cargo IS the dependency document:
+    /// [`extract_dependency_specs`](VersionDiscovery::extract_dependency_specs)
+    /// opens it and reads the top-level `Cargo.toml` out of it, so the
+    /// artifact a client pulls and the manifest a cascade reads are the
+    /// same bytes.
+    ///
+    /// A cargo repository stores nothing else as an artifact row — the
+    /// sparse index is served from upstream metadata and a cached index
+    /// page is not an artifact — so the suffix is the whole test. The
+    /// same signal [`CargoFormatHandler::scan_kind`] reads, answered
+    /// independently because the two decisions are independent: that one
+    /// picks a scanner's analyzer, this one decides whether there is a
+    /// manifest to walk.
+    fn path_carries_dependency_specs(&self, path: &str) -> bool {
+        path.to_ascii_lowercase().ends_with(".crate")
     }
 
     /// Extract the *declared runtime* dependency specs from the **stored
@@ -2492,6 +2496,37 @@ mod tests {
         }
     }
 
+    /// For cargo the archive IS the document — the positive control for
+    /// the cascade-seed gate, and the reason the gate is a per-format
+    /// question rather than "archives cannot be read": every stored
+    /// cargo artifact is a `.crate` and every one of them carries a
+    /// `Cargo.toml` the extractor reads.
+    #[test]
+    fn path_carries_dependency_specs_admits_the_crate_tarball() {
+        let handler = handler();
+
+        for admitted in [
+            "crates/tokio/1.35.1/tokio-1.35.1.crate",
+            "crates/tokio/1.35.1/TOKIO-1.35.1.CRATE",
+        ] {
+            assert!(
+                handler.path_carries_dependency_specs(admitted),
+                "{admitted}"
+            );
+        }
+
+        for refused in [
+            // The sparse index is served from upstream metadata, never
+            // stored as an artifact row — but a cached page written as
+            // one would carry no `[dependencies]` for the walk.
+            "to/ki/tokio",
+            "crates/tokio/1.35.1/tokio-1.35.1.crate.sha256",
+            "config.json",
+        ] {
+            assert!(!handler.path_carries_dependency_specs(refused), "{refused}");
+        }
+    }
+
     #[test]
     fn upstream_metadata_accept_cargo_inherits_trait_default_empty() {
         // Cargo sparse-index serves NDJSON only — no content
@@ -3301,10 +3336,11 @@ dependencies = [
     }
 
     #[test]
-    fn payload_sbom_capability_is_declared_by_cargo_alone() {
+    fn payload_sbom_capability_matches_each_handlers_own_source() {
         // The declaration is what lets the scan orchestrator skip a CAS
-        // read for every other format; `None` must stay the honest answer
-        // for handlers that do not read the payload.
+        // read for a format that has no payload dependency document;
+        // `None` must stay the honest answer for those handlers, and
+        // `Some` for every handler whose declaration is in the artifact.
         assert!(
             handler().payload_sbom().is_some(),
             "cargo derives its scan SBOM from the payload"
@@ -3314,8 +3350,12 @@ dependencies = [
             "npm's SBOM comes from stored metadata; it must not cost a CAS read"
         );
         assert!(
-            crate::pypi::PyPiFormatHandler.payload_sbom().is_none(),
-            "PyPI's SBOM comes from stored metadata; it must not cost a CAS read"
+            crate::pypi::PyPiFormatHandler.payload_sbom().is_some(),
+            "PyPI reads its own METADATA / PKG-INFO; the declaration is in the artifact"
+        );
+        assert!(
+            crate::maven::MavenFormatHandler.payload_sbom().is_some(),
+            "maven reads the embedded POM"
         );
     }
 

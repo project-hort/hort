@@ -1,36 +1,43 @@
 #!/usr/bin/env bash
 # requires: egress worker db compose
-# Proxy pull-through x provenance_mode:Required, multi-layer image — #115
-# Item 4 regression E2E for the defect Item 3 fixed.
+# Proxy pull-through x provenance_mode:Required, multi-layer image — the
+# regression E2E for a defect in the `NoAttestation x Required` hold.
 #
 # ---------------------------------------------------------------------------
-# THE DEFECT (issue #115, defect (b)) AND WHAT THIS PINS.
+# THE DEFECT AND WHAT THIS PINS.
 # ---------------------------------------------------------------------------
-# Before Item 3, `Artifact::complete_provenance`'s NoAttestation x Required
-# arm only HELD (stayed Quarantined, no terminal decision) when the
-# artifact's own observation window was still open (`window_open`). A
-# referenced-tree descendant (#46 Item 2) gets a ZERO-length window by
-# design (anchor = ingested_at - duration), so for a proxy-pulled tree every
+# `Artifact::complete_provenance`'s NoAttestation x Required arm once only
+# HELD (stayed Quarantined, no terminal decision) while the artifact's own
+# observation window was still open. Back then a referenced-tree descendant
+# waived that window unconditionally, so for a proxy-pulled tree every
 # constituent — the platform-specific child manifest, its config blob, its
-# layer blobs — had `window_open == false` from the instant it was ingested,
-# and the OLD code TERMINALLY REJECTED it as `Unsigned` before the parent
-# index (the actual signable subject) ever got a chance to be signed. Item 3
-# widened the hold condition to `window_open || is_referenced_descendant`,
-# so a descendant now HOLDS unconditionally — independent of whether its
-# subject is ever signed — and clears later via cascade
+# layer blobs — had a closed window from the instant it was ingested, and the
+# OLD code TERMINALLY REJECTED it as `Unsigned` before the parent index (the
+# actual signable subject) ever got a chance to be signed.
+#
+# The window is no longer part of that decision at all. ADR 0039 D1/D3
+# (2026-09-12) removed the enumeration: an absent attestation holds EVERY
+# shape unconditionally — independent of the artifact's position in the tree
+# and of whether its subject is ever signed — because an absent attestation
+# states where the evidence was at one instant, which nothing terminal can
+# rest on. Only a signature that is present, readable and invalid is
+# terminal. A held constituent clears later via cascade
 # (`cascade_provenance_clearance`, ADR 0039 §11) once the subject verifies.
+# So the hold this scenario drives no longer depends on the window, and the
+# window assertions in Step 7 are about the RELEASE TIMER (ADR 0007), which
+# is a separate axis that also has to be satisfied before anything serves.
 #
 # This scenario drives that composition for real: pull a genuine multi-layer
 # OCI image INDEX through a `provenance_mode: Required` PROXY repo, sign the
 # INDEX (the real subject), and assert:
 #   (a) the pull EVENTUALLY SUCCEEDS (subject verifies, cascade clears the
-#       child manifest + its config/layer blobs, the quarantine window
+#       child manifest + its config/layer blobs, every quarantine window
 #       elapses, the whole tree becomes anonymously pullable);
 #   (b) NONE of the constituents (child manifest, config blob, every layer
 #       blob) EVER emits `ProvenanceRejected` — the exact defect signature
-#       Item 3 fixed (pre-fix, each would have terminally rejected as
-#       Unsigned within moments of ingest, long before this scenario's
-#       later assertions even run).
+#       the unconditional hold fixed (pre-fix, each would have terminally
+#       rejected as Unsigned within moments of ingest, long before this
+#       scenario's later assertions even run).
 #
 # ---------------------------------------------------------------------------
 # MODEL SCENARIOS COMBINED, NOT REINVENTED.
@@ -66,7 +73,8 @@
 # oci-provenance-proxy-e2e-required.yaml's header): oci-provenance-e2e is
 # hosted-push-only (no upstream mapping — cannot proxy-pull), and
 # oci-proxy-quarantine-e2e's policy is provenanceMode:off and load-bearing
-# for the sibling zero-window scenario. So this item adds ONE new repository
+# for the sibling descendant-window scenario
+# (quarantine/proxy-multiarch-zero-window.sh). So this adds ONE new repository
 # + upstream mapping + policy + a per-repo service account + its
 # PermissionGrants (write, read) + a per-repo dev-user write grant — the same
 # fixture multiplication provenance-push-then-sign.sh's own repo needed,
@@ -79,8 +87,8 @@
 # multiple layers per platform child. The layer COUNT is never assumed —
 # `.layers | length` is asserted `>= 2` against the manifest hort actually
 # served, so a future upstream retag that collapses to a single layer fails
-# loudly instead of silently testing nothing (same discipline as the
-# zero-window scenario's digest-not-count assertions).
+# loudly instead of silently testing nothing (same discipline as
+# proxy-multiarch-zero-window.sh's digest-not-count assertions).
 #
 # ---------------------------------------------------------------------------
 # WHY THIS MAY SELF-SKIP — see provenance-push-then-sign.sh's identical note.
@@ -116,7 +124,7 @@ RESOLVER_REFRESH_GUESS="${RESOLVER_REFRESH_GUESS:-8}"
 # scope-resolution logic the application layer already owns — out of scope for
 # a scenario script to reimplement).
 #
-# ONE definition with TWO consumers: Step 7's zero-window assertion and Step
+# ONE definition with TWO consumers: Step 7's window assertions and Step
 # 9b-i's release budget below. Change the policy's duration and both follow.
 QUARANTINE_DURATION_SECS=120
 #
@@ -125,17 +133,16 @@ QUARANTINE_DURATION_SECS=120
 # starts, so what is outstanding is the worker claiming the provenance-verify
 # job and running one keyed verification — seconds in practice. 240s is a
 # generous ceiling against a backed-up worker queue, not a window computation.
-# The window arithmetic belongs to Step 9b-i, which is the only wait in this
-# scenario that sits behind the quarantine window.
+# The window arithmetic belongs to Steps 9a and 9b-i, the two waits in this
+# scenario that sit behind a quarantine window.
 WINDOW_WAIT_SECS="${PROVENANCE_WINDOW_WAIT_SECS:-240}"
 #
-# Step 9b-i budget — await the INDEX row's release, the one window-bound wait
-# here. Step 7 asserts the index carries the FULL window
-# (`quarantine_window_start == created_at`, anchored on the Step 0 cold ingest:
-# the index is not a content_references target, so the zero-window descendant
-# carve-out does not reach it), and release lands on the first
-# quarantine-release-sweep pass AFTER that window closes. The budget is
-# therefore the whole window + one full sweep-tick interval (a window closing
+# Step 9b-i budget — await the INDEX row's release. Step 7 asserts the index
+# carries the FULL window (`quarantine_window_start == created_at`, anchored
+# on the Step 0 cold ingest: the index is not a content_references target, so
+# the descendant carve-out is not even evaluated for it), and release lands on
+# the first quarantine-release-sweep pass AFTER that window closes. The budget
+# is therefore the whole window + one full sweep-tick interval (a window closing
 # just after a tick fired waits for the next one) + the job-claim/release work
 # behind that tick.
 #
@@ -166,15 +173,68 @@ RELEASE_SWEEP_TICK_BUDGET_SECS=15
 RELEASE_PROCESSING_BUDGET_SECS=105
 INDEX_RELEASE_WAIT_SECS="${INDEX_RELEASE_WAIT_SECS:-$(( QUARANTINE_DURATION_SECS + RELEASE_SWEEP_TICK_BUDGET_SECS + RELEASE_PROCESSING_BUDGET_SECS ))}"
 #
-# Step 9b-ii budget — the anonymous `--all` pull, which runs only after 9b-i
-# has proved the index released. Nothing behind this leg is window-bound: the
-# index is released, and every late joiner 9a drove in is a referenced-tree
-# descendant with a ZERO-length window (Step 7 asserts that carve-out), so the
-# most one can still owe is its own clearance plus a sweep tick — which 9b-i's
-# wait has in practice already absorbed. What remains is a warm pull from local
-# storage. Keeping this budget SHORT is what makes a timeout here mean
-# "clearance or cascade" and never "the window".
+# Step 9b-ii budget — the anonymous `--all` pull, which runs only after 9a
+# proved every constituent BLOB served and 9b-i proved the index released.
+# Nothing behind this leg is window-bound, and the reason is the ORDERING
+# rather than any constituent's window being short: 9a cannot succeed until
+# each blob in the tree has released, which means each blob's own window has
+# already closed — and every blob here is minted after the manifest that
+# names it (the `oci_config` / `oci_layer` edge commits in that manifest's
+# own transition, and nothing in this scenario GETs a blob before its
+# manifest), so every constituent manifest's window closed earlier still.
+# The most one can owe by this point is a sweep tick on an already-eligible
+# row. (Each constituent DOES carry a window of its own: its
+# referencing parent is held when it is minted, so the ADR 0007 carve-out's
+# inherited-trust condition is unmet and no window is waived. 9a is where
+# that time is spent; see its budget below.) What remains here is a warm pull
+# from local storage. Keeping this budget SHORT is what makes a timeout here
+# mean "clearance or cascade" and never "the window".
 ANON_PULL_WAIT_SECS="${ANON_PULL_WAIT_SECS:-60}"
+#
+# Step 9a budget — the AUTHENTICATED `--all` warm pass.
+#
+# Sized against the CONSTITUENT CLEARANCE TAIL, not against a round
+# number, because the exemption this step leans on does not reach what
+# the step actually downloads. ADR 0039 §10's hold-read exemption is
+# MANIFEST-only: a granted-Write caller may GET a held manifest body so
+# a subject image can be signed, and `skopeo copy --all` does get every
+# manifest in the tree that way. Its BLOB content does not come with it
+# — `get_blob_quarantined_write_authorized_caller_still_returns_503`
+# pins that ("only the HEAD existence probe is released; content
+# download stays held"), and serving held blob content would defeat the
+# quarantine. So this pull completes only once every CONSTITUENT blob
+# has actually RELEASED, which means its own scan clearing, its own
+# observation window closing, and a sweep tick.
+#
+# That tail scales with the SIZE OF THE TREE — one scan per constituent
+# — so it is not RELEASE_PROCESSING_BUDGET_SECS, which budgets the
+# release work behind a single artifact's tick (observed 10-40s) and
+# would be reused here far outside what it was measured for.
+#
+# THE WINDOW IS INSIDE THIS BUDGET, NOT ADDED TO IT. A constituent is
+# minted while its referencing parent is still held, so ADR 0007's
+# carve-out does not apply to it and it carries a full
+# QUARANTINE_DURATION_SECS window of its own (Step 7 asserts exactly
+# that). The window and the scan both start at that mint, so what
+# release waits for is the LATER of the two, not their sum — and the
+# window is 120s against a 240s clearance tail, i.e. strictly inside a
+# budget that already had to cover the scan. That holds even for a
+# constituent this very step drives in, whose window therefore starts
+# after the wait did: 120s of window + a sweep tick + the release work
+# behind it is still inside the sum below. Raising the policy's duration
+# past CONSTITUENT_CLEARANCE_BUDGET_SECS would change that, and is where
+# this number would have to be re-derived.
+#
+# FASTER MUST NOT BE WORSE, the same rule 9b-i states: the elapsed time
+# before this wait is deliberately NOT subtracted, so the worst case is
+# "this pass starts at the instant of the Step 0 ingest" and no future
+# speed-up of Steps 0-8 can beat it. (The bare `120` this step used to
+# carry failed exactly that way: a run whose Steps 0-8 took 9.8s reached
+# its deadline 20.4s before the last constituent released, with every
+# byte already in CAS since 28.6s — the tree was ingested and hort was
+# holding it exactly as ADR 0007 requires.)
+CONSTITUENT_CLEARANCE_BUDGET_SECS=240
+WARM_PASS_WAIT_SECS="${WARM_PASS_WAIT_SECS:-$(( CONSTITUENT_CLEARANCE_BUDGET_SECS + RELEASE_SWEEP_TICK_BUDGET_SECS ))}"
 
 REGISTRY_HOST="${HORT_URL#http://}"
 REGISTRY_HOST="${REGISTRY_HOST#https://}"
@@ -205,7 +265,7 @@ PULLED_ARCHIVE="/tmp/prov-proxy-pulled-$$.tar"
 WARM_ARCHIVE="/tmp/prov-proxy-warm-$$.tar"
 trap 'rm -f "$PULLED_ARCHIVE" "$WARM_ARCHIVE" "${ANON_HEADERS:-}" "${ANON_BODY:-}" "${INDEX_HEADERS:-}" "${INDEX_BODY:-}" "${CHILD_HEADERS:-}" "${CHILD_BODY:-}"' EXIT
 
-log "==> Proxy pull-through x provenance_mode:Required, multi-layer image (issue #115 Item 4)"
+log "==> Proxy pull-through x provenance_mode:Required, multi-layer image"
 log "Registry : ${HORT_URL}"
 log "Repo key : ${REPO_KEY} (expected: provenanceMode=required, provenanceBackends=[cosign-key])"
 log "Image    : ${IMAGE} (${IMAGE_PATH})"
@@ -364,8 +424,7 @@ CHILD_HASH="${CHILD_DIGEST#sha256:}"
 # ---------------------------------------------------------------------
 # Step 2: AUTHENTICATED pull of the child manifest BY DIGEST — the
 # write-authorized hold-read exemption again (the child is also still
-# quarantined), and the leg that spawns #51's background config/layer blob
-# warming.
+# quarantined).
 # ---------------------------------------------------------------------
 log ""
 log "--- Step 2: AUTHENTICATED GET the child manifest by digest"
@@ -416,11 +475,16 @@ log "  child layer digests = ${LAYER_DIGESTS[*]}"
 #       ingest as Step 0's index GET regardless of whether the response is
 #       200 or a designed hold-503, so by the time this loop returns every
 #       constituent row exists for the cascade to find;
-#   (b) everything placed between ingest and sign eats into the
-#       observation window, because under a required provenance policy the
-#       window's end IS the signing deadline. The window is sized (120s)
-#       to cover both these constituent pulls (~30-60s incl. docker.io)
-#       and the sign itself, with margin.
+#   (b) everything placed between ingest and sign is time this scenario's
+#       later window-bound waits have to absorb. There is no protocol
+#       DEADLINE on the sign — ADR 0039 D1/D3 holds an unattested artifact
+#       indefinitely rather than rejecting it when a window closes, so a
+#       late sign delays release instead of forfeiting it. What a late sign
+#       costs is budget: Steps 9a and 9b-i are sized against a whole
+#       window each (see their definitions at the top of this file), and
+#       the policy's 120s is chosen to cover these constituent pulls
+#       (~30-60s incl. docker.io) plus the sign while staying short enough
+#       that the release sweep completes inside a smoke run.
 # Statuses are deliberately NOT asserted beyond "curl completed" — this is a
 # forcing step, not an assertion; the 60s polls in Step 6/8 stay as a
 # backstop. Every status here is legitimately a hold-503 or a 200 depending
@@ -533,21 +597,23 @@ CHILD_ID="$(find_artifact_id "$CHILD_HASH" "child manifest")"
 CONFIG_ID="$(find_artifact_id "$CONFIG_HASH" "config blob")"
 [ -n "$INDEX_ID" ] || { fail "resolve index artifact row" "no artifacts row for checksum_sha256='${INDEX_HASH}'"; summary; }
 [ -n "$CHILD_ID" ] || { fail "resolve child artifact row" "no artifacts row for checksum_sha256='${CHILD_HASH}'"; summary; }
-[ -n "$CONFIG_ID" ] || { fail "resolve config artifact row (background blob warming, #51)" "no artifacts row for checksum_sha256='${CONFIG_HASH}'"; summary; }
+[ -n "$CONFIG_ID" ] || { fail "resolve config artifact row" "no artifacts row for checksum_sha256='${CONFIG_HASH}' — neither Step 3's forcing GET nor the eager index-child ingest put this blob in the repository"; summary; }
 pass "index artifact id=${INDEX_ID}, child artifact id=${CHILD_ID}, config artifact id=${CONFIG_ID}"
 
 LAYER_IDS=()
 for h in "${LAYER_HASHES[@]}"; do
     lid="$(find_artifact_id "$h" "layer blob")"
-    [ -n "$lid" ] || { fail "resolve layer artifact row (background blob warming, #51)" "no artifacts row for checksum_sha256='${h}'"; summary; }
+    [ -n "$lid" ] || { fail "resolve layer artifact row" "no artifacts row for checksum_sha256='${h}' — neither Step 3's forcing GET nor the eager index-child ingest put this blob in the repository"; summary; }
     LAYER_IDS+=("$lid")
 done
 pass "all ${#LAYER_IDS[@]} layer artifact rows resolved"
 
 # ---------------------------------------------------------------------
 # Step 6: content_references edges — the pull-through edge-write half of the
-# composition this scenario exercises (targets specific digests, never a
-# count — #51 background warming means unrelated rows can appear).
+# composition this scenario exercises, and the INPUT to the carve-out's
+# condition Step 7 then evaluates (targets specific digests, never a count —
+# the eager index-child ingest legitimately adds rows for every other
+# platform in the index).
 # ---------------------------------------------------------------------
 log ""
 log "--- Step 6: content_references edges"
@@ -572,13 +638,18 @@ for i in "${!LAYER_HASHES[@]}"; do
 done
 
 # ---------------------------------------------------------------------
-# Step 7: sanity — index (NOT a descendant) got the full window; every
-# constituent (a referenced-tree descendant) got the #46 Item 2 zero window
-# — the same mechanism that makes Item 3's hold observable without waiting
-# out a full-length window.
+# Step 7: sanity — every row in this tree carries a FULL observation window.
+# The index because it is nobody's `content_references` target; every
+# constituent because it IS one but its referencing parent was still held
+# when it was minted, so ADR 0007's carve-out ("the carve-out is conditional
+# on inherited trust") has no released parent to inherit from and does not
+# apply. There is nothing provenance-related in this step: the
+# `NoAttestation x Required` hold stopped consulting the window at ADR 0039
+# D1/D3 and holds every shape unconditionally. What this step pins is the
+# RELEASE TIMER the later waits are sized against.
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 7: quarantine_window_start — index full window, constituents zero window"
+log "--- Step 7: quarantine_window_start — a full window on the index AND on every constituent"
 
 # `== created_at` is the FULL-window expectation only while these bytes are
 # COLD to this hort. ADR 0054 anchors a non-descendant on the earliest
@@ -610,26 +681,69 @@ fi
 
 # Built from QUARANTINE_DURATION_SECS, the single definition of this policy's
 # window at the top of this file (which also carries the reason it is a literal
-# rather than a `policy_projections` lookup). Shared so this assertion and Step
-# 9b-i's release budget cannot disagree about how long the window is.
+# rather than a `policy_projections` lookup). Shared so these assertions and
+# Step 9b-i's release budget cannot disagree about how long the window is.
 QUARANTINE_DURATION_SQL="interval '${QUARANTINE_DURATION_SECS} seconds'"
-# Exact, not a bound: the carve-out contributes `minted_at - duration`, and
-# ADR 0054's other sources cannot beat it here — the constituents are pulled
-# seconds before this step, so any age evidence for them is far younger than
-# the 120s window.
-assert_zero_window() {
-    local id="$1" label="$2" got
-    got="$(psql_one "SELECT (quarantine_window_start = created_at - ${QUARANTINE_DURATION_SQL}) FROM artifacts WHERE id = '${id}';")"
-    if [ "$got" = "t" ]; then
-        pass "${label}: quarantine_window_start == created_at - duration (zero window — referenced-tree-descendant carve-out fired)"
+
+# A constituent's window, in two parts: the PREMISE and then the window.
+#
+# The premise is that the constituent was minted while its referencing parent
+# was still inside the parent's OWN observation window. Nothing in this
+# repository can release a row before its window closes — `Artifact::release`
+# needs a timer authority as well as its scan and provenance clearance, and no
+# curator waive is issued anywhere in this scenario — so a constituent minted
+# inside its parent's window was minted against a parent that was NOT
+# `Released`, which is exactly the condition ADR 0007's carve-out requires and
+# does not get. It is asserted rather than assumed for the same reason the
+# index's coldness is asserted above: in a run slow enough for the parent's
+# 120s window to close before its constituents are minted, the carve-out WOULD
+# legitimately apply and the window assertion below would read as a regression
+# it is not.
+#
+# The window itself is then stated as the invariant, not as `created_at`:
+# ADR 0054 anchors on the earliest observation of the row's own content across
+# all repositories, and `created_at` is that minimum only while the bytes are
+# cold. Covering both cases here needs no second coldness premise, and the
+# reduction is logged so a reader of a passing run can see which it was.
+assert_full_window_constituent() {
+    local id="$1" hash="$2" parent_id="$3" label="$4" parent_label="$5"
+    local minted_inside_parent_window anchored_on_evidence first_seen own_created waived
+
+    minted_inside_parent_window="$(psql_one "SELECT (c.created_at < p.quarantine_window_start + ${QUARANTINE_DURATION_SQL}) \
+        FROM artifacts c, artifacts p WHERE c.id = '${id}' AND p.id = '${parent_id}';")"
+    if [ "$minted_inside_parent_window" = "t" ]; then
+        pass "${label}: minted inside its ${parent_label}'s own observation window, so that parent was not Released at the time (the carve-out's inherited-trust condition is unmet)"
     else
-        fail "${label} quarantine_window_start == created_at - duration" "got '${got}' (expected t)"
+        fail "${label} minted inside its ${parent_label}'s own observation window" \
+            "got '${minted_inside_parent_window:-<null>}' (expected t) — this run took longer than the ${QUARANTINE_DURATION_SECS}s window to get from the parent's mint to this constituent's, so the parent may legitimately have been Released first and this constituent may legitimately have inherited the carve-out. That is a slow-run fixture condition, not a defect; the window assertion below is only meaningful under this premise"
+    fi
+
+    first_seen="$(psql_one "SELECT replace(MIN(created_at)::text, ' ', 'T') FROM artifacts WHERE checksum_sha256 = '${hash}';")"
+    own_created="$(psql_one "SELECT replace(created_at::text, ' ', 'T') FROM artifacts WHERE id = '${id}';")"
+    anchored_on_evidence="$(psql_one "SELECT (quarantine_window_start = \
+        (SELECT MIN(created_at) FROM artifacts WHERE checksum_sha256 = '${hash}')) \
+        FROM artifacts WHERE id = '${id}';")"
+    if [ "$anchored_on_evidence" = "t" ]; then
+        if [ "$first_seen" = "$own_created" ]; then
+            pass "${label}: quarantine_window_start == created_at — no earlier observation of these bytes exists, so a full window anchors at its own mint"
+        else
+            pass "${label}: quarantine_window_start == the earliest observation of its own bytes (${first_seen}), made before this row — a full window on ADR 0054 age evidence"
+        fi
+    else
+        waived="$(psql_one "SELECT (quarantine_window_start = created_at - ${QUARANTINE_DURATION_SQL}) FROM artifacts WHERE id = '${id}';")"
+        if [ "$waived" = "t" ]; then
+            fail "${label} quarantine_window_start == MIN(created_at) over artifacts sharing checksum ${hash}" \
+                "this row is anchored at created_at - duration: it WAIVED its observation window while its ${parent_label} was still held. That is the unconditional referenced-tree-descendant carve-out ADR 0007's inherited-trust amendment retired (own created_at=${own_created})"
+        else
+            fail "${label} quarantine_window_start == MIN(created_at) over artifacts sharing checksum ${hash}" \
+                "got '${anchored_on_evidence:-<null>}' (expected t), and it is not the retired waiver's value either: first_seen=${first_seen} own created_at=${own_created}"
+        fi
     fi
 }
-assert_zero_window "$CHILD_ID" "child manifest"
-assert_zero_window "$CONFIG_ID" "config blob"
+assert_full_window_constituent "$CHILD_ID" "$CHILD_HASH" "$INDEX_ID" "child manifest" "parent index"
+assert_full_window_constituent "$CONFIG_ID" "$CONFIG_HASH" "$CHILD_ID" "config blob" "parent child manifest"
 for i in "${!LAYER_IDS[@]}"; do
-    assert_zero_window "${LAYER_IDS[$i]}" "layer[$i] blob"
+    assert_full_window_constituent "${LAYER_IDS[$i]}" "${LAYER_HASHES[$i]}" "$CHILD_ID" "layer[$i] blob" "parent child manifest"
 done
 
 # ---------------------------------------------------------------------
@@ -654,17 +768,32 @@ fi
 # 9b-ii pulls.
 #
 # `--all` forces every platform child of the index through pull-through.
-# This scenario ingests exactly one platform subtree before the sign, so
-# the verify-time cascade clears only that subtree; every OTHER platform
-# child is a LATE JOINER — it arrives after the subject was already
-# verified, and self-clears at its own quarantine commit against the
-# signed index's bytes (child manifests directly; their config/layer
-# blobs via the root behind their cascade-cleared parent).
+# Steps 0-3 only drive ONE platform subtree by hand, but they are not the
+# only thing that ingests: the index's own pull enqueues an
+# `oci-index-child-ingest` row per declared child, and this scenario
+# `requires: worker`, so in the normal case a worker has already ingested
+# every other platform child and warmed its blobs by the time the sign
+# runs. Whatever that path did not complete (a jobs-table failure, an
+# upstream 404 on a layer, the nested-index depth cap) arrives here
+# instead, as a LATE JOINER — after the subject was already verified, so
+# it gets no cascade and self-clears at its own quarantine commit against
+# the signed index's bytes (child manifests directly; their config/layer
+# blobs via the root behind their cascade-cleared parent). This step is
+# correct either way, which is why it does not assert which of the two
+# happened.
 #
 # 9a is the ingest vehicle: an AUTHENTICATED `--all` warm pass. Write
-# authorization gives the hold-read exemption, so this pull can read
-# every held constituent as it lands and drives the full foreign-platform
-# tree through cold pull-through in one client-side pass.
+# authorization carries the ADR 0039 §10 hold-read exemption for every
+# MANIFEST in the tree, so the walk is never blocked on resolving one;
+# each blob it then requests is pulled through and ingested even when
+# the response to that request is the 503 of a fresh hold. That is what
+# makes this the ingest vehicle, and it is all this step relies on.
+#
+# It is NOT exempt from the holds themselves. Blob CONTENT stays held
+# from every caller, write-granted included, so the copy only COMPLETES
+# once each constituent has released on its own clearance plus a sweep
+# tick. The budget is sized for that tail (WARM_PASS_WAIT_SECS); do not
+# re-describe this step as reading held constituents.
 #
 # 9b proves the actual acceptance criterion: an ANONYMOUS `--all` pull
 # succeeds end-to-end once every constituent has cleared and released.
@@ -675,27 +804,33 @@ fi
 # a slow-but-finite wait. 9a removes that dependency.
 #
 # What is left after 9a is TWO different waits, which is why 9b is itself
-# two steps. The index carries the FULL quarantine window and is the last
-# thing in the tree to become servable; every constituent, first subtree
-# and late joiner alike, has a ZERO-length window and owes only its own
-# clearance plus a sweep tick. 9b-i waits out the window against the
-# database; 9b-ii then pulls. Folding them back together would reinstate
-# a single budget that has to cover a 120s window while its wording
-# blames clearance — which is what it did, and the diagnosis it produced
-# was of a cascade defect that was not there.
+# two steps. Every row in this tree carries a full observation window —
+# the index because it is nobody's target, each constituent because its
+# referencing parent was still held when it was minted and so there was
+# no inherited trust to waive it (Step 7). What differs is WHEN each
+# window started: the index's at Step 0, each constituent's at its own
+# mint shortly after, so the index's is the first to close and every
+# constituent's closes later. 9a is therefore where the window time is
+# actually spent — a blob does not serve until it releases, so 9a cannot
+# finish until every constituent window has closed, which is already past
+# the index's. 9b-i then confirms the index ROW released, against the
+# database rather than the registry; 9b-ii pulls. Folding them back
+# together would reinstate a single budget that has to cover a 120s
+# window while its wording blames clearance — which is what it did, and
+# the diagnosis it produced was of a cascade defect that was not there.
 # ---------------------------------------------------------------------
 log ""
 log "--- Step 9a: authenticated warm pass (late-joiner ingest vehicle)"
 rm -f "$WARM_ARCHIVE"
 if bounded_poll \
         "signed image pullable (authenticated warm pass)" \
-        120 \
+        "$WARM_PASS_WAIT_SECS" \
         "skopeo copy --all --insecure-policy --src-tls-verify=false --src-creds '${PUSH_USER}:${PUSH_SECRET}' 'docker://${REGISTRY_HOST}/${REPO_KEY}/dockerhub/${IMAGE_PATH}@${INDEX_DIGEST}' 'oci-archive:${WARM_ARCHIVE}'" \
         5; then
     pass "authenticated --all warm pass ingested every foreign platform (hold-read exemption honored; each late joiner self-cleared at its own quarantine commit)"
 else
     fail "authenticated warm pass ingests every foreign platform" \
-         "the signed index never became fully (--all) authenticated-pullable within 120s (hold-read exemption not honored, or a foreign platform failed to ingest/self-clear)"
+         "the signed index never became fully (--all) authenticated-pullable within ${WARM_PASS_WAIT_SECS}s, a budget that covers the later of a constituent's whole ${QUARANTINE_DURATION_SECS}s observation window and its whole clearance tail, measured from this step's own start — so neither the elapsed time before this step, nor the index's own window, nor a constituent's window is an available explanation. Write authority exempts the MANIFEST reads only; what this pass waits on is every constituent BLOB releasing. Look at the scan path: a constituent whose scan never completed, or a foreign platform that never ingested at all (compare count(*) on artifacts in this repository against the index's .manifests[] children)."
 fi
 rm -f "$WARM_ARCHIVE"
 
@@ -704,10 +839,17 @@ rm -f "$WARM_ARCHIVE"
 #
 # Split out of the pull below because the two legs wait on different
 # things, and a reader of a failing run has to be able to tell which one
-# gave out. This is the only wait in the scenario that sits behind the
-# quarantine window: Step 7 has asserted the index carries the FULL one,
-# so until it elapses NOTHING anonymous can be served, and that is hort
-# behaving correctly (ADR 0007), not a defect.
+# gave out. Step 7 asserted the index carries a FULL window, started at
+# the Step 0 ingest, and until it elapses NOTHING anonymous can be served,
+# which is hort behaving correctly (ADR 0007), not a defect. Every
+# constituent carries a full window too; the index's is simply the one
+# that STARTED first, so it is the first to close and 9a (which cannot
+# finish until every constituent blob has released, i.e. until every
+# later-starting window has also closed) has in practice already outlasted
+# it. What is normally left here is the release SWEEP acting on the index
+# row, not the clock — the budget still counts a whole window, because a
+# budget that leaned on 9a running first would silently become wrong the
+# moment these steps were reordered.
 #
 # The database is what is polled, not the registry, because a 503 from an
 # anonymous pull cannot distinguish "the window has not closed" from
@@ -751,7 +893,7 @@ if [ "$INDEX_RELEASED" = "1" ]; then
         pass "release acceptance after warm pass: the signed+cleared multi-arch index pulled anonymously in full (Cleared + timer gate satisfied for every platform, late joiners included)"
     else
         fail "release acceptance after warm pass: signed index pulls anonymously with --all" \
-             "the signed index did not become fully (--all) anonymously pullable within ${ANON_PULL_WAIT_SECS}s of its OWN release. The window is not the explanation — 9b-i proved it closed — so this is cascade, LATE-JOINER clearance, or the release sweep still owing a zero-window constituent."
+             "the signed index did not become fully (--all) anonymously pullable within ${ANON_PULL_WAIT_SECS}s of its OWN release. The window is not the explanation — 9b-i proved it closed — so this is cascade, LATE-JOINER clearance, or the release sweep still owing a constituent whose own window has already closed."
     fi
 else
     log "  NOTE: Step 9b-ii not attempted — the index row never released, so an anonymous --all pull cannot succeed, and running it would report a clearance failure for a window that never closed (see Step 9b-i)."
@@ -795,7 +937,7 @@ fi
 # fired within moments of ingest, well before this poll).
 # ---------------------------------------------------------------------
 log ""
-log "--- Step 10: THE #115 Item 3 regression pin — no constituent ever rejected"
+log "--- Step 10: THE regression pin — no constituent ever rejected"
 
 # Queried by artifact id (stream_id = 'artifact-<id>'), not checksum —
 # checksum alone is not repository-scoped, and an unrelated fixture
@@ -804,10 +946,10 @@ assert_never_rejected() {
     local id="$1" label="$2" row
     row="$(psql_one "SELECT 1 FROM events WHERE stream_id = 'artifact-${id}' AND event_type = 'ProvenanceRejected' LIMIT 1;")"
     if [ -z "$row" ]; then
-        pass "${label}: no ProvenanceRejected ever emitted (#115 Item 3 hold-not-reject held)"
+        pass "${label}: no ProvenanceRejected ever emitted (the unconditional hold-not-reject held)"
     else
         fail "${label}: no ProvenanceRejected ever emitted" \
-             "found a ProvenanceRejected event for artifact ${id} — the referenced-tree-descendant hold (#115 Item 3) did not fire; this constituent terminally rejected instead of holding for cascade clearance"
+             "found a ProvenanceRejected event for artifact ${id} — the NoAttestation x Required hold (ADR 0039 D1/D3: an absent attestation holds every shape) did not fire; this constituent terminally rejected instead of holding for cascade clearance"
     fi
 }
 assert_never_rejected "$INDEX_ID" "index (control — the signed subject itself must not reject)"

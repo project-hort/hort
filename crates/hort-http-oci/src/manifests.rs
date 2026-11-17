@@ -68,6 +68,7 @@ use uuid::Uuid;
 use hort_app::error::AppError;
 use hort_app::metrics::{emit_upstream_checksum, UpstreamChecksumResult};
 use hort_app::pull_dedup::DedupKey;
+use hort_app::use_cases::index_filters::HeldVisibility;
 use hort_app::use_cases::ingest_use_case::{RegisterExistingCasBlobRequest, VerifiedIngestRequest};
 use hort_app::use_cases::manifest_deliverability::ManifestDeliverability;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
@@ -83,6 +84,7 @@ use hort_formats::oci::OciFormatHandler;
 
 use super::coords::oci_manifest_coords;
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
+use super::download_refusal::{self, FailedDownload};
 use super::error::OciError;
 use super::quarantine;
 use super::refusal::{log_refused_read, ReadRoute, RefusalReason, RefusedRead};
@@ -285,18 +287,30 @@ pub(super) async fn serve(
     //    before attaching the signature. Hence no `head` term: the body
     //    is the point.
     //
+    //    It covers both holds *pending a verdict*. `ScanIndeterminate`
+    //    is one: `QuarantineEvent::SupersedeAbsentVerdict` admits it and
+    //    reaches `Quarantined`, so a verdict arriving later supersedes
+    //    the absent one and the artifact rejoins the ordinary timed
+    //    hold. The two holds differ in what is known about the artifact,
+    //    not in whether the publisher may finish publishing it — a
+    //    publisher that could sign an artifact held by the timed
+    //    quarantine but not one held for want of a verdict would be
+    //    blocked by the same unreachable precondition this exemption
+    //    exists to remove.
+    //
     //    (b) `write_authorized_existence_probe` — the pre-upload
-    //    existence probe on a terminal verdict (ADR 0055's 2026-10-21
-    //    amendment D2). `head`-bound, and that bound is the whole
-    //    difference: a hold means "not yet", so serving its manifest
-    //    lets the publisher complete a workflow that resolves it, while
-    //    a terminal verdict is a verdict already reached and no workflow
-    //    makes it deliverable. Widening (a) to cover it would serve a
-    //    rejected manifest's BODY, which the amendment refuses outright.
-    //    What the probe answers is "must I still send these bytes?" —
-    //    the caller already holds them, the answer leads to no download,
-    //    and the `GET` on this same route keeps refusing with its axis
-    //    for every caller.
+    //    existence probe on a verdict already reached, which is
+    //    `Rejected` and only `Rejected` (ADR 0055's 2026-10-21 amendment
+    //    D2, as amended 2026-11-11). `head`-bound, and that bound is the
+    //    whole difference: a hold means "not yet", so serving its
+    //    manifest lets the publisher complete a workflow that resolves
+    //    it, while a reached verdict is final and no workflow makes it
+    //    deliverable. Widening (a) to cover it would serve a rejected
+    //    manifest's BODY, which the amendment refuses outright. What the
+    //    probe answers is "must I still send these bytes?" — the caller
+    //    already holds them, the answer leads to no download, and the
+    //    `GET` on this same route keeps refusing with its axis for every
+    //    caller.
     //
     //    Both key on GRANTED write authority (`resolve_granted_write`:
     //    the grants leg alone, cap ignored), not the presented token's
@@ -320,22 +334,25 @@ pub(super) async fn serve(
     //    (quarantine invariant #5) is untouched, and a `Rejected`
     //    manifest's body is served to nobody. Fail closed on both: ONLY
     //    a definitive granted-Write authorization lifts the refusal — a
-    //    denied or errored resolve keeps it. The two `matches!` sets are
+    //    denied or errored resolve keeps it. The two status sets are
     //    disjoint, so at most one `resolve_granted_write` ever fires, and
     //    only on the narrow withheld-manifest path — the hot read path is
     //    unaffected.
-    let write_authorized_hold_read =
-        matches!(artifact.quarantine_status, QuarantineStatus::Quarantined)
-            && ctx
-                .repository_access_use_case
-                .resolve_granted_write(repo_key, actor)
-                .await
-                .is_ok();
-    let write_authorized_existence_probe =
-        head && matches!(
-            artifact.quarantine_status,
-            QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate
-        ) && ctx
+    //
+    //    (a) asks `HeldVisibility::exemption_covers` rather than
+    //    spelling the pair again here: that type carries the hold-read's
+    //    status set for every consumer, and a route that re-states it
+    //    locally is a copy that can answer a status differently from the
+    //    rule it is enforcing.
+    let write_authorized_hold_read = HeldVisibility::exemption_covers(artifact.quarantine_status)
+        && ctx
+            .repository_access_use_case
+            .resolve_granted_write(repo_key, actor)
+            .await
+            .is_ok();
+    let write_authorized_existence_probe = head
+        && matches!(artifact.quarantine_status, QuarantineStatus::Rejected)
+        && ctx
             .repository_access_use_case
             .resolve_granted_write(repo_key, actor)
             .await
@@ -373,7 +390,9 @@ pub(super) async fn serve(
                 return response;
             }
             // else: ADR 0039 §10 write-authorized hold-read — fall
-            // through to serve the manifest (HEAD and GET alike).
+            // through to serve the manifest (HEAD and GET alike). The
+            // `ScanIndeterminate` arm below reaches the same
+            // fall-through through the same predicate.
         }
         QuarantineStatus::Rejected => {
             if !write_authorized_existence_probe {
@@ -390,10 +409,11 @@ pub(super) async fn serve(
                 //
                 // Resolvability is NOT what changes. The manifest still
                 // never resolves to bytes, for anyone, publisher
-                // included: the hold-read exemption serves a
-                // `Quarantined` body and stops there, and the probe
-                // exemption that does reach this arm is `head`-bound. So
-                // every `GET` lands here, whatever the caller's grants.
+                // included: the hold-read exemption serves a body held
+                // *pending a verdict* and stops short of a verdict
+                // reached, and the probe exemption that does reach this
+                // arm is `head`-bound. So every `GET` lands here,
+                // whatever the caller's grants.
                 // What the write-granted caller gains is the diagnosis,
                 // which they are owed for the same reason every admitted
                 // reader is: they certainly pass the read gate.
@@ -447,18 +467,28 @@ pub(super) async fn serve(
             // exemption exists for.
         }
         QuarantineStatus::ScanIndeterminate => {
-            if !write_authorized_existence_probe {
-                // Refused for every caller on the body path, the
-                // write-granted one included — the hold-read exemption
-                // above covers `Quarantined` only, because an
-                // indeterminate verdict is already reached and no
-                // publisher workflow resolves it. No `Retry-After`: this
-                // hold has no self-resolving deadline.
+            if !write_authorized_hold_read {
+                // A hold pending a verdict, refused to every caller that
+                // has not established granted Write on this repository —
+                // the same gate and the same predicate the `Quarantined`
+                // arm above applies, because an arriving verdict leads
+                // out of this state too
+                // (`QuarantineEvent::SupersedeAbsentVerdict` reaches
+                // `Quarantined`), so the publisher workflow the exemption
+                // exists for stays reachable here. No `Retry-After`,
+                // which is where the two holds still differ: this one
+                // advertises no deadline, because its exit is an arriving
+                // verdict or an operator, never elapsed time.
                 let response = quarantine::check_scan_indeterminate();
                 log_refused_read(&response, &refused, &RefusalReason::ScanIndeterminate);
                 return response;
             }
-            // else: same probe, same `head` bound as the `Rejected` arm.
+            // else: the same write-authorized hold-read as the
+            // `Quarantined` arm — fall through and serve, HEAD and GET
+            // alike. Bytes are untouched: a layer blob of this artifact
+            // stays `503` for every caller (`blobs.rs` keeps its
+            // existence probe `HEAD`-only), so what leaves the hold is
+            // the resolution document and nothing else.
         }
     }
 
@@ -526,8 +556,14 @@ pub(super) async fn serve(
 
     // A held manifest served under the write-authorized hold-read exemption
     // (ADR 0039 §10) streams via `download_hold_read`: the audited `download`
-    // path refuses a `Quarantined` artifact (`is_downloadable()` is false),
-    // so it cannot serve the held subject keyed `cosign sign` resolves by GET.
+    // path refuses a held artifact (`is_downloadable()` is false), so it
+    // cannot serve the held subject keyed `cosign sign` resolves by GET.
+    // `download_hold_read` gates on `HeldVisibility::exemption_covers` too,
+    // so the two halves ask one question rather than agreeing by hand: a
+    // status the gate above admits is one that read serves, and a future
+    // one is decided in that predicate alone. An admitted status refused
+    // there would arrive here as the `OciError::Internal` below — a `500`
+    // on a read this route already decided was allowed.
     // Otherwise (a released / `None` artifact) thread the resolved principal
     // through the audited `download` for opt-in download-audit attribution
     // (ADR 0020). No per-handler auth code.
@@ -536,15 +572,29 @@ pub(super) async fn serve(
     } else {
         ctx.artifact_use_case.download(artifact.id, actor).await
     };
+    // A refusal from either call is answered in the refused status's own
+    // envelope and recorded, rather than reported as a server fault: the
+    // row can turn terminal between step 4's gate and the download's own
+    // re-read, and that is a withheld read, not a broken registry. Which
+    // failures are refusals, and why the discrimination is on the error,
+    // is `crate::download_refusal`.
     let (_a, stream) = match download_result {
         Ok(r) => r,
         Err(e) => {
-            tracing::error!(
-                artifact_id = %artifact.id,
-                error = %e,
-                "OCI manifest download failed after lookup"
-            );
-            return OciError::Internal.into_response();
+            return download_refusal::response_for(
+                &ctx,
+                &FailedDownload {
+                    error: &e,
+                    artifact_id: artifact.id,
+                    operation: if write_authorized_hold_read {
+                        "manifest_download_hold_read"
+                    } else {
+                        "manifest_download"
+                    },
+                    refused: &refused,
+                },
+            )
+            .await;
         }
     };
 
@@ -656,46 +706,8 @@ async fn terminal_constituent_response(
     let subject = format!("sha256:{}", constituent.content_hash);
     match constituent.status {
         QuarantineStatus::Rejected => {
-            let axis = match ctx
-                .artifact_use_case
-                .find_in_repo_by_hash(repo.id, &constituent.content_hash)
-                .await
-            {
-                // An absent axis emits no field and never an `unknown`
-                // token — a token would dress an inconsistency up as a
-                // verdict. The operator is told by the hydration itself,
-                // which distinguishes "no `ArtifactRejected` on the
-                // stream" (the illegal state ADR 0039 D6 names) from
-                // "could not read the stream" in its own log; repeating
-                // that line here would double-count one incident.
-                Ok(Some(artifact)) => artifact
-                    .rejection_reason
-                    .as_ref()
-                    .map(RejectionReason::wire_kind),
-                // The row the resolution just matched is gone or
-                // unreadable. The refusal stands — see the note above on
-                // why this is not a second decision — and the client is
-                // told the subject without an axis.
-                Ok(None) => {
-                    tracing::warn!(
-                        repo_key = %repo.key,
-                        constituent = %constituent.content_hash,
-                        "OCI manifest: the terminal constituent has no row to read its \
-                         rejection axis from; refusing without an axis"
-                    );
-                    None
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        repo_key = %repo.key,
-                        constituent = %constituent.content_hash,
-                        error = %e,
-                        "OCI manifest: could not load the terminal constituent to recover \
-                         its rejection axis; refusing without an axis"
-                    );
-                    None
-                }
-            };
+            let axis =
+                terminal_constituent_axis(ctx, repo.id, &constituent.content_hash, &repo.key).await;
             let response = OciError::ArtifactRejected { subject, axis }.into_response();
             log_refused_read(&response, refused, &RefusalReason::TerminalConstituent);
             response
@@ -729,6 +741,80 @@ async fn terminal_constituent_response(
                  disagreement about what terminal means"
             );
             OciError::Internal.into_response()
+        }
+    }
+}
+
+/// The rejection axis a **terminal-constituent** refusal reports, for
+/// whichever side is asking.
+///
+/// Both ends of a manifest's life answer about the same constituent and
+/// must answer alike: the read route refuses a stored document whose
+/// closure carries a terminal verdict, and the manifest `PUT` refuses a
+/// document being admitted over the same closure
+/// (`manifests_write::refuse_undeliverable_closure`). One definition, so
+/// the disclosure cannot come out depth-dependent or route-dependent.
+///
+/// The axis is not a column: `ArtifactUseCase` derives it from the
+/// constituent's own `ArtifactRejected` event during the load, at the
+/// one read-path hydration point every format shares (a format crate
+/// must not read a stream, ADR 0008). That costs one bounded stream
+/// read, paid **only** on a path that is already refusing rather than
+/// serving — the same trade a manifest's own `Rejected` arm makes.
+///
+/// An absent axis emits **no** field and never an `unknown` token — a
+/// token would dress an inconsistency up as a verdict. The operator is
+/// told by the hydration itself, which distinguishes "no
+/// `ArtifactRejected` on the stream" (the illegal state ADR 0039 D6
+/// names) from "could not read the stream" in its own log; repeating
+/// that line here would double-count one incident.
+///
+/// **This load is not a second decision.** The refusal was already
+/// decided by the deliverability resolution; this only recovers the
+/// axis, so a constituent re-judged between the two reads does not flip
+/// the answer. Treating it as a re-decision would make the response
+/// depend on which of two reads won a race — hence the two `None` arms
+/// below, which report and carry on rather than reconsidering.
+///
+/// `context` is the caller's own label for the log line (a repository
+/// key on the read route, the pushed document's digest on the write
+/// route), so one grep finds the constituent from either side.
+pub(crate) async fn terminal_constituent_axis(
+    ctx: &AppContext,
+    repo_id: Uuid,
+    constituent: &ContentHash,
+    context: &str,
+) -> Option<&'static str> {
+    match ctx
+        .artifact_use_case
+        .find_in_repo_by_hash(repo_id, constituent)
+        .await
+    {
+        Ok(Some(artifact)) => artifact
+            .rejection_reason
+            .as_ref()
+            .map(RejectionReason::wire_kind),
+        // The row the resolution just matched is gone or unreadable. The
+        // refusal stands and the client is told the subject without an
+        // axis.
+        Ok(None) => {
+            tracing::warn!(
+                context = %context,
+                constituent = %constituent,
+                "OCI: the terminal constituent has no row to read its rejection axis \
+                 from; refusing without an axis"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                context = %context,
+                constituent = %constituent,
+                error = %e,
+                "OCI: could not load the terminal constituent to recover its rejection \
+                 axis; refusing without an axis"
+            );
+            None
         }
     }
 }
@@ -1081,10 +1167,39 @@ pub(super) enum UpstreamManifestPullOutcome {
     /// the generic [`Self::UpstreamUnavailable`] envelope — operators see
     /// the exact numbers they need to size the knob.
     ManifestTooLarge { bytes_read: u64, cap: u64 },
+    /// The upstream manifest declares a composition the composite scan could
+    /// never assess — more constituents than the whole-image budget allows, or
+    /// more bytes. Surfaces as 400 `UNSUPPORTED`.
+    ///
+    /// **An upstream image above the bound cannot be mirrored, and that is the
+    /// accepted cost rather than an oversight**: accepting it would mint a row
+    /// whose composite verdict is permanently absent, so the release authority
+    /// never arrives and the hold carries no deadline — a state only a curator
+    /// override leaves. The consequence is documented where an operator
+    /// configures an upstream
+    /// (`docs/architecture/how-to/declare-gitops-config.md`).
+    ///
+    /// Carries nothing: the actual and the bound came out of an upstream
+    /// response body, so they are logged where the refusal is decided and the
+    /// wire gets a fixed message — the sanitisation discipline
+    /// `DomainError::UpstreamMetadataInvalid` established.
+    UnassessableComposition,
     /// Infrastructure failure (storage, event store, repo lookup
     /// after ingest). Surfaces as 500.
     Internal,
 }
+
+/// Leader-side sentinel for [`UpstreamManifestPullOutcome::UnassessableComposition`],
+/// carried out of the coalesce closure the same way the
+/// missing-`Docker-Content-Digest` case is.
+///
+/// A sentinel rather than a typed `DomainError` variant because this refusal is
+/// made and classified inside one crate: nothing outside the OCI pull-through
+/// legs can produce it, and nothing outside them has an answer for it. Both
+/// mappers match it **before** their string-classifying tail, which would
+/// otherwise fold an `upstream:`-prefixed message into a generic 502 and blame
+/// an upstream that answered correctly.
+const UNASSESSABLE_COMPOSITION_SENTINEL: &str = "upstream:unassessable_composition:oci-manifest";
 
 /// On local manifest miss, attempt to fetch the manifest from a
 /// configured upstream and ingest it locally. Mirror of
@@ -1292,6 +1407,27 @@ async fn try_upstream_manifest_pull_by_digest(
             // for the path again, so dropping it now also stops an ingest
             // failure from leaving it behind.
             hort_app::project::remove_cached_body(cache_handle).await;
+            // The admission gate, before the mint: hort must not accept an
+            // artifact it can never answer about, and a manifest the
+            // composition can never assemble is refused deterministically
+            // before its config is even read — so its composite verdict is
+            // permanently absent, the release authority never arrives, and the
+            // hold has no deadline. Decided from the manifest's own
+            // declarations, so no blob is fetched to reach it.
+            if let Err(reason) =
+                crate::manifests_write::refuse_past_assessment_budget(&manifest_bytes)
+            {
+                tracing::warn!(
+                    repo_id = %blob_repo_id,
+                    manifest_digest = %blob_upstream_digest,
+                    refusal = %reason,
+                    "OCI pull-through: upstream manifest declares a composition the composite \
+                     scan cannot assess; refusing to mirror it"
+                );
+                return Err(AppError::External(
+                    UNASSESSABLE_COMPOSITION_SENTINEL.to_string(),
+                ));
+            }
             let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
                 Box::new(std::io::Cursor::new(manifest_bytes.clone()));
             // Derived before the mint so the claims ride the manifest's own
@@ -1590,6 +1726,22 @@ async fn try_upstream_manifest_pull_by_tag(
             // for the path again, so dropping it now also stops an ingest
             // failure from leaving it behind.
             hort_app::project::remove_cached_body(cache_handle).await;
+            // The admission gate — see the digest-ref leg for why a manifest
+            // the composite scan cannot assess must not be minted at all.
+            if let Err(reason) =
+                crate::manifests_write::refuse_past_assessment_budget(&manifest_bytes)
+            {
+                tracing::warn!(
+                    repo_id = %meta_repo_id,
+                    manifest_digest = %upstream_digest,
+                    refusal = %reason,
+                    "OCI pull-through: upstream manifest declares a composition the composite \
+                     scan cannot assess; refusing to mirror it"
+                );
+                return Err(AppError::External(
+                    UNASSESSABLE_COMPOSITION_SENTINEL.to_string(),
+                ));
+            }
             let async_read: Box<dyn tokio::io::AsyncRead + Send + Unpin> =
                 Box::new(std::io::Cursor::new(manifest_bytes.clone()));
             let claims = crate::manifests_write::pull_membership_claims(
@@ -1737,6 +1889,13 @@ fn map_manifest_pull_error(
         }
         Err(AppError::Domain(DomainError::CurationBlocked { .. })) => {
             Err(UpstreamManifestPullOutcome::CurationBlocked)
+        }
+        // Matched ahead of the string-classifying tail, which would read the
+        // `upstream:` prefix as "the upstream failed" and answer 502 for a
+        // refusal that is hort's own. The leader has already logged the actual
+        // and the bound.
+        Err(AppError::External(ref msg)) if msg.contains(UNASSESSABLE_COMPOSITION_SENTINEL) => {
+            Err(UpstreamManifestPullOutcome::UnassessableComposition)
         }
         Err(AppError::Domain(DomainError::UpstreamBodyTooLarge {
             bytes_read, cap, ..
@@ -2025,9 +2184,10 @@ async fn finalise_manifest_pull(
 /// creates its per-repo row, not only for the leg that fetched it from
 /// upstream. Those edges are what the referenced-tree-descendant
 /// target-check reads, so a row without them silently loses the
-/// descendant carve-out (its constituents get a full observation window
-/// instead of inheriting the parent's) and loses the GC keepalive on
-/// every blob it references.
+/// descendant carve-out — where it would have applied at all, which
+/// since ADR 0007's *conditional on inherited trust* amendment means
+/// where a referencing parent is already `Released` — and loses the GC
+/// keepalive on every blob it references, which it loses either way.
 ///
 /// The pull-through's fetch closure runs at most once per coalescing
 /// window, and that window is keyed by content hash alone — it is
@@ -2163,6 +2323,25 @@ fn upstream_pull_failure_response(
                 "bytes_read": bytes_read,
                 "cap": cap,
             })),
+        }
+        .into_response(),
+        // `UNSUPPORTED` and deliberately neither `MANIFEST_INVALID` nor
+        // `502`: the client did not send this manifest and the upstream
+        // answered correctly — hort is the one refusing. "The server does not
+        // support the requested operation" is the honest statement, and it is
+        // the code `parse_index_children_for_admission` already answers for a
+        // valid index this registry cannot store. The specifics stay in the
+        // leader's `warn!` (upstream-derived text).
+        //
+        // One message for all three admission refusals, and worded over what
+        // they share rather than over the byte and count bounds alone: the
+        // third is a descriptor declaring no readable `size`, and telling that
+        // operator the composition was "larger than this registry can assess"
+        // would send them to size a bound that is not what refused them.
+        UpstreamManifestPullOutcome::UnassessableComposition => OciError::Unsupported {
+            message: "upstream manifest declares a composition this registry cannot \
+                      assess, so it is not mirrored"
+                .to_string(),
         }
         .into_response(),
         UpstreamManifestPullOutcome::Internal => OciError::Internal.into_response(),
@@ -3634,7 +3813,8 @@ mod tests {
     ///
     /// Both halves of that pin now have to be stated, because only one of
     /// them moved. **Resolvability is unchanged**: the ADR 0039 §10
-    /// hold-read exemption covers `Quarantined` and stops there, so a
+    /// hold-read exemption covers a hold pending a verdict and stops
+    /// short of a verdict reached, so a
     /// write-granted pull-scoped capability principal gets no manifest
     /// body out of a `Rejected` row — no grant and no cap shape
     /// resurrects a rejected manifest. **Diagnosability is what changes**:
@@ -3818,9 +3998,9 @@ mod tests {
     /// (`rejected_manifest_write_authorized_get_still_hidden_as_404`),
     /// the RBAC-enabled claims-principal mirror of the capability case
     /// above. Same two halves, and the same split: the ADR 0039 §10
-    /// hold-read exemption is `Quarantined`-only, so a `Write` grant
-    /// still buys no manifest body out of a `Rejected` row —
-    /// resolvability does not move. What the write-granted caller gains
+    /// hold-read exemption reaches a hold pending a verdict and stops
+    /// there, so a `Write` grant still buys no manifest body out of a
+    /// `Rejected` row — resolvability does not move. What the write-granted caller gains
     /// is the diagnosis, owed to them because they certainly pass the
     /// read gate, which is the only predicate the reason keys on.
     #[test]
@@ -3834,7 +4014,8 @@ mod tests {
             status,
             StatusCode::FORBIDDEN,
             "a write-authorized GET of a Rejected manifest must still never serve it — \
-             the hold-read exemption covers Quarantined only"
+             the hold-read exemption covers a hold pending a verdict and never a \
+             verdict reached"
         );
         let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["errors"][0]["code"], "DENIED");
@@ -3844,15 +4025,19 @@ mod tests {
         );
     }
 
-    // ------- The existence probe on a terminal verdict (ADR 0055) -------
+    // ------- The existence probe on a reached verdict (ADR 0055) -------
     //
-    // The manifest route carries its own, `head`-bound predicate for the
-    // two terminal verdicts rather than a widened
-    // `write_authorized_hold_read`: that one has no `head` term because
-    // for `Quarantined` the exemption deliberately serves the `GET` too,
-    // and widening it would serve a rejected manifest's BODY. So the
-    // matrix below asserts both halves on every arm — the probe answers
-    // `200`, and the `GET` beside it does not.
+    // `Rejected` is the whole of this predicate's reach, and the
+    // `head` bound is why it is a separate predicate rather than a
+    // widened `write_authorized_hold_read`: that one has no `head` term,
+    // because for a hold pending a verdict the exemption deliberately
+    // serves the `GET` too, and widening it to a reached verdict would
+    // serve a rejected manifest's BODY. (`ScanIndeterminate` was in this
+    // set until the 2026-11-11 amendment re-sorted it as a hold; it now
+    // answers through the hold-read exemption itself, `GET` included,
+    // and its arms live in the `ScanIndeterminate` section below.) So
+    // the matrix below asserts both halves on every arm — the probe
+    // answers `200`, and the `GET` beside it does not.
 
     /// The manifest every arm in this section seeds — the same
     /// constituent-free body the `Quarantined` helpers use, so the
@@ -4025,19 +4210,6 @@ mod tests {
         let (status, parsed) = run(manifest_refusal_parts(resp));
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
-    }
-
-    /// `ScanIndeterminate` answers the probe identically, through the
-    /// same helper, so the two terminal verdicts cannot drift apart.
-    #[test]
-    fn head_manifest_scan_indeterminate_by_write_authorized_caller_reports_exists() {
-        let resp = terminal_manifest_response(
-            QuarantineStatus::ScanIndeterminate,
-            /* no axis: this verdict has none */ None,
-            /* head = */ true,
-            Some("ci-pusher"),
-        );
-        run(assert_manifest_probe_reports_exists(resp));
     }
 
     /// The gate that fires before any of this: a caller the repository
@@ -4779,14 +4951,18 @@ mod tests {
 
     // ---------------- ScanIndeterminate ----------------
     //
-    // ScanIndeterminate has no hold-read exemption: the manifest BODY is
-    // withheld from every caller — anonymous, pull-scoped,
-    // write-granted — with a 503 carrying NO Retry-After (no
-    // self-resolving deadline; exit is admin action or a successful
-    // rescan). The one shape that answers 200 is the write-authorized
-    // `HEAD` existence probe, `head`-bound and body-less (ADR 0055's
-    // 2026-10-21 amendment). The state × {GET, HEAD} × {anonymous,
-    // pull-scoped, write-granted} matrix below pins that shape.
+    // ScanIndeterminate carries the hold-read exemption, on the same
+    // terms as Quarantined (ADR 0055's 2026-11-11 amendment): it is a
+    // hold *pending* a verdict, because
+    // `QuarantineEvent::SupersedeAbsentVerdict` admits it and reaches
+    // `Quarantined`. So a write-granted caller resolves the manifest by
+    // HEAD and by GET, and every caller without that grant — anonymous,
+    // pull-scoped — still gets a 503 carrying NO Retry-After (this hold
+    // advertises no deadline: its exit is an arriving verdict or an
+    // operator, never elapsed time). The state × {GET, HEAD} ×
+    // {anonymous, pull-scoped, write-granted} matrix below pins that
+    // shape, and the asymmetry test at the end of the section pins the
+    // other half of the rule: the document resolves, the bytes do not.
 
     /// Common assertions for every `ScanIndeterminate` response in this
     /// section: 503, `UNAVAILABLE` code, the scan-indeterminate detail
@@ -4838,8 +5014,8 @@ mod tests {
                 QuarantineStatus::ScanIndeterminate,
             );
             // `ci-pusher` Write grant wired the same as the Quarantined
-            // suite: the write-granted caller's HEAD is exempted here
-            // too, and — unlike Quarantined — the GET is not.
+            // suite: the write-granted caller's HEAD and GET are both
+            // exempted here, exactly as they are there.
             let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
             serve(
                 ctx,
@@ -4867,22 +5043,60 @@ mod tests {
         run(assert_scan_indeterminate_response(resp));
     }
 
+    /// The hold-read exemption's payoff for this state: a publisher
+    /// whose own upload is held for want of a verdict can resolve the
+    /// manifest it just pushed, and therefore sign it — keyed signing
+    /// resolves the subject by `GET` before it can attach anything.
+    /// Before the 2026-11-11 amendment this answered `503`, so the same
+    /// publisher could sign an artifact held by the timed quarantine and
+    /// not one held for want of a verdict.
+    ///
+    /// The body is asserted, not just the status: `HEAD`-before-`GET`
+    /// parity makes the header set identical to the probe's `200`, so
+    /// only the bytes distinguish "served the manifest" from "reported
+    /// that it exists".
     #[test]
-    fn scan_indeterminate_manifest_get_write_granted_still_returns_503() {
+    fn scan_indeterminate_manifest_get_write_granted_serves_the_body() {
         let principal = principal_with_claim("ci-pusher");
         let resp = scan_indeterminate_manifest_response(/* head = */ false, Some(&principal));
-        run(assert_scan_indeterminate_response(resp));
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = run(to_bytes(resp.into_body(), 4 * 1024)).unwrap().to_vec();
+        assert_eq!(
+            body, br#"{"schemaVersion":2}"#,
+            "the hold-read serves the manifest itself, not an empty probe answer"
+        );
     }
 
     #[test]
     fn scan_indeterminate_manifest_head_write_granted_reports_exists() {
-        // The existence probe reaches this verdict too; the GET above
-        // still refuses. Status-only, because the header set and the
-        // empty body are pinned by
+        // The same exemption, through its `HEAD` half — which the
+        // exemption has no `head` term to distinguish, so this and the
+        // `GET` above differ only in step 6's short-circuit.
+        // Status-only, because the header set and the empty body are
+        // pinned by
         // `head_manifest_scan_indeterminate_by_write_authorized_caller_reports_exists`.
         let principal = principal_with_claim("ci-pusher");
         let resp = scan_indeterminate_manifest_response(/* head = */ true, Some(&principal));
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// The `HEAD` answer's whole shape, on the fixture the `Rejected`
+    /// arms share: `200`, the normal manifest header set, and an empty
+    /// body. Reached through the hold-read exemption rather than the
+    /// `head`-bound probe since the 2026-11-11 amendment, which is why
+    /// the `GET` beside it serves the manifest instead of refusing —
+    /// but the `HEAD` answer itself is unchanged, and asserting it on
+    /// the shared fixture is what keeps this state's header set from
+    /// drifting away from `Rejected`'s.
+    #[test]
+    fn head_manifest_scan_indeterminate_by_write_authorized_caller_reports_exists() {
+        let resp = terminal_manifest_response(
+            QuarantineStatus::ScanIndeterminate,
+            /* no axis: this state has none */ None,
+            /* head = */ true,
+            Some("ci-pusher"),
+        );
+        run(assert_manifest_probe_reports_exists(resp));
     }
 
     #[test]
@@ -4929,8 +5143,11 @@ mod tests {
     fn scan_indeterminate_manifest_pull_scoped_cap_with_write_grant_reports_exists() {
         // The cap-token shape that exempts a Quarantined manifest
         // (`quarantined_manifest_pull_scoped_cap_with_write_grant_serves`)
-        // exempts this verdict's HEAD too: the exemption keys on the
-        // grants leg, and a read-only cap does not veto it.
+        // exempts this hold too: the exemption keys on the grants leg,
+        // and a read-only cap does not veto it. This is the shape a real
+        // OCI client presents — a subject read is scoped `pull` — so a
+        // cap-intersected resolve would make the exemption unreachable
+        // for exactly the caller it exists for.
         use hort_domain::entities::rbac::Permission;
         let content = br#"{"schemaVersion":2}"#.to_vec();
         let hex = {
@@ -4972,6 +5189,103 @@ mod tests {
             .await
         });
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// **The rule's second sentence, asserted where the first one just
+    /// moved.** ADR 0055: "A principal that may write to a repository
+    /// may resolve held *metadata* there. Held *bytes* never leave
+    /// quarantine, for anyone." Admitting `ScanIndeterminate` to the
+    /// hold-read widens the first sentence by one status and the second
+    /// by none, and nothing in either route's own tests states that
+    /// asymmetry — each side only ever asserts about itself.
+    ///
+    /// So: one harness, one repository, one write-granted caller, one
+    /// status, and the two routes side by side. The manifest `GET`
+    /// serves its body; the layer blob's `GET` is `503`, which is what
+    /// keeps the image unpullable and unrunnable while the hold stands.
+    /// A change that widened `blobs.rs` to match the manifest route
+    /// would leave every test in both files green and fail here.
+    #[test]
+    fn scan_indeterminate_serves_the_manifest_to_a_writer_and_never_the_blob() {
+        let manifest_body = br#"{"schemaVersion":2}"#.to_vec();
+        let manifest_hex = sha256_hex(&manifest_body);
+        let layer_body = b"held layer bytes".to_vec();
+        let layer_hex = sha256_hex(&layer_body);
+
+        let (manifest_status, manifest_bytes, blob_status) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &manifest_hex,
+                &manifest_body,
+                None,
+                QuarantineStatus::ScanIndeterminate,
+            );
+            // The layer, seeded the way `blobs.rs` addresses one: a
+            // separate artifact row at `blobs/sha256:<hex>`, held in the
+            // same state as the manifest that names it.
+            let layer_hash: ContentHash = layer_hex.parse().unwrap();
+            let mut layer = sample_artifact(QuarantineStatus::None);
+            layer.repository_id = repo_id;
+            layer.path = format!("blobs/sha256:{layer_hex}");
+            layer.sha256_checksum = layer_hash.clone();
+            layer.size_bytes = layer_body.len() as i64;
+            layer.quarantine_status = QuarantineStatus::ScanIndeterminate;
+            h.artifacts.insert(layer);
+            h.storage.insert_content(layer_hash, layer_body.clone());
+
+            let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+            let principal = principal_with_claim("ci-pusher");
+
+            let manifest_resp = serve(
+                ctx.clone(),
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{manifest_hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await;
+            let manifest_status = manifest_resp.status();
+            let manifest_bytes = to_bytes(manifest_resp.into_body(), 4 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+
+            let blob_status = crate::blobs::serve(
+                ctx,
+                "myrepo",
+                "library/nginx",
+                &format!("sha256:{layer_hex}"),
+                &HeaderMap::new(),
+                /* head = */ false,
+                Some(&principal),
+            )
+            .await
+            .status();
+
+            (manifest_status, manifest_bytes, blob_status)
+        });
+
+        assert_eq!(
+            manifest_status,
+            StatusCode::OK,
+            "the resolution document resolves for a principal that may write here"
+        );
+        assert_eq!(manifest_bytes, manifest_body, "and it is the manifest");
+        assert_eq!(
+            blob_status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "held bytes never leave quarantine, for anyone — the same caller, the same \
+             repository and the same status, and the layer is still withheld"
+        );
     }
 
     // ---------------- Default media type fallback ----------------
@@ -5331,6 +5645,300 @@ mod tests {
         });
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, content);
+    }
+
+    /// **The pull-through half of the admission gate.** An upstream image
+    /// whose declared composition the composite scan could never assess is
+    /// not mirrored — refused before the mint, so no row, no scan job and no
+    /// deadline-less hold.
+    ///
+    /// `400 UNSUPPORTED` and deliberately not a `502`: the upstream answered
+    /// correctly and the manifest is valid; hort is the one refusing. The
+    /// actual and the bound stay in the server log, because they came out of
+    /// an upstream response body.
+    ///
+    /// **An upstream image above the bound therefore cannot be mirrored**, and
+    /// that is the accepted cost of not accepting what cannot be assessed —
+    /// documented where an operator configures an upstream, not only here.
+    ///
+    /// Asserted on **both** legs, because they are two functions that read the
+    /// same body: the digest-ref leg and the tag leg.
+    #[test]
+    fn pull_through_refuses_a_manifest_past_the_assessment_bound() {
+        use hort_domain::oci::ImageBudget;
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        // One reference past the bound: the registry used to accept this and
+        // the composition then refused it before reading its config.
+        let references = ImageBudget::default_for_composite_scan().max_manifest_blob_references();
+        let layers: Vec<serde_json::Value> = (0..references)
+            .map(|i| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": format!("sha256:{i:016x}{}", "0".repeat(48)),
+                    "size": 64,
+                })
+            })
+            .collect();
+        let content = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 7,
+            },
+            "layers": layers,
+        }))
+        .expect("fixture serialises");
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let media = "application/vnd.oci.image.manifest.v1+json";
+        let digest_ref = format!("sha256:{hex}");
+
+        for (leg, reference) in [("digest-ref", digest_ref.as_str()), ("tag", "v1")] {
+            let (status, minted, scan_enqueues) = run(async {
+                let handle = PrometheusBuilder::new().build_recorder().handle();
+                let (ctx, mocks) = build_mock_ctx(handle);
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                mocks.repositories.insert(repo);
+
+                seed_upstream_mapping(&mocks, repo_id);
+                mocks.upstream_proxy.insert_manifest(
+                    UP_PREFIX,
+                    UP_NAME,
+                    reference,
+                    ManifestFetch {
+                        bytes: content.clone(),
+                        media_type: media.into(),
+                        declared_digest: Some(digest_ref.clone()),
+                        last_modified: None,
+                    },
+                );
+
+                let router = manifest_router(ctx);
+                let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{reference}");
+                let resp = router
+                    .oneshot(
+                        Request::get(&uri)
+                            .header(ACCEPT, media)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let minted = mocks
+                    .artifacts
+                    .find_by_checksum(&hex.parse().expect("the fixture digest parses"))
+                    .await
+                    .expect("the artifact lookup answers");
+                let scan_enqueues = mocks.lifecycle.scan_enqueues().len();
+                (status, minted.is_some(), scan_enqueues)
+            });
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{leg}: an image this registry cannot assess is not mirrored"
+            );
+            assert!(
+                !minted,
+                "{leg}: the refusal is before the mint, so there is no row to hold"
+            );
+            assert_eq!(
+                scan_enqueues, 0,
+                "{leg}: and no scan job whose verdict could never arrive"
+            );
+        }
+    }
+
+    /// **The pull-through half of the conformance refusal.** An upstream
+    /// manifest whose `config` or `layers[]` declares no readable `size` is
+    /// not mirrored either: `size` is REQUIRED by the OCI image spec, and
+    /// charging an absent one as zero let such a manifest clear the byte
+    /// bound, be minted, and then be refused by the assessment — accepted,
+    /// then permanently unassessable.
+    ///
+    /// Same code as the bound refusals (`400 UNSUPPORTED`) and deliberately
+    /// not a third: hort is the one refusing, the upstream answered correctly,
+    /// and the client did not send this manifest. Which descriptor was at
+    /// fault is in the leader's `warn!` and **not** in the response — the
+    /// whole document came out of an upstream response body, so there is
+    /// nothing in it a client of hort is owed.
+    #[test]
+    fn pull_through_refuses_a_manifest_whose_descriptor_declares_no_readable_size() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        // A one-layer image, far inside both bounds, whose single layer
+        // declares nothing. Under the old "contributes zero" reading this was
+        // the smallest manifest in the world and was mirrored whatever the
+        // layer really weighed.
+        let content = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 7,
+            },
+            "layers": [{
+                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                "digest": format!("sha256:{}", "1".repeat(64)),
+            }],
+        }))
+        .expect("fixture serialises");
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let media = "application/vnd.oci.image.manifest.v1+json";
+        let digest_ref = format!("sha256:{hex}");
+
+        let (status, body, minted, scan_enqueues) = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: media.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, media)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            let minted = mocks
+                .artifacts
+                .find_by_checksum(&hex.parse().expect("the fixture digest parses"))
+                .await
+                .expect("the artifact lookup answers");
+            let scan_enqueues = mocks.lifecycle.scan_enqueues().len();
+            (status, body, minted.is_some(), scan_enqueues)
+        });
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a non-conformant upstream manifest is not mirrored"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&body).expect("an OCI error envelope is JSON");
+        assert_eq!(envelope["errors"][0]["code"], "UNSUPPORTED", "{envelope}");
+        let serialized = envelope.to_string();
+        for leak in ["layers[", "config", "size"] {
+            assert!(
+                !serialized.contains(leak),
+                "the response must not say which descriptor an upstream document got \
+                 wrong, found {leak:?} in {serialized}"
+            );
+        }
+        assert!(
+            !minted,
+            "the refusal is before the mint, so there is no row to hold"
+        );
+        assert_eq!(
+            scan_enqueues, 0,
+            "and no scan job whose verdict could never arrive"
+        );
+    }
+
+    /// The boundary, on the same path: an upstream image **exactly at** the
+    /// bound is mirrored. Refusing a composable image is the failure the
+    /// admission gate must not introduce, and a proxy is where it would be
+    /// least visible.
+    #[test]
+    fn pull_through_mirrors_a_manifest_exactly_at_the_assessment_bound() {
+        use hort_domain::oci::ImageBudget;
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+
+        let references = ImageBudget::default_for_composite_scan().max_manifest_blob_references();
+        let layers: Vec<serde_json::Value> = (0..references - 1)
+            .map(|i| {
+                serde_json::json!({
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": format!("sha256:{i:016x}{}", "0".repeat(48)),
+                    "size": 64,
+                })
+            })
+            .collect();
+        let content = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": format!("sha256:{}", "c".repeat(64)),
+                "size": 7,
+            },
+            "layers": layers,
+        }))
+        .expect("fixture serialises");
+        let hex = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&content))
+        };
+        let media = "application/vnd.oci.image.manifest.v1+json";
+        let digest_ref = format!("sha256:{hex}");
+
+        let status = run(async {
+            let handle = PrometheusBuilder::new().build_recorder().handle();
+            let (ctx, mocks) = build_mock_ctx(handle);
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            mocks.repositories.insert(repo);
+
+            seed_upstream_mapping(&mocks, repo_id);
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                UP_NAME,
+                &digest_ref,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: media.into(),
+                    declared_digest: Some(digest_ref.clone()),
+                    last_modified: None,
+                },
+            );
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest_ref}");
+            let resp = router
+                .oneshot(
+                    Request::get(&uri)
+                        .header(ACCEPT, media)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            resp.status()
+        });
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the largest composable image must still be mirrorable"
+        );
     }
 
     // ================================================================
@@ -7694,6 +8302,7 @@ mod tests {
             UpstreamManifestPullOutcome::UpstreamUnavailable => "UpstreamUnavailable",
             UpstreamManifestPullOutcome::UpstreamDigestMissing => "UpstreamDigestMissing",
             UpstreamManifestPullOutcome::ManifestTooLarge { .. } => "ManifestTooLarge",
+            UpstreamManifestPullOutcome::UnassessableComposition => "UnassessableComposition",
             UpstreamManifestPullOutcome::Internal => "Internal",
         }
     }
@@ -9061,5 +9670,352 @@ mod tests {
             "the premise of this test is an exempted hold-read, not a refusal"
         );
         crate::refusal::assert_no_refusal_line(&events);
+    }
+
+    // -- the status flip inside the read ----------------------------------
+
+    /// Drive one anonymous manifest `GET` **by tag** of a `Released`
+    /// manifest whose row flips to `flip_to` **between** step 4's status
+    /// gate and `ArtifactUseCase::download`'s re-read of the same row —
+    /// the window a concurrent rescan lands in during normal operation.
+    ///
+    /// Every constituent is seeded `Released`, so the ADR 0062 closure
+    /// check passes and the request genuinely reaches the download: a
+    /// refusal from there would otherwise be indistinguishable from the
+    /// constituent arm.
+    ///
+    /// Returns the status, the `Retry-After`, the body and every
+    /// `tracing` event — before this, every error from the download
+    /// mapped to `500` and recorded nothing at all, so a status
+    /// assertion alone cannot settle it.
+    #[allow(clippy::type_complexity)]
+    fn manifest_read_with_status_flip(
+        flip_to: QuarantineStatus,
+        axis: Option<RejectionReason>,
+    ) -> (
+        (StatusCode, Option<String>, Vec<u8>),
+        Vec<CapturedEvent>,
+        String,
+    ) {
+        let body = image_manifest_body(CONFIG_HEX, &[LAYER_HEX]);
+        let hex = sha256_hex(&body);
+        let reported = hex.clone();
+        let (parts, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let (artifact_id, hash) = seed_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    &h.metadata,
+                    repo_id,
+                    &hex,
+                    &body,
+                    None,
+                    QuarantineStatus::Released,
+                );
+                seed_constituent(&h, repo_id, CONFIG_HEX, QuarantineStatus::Released, None);
+                seed_constituent(&h, repo_id, LAYER_HEX, QuarantineStatus::Released, None);
+                seed_tag(&h.refs, repo_id, WITHHELD_NAME, WITHHELD_TAG, &hash);
+                if flip_to == QuarantineStatus::Rejected {
+                    h.events.set_stream(
+                        &hort_domain::events::StreamId::artifact(artifact_id),
+                        axis.map(|reason| {
+                            vec![persisted_artifact_rejected(artifact_id, reason, 1)]
+                        })
+                        .unwrap_or_default(),
+                    );
+                }
+                // The flip lands on the handler's own read: step 3 is
+                // served the `Released` row and step 4 admits it, and
+                // every later read of that row — the download's gate, and
+                // the refusal mapping's re-read — sees the new status.
+                h.artifacts
+                    .set_status_after_next_find_by_path(artifact_id, flip_to);
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+                let response = serve(
+                    ctx,
+                    "myrepo",
+                    WITHHELD_NAME,
+                    WITHHELD_TAG,
+                    &HeaderMap::new(),
+                    /* head = */ false,
+                    /* actor = */ None,
+                )
+                .await;
+                let status = response.status();
+                let retry_after = response
+                    .headers()
+                    .get("Retry-After")
+                    .map(|v| v.to_str().unwrap().to_string());
+                let bytes = to_bytes(response.into_body(), 4 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec();
+                (status, retry_after, bytes)
+            })
+        });
+        (parts, events, reported)
+    }
+
+    /// **Acceptance, manifest route.** The flip to `Rejected` answers
+    /// that status's own `403 DENIED` — naming the client's reference and
+    /// the axis, the same envelope step 4 sends for a row that was
+    /// already `Rejected` when it was read — instead of the `500` that
+    /// told the caller the server broke. And it leaves a `rejected`
+    /// refusal line, which this path used to leave nothing of.
+    #[test]
+    fn a_manifest_read_whose_row_turns_rejected_mid_read_answers_403_and_records_it() {
+        let ((status, _, body), events, hex) = manifest_read_with_status_flip(
+            QuarantineStatus::Rejected,
+            Some(RejectionReason::Scanner),
+        );
+        let rendered = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a withheld read is not a server fault: {rendered}"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "DENIED");
+        assert_eq!(
+            parsed["errors"][0]["detail"]["subject"], WITHHELD_TAG,
+            "the manifest route names the client's own reference, as its gate arm does"
+        );
+        assert_eq!(parsed["errors"][0]["detail"]["axis"], "scanner");
+        crate::refusal::assert_refusal_line(
+            &events,
+            &crate::refusal::ExpectedRefusal {
+                level: tracing::Level::WARN,
+                route: "manifest",
+                repository: "myrepo",
+                name: WITHHELD_NAME,
+                reference: WITHHELD_TAG,
+                digest: &hex,
+                status: 403,
+                reason: "rejected",
+            },
+        );
+    }
+
+    /// The other terminal state on the same window: `503` with no
+    /// `Retry-After`, recorded as `scan_indeterminate`.
+    #[test]
+    fn a_manifest_read_whose_row_turns_indeterminate_mid_read_answers_503_without_a_deadline() {
+        let ((status, retry_after, body), events, hex) =
+            manifest_read_with_status_flip(QuarantineStatus::ScanIndeterminate, None);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(retry_after, None, "no self-resolving deadline");
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["errors"][0]["code"], "UNAVAILABLE");
+        crate::refusal::assert_refusal_line(
+            &events,
+            &crate::refusal::ExpectedRefusal {
+                level: tracing::Level::WARN,
+                route: "manifest",
+                repository: "myrepo",
+                name: WITHHELD_NAME,
+                reference: WITHHELD_TAG,
+                digest: &hex,
+                status: 503,
+                reason: "scan_indeterminate",
+            },
+        );
+    }
+
+    /// A flip back into a **hold** is a refusal too, and the one whose
+    /// level differs: `503` with its `Retry-After`, recorded at `info!`
+    /// because waiting does resolve it. The level criterion is
+    /// `crate::refusal`'s and is not re-decided at this exit.
+    #[test]
+    fn a_manifest_read_whose_row_turns_quarantined_mid_read_answers_503_at_info() {
+        let ((status, retry_after, _), events, hex) =
+            manifest_read_with_status_flip(QuarantineStatus::Quarantined, None);
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            retry_after.is_some(),
+            "a timed hold advertises its deadline"
+        );
+        crate::refusal::assert_refusal_line(
+            &events,
+            &crate::refusal::ExpectedRefusal {
+                level: tracing::Level::INFO,
+                route: "manifest",
+                repository: "myrepo",
+                name: WITHHELD_NAME,
+                reference: WITHHELD_TAG,
+                digest: &hex,
+                status: 503,
+                reason: "quarantined",
+            },
+        );
+    }
+
+    /// **The hold-read's own download refusal.** A write-granted caller
+    /// is admitted to a `Quarantined` manifest by the ADR 0039 §10
+    /// exemption, and the row turns `Rejected` before
+    /// `download_hold_read` re-reads it — `HeldVisibility::exemption_covers`
+    /// does not cover a verdict already reached, so that call refuses.
+    ///
+    /// The answer is the one this route gives for a `Rejected` manifest
+    /// `GET` for every caller, write grant or not: `403 DENIED` with the
+    /// axis. Before, it was the `500` this route's own comment predicted
+    /// ("an admitted status refused there would arrive here as the
+    /// `OciError::Internal` below — a `500` on a read this route already
+    /// decided was allowed").
+    #[test]
+    fn a_hold_read_whose_row_turns_rejected_mid_read_answers_403_and_records_it() {
+        let (content, hex) = withheld_manifest();
+        let (status, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let (artifact_id, _) = seed_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    &h.metadata,
+                    repo_id,
+                    &hex,
+                    &content,
+                    None,
+                    QuarantineStatus::Quarantined,
+                );
+                h.events.set_stream(
+                    &hort_domain::events::StreamId::artifact(artifact_id),
+                    vec![persisted_artifact_rejected(
+                        artifact_id,
+                        RejectionReason::Scanner,
+                        1,
+                    )],
+                );
+                // The hold-read gate is served the `Quarantined` row and
+                // admits it; the download's own gate sees `Rejected`.
+                h.artifacts
+                    .set_status_after_next_find_by_path(artifact_id, QuarantineStatus::Rejected);
+                let ctx = write_grant_ctx(&h.ctx, h.repositories.clone(), "ci-pusher");
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&ctx);
+                let principal = principal_with_claim("ci-pusher");
+                serve(
+                    ctx,
+                    "myrepo",
+                    WITHHELD_NAME,
+                    &format!("sha256:{hex}"),
+                    &HeaderMap::new(),
+                    /* head = */ false,
+                    Some(&principal),
+                )
+                .await
+                .status()
+            })
+        });
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a verdict reached inside the hold-read is a refusal, not a server fault"
+        );
+        crate::refusal::assert_refusal_line(
+            &events,
+            &crate::refusal::ExpectedRefusal {
+                level: tracing::Level::WARN,
+                route: "manifest",
+                repository: "myrepo",
+                name: WITHHELD_NAME,
+                reference: &format!("sha256:{hex}"),
+                digest: &hex,
+                status: 403,
+                reason: "rejected",
+            },
+        );
+    }
+
+    // -- the shared axis recovery's two fail-safe arms --------------------
+    //
+    // `terminal_constituent_axis` is asked by both ends of a manifest's
+    // life — the read route's refusal of a stored document and the PUT's
+    // refusal of one being admitted. Its two `None` arms report and carry
+    // on rather than reconsidering, because the refusal was decided
+    // before the load and a constituent re-judged between the two reads
+    // must not flip the answer. Driven here directly: the harness's
+    // `ConstituentStatusReader` answers from the same artifact store, so
+    // a constituent it names terminal always has a row to load — which is
+    // the property that makes it faithful, and the reason neither arm is
+    // reachable through a handler.
+
+    /// The row the resolution just matched is **gone**. The refusal
+    /// stands without an axis, and the operator is told.
+    #[test]
+    fn the_axis_recovery_reports_a_constituent_with_no_row_and_returns_none() {
+        let hash: ContentHash = CONFIG_HEX.parse().unwrap();
+        let (axis, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+                terminal_constituent_axis(&ctx, Uuid::new_v4(), &hash, "myrepo").await
+            })
+        });
+        assert_eq!(axis, None, "an absent row yields no axis, never a token");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.fields.contains("has no row to read its rejection axis")),
+            "and the operator is told which arm it was: {events:?}"
+        );
+    }
+
+    /// The load itself **fails**. Same answer, different line: nothing is
+    /// known to be wrong with the constituent, only that the axis could
+    /// not be looked up — collapsing the two would make the first line
+    /// meaningless.
+    #[test]
+    fn the_axis_recovery_reports_a_failed_load_and_returns_none() {
+        let hash: ContentHash = CONFIG_HEX.parse().unwrap();
+        let (axis, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                h.artifacts
+                    .fail_next_find_by_repo_and_checksum(DomainError::Invariant(
+                        "catalog down".into(),
+                    ));
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+                terminal_constituent_axis(&ctx, Uuid::new_v4(), &hash, "myrepo").await
+            })
+        });
+        assert_eq!(axis, None);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.fields.contains("could not load the terminal constituent")),
+            "the failed-load arm is distinguishable from the absent-row one: {events:?}"
+        );
+    }
+
+    /// And the positive arm, so the two above are not satisfied by an
+    /// implementation that always answers `None`: a constituent with a
+    /// row and an `ArtifactRejected` on its stream yields its axis.
+    #[test]
+    fn the_axis_recovery_returns_the_axis_from_the_constituents_own_stream() {
+        let axis = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_constituent(
+                &h,
+                repo_id,
+                CONFIG_HEX,
+                QuarantineStatus::Rejected,
+                Some(RejectionReason::Curator {
+                    curator_id: Uuid::new_v4(),
+                }),
+            );
+            let hash: ContentHash = CONFIG_HEX.parse().unwrap();
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            terminal_constituent_axis(&ctx, repo_id, &hash, "myrepo").await
+        });
+        assert_eq!(axis, Some("curator"));
     }
 }

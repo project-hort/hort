@@ -103,6 +103,7 @@ use hort_app::use_cases::api_token_use_case::{
 };
 use hort_app::use_cases::pat_validation_use_case::parse_pat_token_format;
 use hort_config::SUBJECT_IDENTIFYING_CLAIMS;
+use hort_domain::entities::api_token::IssuedVia;
 use hort_domain::entities::service_account::ServiceAccount;
 use hort_domain::ports::federated_jwt_validator::{FederationDenyReason, ValidatedClaims};
 use hort_domain::ports::identity_provider::OidcValidationError;
@@ -1398,6 +1399,10 @@ async fn handle_federated_jwt(
             exp: claims.exp_raw,
             require_jti,
         }),
+        // The one origin the operator authority query excludes: this
+        // row is a short-lived exchange bearer, not an identity
+        // somebody administers.
+        issued_via: IssuedVia::FederationExchange,
     };
 
     let issued = match ctx
@@ -4615,6 +4620,37 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             assert_eq!(
                 issued_event.source_sub.as_deref(),
                 Some("repo:my-org/my-repo:ref:refs/heads/main")
+            );
+        });
+    }
+
+    /// The row AND the event say `federation_exchange` — the one origin
+    /// the operator authority query excludes.
+    ///
+    /// This path is why the column exists: an exchange mints one
+    /// short-lived row per workload, every one of them `kind =
+    /// service_account` and `created_by_user_id` = the SA's own backing
+    /// user, so a durable identity and the residue of a CI job are
+    /// indistinguishable in the row without it. The event is asserted
+    /// alongside the row because a value that reached one and not the
+    /// other would leave the audit trail and the query disagreeing.
+    #[test]
+    fn federation_mint_row_and_event_say_federation_exchange() {
+        rt().block_on(async {
+            let (router, validator, sas, mocks) = build_federation_router();
+            let sa = sample_sa();
+            seed_sa_user(&mocks, &sa);
+            sas.insert(sa.clone());
+            validator.register_token("ok-jwt", sample_validated_claims(600));
+            let resp = post_form(router, federation_form("ok-jwt")).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            let inserted = mocks.api_tokens.inserted();
+            assert_eq!(inserted.len(), 1);
+            assert_eq!(inserted[0].issued_via, IssuedVia::FederationExchange);
+            assert_eq!(
+                last_issued_event(&mocks).issued_via,
+                IssuedVia::FederationExchange
             );
         });
     }

@@ -246,7 +246,7 @@ pub fn evaluate_rescan_drive_liveness(
 mod tests {
     use super::*;
     use crate::entities::scan_policy::{
-        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
+        NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
     };
     use crate::events::PolicyScope;
     use chrono::TimeZone;
@@ -277,7 +277,6 @@ mod tests {
             rescan_interval_hours,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),

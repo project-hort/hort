@@ -1,16 +1,14 @@
-# Hosted OCI repo under a Trivy ScanPolicy that both ENFORCES
-# (`enforcement: reject`) and PROMOTES the composed-image verdict
-# (`compositeVerdictMode: promoted`). Used by
+# Hosted OCI repo under a Trivy ScanPolicy that ENFORCES
+# (`enforcement: reject`). Used by
 # scripts/native-tests/scenarios/quarantine/trivy-oci-constituent-abstention.sh .
 #
 # Distinct from oci-trivy-e2e, its nearest sibling, on the one axis that
-# matters: oci-trivy-e2e is `enforcement: record` + the default
-# `compositeVerdictMode: observed`, deliberately, so its release
-# assertions never depend on which CVEs the base image carries. Under
-# that posture no verdict gates and no constituent's assessment can
-# belong to a composition, so the posture ADR 0064 D2's loosening is
-# scoped to — a promoted composite verdict over a gating repository —
-# cannot be reached from it at all. Hence a second fixture rather than a
+# matters: oci-trivy-e2e is `enforcement: record`, deliberately, so its
+# release assertions never depend on which CVEs the base image carries.
+# Under that posture no verdict gates at all, so what this scenario
+# asserts — that a constituent whose absent assessment belongs to its
+# composition still releases and serves — cannot be distinguished there
+# from nothing gating anything. Hence a second fixture rather than a
 # second leg.
 #
 # `isPublic: true` so the post-release leg can assert an ANONYMOUS layer
@@ -22,7 +20,7 @@ metadata:
   name: oci-trivy-composite-e2e
 spec:
   name: "OCI Trivy Composite-Verdict E2E"
-  description: "Hosted OCI repo under an enforcing Trivy ScanPolicy with the composed-image verdict promoted; used to confirm a layer whose materialised tree no analyzer claimed releases and serves, because that absence of assessment belongs to the composition. requires: egress."
+  description: "Hosted OCI repo under an enforcing Trivy ScanPolicy; used to confirm a layer whose materialised tree no analyzer claimed releases and serves, because that absence of assessment belongs to the composition. requires: egress."
   format: oci
   type: hosted
   storage:

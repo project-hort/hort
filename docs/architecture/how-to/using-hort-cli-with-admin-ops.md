@@ -209,6 +209,89 @@ Both of the above endpoints are gated by the same `AdminPrincipal` check as
 rationale behind the admin-only scope, the in-memory apply-status
 semantics, and the secrets-exclusion mechanism.
 
+### Read what each repository holds
+
+`GET /api/v1/admin/inventory` answers "how many artifacts and how many
+bytes does each repository hold?" — the measurement that makes a
+retention cleanup verifiable, because without a before and an after
+there is nothing to check the sweep against.
+
+```sh
+curl -sH "Authorization: Bearer $TOKEN" "$HORT_URL/api/v1/admin/inventory" | jq .
+```
+
+```json
+{
+  "measured_at": "2026-11-09T10:14:22.481Z",
+  "repositories": [
+    {
+      "repository_id": "7c1e...",
+      "repository_key": "oci-main",
+      "artifact_count": 3647,
+      "distinct_content_count": 3608,
+      "live_primary_content_bytes": 142117796
+    }
+  ]
+}
+```
+
+Three numbers per repository, and each name says which one it is:
+
+- **`artifact_count`** — live artifact rows. Soft-deleted artifacts are
+  excluded: they are no longer in the repository's served catalog.
+- **`distinct_content_count`** — how many distinct contents those rows
+  name. hort stores content by hash, so several rows routinely point at
+  one set of bytes; the figures above are from a real instance, where
+  3 647 rows stood on 3 608 contents.
+- **`live_primary_content_bytes`** — `size_bytes` summed over those
+  **distinct** contents, each counted once however many rows name it.
+
+Every repository the installation declares appears, ordered by key,
+**including the ones holding nothing** — those report zeros. That is
+deliberate: "retention emptied this repository" is a result you need to
+be able to read, and an omitted entry would be indistinguishable from a
+repository the readout never saw.
+
+#### `live_primary_content_bytes` is a catalog weight, not disk usage
+
+This is the one number here that can be acted on wrongly, so it is worth
+being exact about what it is not. **Three things:**
+
+- **It is not additive across repositories.** One stored content can be
+  held by several repositories, and each one's figure counts it in full.
+  Adding the figures up double-counts every shared blob — and there is
+  no per-repository physical ownership to report instead, because
+  ownership is not what content-addressed storage has.
+- **It is not a measurement of bytes at rest.** It sums the *primary*
+  content of artifact rows only, so it omits metadata hort stores in CAS
+  and every other kind of content it references.
+- **It is not reclaimable space.** A deleted artifact leaves these
+  numbers immediately while its bytes stay resident until the
+  reference-counted collector removes them, and what a disposal would
+  actually free depends on every other claim on that content — which is
+  what `hort-cli admin retention preview` below answers, and this
+  readout does not.
+
+What it *is*: how much this repository's served catalog weighs. Use it
+to compare a repository against itself over time, which is what a
+before/after needs; do not use it for capacity planning or to predict
+what a cleanup will return.
+
+The readout reports **no quota**, and hort has none to report: the
+`quotaBytes` field on a repository envelope was never enforced and is now
+retired — an apply that declares it fails, telling you to drop the line.
+Putting a stored leftover beside a usage figure here would make this look
+like quota monitoring when no quota exists to monitor.
+
+This is a read-only admin endpoint and needs the `admin` claim like the
+other `admin` subcommands. It is not the held-set overview
+(`GET /api/v1/admin/retention/overview`, see the
+[curator workflow](curator-workflow.md)): that reports the same first
+two numbers under the same two names over the narrow slice the release
+gate is holding pending a signature, and carries no byte figure at all,
+because what a *disposal* would free is refcount-decided and not
+computable from the rows.
+
 ### Preview and execute a retention cleanup
 
 Retention deletes real content, so the CLI puts a readable proposal and a
@@ -307,27 +390,44 @@ rather than the world, instead of reporting it as the proposal changing.
 `delta.proposal.window_limited` is the same fact for a script.
 
 Authority: `preview` needs only the ordinary admin-task permission;
-`apply`'s execute step additionally needs the `task:destructive` claim,
-which the `--admin` session above carries. Nothing here introduces a new
-permission, claim, or token lifetime.
+`apply`'s execute step additionally needs the `destroy_content`
+permission, which the `--admin` session does **not** carry on its own —
+it is held through an explicit `kind: PermissionGrant` bound to your
+identity, because destructive authority is deliberately not implied by
+being an admin. Apply it per
+[`enable-admin-task-cronjobs.md`](deploy/enable-admin-task-cronjobs.md)
+§5.1; without it, `preview` works and `apply` is refused at the execute
+step.
+
+**That authority can be held for one repository instead of the
+instance.** `retention-evaluate` accepts a `repository_id` in its params
+and then evaluates only that repository, and the `destroy_content` check
+is made about *that* repository — so a grant scoped to it is enough. The
+instance-wide run is still asked at `repository = None` and still needs a
+repository-less grant: a narrow grant never authorizes the broad action.
+`preview` and `apply` have no repository flag yet, so the scoped run goes
+through `hort-cli admin task invoke retention-evaluate --params-file`;
+[`enable-admin-task-cronjobs.md`](deploy/enable-admin-task-cronjobs.md)
+§5.1.1 has the grant and the two command lines.
 
 **That authority is checked twice: once when the job is accepted, and
 again when the worker is about to run it.** A destructive job is queued,
 not executed inline, so the second check reads the live authority of the
 user the job was enqueued under. If it was revoked in between — the
-account demoted or deactivated, or its `admin_task_invoke` grant removed
-— the handler is never called, nothing is destroyed, and the job becomes
-a terminal `failed` row whose `last_error` begins `destructive task
-refused at execution`. It reaches a scheduled run the same way, where a
-deployment drives a destructive kind on a schedule: the CronJob invokes
-through this same surface, so revoking the identity it authenticates as
-stops scheduled retention too. See
+account deactivated, or either of its grants removed — the handler is
+never called, nothing is destroyed, and the job becomes a terminal
+`failed` row whose `last_error` begins `destructive task refused at
+execution`. It reaches a scheduled run the same way, where a deployment
+drives a destructive kind on a schedule: the CronJob invokes through this
+same surface, so revoking the identity it authenticates as stops
+scheduled retention too. See
 [`enable-admin-task-cronjobs.md`](deploy/enable-admin-task-cronjobs.md)
-§5.1 for the operator-facing detail. One consequence worth knowing
-before you grant: the claim is resolved from your IdP at login and is not
-persisted, so only an `admin` requester's destructive authority survives
-the wait — a non-admin holder of a `task:destructive` `ClaimMapping` can
-submit a job that is then refused at execution.
+§5.2 for the operator-facing detail. One consequence worth knowing
+before you ask for the grant: the second check rebuilds you from your
+`users` row, which carries no IdP-resolved claims, so a destructive grant
+must be bound to your identity (`kind: user`) rather than to a claim —
+a claim-bound one lets you submit a job that is then refused at
+execution.
 
 Exit codes worth scripting against: `0` ran and the result was read, `3`
 the job outlived `--wait-timeout` (the job id is printed and nothing is

@@ -375,7 +375,7 @@ fn render_outcome(
             if !outcome.rejected_packages.is_empty() {
                 writeln!(
                     out,
-                    "\n{red}REJECTED ({}) — terminal hort status; use `hort-cli curation waive` or admin override:{reset}",
+                    "\n{red}REJECTED ({}) — terminal hort status; use `hort-cli curation waive artifact` or admin override:{reset}",
                     outcome.rejected_packages.len(),
                 )?;
                 let hdr = &["PACKAGE", "VERSION", "REASON"];

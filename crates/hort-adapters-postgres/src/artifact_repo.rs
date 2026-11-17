@@ -8,7 +8,9 @@ use uuid::Uuid;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{Actor, DomainEvent, StreamId};
-use hort_domain::ports::artifact_repository::{ArtifactRepository, PackageFileDigestRow};
+use hort_domain::ports::artifact_repository::{
+    ArtifactRepository, ChecksumMatchRow, PackageFileDigestRow,
+};
 use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::types::{ContentHash, LimitedList, Page, PageRequest, LIMIT_LIST_MAX_ITEMS};
 
@@ -167,6 +169,76 @@ impl ArtifactRepository for PgArtifactRepository {
                 .await
                 .map_err(|e| map_sqlx_error(&e, "Artifact", &sha256))?;
             row.map(Artifact::try_from).transpose()
+        })
+    }
+
+    fn find_live_rows_by_repo_and_checksums(
+        &self,
+        repository_id: Uuid,
+        checksums: &[ContentHash],
+    ) -> BoxFuture<'_, DomainResult<Vec<ChecksumMatchRow>>> {
+        let wanted: Vec<String> = checksums.iter().map(|h| h.as_ref().to_string()).collect();
+        Box::pin(async move {
+            let checksum_count = wanted.len();
+            tracing::debug!(
+                entity = "Artifact",
+                %repository_id,
+                checksum_count,
+                "find_live_rows_by_repo_and_checksums"
+            );
+            // An empty set has no rows to find and no statement worth
+            // issuing. Answered here rather than let `= ANY('{}')` run,
+            // because the caller's own validation rejects an empty entry
+            // list before it ever reaches a resolver — so this arm is the
+            // adapter refusing to make a round trip for a question with
+            // only one answer.
+            if wanted.is_empty() {
+                return Ok(Vec::new());
+            }
+            // `checksum_sha256` is `character(64) NOT NULL` and the index
+            // on it (`migrations/003_artifacts_cas.sql`) is not
+            // repository-scoped, so the digest equality drives the scan
+            // and `repository_id` filters it. `= ANY($2)` keeps the whole
+            // set in one round trip rather than one per digest.
+            //
+            // Three narrow columns and no `LIMIT`: the caller distinguishes
+            // "one row" from "more than one row" and names the rows it
+            // refuses over, so a truncated answer would not be a shorter
+            // answer but a different one — a digest whose only row fell
+            // outside the bound would read as bytes this repository does
+            // not hold.
+            let rows: Vec<(String, Uuid, Option<String>)> = sqlx::query_as(
+                "SELECT checksum_sha256, id, quarantine_status \
+                 FROM artifacts \
+                 WHERE repository_id = $1 AND checksum_sha256 = ANY($2) \
+                   AND deleted_at IS NULL",
+            )
+            .bind(repository_id)
+            .bind(&wanted)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "Artifact", "checksum_set"))?;
+
+            let mut out: Vec<ChecksumMatchRow> = Vec::with_capacity(rows.len());
+            for (checksum, id, status_str) in rows {
+                // `character(64)` is blank-padded on read for a shorter
+                // value; the column is exactly 64 characters wide so this
+                // is a no-op today, and it keeps the parse from depending
+                // on that.
+                let hash: ContentHash = checksum.trim_end().parse()?;
+                // Fail closed, for the reason every status read in this
+                // file does: this row decides a curator release, and
+                // `QuarantineStatus::None` — the value a substituted
+                // decode lands on — is the one state the bulk waive's
+                // own guard would read as "nothing to release". An
+                // unreadable status fails the resolution rather than
+                // mis-describe the row.
+                let status = quarantine_status_from_sql(status_str.as_deref(), || {
+                    format!("find_live_rows_by_repo_and_checksums({repository_id}, {id})")
+                })?;
+                out.push((hash, id, status));
+            }
+            Ok(out)
         })
     }
 

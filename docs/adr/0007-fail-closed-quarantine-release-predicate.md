@@ -49,17 +49,13 @@ A `ScanRunOutcome::Failed` that exhausts `HORT_SCANNER_MAX_ATTEMPTS` is a scanne
   The widening carries a **scan-policy guard**, and it is load-bearing: candidacy additionally requires the artifact's resolved policy (repo-scoped-else-global-else-`DefaultPolicy`, the same resolution `select_eligible` uses) to actually scan — `COALESCE(cardinality(scan_backends), <default-len>) > 0`. A job-less quarantined artifact under a `scan_backends: []` (ScanWaived) policy is **not** stranded: it releases via the existing `ScanWaived` authority, and enqueueing a scan for it would contradict the operator's own explicit opt-out. Terminal states (`rejected`, `scan_indeterminate`) and `is_deleted` remain never selected, exactly as before. No new release authority is added — this only restores the *scan* that the existing authorities already required.
 - **any other status** (`None` — the permissive default, no window to fall back into; or an already-terminal status) → terminal **`scan_indeterminate`**, exactly as before this amendment. A best-effort artifact-load failure resolves to `None` here and therefore also fails to `scan_indeterminate` (safe direction).
 
+**The self-healing promise is about the release axis, not about retention (amended 2026-11-09; issue #288 — *wording pending maintainer approval*).** "Re-scanned once the scanner recovers, self-healing without operator intervention" describes what *ends the hold*, and that is unchanged: only a scan, or one of the enumerated authorities, releases the artifact. It is not a promise that the artifact's row and bytes persist until that happens. An independently authorised retention policy — one whose `heldStates` names `quarantined` or `scan_indeterminate`, and whose predicate carries a positive age bound on every successful branch, measured from the artifact's **entry into that state** — may dispose of the artifact after that span has run in the state. The hold is still indefinite in the sense that matters here: nothing times out into `released`, nothing times out into `rejected`, and an artifact a scanner can still reach is still healed by reaching it.
+
 **Why staying `quarantined` is still fail-closed.** The two impossible failure modes in *Context* are unchanged. A `quarantined`, never-successfully-scanned artifact is **not** releasable by the timer: release still requires one of the five enumerated authorities, and the only one the sweep can synthesize is `ScanSucceeded` — derived from a `ScanCompleted` **event on the artifact stream**, which a stranded artifact does not have. `resolve_release_authority` returns `None`, the sweep skips it (`skipped_no_authority`), and `Artifact::release` re-denies deny-by-default. Window expiry remains candidacy-only. This amendment adds **no new release authority** and changes **no** release path; it only avoids escalating a recoverable outage to the stricter terminal state, so the artifact can heal via the *existing* `ScanSucceeded` path instead of requiring an admin override.
 
 ### Referenced-tree descendant zero-window carve-out (issue #46, amended 2026-07-17)
 
 A **scoped carve-out**, NOT a reversal of the rejected "clean scan releases immediately" alternative below: a scanned-clean artifact that is a `content_references` **target** of an already-ingested parent (a referenced-tree descendant — e.g. an OCI image-index child manifest, or a manifest's config/layer blob) releases on its own `ScanSucceeded` **without re-applying the observation window**; forward observation is the standard released-artifact rescan.
-
-**Why this loses no protection:**
-
-1. **No in-window rescan (verified).** `RescanCandidatesRepository::select_eligible` rescans only `released`/`NULL` artifacts on the 24h interval — the window never re-scans a `quarantined` artifact. So for *every* artifact, quarantined or not, the window is a single-scan-at-ingest + timer, not a rescan mechanism; it does not itself realise "reputation catch-up."
-2. **Fresher scan.** The descendant is scanned at first-touch against the *current* CVE database — strictly more recent than the parent's ingest-time scan the operator already trusted at release.
-3. **Identical forward observation.** On release the descendant enters the same 24h released-artifact rescan pool as everything else; post-release CVEs are caught identically to any other released artifact.
 
 **Explicitly narrow.** This is *not* the general "clean scan releases immediately" alternative (below), which stays rejected. Only `content_references` **targets** qualify — an artifact with no parent referencing it keeps the full window, unchanged. A blob touched before its referencing manifest exists (no edge yet) takes the normal window; a later re-touch after the edge appears is a non-issue because the pull flow ingests the manifest before its blobs.
 
@@ -68,7 +64,58 @@ A **scoped carve-out**, NOT a reversal of the rejected "clean scan releases imme
 1. A clean scan cannot release *early*: the release predicate is completely untouched (`Artifact::release`'s deny-by-default `(reason, authority)` match) — a descendant still needs its own `ScanSucceeded`; releasing purely because the window collapsed to zero, with no scan, remains impossible.
 2. A never-successfully-scanned artifact cannot release on the timer alone: the carve-out changes only the ingest-time **anchor** (`quarantine_window_start`), never the authority check — `resolve_release_authority` still requires a real `ScanCompleted` event on the artifact's own stream.
 
-**As-built:** the anchor-backdating lives in `IngestUseCase::ingest_inner` (`crates/hort-app/src/use_cases/ingest_use_case.rs`) — a referenced-tree-descendant artifact's `quarantine_window_start` is set to `ingested_at - effective_duration` instead of `ingested_at`, so the live-computed deadline (`effective_quarantine_deadline(anchor, duration)`) equals `ingested_at`. The target-check excludes the self-referencing refcount kinds `primary_content` / `metadata_blob` — every artifact's own ingest writes a `primary_content` row targeting its own hash, so an unfiltered "is this hash a target of any kind" check would misidentify every artifact as its own descendant; this exclusion is load-bearing for the carve-out to stay correctly scoped. The predicate itself now lives in one shared helper (`hort_app::use_cases::referenced_descendant::is_referenced_tree_descendant`) used by both the ingest anchor decision and the provenance hold below, so the two definitions cannot drift.
+#### The carve-out is conditional on inherited trust (amended 2026-11-15; human-approved)
+
+**Decision.** The observation window belongs to the bytes. A referenced-tree
+descendant skips it only where it inherits trust that already exists: the
+window is waived for a `content_references` target of which **at least one
+referencing parent is itself `Released`**. A descendant whose parents are all
+still held keeps the full window. `content_references` are resolved within one
+repository, so a parent and the constituent it references are governed by the
+same policy and the same window length.
+
+**Why the condition is the rationale.** The carve-out rested on the
+descendant's scan being more recent than *the parent's ingest-time scan the
+operator already trusted at release*, which presupposes a released parent. On
+a cold pull of a composed artifact, parent and constituents are minted seconds
+apart against the same advisory data and the parent's own window is still
+running: there is no earlier trusted assessment for the descendant's to be
+fresher than, so the premise is absent and the waiver rests on nothing. Making
+it a condition takes nothing from the carve-out — it states when it applies.
+
+**What the window is for.** It is a proxy for elapsed *ecosystem exposure*
+([ADR 0054](0054-content-level-age-evidence-anchors-quarantine.md)): the
+assumption that content available in the world for the window's duration has
+had the ecosystem's scanners, advisories and researchers looking at it. An
+argument from hort's own behaviour — the window never re-scans a quarantined
+artifact, so it is pure latency — is true and not the point: the protection is
+the world's clock, not hort's rescan, and a first-touch scan against advisory
+data that has had no time to learn about the content is the gap the window
+covers. Where the two readings disagree, ADR 0054's governs, because it states
+what the window measures.
+
+**No authority is added and no release path changes.** The carve-out touches
+only the ingest-time anchor, never the authority check; `resolve_release_authority`
+still requires the artifact's own `ScanSucceeded` / `ScanWaived`. The condition
+can only lengthen a window, never shorten one — the direction ADR 0054's anchor
+module names as the one that cannot open a hole.
+
+**Retired with this amendment:** the as-built paragraph naming the anchor
+arithmetic and its call sites, and the three-part justification that preceded
+this one. A mechanism recorded in an ADR expires with the mechanism while the
+decision underneath does not — the same correction
+[ADR 0064](0064-a-filesystem-finding-is-about-the-composed-filesystem.md) D6
+made for its own retired posture field. What this ADR carries is the decision
+above.
+
+**Corrected here because it misleads a reader of this ADR:** the #115
+amendment below states that `Artifact::complete_provenance`'s
+`NoAttestation × Required` arm holds on
+`window_open || is_referenced_descendant`. That enumeration was removed on
+2026-09-12 ([ADR 0039](0039-keyed-provenance-verification.md) D1/D3): an
+absent attestation holds unconditionally, and only a signature that is
+present, readable and invalid is terminal. The provenance axis no longer
+consults the window, and nothing in this amendment affects it.
 
 #### The window is ALSO the `Required`-mode provenance hold predicate (issue #115, amended 2026-08-05)
 
@@ -79,6 +126,8 @@ That is a real, reachable failure: OCI pull-through writes `oci_config`/`oci_lay
 **Decision:** `Artifact::complete_provenance`'s `NoAttestation × Required` arm holds on `window_open || is_referenced_descendant`. A descendant's provenance authority **is its parent's signature** — delivered by the ADR 0039 cascade, not by an attestation of its own — so it must never be terminally rejected for lacking one. This is scoped exactly like `window_open`: **only** that arm consults the flag. A forged / untrusted / digest-mismatch signature on a descendant is position-independent (already wrong) and still rejects terminally, so the carve-out cannot launder a tampered layer.
 
 **This strengthens fail-closed rather than relaxing it.** The held descendant stays `Quarantined` — not downloadable, 503 — until either the cascade clears it or an admin releases it under the ADR 0025 source-state rules. An unsigned parent under `Required` leaves its constituents held **forever**, which is the correct outcome and, unlike the terminal rejection it replaces, is recoverable: sign the parent, the S3 hook re-verifies the subject, the cascade clears the constituents. No release authority is added; `Pending` is the fail-closed reading at the release gate either way.
+
+**"Held forever" is a statement about the provenance axis (amended 2026-11-09; issue #288 — *wording pending maintainer approval*).** "An unsigned parent under `Required` leaves its constituents held **forever**" says that nothing on the provenance axis ends the hold by itself, and that stays true: no deadline rejects the constituent, no timer releases it, and signing the parent still clears it through the cascade. It does not say the artifact is undeletable. A retention policy that explicitly names `quarantined` in its `heldStates` and bounds every successful branch of its predicate by time **in that state** may dispose of a constituent that has sat there for that span. The disposal is a separate, independently authorised decision recorded as its own event; it is not a provenance verdict, and it does not make the held artifact deliverable for even an instant.
 
 The carve-out is automatic (derived from the reference graph), not an operator opt-in, so it adds no ADR 0016 cross-opt-in matrix row — it is recorded here as a prose interaction between two existing mechanisms.
 
@@ -115,7 +164,7 @@ Authority 1 ("a successful `ScanCompleted`") presumes there is something for a s
 
 **Clarification (no authority added, none changed):** the fail-closed rule governs an *expected* surface that could not be assessed. For an artifact with no surface, the recorded assessment is **"not applicable"** — a completed assessment with nothing to assess. It satisfies authority 1 exactly as a clean verdict does, and the **time gate alone** governs the release; the observation window is not shortened, skipped or otherwise weakened. The trail stays honest: `ScanCompleted.assessment` distinguishes `analysed` from `not_applicable`, so a reader can never mistake "nothing to assess" for "examined and clean", and the terminal-decision counter `hort_scan_terminal_total{result="not_applicable"}` keeps the two apart in monitoring.
 
-The **code-level definition** of "nothing for this artifact to be held for" is `NotAnalysable::gates_release` (`crates/hort-domain/src/ports/scanner.rs`) answering `false`, and that is the single place the split is decided. `NotAnalysable::NotApplicable` answers so unconditionally — it is the absence of a surface. **Widened 2026-11-01 to conform to [ADR 0064](0064-a-filesystem-finding-is-about-the-composed-filesystem.md) D2 — two siblings answer so conditionally, and they are the only ones:** `UnsupportedContainer` (a container this adapter has no decoder for) and `NoAnalyzerMatched` (a materialised target no analyzer claimed) do not hold an **OCI blob** under a scan policy that has promoted the composite verdict, because the composition that binds the layer decodes it and owns its filesystem verdict (D2) — the same "this surface is assessed elsewhere" reasoning the rootfs-empty clarification below now rests on. Neither says anything about the layer's bytes, and D2 governs the **absence** of an assessment exactly as it governs a finding; an earlier revision of this paragraph placed `NoAnalyzerMatched` with the holding siblings, which left the rule stated two ways in one repository. The predicate therefore takes the artifact's kind and the resolved `compositeVerdictMode` alongside the reason; **no eighth authority is added**, and the release predicate above is untouched. Its siblings `UnusableArchive` (an archive the adapter refused to unpack — a statement about the bytes) and `IncompleteComposition` (the composition's own assessment is absent, so there is nothing above the constituent to inherit the obligation) are an expected surface left unassessed and keep the fail-closed `scan_indeterminate` hold unchanged — a single one of them among the abstentions holds the artifact even when every other backend abstained as not-applicable. Advisory enrichment that produced a finding while every backend abstained also keeps the hold: something did have an opinion, so "nothing to assess" would be a false statement.
+The **code-level definition** of "nothing for this artifact to be held for" is `NotAnalysable::gates_release` (`crates/hort-domain/src/ports/scanner.rs`) answering `false`, and that is the single place the split is decided. `NotAnalysable::NotApplicable` answers so unconditionally — it is the absence of a surface. **Widened 2026-11-01 to conform to [ADR 0064](0064-a-filesystem-finding-is-about-the-composed-filesystem.md) D2, and made unconditional by that ADR's 2026-11-10 amendment — two siblings answer so conditionally on the artifact's *kind*, and they are the only ones:** `UnsupportedContainer` (a container this adapter has no decoder for) and `NoAnalyzerMatched` (a materialised target no analyzer claimed) never hold an **OCI blob**, because an OCI blob is a composition constituent and neither statement is about the composition that runs — where an image binds the layer, that composition decodes it and owns its filesystem verdict (ADR 0064 D2); where nothing binds it, a package finding read out of it is a statement about a tree nothing runs (ADR 0064 D6). This is the same "this surface is assessed elsewhere" reasoning the rootfs-empty clarification below now rests on. Neither says anything about the layer's bytes, and D2 governs the **absence** of an assessment exactly as it governs a finding. The predicate therefore takes the artifact's kind alongside the reason and nothing else, reducing to `!kind.is_composition_constituent()` for these two; **no eighth authority is added**, and the release predicate above is untouched. Its siblings `UnusableArchive` (an archive the adapter refused to unpack — a statement about the bytes) and `IncompleteComposition` (the composition's own assessment is absent, so there is nothing above the constituent to inherit the obligation) are an expected surface left unassessed and keep the fail-closed `scan_indeterminate` hold unchanged — a single one of them among the abstentions holds the artifact even when every other backend abstained as not-applicable. Advisory enrichment that produced a finding while every backend abstained also keeps the hold: something did have an opinion, so "nothing to assess" would be a false statement.
 
 Consequence for future work: a new `NotAnalysable` variant has to state which side of `gates_release` it falls on (the match is exhaustive, so it cannot inherit an answer), and "not applicable" must never be widened into a way to *skip* a scan an operator asked for — `scan_backends: []` is the sanctioned waiver (authority 2) and stays the only one.
 
@@ -244,7 +293,7 @@ The bound did not protect the greater power; it split one power across two roles
 - **Record:** a justification is required (non-empty, ≤ 512 bytes) and the `ArtifactReleased` carries `released_by: Curator` plus the deciding curator's user id. Who decided, and why, stays answerable from the stream alone (ADR 0002).
 - **A state the rule does not admit answers 409, never 500.** An operator can POST a release against an artifact in any state, so the refusal is a caller-reachable state precondition — `DomainError::InvalidState` (ADR 0025).
 
-**What keeps automation out is a grant nobody makes, not a token-kind check.** The deployed curator identity is itself a PAT-only `kind: ServiceAccount` carrying a global `curate` grant (`deploy/ansible/files/gitops/auth/service-accounts/maintainer-curator.yaml`), and service accounts are strictly non-admin (ADR 0038) — so `TokenKind::ServiceAccount` has never meant "a pipeline", and a principal-shape gate on this route would lock out the very operator it was meant to protect. ADR 0055 governs the question and answers it by refusing the grant: *"Granting `curate` to the release identity. Would work, and hands CI standing authority over other people's artifacts to solve a problem about its own."* That refusal is the control. This amendment does not reopen it, and the curator surface keeps its deliberate non-features (no bulk-waive, no rule-driven release).
+**What keeps automation out is a grant nobody makes, not a token-kind check.** The deployed curator identity is itself a PAT-only `kind: ServiceAccount` carrying a global `curate` grant (`deploy/ansible/files/gitops/auth/service-accounts/maintainer-curator.yaml`), and service accounts are strictly non-admin (ADR 0038) — so `TokenKind::ServiceAccount` has never meant "a pipeline", and a principal-shape gate on this route would lock out the very operator it was meant to protect. ADR 0055 governs the question and answers it by refusing the grant: *"Granting `curate` to the release identity. Would work, and hands CI standing authority over other people's artifacts to solve a problem about its own."* That refusal is the control. This amendment does not reopen it, and the curator surface keeps its deliberate non-features: **no rule-driven release and no self-service release.** A bulk waive is neither — it is an explicit, operator-written list of targets under one justification, bounded, applied all-or-nothing, with the same `CuratorWaiver` authority evaluated per artifact. What the refused grant keeps out is an identity that decides *which* artifacts to release; it was never about how many names one decision may carry.
 
 #### The axis boundary for a `Rejected` artifact: as far as the curator's instrument reaches
 
@@ -336,6 +385,7 @@ not become a hot loop.
 ## Consequences
 
 - A missing or failed scan **fails closed**: the artifact does not leak out when its timer expires. A never-scanned (`None`-status) or already-terminal artifact lands in `scan_indeterminate`; an artifact still `quarantined` when its scan exhausts retries stays `quarantined` and is auto-rescanned once the scanner recovers (issue #6, above) — in both cases the timer cannot release it.
+- **A held artifact is not thereby undeletable** (2026-11-09; issue #288 — *wording pending maintainer approval*). `quarantined`, `rejected` and `scan_indeterminate` remain GC-protected by default and against every policy that does not say otherwise. A retention policy may opt a state in (`spec.heldStates`), and then only with a positive age bound on **every** successful branch of its predicate, re-anchored to the artifact's entry into that state; the purge checks the authority the resulting `ArtifactExpired` carries and never the artifact's bare status. Nothing here adds a release authority, shortens an observation window, or makes a held artifact deliverable: the only new outcome is disposal, which is what retention has always been for.
 - Adding any new release path means adding an authority to the enumerated predicate, with its own guard — there is no "fall through to released".
 - The `scan_backends: []` waiver is an explicit, audited authority, not an accidental gap.
 - Re-evaluation after an exclusion does not skip the remaining observation window: it removes the scan block, not the time hold.
@@ -357,4 +407,5 @@ not become a hot loop.
 - `docs/architecture/how-to/recover-stranded-artifacts.md`; `ScanOrchestrationUseCase::record_outcome` and `RescanCandidatesRepository::select_stranded` — the issue #6 exhaustion-split / stranded-scan recovery amended in above (commit `55a93e40`; ratified by decision issue #32, 2026-07-14).
 - `crates/hort-http-oci/src/blobs.rs` (`maybe_bounded_await_release`) and `crates/hort-app/src/use_cases/quarantine_use_case.rs` (`QuarantineUseCase::is_window_elapsed`) — the issue #65 read-path bounded-await pattern amended in above.
 - `crates/hort-domain/src/entities/quarantine_transitions.rs` (`QuarantineEvent::SupersedeAbsentVerdict`, and `RejectFromScan`'s `ScanIndeterminate` cell), `crates/hort-domain/src/entities/artifact.rs` (`Artifact::supersede_absent_verdict`), `crates/hort-app/src/use_cases/quarantine_use_case.rs` (`record_scan_result`'s non-rejecting branch) and `crates/hort-adapters-postgres/src/rescan_candidates.rs` (`select_stranded`) — the sites the issue #419 "a reached verdict supersedes an absent one" amendment above governs.
+- `crates/hort-domain/src/retention/held_state_entry.rs` (`HeldState`, `resolve_held_state_entry`), `crates/hort-domain/src/retention/policy.rs` (`RetentionPolicy::held_states` and its paired age-bound invariant) and `crates/hort-domain/src/events/artifact_events.rs` (`ArtifactExpired::held_state_authority`) — the held-state retention exception amended in above (issue #288). ADR 0039 D4 carries the provenance-axis half.
 - `crates/hort-app/src/use_cases/ingest_use_case.rs` (`IngestUseCase::ingest_inner`) — the referenced-tree-descendant zero-window anchor-backdating (issue #46, amended above); `docs/adr/0043-oci-image-index-support.md` — the `content_references` membership graph (`oci_index_member` / `oci_subject` / `oci_config` / `oci_layer`) the target-check reads.

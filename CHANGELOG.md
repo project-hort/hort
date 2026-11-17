@@ -7,6 +7,248 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-11-17
+
+### Migration notice
+
+- **A cold pull of a composed artifact now holds its whole closure for the
+  configured observation window.** A constituent — an index's child manifest, a
+  manifest's config or layer blob — skips the window only while a referencing
+  parent is already released, where before it was deliverable as soon as its own
+  scan finished; on a repository with a long `quarantineDuration`, expect
+  first-time pulls by digest to `503` for that duration.
+- **A `ScanPolicy` that sets `compositeVerdictMode` is refused at apply.**
+  The field is retired, including the value `promoted`, which earlier releases
+  accepted. Remove the line from every policy document before upgrading, or
+  the first gitops apply after the upgrade fails and `hort-server` exits
+  non-zero at boot. Nothing to do if no policy document sets it.
+- **A composed OCI image's scan verdict now decides its manifest's release
+  unconditionally.** On the previous default the composition was assessed
+  without release authority and a single constituent layer hort could not
+  analyse in isolation (`UnsupportedContainer`, `NoAnalyzerMatched`) withheld
+  the manifest with no deadline; such a layer no longer holds the artifact on
+  its own, and the composite verdict decides. Images held this way become
+  deliverable; images whose composite verdict carries blocking findings are
+  rejected where the per-layer rule previously let them through.
+- **Artifacts already stored are reassessed by the `cron-rescan-tick` sweep,
+  which the chart ships disabled.** Run `hort-cli admin task invoke
+  cron-rescan-tick` once after upgrading and repeat while its
+  `result_summary` reports a non-zero `stranded_eligible` or
+  `composite_unassessed` count; each invocation enqueues at most 1000 scans
+  per population. Without it, layers held under the old rule stay held and
+  images with no composite assessment keep serving. See
+  `docs/architecture/how-to/recover-stranded-artifacts.md`.
+- **The Ansible Podman flavour now deploys `postgres:15-alpine` instead of
+  `postgres:15`.** The base moves from glibc to musl, which changes the C
+  library behind PostgreSQL's collations, so an existing
+  `/var/lib/hort/postgres-data` first initdb'd under the Debian image needs its
+  collation-dependent indexes rebuilt (`REINDEX DATABASE`) after the switch;
+  nothing in the deploy path does it for you. Set `postgres_image` back to the
+  Debian tag to defer. File ownership needs no action: the `postgres` uid
+  differs between the bases (999 on Debian, 70 on Alpine) and the quadlet
+  bind-mounts with `:U`, so Podman re-chowns the directory on first start —
+  which takes time proportional to its size. The native flavour is unaffected;
+  it installs PostgreSQL from Debian apt and pulls no image.
+- **The database column is not dropped in this release.**
+  `policy_projections.composite_verdict_mode` and its CHECK constraint still
+  exist and are no longer read. The migration that removes them ships in a
+  later release, per the expand/contract policy (ADR 0030) — do not expect the
+  column to be gone after upgrading, and no action is needed for it.
+
+### Added
+
+- `destroy_content` / `destroy_record` can be granted for a single repository:
+  `retention-evaluate` accepts a `repository_id` in its params and then
+  evaluates only that repository, authorized against a repository-scoped grant
+  (#447).
+- `api_tokens` rows record which issuance path minted them (`issued_via`, also
+  on the token-list response); rows predating the column read `unknown` (#271).
+- New default-on daily `api-token-retention-sweep` deletes rows over 90 days past
+  their own `expires_at` or `revoked_at`, discarding the last-used timestamp, IP
+  and user-agent; a token with neither mark set is never touched (#271).
+- The curation queue now names the bytes each row decides about: the
+  artifact's SHA-256 digest and the tags pointing at it, in the admin API
+  JSON, `hort-cli curation queue --output json`, and the CLI table (digest
+  abbreviated there) (#176).
+- Curation decisions can be addressed by version list or content digest:
+  `POST /api/v1/admin/curation/{waive-versions,waive-digests,block-digests}`.
+  A bulk waive caps at 25 entries and is all-or-nothing — one unresolvable,
+  ambiguous or non-quarantined entry returns `409` with a per-entry report
+  and releases nothing (#176).
+- New curator/admin read surface for the artifacts the release gate is holding
+  for a missing attestation, with each hold's age:
+  `GET /api/v1/admin/retention/{overview,held}`. The overview's counts are an
+  upper bound (`held_pending_signature_candidates`) and are artifact counts,
+  not byte counts (#244).
+- New admin readout of what each repository holds — live artifact rows,
+  distinct contents and the weight of those contents:
+  `GET /api/v1/admin/inventory`. The byte figure is a catalog weight, not disk
+  usage: it is not additive across repositories and not reclaimable space (#280).
+- A `RetentionPolicy` can now collect quarantined, rejected or
+  scan-indeterminate artifacts, with `spec.heldStates` naming the states and
+  a positive `AgeExceeds` on every branch of the predicate measured from the
+  artifact's entry into the state. Omitted or empty — the default for every
+  existing policy — such artifacts stay protected exactly as before (#288).
+
+### Changed
+
+- An OCI manifest declaring more than 255 blob references, more than 8 GiB of
+  content, or a `config`/`layers[]` descriptor with no readable `size` (which
+  the image spec requires), is now refused at the push (`400 MANIFEST_INVALID`)
+  and not mirrored from an upstream (`400 UNSUPPORTED`): such an image used to
+  be accepted and then held with no verdict for ever (#428).
+- A non-image OCI artifact manifest — an SBOM attachment, a signature referrer,
+  a BuildKit attestation manifest — is no longer held as an image with an
+  unsupported layer; a multi-arch image carries one attestation manifest per
+  platform, and a scan policy held every one of them indefinitely (#428).
+- An OCI blob a manifest declares to be something other than an image layer —
+  a Helm chart's content, an SBOM or signature payload — is no longer scanned
+  as a root filesystem and records "not applicable" instead of package
+  findings; a layer, and a blob no manifest names yet, are scanned as before
+  (#428).
+- A composed OCI image the scanner assembled whole and found no package
+  surface in — a from-scratch image — is now released rather than held
+  `scan_indeterminate`; an image that could not be assembled is held exactly
+  as before (#440).
+- A gitops apply now fails when a `ScanPolicy` waives scanning
+  (`scanBackends: []`) for an `oci` repository: the composed image is such an
+  artifact's only assessment, and the waiver skips it while itself authorising
+  release. Declare the backends that should assess the composition, or scope a
+  policy with backends to that repository. The waiver is unchanged for every
+  other format (#428).
+- A scan in which every backend ran and none could analyse the artifact now
+  leaves its job row `completed` with the reason in `result_summary`, and ticks
+  the new `hort_scan_jobs_total{result="nothing_analysable"}` instead of
+  `failed`. The artifact is still held `scan_indeterminate`; it no longer
+  appears under `?kind=scan&status=failed`, and the stranded sweep re-asks only
+  once the policy's rescan interval has elapsed — list it with
+  `GET /api/v1/admin/curation/queue?status=scan_indeterminate` and recover it
+  by fixing the policy's `scanBackends` and rescanning (#427).
+- **Breaking:** invoking a destructive admin task now requires an explicit
+  permission that being an administrator does **not** confer —
+  `destroy_content` for `retention-purge` and an executing
+  `retention-evaluate`, `destroy_record` for `eventstore-archive`. The
+  `task:destructive` claim is gone. Apply a global grant bound to the
+  invoking identity (`kind: user` / `kind: serviceAccount`) before running
+  one; a dry-run `retention-evaluate` still needs neither (#285).
+- A service account may now hold `destroy_content`, so the retention CronJobs
+  can run unattended on the job's own identity instead of by hand: declare a
+  `serviceAccount`-subject grant, add the permission to the token's mint, and
+  rotate the token — a token's capability is frozen at mint, so the grant alone
+  does not reach an existing one. `destroy_record` is refused to a service
+  account outright, so `eventstore-archive` keeps only the manual path (#285).
+- `hort-cli curation waive <artifact_id>` is now `curation waive artifact
+  <artifact_id>`; `waive versions`, `waive digests` and `block digests`
+  address a decision in bulk (#176).
+- A PyPI scan now reads the distribution's own dependency declaration, so a
+  proxied distribution's dependencies reach the scan. Expect dependency
+  findings on proxied PyPI repositories; they do not by themselves reject the
+  distribution (#424).
+- `hort_sbom_resolution_total{format="pypi"}` reports a new `declared` value
+  instead of `not_applicable` — re-key any dashboard on that series, and alert
+  on `unusable_lockfile`, the arm that withholds an artifact (#424).
+- An OCI manifest push naming a constituent hort has already decided about no
+  longer answers `400 MANIFEST_BLOB_UNKNOWN`: a rejected constituent answers
+  `403 DENIED` naming that digest, and one held for want of a scan verdict
+  answers `503 UNAVAILABLE`. A constituent not yet pushed is unchanged (#429).
+- **Rust toolchain 1.97.1 → 1.100.0** (#437): MSRV 1.100 (`Cargo.toml`,
+  `.clippy.toml`, `rust-toolchain.toml`), builder, compose and E2E client images
+  on `rust:1.100-slim`. Building from source now needs Rust 1.100 or newer;
+  runtime-baseline move only, no behaviour change.
+
+### Fixed
+
+- A scan that assesses very many findings now records its verdict and all of its
+  finding rows; such a scan previously left the artifact reading as if it had no
+  findings at all (#441).
+- `hort-cli admin task get` no longer panics on a job whose `result_summary` or
+  `last_error` is large (a `retention-evaluate` dry run's is), and its table now
+  shows a readable prefix of those two fields naming `--output json` for the
+  whole value (#445).
+- An artifact that returns to the observation window now begins it where hort
+  can first prove the content was published, not at the moment of the re-scan.
+  Content hort has held for longer than its repository's `quarantineDuration`
+  is therefore released, instead of waiting out a fresh window again on every
+  tick (#443, #444).
+- The rescan sweep no longer re-enqueues a scan for the same artifacts on every
+  tick when their scan reaches no verdict — an image whose constituent the
+  upstream no longer serves, or an artifact no configured backend can analyse.
+  Both the interval sweep and the composite-reassessment sweep now wait out the
+  policy's `rescanIntervalHours` after a scan has reported (#427).
+- A rescan that finds very many new vulnerabilities no longer leaves the
+  artifact without a verdict: the audit event now records the most severe new
+  findings plus the true total, instead of being too large to store.
+- A scan of an artifact with very many findings now records a verdict instead
+  of failing at the attempt cap. Such an artifact is re-evaluated on its
+  severity counts, so a CVE exclusion cannot release it — it stays rejected
+  until its findings fit or a curator waives it (#441).
+- An image layer or archive whose members carry absolute paths is now scanned
+  instead of being held unassessed as an unusable archive.
+- The Maven transitive-prefetch cascade now warms a BOM a POM imports through
+  `<dependencyManagement>` (`type=pom, scope=import`), so a BOM-managed tree
+  cascades instead of stopping at `deps_extracted=0` (#439).
+- A retention dry run's `freed_bytes` estimate no longer vanishes because one
+  reclaimable target is missing from storage: it reports the sum over the
+  targets it could size as `at_least`, with a count of the ones it could not,
+  and `hort-cli admin retention preview` renders that as a floor (#281).
+- An OCI image index is refused at push when a child it names has no manifest
+  in the repository (only a blob under that digest), or when anything the
+  child itself binds carries a terminal verdict — previously both pushes
+  answered `201` and the image could never be pulled (#429).
+- An OCI manifest or blob `GET` whose artifact turns terminal mid-request now
+  answers that status's own refusal (`403`/`503`) and records it, instead of
+  `500` with nothing in the registry's own log (#429).
+- An artifact whose embedded dependency declaration cannot be read is no
+  longer recorded as a clean scan under a policy whose only backend adjudicates
+  the component list — it is held instead. Affects PyPI, Cargo and Maven
+  (#424).
+- A PyPI requirement whose specifier does not pin exactly one version
+  (`==1.*`, `==1.0,!=1.0`, `===1.0`) no longer reaches the SBOM as a versioned
+  component, so advisory matching is not keyed on a version nothing resolves
+  to (#424).
+- A PyPI metadata field folded across lines is now read whole: a distribution
+  that marks `Requires-Dist` dynamic on a continuation line is held rather than
+  recorded clean, and a folded requirement no longer drops out of the component
+  list and the prefetch cascade (#424).
+- A write-granted publisher can now resolve its own artifact held
+  `scan_indeterminate` — OCI manifest and cargo index entry — so an upload held
+  for want of a scan verdict can still be signed.
+- An OCI image manifest whose composition could not be produced within the
+  scan's attempt budget — an unreachable upstream or a store that did not
+  answer — is now held `quarantined` rather than terminal
+  `scan_indeterminate`, so a write-granted read still reaches it and the
+  `cron-rescan-tick` sweep re-asks once the condition clears. Counted on
+  `hort_scan_record_outcome_failures_total{result="composition_not_produced"}`
+  (#428).
+- The `transitive_deps` prefetch trigger no longer enqueues a dependency-walk
+  job for an artifact that declares none — only the format's own manifest
+  document is walked. Skips are counted on
+  `hort_prefetch_cascade_seed_skipped_total{format}` (#421).
+- An admin task's `TaskFailed` audit record is no longer lost when the end of
+  the audit stream is contended — both halves of the invoke/outcome trail now
+  retry the append (#426).
+
+### Removed
+
+- `quotaBytes` on an `ArtifactRepository` envelope is retired: no quota was
+  ever enforced, so a gitops apply declaring the field now fails — drop the
+  line to apply. The admin effective-config response no longer reports it
+  (#280).
+- `compositeVerdictMode` on a `ScanPolicy` envelope is retired: the composed
+  image's verdict decides its manifest's release unconditionally, so a gitops
+  apply declaring the field now fails — drop the line to apply. The admin
+  effective-config response no longer reports it (#428).
+
+### Security
+
+- **The GitLab pipeline now scans the container images it builds and the base
+  images it pins for fixable `CRITICAL` CVEs** — blocking for an image hort
+  builds, a warning for a base image it only pins, and a hard failure either
+  way when the scan could not run at all. Self-hosted pipelines need the
+  runner to reach Trivy's vulnerability database; see *Runner prerequisites*
+  in `docs/ci/README.md` for the one variable an installation behind a
+  registry mirror has to set (#437).
+
 ## [0.17.3] - 2026-11-08
 
 ### Added

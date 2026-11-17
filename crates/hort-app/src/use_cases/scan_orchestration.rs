@@ -40,11 +40,12 @@ use hort_domain::entities::scan_policy::{
 };
 use hort_domain::error::DomainError;
 use hort_domain::events::ScanAssessment;
-use hort_domain::policy::scan::{composite_verdict_mode_of, DefaultPolicy};
+use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::artifact_metadata_repository::ArtifactMetadataRepository;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
-use hort_domain::ports::format_handler::FormatHandler;
+use hort_domain::ports::content_reference_index::ContentReferenceIndex;
+use hort_domain::ports::format_handler::{FormatHandler, SbomResolution};
 use hort_domain::ports::jobs_repository::{JobsRepository, ScanJob};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
@@ -80,6 +81,7 @@ use crate::use_cases::composite_scan::{
     CompositeDisposition, CompositeScan, CompositeVerdict, ShadowObservationSink,
     COMPOSITE_CONTRIBUTOR,
 };
+use crate::use_cases::layer_role_resolution::resolve_layer_role;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_use_case::QuarantineUseCase;
 use crate::use_cases::scan_kind_resolution::scan_kind_of;
@@ -272,7 +274,13 @@ pub enum ScanRunOutcome {
     /// nothing to analyse will have nothing to analyse again — the
     /// artifact's kind and the backend's analyzers are both fixed — so
     /// retrying only delays the hold by `max_attempts` backoffs. This
-    /// arm goes terminal immediately.
+    /// arm spends no budget at all.
+    ///
+    /// And it is the one arm where the artifact and the job end in
+    /// opposite states: the artifact is terminal
+    /// (`ScanIndeterminate`), because nothing examined it; the job
+    /// reports [`ScanRowDisposition::Completed`], because every backend
+    /// ran and reported. `record_outcome` is where that is spelled out.
     NothingAnalysable {
         /// Comma-joined backend names that were asked, for the
         /// `ScanIndeterminate` event's audit label.
@@ -285,6 +293,57 @@ pub enum ScanRunOutcome {
     /// retry or reports a terminal failure based on the job's attempt
     /// count.
     Failed(String),
+    /// The manifest's composition could not be **produced** for a
+    /// condition that may clear, and the job's attempt budget is spent.
+    /// No composite verdict exists, no more attempts are owed on this
+    /// job — and, crucially, the reason the composition is absent is one
+    /// a later attempt may not meet.
+    ///
+    /// # Why this is not [`Self::NothingAnalysable`]
+    ///
+    /// That arm is a *deterministic* no-verdict: the artifact's kind and
+    /// the backends' analyzers are both fixed, so the next attempt reads
+    /// the same facts and the artifact is entitled to the strict terminal
+    /// hold. This arm reaches the same absence of a verdict from the
+    /// opposite premise — the store or the upstream did not answer — and
+    /// ADR 0064 D1 is explicit that collapsing the two "turns a momentary
+    /// hiccup into a permanent-looking absence of assessment". The
+    /// collapse used to happen at exactly one point, the attempt cap:
+    /// below it a transient refusal took [`Self::Failed`] and was
+    /// retried, and at it the run fell through to the abstention fold and
+    /// reported the deterministic outcome.
+    ///
+    /// # Why the hold has to differ, not just the word
+    ///
+    /// `ScanIndeterminate` is the one withheld state with **no ADR 0039
+    /// hold-read exemption for any caller, including write-granted**, and
+    /// no `Retry-After`. On a pull-through repository the client's own
+    /// authenticated pull is one of the two things that drive the absent
+    /// constituents into CAS; the other is hort's own acquisition on the
+    /// next scan, which arrives through the stranded sweep the chart
+    /// ships disabled. So the terminal state closes the half that does
+    /// not wait on an operator scheduling a cron tick, and closes it for
+    /// a caller holding `Write` as firmly as for an anonymous client. A
+    /// `Quarantined` hold withholds an ordinary client exactly as
+    /// strictly, carries the exemption, and advertises a `Retry-After`,
+    /// so both halves stay open. ADR 0065 D4 — "where both directions
+    /// look restrictive, recoverability decides" — is the standing
+    /// decision for this problem class, and ADR 0007 already declines to
+    /// escalate a recoverable scanner outage to the stricter state by the
+    /// same reasoning.
+    ///
+    /// Nothing is released: `record_outcome` records **no**
+    /// `ScanCompleted`, so no scan-axis release authority exists and
+    /// `Artifact::release`'s fail-closed predicate refuses the timer
+    /// release for want of one (ADR 0064 D6's hazard stays closed). The
+    /// composition's absence still reaches the release gate as an absent
+    /// assessment; what changes is which hold carries it.
+    CompositionNotProduced {
+        /// Operator-visible text for the job row's `last_error`, naming
+        /// the composed unit, the spent budget and the upstream's or the
+        /// store's own complaint.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +387,21 @@ pub enum ScanRunOutcome {
 /// can retire a row the other still considers owed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanRowDisposition {
-    /// The scan recorded a result. Terminal success; the row carries
-    /// the handler's `result_summary`.
+    /// **The scan answered.** Terminal success; the row carries the
+    /// handler's `result_summary`.
+    ///
+    /// Three arms reach it, and only two of them recorded a verdict:
+    /// `Completed { … }` (a backend examined the artifact),
+    /// `SkippedNoBackends` (the operator waived scanning) and
+    /// `NothingAnalysable` (every backend ran and none examined it).
+    /// The third holds the artifact `scan_indeterminate` and still
+    /// completes its row, because this type is the **row's**
+    /// vocabulary: it says what the dispatcher should write and nothing
+    /// else, and a job that did everything asked of it did not fail.
+    /// What the scan *found* is `ScanRunOutcome`'s question, and what an
+    /// operator watches it on is
+    /// `hort_scan_jobs_total{result}` — which keeps the three apart,
+    /// `nothing_analysable` included.
     Completed,
     /// Terminal failure. `String` is the operator-visible `last_error`
     /// text, verbatim — the same string the removed `mark_failed` calls
@@ -437,9 +509,10 @@ pub struct ScanOrchestrationUseCase {
     policy_projections: Arc<dyn PolicyProjectionRepository>,
     advisory: Arc<dyn AdvisoryPort>,
     /// CAS handle for the scan-time payload read. Only formats that
-    /// declare `FormatHandler::payload_sbom`, in a `Hosted` repository,
-    /// reach it — every other scan costs no storage round-trip. Wired to
-    /// the same CAS the Trivy
+    /// declare `FormatHandler::payload_sbom` reach it — every other scan
+    /// costs no storage round-trip. The repository class plays no part:
+    /// `try_extract_sbom`'s own docs say why a proxied artifact is read
+    /// exactly as a hosted one is. Wired to the same CAS the Trivy
     /// adapter reads from (which has streamed artifact bytes at scan
     /// time since it shipped; this field puts the SBOM path on the same
     /// footing).
@@ -458,6 +531,11 @@ pub struct ScanOrchestrationUseCase {
     /// that name would resolve through. A hosted repository resolves to
     /// nothing, and an absent constituent there is a real refusal.
     upstream_resolver: Arc<dyn UpstreamResolver>,
+    /// The membership projection the layer-role resolver reads a blob's
+    /// nominating manifests out of (ADR 0064 D6). Reached only for a row
+    /// whose kind is a composition constituent — every other scan costs
+    /// no lookup — and read-only: nothing on this path writes an edge.
+    content_references: Arc<dyn ContentReferenceIndex>,
     scanners: HashMap<String, Arc<dyn ScannerPort>>,
     handlers: HashMap<String, Arc<dyn FormatHandler>>,
     quarantine: Arc<QuarantineUseCase>,
@@ -482,6 +560,7 @@ impl ScanOrchestrationUseCase {
         storage: Arc<dyn StoragePort>,
         upstream_proxy: Arc<dyn UpstreamProxy>,
         upstream_resolver: Arc<dyn UpstreamResolver>,
+        content_references: Arc<dyn ContentReferenceIndex>,
         scanners: HashMap<String, Arc<dyn ScannerPort>>,
         handlers: HashMap<String, Arc<dyn FormatHandler>>,
         quarantine: Arc<QuarantineUseCase>,
@@ -498,6 +577,7 @@ impl ScanOrchestrationUseCase {
             storage,
             upstream_proxy,
             upstream_resolver,
+            content_references,
             scanners,
             handlers,
             quarantine,
@@ -618,27 +698,21 @@ impl ScanOrchestrationUseCase {
             return Ok(ScanRunOutcome::SkippedNoBackends { kind });
         }
 
-        // The resolved composite-verdict posture for this repository
-        // (ADR 0064 D6). Read once, from the policy just resolved, and
-        // spent twice below — on the log level an abstention earns, and on
-        // the partition that decides whether an abstention holds the
-        // artifact. Both are the same question about the same run, so a
-        // second resolution would be a second answer.
+        // Whether an abstention holds this artifact is `kind`'s question
+        // alone (ADR 0064 D2): an OCI layer's filesystem is assessed as
+        // part of the composition that binds it, so an absence of *that*
+        // assessment — "I have no decoder for this container" — is the
+        // composition's business and not the layer's. The derivation
+        // lives in `NotAnalysable::gates_release`; the finding side asks
+        // the same question of the same input in
+        // `Finding::may_condemn_artifact`, which the consumer reaches
+        // through `evaluate_scan_result` with the `kind` resolved above —
+        // so an absent assessment and a finding over the same surface
+        // cannot disagree about whether this row is a constituent.
         //
-        // What it decides for a **constituent** is ADR 0064 D2's
-        // loosening: an OCI layer's filesystem is assessed as part of the
-        // composition that binds it, so an absence of *that* assessment —
-        // "I have no decoder for this container" — is the composition's
-        // business and not the layer's. The derivation that pairs the
-        // posture with the row's kind lives in
-        // `NotAnalysable::gates_release`; the finding side pairs the same
-        // two inputs in `Finding::may_condemn_artifact`, which the
-        // consumer reaches through `evaluate_scan_result` with the `kind`
-        // resolved above — so an absent assessment and a finding over the
-        // same surface cannot disagree about whether this row is a
-        // constituent.
-        let composite_verdict = composite_verdict_mode_of(policy.as_ref());
-
+        // It is spent twice below: on the log level an abstention earns,
+        // and on the partition that decides whether an abstention holds
+        // the artifact.
         // Step 3-5: extract SBOM via the format handler (best-effort for
         // the run, but the *reason* no BOM came out is kept — see
         // `SbomExtraction` and the abstention arm below).
@@ -678,11 +752,44 @@ impl ScanOrchestrationUseCase {
             None => Vec::new(),
         };
 
+        // What hort's own manifests declare about this row's place in a
+        // composed image (ADR 0064 D6). It decides one thing and only
+        // one: whether a backend may present these bytes **as a root
+        // filesystem**. A package finding is a statement about an
+        // installed package tree that runs, so reading one out of a blob
+        // no image is composed of is "a statement about nothing" — and
+        // hort produced one only because every tar-shaped blob was
+        // materialised as a rootfs, correct for a layer and a
+        // coincidence otherwise.
+        //
+        // Resolved here, beside `kind`, because deciding *what* a scan is
+        // of is the application layer's (ADR 0064 D1's division: the
+        // decision here, the mechanism in the adapter) and because the
+        // answer needs the catalog and the manifests' own bytes, which no
+        // scanner adapter may reach. `kind` is what scopes it: a
+        // non-constituent row costs no lookup at all.
+        //
+        // The one outcome that changes behaviour is a resolved negative.
+        // An absent nomination is `LayerRole::Unknown` and leaves the
+        // materialisation as it was — on a hosted push the layer blobs
+        // are scanned before their manifest exists, so reading silence as
+        // "not a layer" would withdraw ADR 0064 D2's layer evidence scan
+        // from the whole push population, by job ordering.
+        let layer_role = resolve_layer_role(
+            &*self.content_references,
+            &*self.artifacts,
+            &*self.storage,
+            &artifact,
+            kind,
+        )
+        .await;
+
         let target = ScanTarget {
             unit: ScanUnit::Blob(&artifact.sha256_checksum),
             format: &job.format,
             coords: &subject.coords,
             kind,
+            layer_role,
         };
 
         // Step 7-8: invoke each configured backend in declared order.
@@ -849,7 +956,7 @@ impl ScanOrchestrationUseCase {
                     // asks nothing of anyone, so it is `debug!`: warning
                     // once per blob would bury the actionable half.
                     // Per-artifact detail stays on the span either way.
-                    if why.gates_release(kind, composite_verdict) {
+                    if why.gates_release(kind) {
                         tracing::warn!(
                             artifact_id = %artifact.id,
                             scanner = backend,
@@ -898,36 +1005,32 @@ impl ScanOrchestrationUseCase {
             }
         }
         // The composed-image assessment (ADR 0064 D1). It is produced,
-        // mapped, logged and recorded on every manifest scan; whether it
-        // reaches the artifact is the resolved policy's
-        // `composite_verdict_mode` (ADR 0064 D6). Under `observed` — the
-        // default, and every policy that predates the field — the
-        // returned verdict is `Withheld` and this run's outcome is
-        // byte-for-byte what it would be with no composite path at all.
-        // Under `promoted` the composition's answer joins the loop's own
-        // bookkeeping below, which is the path the manifest's verdict
-        // already takes; nothing reads the observation projection to
+        // mapped, logged and recorded on every manifest scan, and its
+        // answer **is** the manifest's (D2): the composition's findings
+        // join the loop's own bookkeeping below, which is the path the
+        // manifest's verdict already takes, and its absence joins the
+        // run's abstentions. Nothing reads the observation projection to
         // decide anything, which is what keeps that table a measurement
         // surface. Only an OCI image manifest has a composition; every
         // other row returns immediately.
         //
         // Placed after the loop so it cannot perturb what the loop
         // *produced*, and before the partition below because that
-        // partition is where a promoted composition's answer has to be
-        // counted: an image manifest's own bytes carry no package
-        // surface, so without the fold every promoted manifest would
-        // take the partition's not-applicable early return no matter
-        // what the composition said.
+        // partition is where the composition's answer has to be counted:
+        // an image manifest's own bytes carry no package surface, so
+        // without the fold every manifest would take the partition's
+        // not-applicable early return no matter what the composition
+        // said.
         //
-        // The assessment leaves a durable row (ADR 0064 D6): a `tracing`
+        // The assessment leaves a durable row (ADR 0064 D2): a `tracing`
         // line reaches a log aggregator if one is configured and is gone
-        // when its retention expires, and the promotion criterion —
-        // "across this estate, what would promoting the composite
-        // verdict have changed?" — has to be a query. The exclusion set
-        // that row's two sides are judged against is resolved **here**,
-        // once, and handed down; the counterfactual never fetches its
-        // own, because a second resolution is a second set and the row
-        // would be comparing two verdicts reached under different rules.
+        // when its retention expires, and "across this estate, what did
+        // assessing the composition contribute?" has to be a query. The
+        // exclusion set that row's two sides are judged against is
+        // resolved **here**, once, and handed down; the second side never
+        // fetches its own, because a second resolution is a second set
+        // and the row would be comparing two verdicts reached under
+        // different rules.
         //
         // Resolved only for the one row shape the composite path acts
         // on. Every other artifact in every other format reaches this
@@ -975,23 +1078,16 @@ impl ScanOrchestrationUseCase {
         // never means unbounded attempts. Nothing parallel is invented and
         // no new terminal state exists.
         //
-        // Three guards, and each one is what keeps this request free of
+        // Two guards, and each one is what keeps this request free of
         // release authority:
         //
-        // - **The attempt budget still has room.** On the last attempt the
-        //   request is declined and the primary outcome is recorded
-        //   exactly as it would have been — so the composite can never
-        //   reach `record_outcome`'s retry-exhausted arm, which transitions
-        //   the artifact to `scan_indeterminate`. Exhausting the budget
-        //   lands back on the deterministic outcome: still no composite
-        //   verdict, and now also no more tries.
         // - **No backend produced a verdict** (`contributors` empty) and
         //   **nothing was found** (`accumulated` empty). Both are outcomes
         //   the primary axis earned over the manifest's own bytes, and a
         //   retry would delay them — a clean `ScanCompleted` in the first
         //   case, a reject in the second. The composite path has no
-        //   authority to spend either, promoted or not: promotion decides
-        //   whose verdict gates, never whose outcome is thrown away.
+        //   authority to spend either: the composite verdict decides the
+        //   manifest's release, never whose outcome is thrown away.
         // - **No backend errored.** That run is already taking the
         //   retryable path below, with its own message; overriding it here
         //   would replace the operator's actual error with a second one.
@@ -1002,21 +1098,47 @@ impl ScanOrchestrationUseCase {
         // produces it — when the upstream will not serve the layers to
         // hort, it will not serve them to a pull through hort either, so
         // the image was not pullable during the wait regardless.
+        //
+        // **Spending the budget ends the attempts, not the distinction.**
+        // The request is declined on the last attempt exactly as above —
+        // but what the run then reports is still a *transient* absence of
+        // a composition, because that is what the composite path said and
+        // a worker pool under load is precisely when it says it. Falling
+        // through to the abstention fold here reported the deterministic
+        // outcome instead, and the two conditions converged at the one
+        // point where the difference decides how the hold lifts:
+        // `IncompleteComposition` gates unconditionally, so the manifest
+        // went terminal `scan_indeterminate` — the one withheld state
+        // with no ADR 0039 hold-read exemption for any caller, which on a
+        // pull-through repository withholds the pull that would drive the
+        // absent constituents into CAS even from a caller holding
+        // `Write`. See `ScanRunOutcome::CompositionNotProduced`.
         if let CompositeDisposition::Retry(why) = composite.disposition {
-            if accumulated.is_empty()
-                && contributors.is_empty()
-                && total_failed == 0
-                && job.attempts < self.config.max_attempts
-            {
+            if accumulated.is_empty() && contributors.is_empty() && total_failed == 0 {
                 // "scan attempt" rather than "attempt": the acquisition
                 // path reports a second, inner budget of its own, and a
                 // frame that does not say which of the two it is counting
                 // reads as a contradiction of the number inside it.
-                return Ok(ScanRunOutcome::Failed(format!(
+                let reason = format!(
                     "the composed image of artifact {} could not be produced on scan attempt \
                      {} of {}: {why}",
                     artifact.id, job.attempts, self.config.max_attempts
-                )));
+                );
+                if job.attempts < self.config.max_attempts {
+                    return Ok(ScanRunOutcome::Failed(reason));
+                }
+                tracing::warn!(
+                    artifact_id = %artifact.id,
+                    attempts = job.attempts,
+                    max_attempts = self.config.max_attempts,
+                    reason = %why,
+                    "composite scan: the attempt budget is spent and the composition was \
+                     never produced — reporting a verdictless run, which withholds an \
+                     artifact that carries no verdict recoverably (a later scan and a \
+                     write-granted read both still reach it) and leaves one that does \
+                     exactly as it is",
+                );
+                return Ok(ScanRunOutcome::CompositionNotProduced { reason });
             }
             tracing::warn!(
                 artifact_id = %artifact.id,
@@ -1024,30 +1146,33 @@ impl ScanOrchestrationUseCase {
                 max_attempts = self.config.max_attempts,
                 reason = %why,
                 "composite scan: no further attempt for the composed image — the run has an \
-                 outcome of its own, or the attempt budget is spent; the composition stays \
-                 unassessed for this run",
+                 outcome of its own; the composition stays unassessed for this run",
             );
         }
 
-        // A **promoted** composition's answer, folded into the same
-        // per-unit bookkeeping a backend's answer over the manifest's own
-        // bytes goes into (ADR 0064 D6). Under `observed` this is
-        // `Withheld` and the match is three no-ops, which is what makes
-        // "an unpromoted run is byte-for-byte today's behaviour" a
-        // property of one place rather than of every arm below.
+        // The composition's answer, folded into the same per-unit
+        // bookkeeping a backend's answer over the manifest's own bytes
+        // goes into (ADR 0064 D2). `Withheld` — a row with no composition
+        // to be about — is the one arm that contributes nothing, and it
+        // is spelled out rather than defaulted so a future assessment
+        // cannot inherit it.
         //
-        // The fold is **after** the retry decision because a granted
-        // retry has already returned: a transient refusal asks for
-        // another attempt first, and only once that request is declined —
-        // the budget is spent, or the run earned an outcome of its own —
-        // does its absence become the manifest's unassessed filesystem.
+        // The fold is **after** the retry decision because every
+        // transient arm has already returned: a transient refusal asks
+        // for another attempt first, and if the budget is spent it
+        // reports `CompositionNotProduced` rather than falling through.
+        // What reaches the fold from a transient refusal is therefore
+        // only the case where the run earned an outcome of its own — and
+        // there its absence does become the manifest's unassessed
+        // filesystem, beside the finding or the backend error that
+        // declined the request.
         //
         // `total_attempted` grows with it, and that is the load-bearing
         // part rather than bookkeeping tidiness: the partition below
         // fires when *every* unit asked produced no verdict, so a
         // composition that was assessed has to be one of the units
-        // asked. Without it a promoted manifest whose composition came
-        // back clean would still take the not-applicable early return —
+        // asked. Without it a manifest whose composition came back clean
+        // would still take the not-applicable early return —
         // recording "nothing to assess" about an image that was
         // assembled and examined.
         match composite.verdict {
@@ -1130,10 +1255,7 @@ impl ScanOrchestrationUseCase {
             // artifact, so "nothing to assess" would be a false
             // statement and would drop a real finding — that case keeps
             // the fail-closed hold.
-            if accumulated.is_empty()
-                && !abstentions
-                    .iter()
-                    .any(|(_, why)| why.gates_release(kind, composite_verdict))
+            if accumulated.is_empty() && !abstentions.iter().any(|(_, why)| why.gates_release(kind))
             {
                 tracing::info!(
                     artifact_id = %artifact.id,
@@ -1145,7 +1267,6 @@ impl ScanOrchestrationUseCase {
                         .map(|(backend, why)| format!("{backend}={}", why.as_str()))
                         .collect::<Vec<_>>()
                         .join(","),
-                    composite_verdict = %composite_verdict,
                     "no assessable surface belongs to this artifact — recording a completed \
                      not-applicable assessment (nothing for a hold to wait on)",
                 );
@@ -1277,10 +1398,11 @@ impl ScanOrchestrationUseCase {
     /// were previously held by comments:
     ///
     /// - **Fail-closed ordering holds by construction.** The artifact's
-    ///   transition to `ScanIndeterminate` precedes the row's terminal
-    ///   write because the row write happens after this function has
-    ///   returned. A failure here propagates as `Err` and no terminal
-    ///   row is written on the strength of it.
+    ///   transition to `ScanIndeterminate` precedes the row's result
+    ///   write — on both arms that make it, the retry-exhausted one and
+    ///   the no-verdict one — because the row write happens after this
+    ///   function has returned. A failure here propagates as `Err` and
+    ///   no row result is written on the strength of it.
     /// - **A persistence failure is an undischarged obligation.** When
     ///   this returns `Err`, no verdict was recorded, so the handler
     ///   reports a retryable failure. Below the cap the row goes back
@@ -1389,34 +1511,128 @@ impl ScanOrchestrationUseCase {
                 // exists to remove: it would hand release authority to a
                 // scan that never looked at the bytes.
                 //
-                // No retry budget and no "stay quarantined" carve-out.
-                // The retry-exhausted `Failed` arm below keeps an
-                // already-`Quarantined` artifact where it is because a
-                // scanner *outage* is transient and the rescan sweep will
-                // re-pick it on recovery. Here nothing is transient: the
+                // No retry budget and no recoverable-hold carve-out. The
+                // two arms below both leave the artifact somewhere a
+                // later scan can still change its mind — the
+                // retry-exhausted `Failed` arm because a scanner *outage*
+                // is transient, `CompositionNotProduced` because an
+                // unproduced composition is — and the rescan sweep
+                // re-picks it on recovery. Here nothing is transient: the
                 // artifact's kind and the backend's analyzers are both
                 // fixed, so the next attempt has the same outcome.
                 // `record_scan_indeterminate` is idempotent on an
                 // already-terminal artifact.
+                //
+                // **And the row completes.** The artifact's state above
+                // and the `jobs` row below answer two different
+                // questions, and this arm answers them differently: the
+                // artifact is held because nothing knows what is in it,
+                // while the *job* did everything that was asked of it —
+                // every backend ran and reported. A `failed` row here
+                // says the scan errored, which is the word that put this
+                // population into every surface keyed on
+                // `jobs.status='failed'`: an operator's
+                // `?kind=scan&status=failed` triage listing, and
+                // `RescanCandidatesRepository::select_stranded`, which
+                // re-enqueued the same deterministic abstention on every
+                // tick forever. Neither is a statement anyone can act on
+                // — the fix for an abstention is the `ScanPolicy`'s
+                // backends, not another attempt at the same scan.
+                //
+                // The reason therefore travels on `result_summary`
+                // (built by `ScanTaskHandler::run`) rather than on
+                // `last_error`, which only terminal and rescheduled rows
+                // carry. The scan counter keeps the three words apart:
+                // `nothing_analysable`, not `completed` — a held,
+                // unassessed artifact must not read as clean — and not
+                // `failed`, because nothing failed.
+                // What this line may claim is what this scope knows. The
+                // run produced no verdict and therefore no release
+                // authority, and that is unconditional. Whether the
+                // artifact *becomes* `scan_indeterminate` is not: on one
+                // already carrying a terminal verdict the call below
+                // takes its already-terminal skip and holds nothing, so a
+                // line asserting the transition would describe an outcome
+                // the call did not produce for the row an operator is
+                // reading about. `record_scan_indeterminate` logs the
+                // transition where it happens, and only when it happens.
                 tracing::warn!(
                     artifact_id = %job.artifact_id,
                     format = %job.format,
                     scanner = %scanner,
                     reason = %reason,
-                    "no scan backend produced a verdict — holding artifact scan_indeterminate \
-                     (fail-closed); a backend that cannot analyse this format is a policy \
-                     mismatch, not a clean scan",
+                    "no scan backend produced a verdict: this run mints no release authority \
+                     and overwrites no verdict the artifact already carries — an artifact \
+                     that carries none is held scan_indeterminate (fail-closed). A backend \
+                     that cannot analyse this format is a policy mismatch, not a clean scan",
                 );
                 self.quarantine
-                    .record_scan_indeterminate(
-                        job.artifact_id,
-                        scanner,
-                        reason.clone(),
-                        job.attempts,
-                    )
+                    .record_scan_indeterminate(job.artifact_id, scanner, reason, job.attempts)
+                    .await?;
+                emit_scan_jobs(ScanJobsResult::NothingAnalysable);
+                emit_scan_terminal(ScanTerminalResult::Indeterminate);
+                Ok(ScanRowDisposition::Completed)
+            }
+            ScanRunOutcome::CompositionNotProduced { reason } => {
+                // FAIL-CLOSED, and **recoverably** so. The run reached no
+                // verdict, so nothing here records a `ScanCompleted` and
+                // no scan-axis release authority comes into existence —
+                // the timer release's fail-closed predicate refuses for
+                // want of one, whatever the observation window says. What
+                // this arm does not do is escalate the artifact to the
+                // strict terminal `scan_indeterminate`: the composition
+                // was absent for a condition that may clear, and on a
+                // pull-through repository the client pull that clears it
+                // is the one that state withholds (no ADR 0039 hold-read
+                // exemption, no `Retry-After`). ADR 0065 D4.
+                //
+                // It is the *same* hold the retry-exhausted `Failed` arm
+                // below leaves an already-quarantined artifact in, and
+                // reached for the same reason. The two differ on the
+                // permissive `None` status, where there is no hold to stay
+                // in: `Failed` takes ADR 0007's fail-closed backstop and
+                // transitions to `scan_indeterminate`, and this arm takes
+                // the recoverable hold instead, because only here is the
+                // terminal state **self-sustaining**. A dead scanner is not
+                // revived by a client read, so withholding every read costs
+                // that recovery nothing; an absent constituent on a
+                // pull-through repository is driven into CAS *by* a client
+                // read, so withholding every read is what keeps the
+                // composition unproducible. Leaving the artifact `None` is
+                // not the third option: that serves an image whose
+                // filesystem nothing assessed.
+                // Same scoping as the arm above: the absent verdict is
+                // this run's fact, the hold is not. On an artifact
+                // already carrying a verdict —
+                // `select_composite_unassessed`'s whole population is
+                // `released`/`NULL` — `hold_for_unproduced_composition`
+                // leaves the state alone and logs that where it decides
+                // it, so this line states the run's outcome and names the
+                // hold only as what an unverdicted artifact receives.
+                tracing::warn!(
+                    artifact_id = %job.artifact_id,
+                    format = %job.format,
+                    attempts = job.attempts,
+                    reason = %reason,
+                    "the composed image was never produced within the attempt budget: no \
+                     verdict, so no release authority, and no verdict the artifact already \
+                     carries is overwritten — one that carries none takes the recoverable \
+                     hold, from which the rescan sweep re-asks and a write-granted read \
+                     still reaches it",
+                );
+                self.quarantine
+                    .hold_for_unproduced_composition(job.artifact_id, reason.clone())
                     .await?;
                 emit_scan_jobs(ScanJobsResult::Failed);
-                emit_scan_terminal(ScanTerminalResult::Indeterminate);
+                // Deliberately **no** `emit_scan_terminal`: that counter
+                // reports artifact-*terminal* scan decisions and this run
+                // reached none. The alerting counter below is the one that
+                // says what happened, and its label is what separates this
+                // population from the deterministic abstention's.
+                emit_scan_failure(
+                    ScanFailureResult::CompositionNotProduced,
+                    COMPOSITE_CONTRIBUTOR,
+                );
                 Ok(ScanRowDisposition::Failed(reason))
             }
             ScanRunOutcome::Failed(err) => {
@@ -1711,15 +1927,46 @@ impl ScanOrchestrationUseCase {
         if extraction.skipped_non_registry > 0 {
             emit_sbom_components_skipped(format_key, extraction.skipped_non_registry as u64);
         }
-        match extraction.sbom {
-            Some(sbom) => {
+        // **The resolution decides, not the `Option`.** A handler that
+        // could not read the artifact's dependency document degrades to a
+        // subject-only BOM rather than erroring, which is right for the
+        // BOM and wrong for the verdict: reading `Some(_)` as "a BOM came
+        // out" hands an SBOM-only backend a component list of length zero,
+        // and that backend returns `Analysed([])` — a *clean scan* over an
+        // artifact whose declaration was never read. Fail-soft about the
+        // BOM is not fail-soft about release authority (ADR 0007).
+        //
+        // So `UnusableLockfile` takes the same gating absence a handler
+        // `Err` takes above, and for the same reason: the two are one fact
+        // to an operator, and the only thing separating them is whether
+        // the handler chose to keep the subject on its way out. The
+        // subject is dropped with it — a BOM that reaches a backend is a
+        // BOM that backend will answer over, so the one shape this arm
+        // must not produce is a `Some` that gates nothing.
+        //
+        // Nothing is lost on a policy whose backend reads the payload: it
+        // never consulted the component list, so it still assesses the
+        // artifact and the run still completes with its verdict.
+        match (extraction.sbom, extraction.resolution) {
+            (_, SbomResolution::UnusableLockfile) => {
+                tracing::warn!(
+                    artifact_id = %artifact.id,
+                    format_key,
+                    "the payload's dependency declaration could not be read; proceeding with \
+                     no SBOM so a backend whose whole input is the component list cannot \
+                     report an unexamined artifact clean",
+                );
+                emit_sbom_extraction(format_key, SbomExtractionResult::ParseError);
+                SbomExtraction::Absent(SbomAbsence::Unreadable)
+            }
+            (Some(sbom), _) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::Success);
                 SbomExtraction::Extracted(sbom)
             }
             // The handler reached the payload and declares it carries no
             // dependency information — the same answer an opaque format
             // gives, and a completed fact rather than a failure.
-            None => {
+            (None, _) => {
                 emit_sbom_extraction(format_key, SbomExtractionResult::UnsupportedFormat);
                 SbomExtraction::Absent(SbomAbsence::NotDeclared)
             }

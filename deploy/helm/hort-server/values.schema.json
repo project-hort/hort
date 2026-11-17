@@ -1008,6 +1008,16 @@
             "schedule": {"type": "string", "minLength": 1}
           }
         },
+        "apiTokenRetentionSweep": {
+          "description": "executionPath: dsn-direct. Credential-store retention-sweep CronJob — the horizon on `public.api_tokens`, and the only sweep in this chart whose DELETE lands outside the task queue. Inserts a `kind='api-token-retention-sweep'` row every tick using the runtime DSN; the worker dispatches to `ApiTokenRetentionSweepHandler`, which deletes a row whose own `expires_at` is more than the handler's 90-day `DEFAULT_HORIZON` in the past, or whose own `revoked_at` is (the schedule below is a chart value; the horizon is not — no chart value, no CLI flag, and no HTTP invoke route sets it). **A row with both marks NULL survives**: both columns are nullable, a row with neither set is a durable identity that never expires, and each disjunct of the predicate requires that row's own mark to be present, so a both-NULL row matches neither. The 90 days are what buys the deleted row's `last_used_at` / `last_used_ip` / `last_used_user_agent` — which exist nowhere else in hort — to an investigation opened within the quarter; the credential itself has been dead since its mark was set. Longer than the three `jobs`-row sweeps' 7 days because those age out operational accounting and this ages out audit material. Default-enabled: `api_tokens` grows on every deployment from day one (one row per issued credential, plus one per federated workload exchange) and had no horizon at all before this CronJob. DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "executionPath": {"type": "string", "enum": ["dsn-direct", "admin-task"]},
+            "enabled": {"type": "boolean"},
+            "schedule": {"type": "string", "minLength": 1}
+          }
+        },
         "wheelMetadataBackfill": {
           "description": "executionPath: dsn-direct. Periodic wheel-metadata-backfill CronJob. Inserts a `kind='wheel-metadata-backfill'` row every tick using the runtime DSN; the worker dispatches to `WheelMetadataBackfillHandler`, which walks PyPI wheel artifacts whose `content_references` row of kind `wheel_metadata` is absent, streams each wheel from CAS, invokes `FormatHandler::extract_wheel_metadata_bytes`, and on `Some(bytes)` persists the bytes to CAS + inserts the ContentReference row — retroactively enabling PEP 658 advertisement for pre-existing wheels. Default-disabled (one-shot retrofit for operators upgrading from an earlier release; a freshly-deployed operator's wheel inventory is empty and the tick is a no-op). DSN-only delivery contract — no svc-token, no `adminTasksEnabled` umbrella.",
           "type": "object",

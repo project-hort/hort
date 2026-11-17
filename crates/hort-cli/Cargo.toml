@@ -31,7 +31,7 @@ hort-secret-file = { workspace = true }
 # HTTP client — pure HTTP, no DSN, no hort-domain / hort-app / hort-adapters-* deps.
 reqwest    = { workspace = true, features = ["rustls", "json", "form"] }
 clap       = { workspace = true, features = ["derive", "env"] }
-clap_complete = { version = "=4.6.11", features = ["unstable-dynamic"] }
+clap_complete = { version = "=4.6.12", features = ["unstable-dynamic"] }
 # `time` backs the bounded job-wait poll loop in `admin retention`
 # (`tokio::time::sleep` between reads). A feature of a crate already in
 # the graph: no new dependency, no third-party attribution change.

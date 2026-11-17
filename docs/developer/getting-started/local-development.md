@@ -4,7 +4,7 @@ Use this guide to set up a Rust workspace for contributing to hort. This is **de
 
 ## Prerequisites
 
-- Git and the Rust toolchain required by the repository's `Cargo.toml` (workspace `rust-version` is **1.97** in this source snapshot). Check the current workspace before installing a toolchain.
+- Git and the Rust toolchain required by the repository's `Cargo.toml` (workspace `rust-version` is **1.100** in this source snapshot). Check the current workspace before installing a toolchain.
 - A Linux/macOS development environment or a supported Rust toolchain on your platform.
 - PostgreSQL and Docker/Compose **only** for tests that need them; basic library checks do not require a running hort service.
 

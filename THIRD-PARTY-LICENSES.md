@@ -34,7 +34,7 @@ the result instead.
 | kube | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
 | metrics-exporter-prometheus | 0.18.3 | Apache-2.0 | https://github.com/metrics-rs/metrics |
 | pep440_rs | 0.7.3 | Apache-2.0 | https://github.com/konstin/pep440-rs |
-| rpassword | 7.5.4 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
+| rpassword | 7.5.5 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
 | rtoolbox | 0.0.5 | Apache-2.0 | https://github.com/conradkleinespel/rtoolbox |
 | ryu-js | 1.0.2 | Apache-2.0 | https://github.com/boa-dev/ryu-js |
 | ryu | 1.0.23 | Apache-2.0 | https://github.com/dtolnay/ryu |
@@ -97,7 +97,7 @@ the result instead.
 | socket2 | 0.6.3 | MIT | https://github.com/rust-lang/socket2 |
 | mio | 1.2.0 | MIT | https://github.com/tokio-rs/mio |
 | errno | 0.3.14 | MIT | https://github.com/lambda-fairy/rust-errno |
-| mime | 0.3.17 | MIT | https://github.com/hyperium/mime |
+| mime | 0.3.18 | MIT | https://github.com/hyperium/mime |
 | base64ct | 1.8.3 | MIT | https://github.com/RustCrypto/formats |
 | base16ct | 0.2.0 | MIT | https://github.com/RustCrypto/formats/tree/master/base16ct |
 | base16ct | 1.0.0 | MIT | https://github.com/RustCrypto/formats |
@@ -112,11 +112,11 @@ the result instead.
 | regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.29.0 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.29.2 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
-| flate2 | 1.1.10 | MIT | https://github.com/rust-lang/flate2-rs |
+| flate2 | 1.1.11 | MIT | https://github.com/rust-lang/flate2-rs |
 | hyper | 1.12.0 | MIT | https://github.com/hyperium/hyper |
 | unicase | 2.9.0 | MIT | https://github.com/seanmonstar/unicase |
 | either | 1.15.0 | MIT | https://github.com/rayon-rs/either |
@@ -130,7 +130,7 @@ the result instead.
 | tempfile | 3.27.0 | MIT | https://github.com/Stebalien/tempfile |
 | xattr | 1.6.1 | MIT | https://github.com/Stebalien/xattr |
 | heck | 0.5.0 | MIT | https://github.com/withoutboats/heck |
-| is_executable | 1.0.5 | MIT | https://github.com/fitzgen/is_executable |
+| is_executable | 1.0.6 | MIT | https://github.com/fitzgen/is_executable |
 | unicode-bidi | 0.3.18 | MIT | https://github.com/servo/unicode-bidi |
 | unicode-normalization | 0.1.25 | MIT | https://github.com/unicode-rs/unicode-normalization |
 | unicode-properties | 0.1.4 | MIT | https://github.com/unicode-rs/unicode-properties |
@@ -184,7 +184,7 @@ the result instead.
 | fnv | 1.0.7 | MIT | https://github.com/servo/rust-fnv |
 | stable_deref_trait | 1.2.1 | MIT | https://github.com/storyyeller/stable_deref_trait |
 | stringprep | 0.1.5 | MIT | https://github.com/sfackler/rust-stringprep |
-| arc-swap | 1.9.3 | MIT | https://github.com/vorner/arc-swap |
+| arc-swap | 1.9.5 | MIT | https://github.com/vorner/arc-swap |
 | bytes-utils | 0.1.4 | MIT | https://github.com/vorner/bytes-utils |
 | h2 | 0.4.16 | MIT | https://github.com/hyperium/h2 |
 | http | 1.5.0 | MIT | https://github.com/hyperium/http |
@@ -288,7 +288,7 @@ the result instead.
 | pem-rfc7468 | 1.0.0 | MIT | https://github.com/RustCrypto/formats |
 | crypto-common | 0.2.2 | MIT | https://github.com/RustCrypto/traits |
 | argon2 | 0.6.0 | MIT | https://github.com/RustCrypto/password-hashes |
-| crypto-bigint | 0.7.6 | MIT | https://github.com/RustCrypto/crypto-bigint |
+| crypto-bigint | 0.7.11 | MIT | https://github.com/RustCrypto/crypto-bigint |
 | phc | 0.6.1 | MIT | https://github.com/RustCrypto/formats |
 | scrypt | 0.12.0 | MIT | https://github.com/RustCrypto/password-hashes |
 | sec1 | 0.8.1 | MIT | https://github.com/RustCrypto/formats |
@@ -297,7 +297,7 @@ the result instead.
 | inout | 0.2.2 | MIT | https://github.com/RustCrypto/utils |
 | cmov | 0.5.4 | MIT | https://github.com/RustCrypto/utils |
 | hybrid-array | 0.4.14 | MIT | https://github.com/RustCrypto/hybrid-array |
-| rustls-pki-types | 1.15.1 | MIT | https://github.com/rustls/pki-types |
+| rustls-pki-types | 1.16.0 | MIT | https://github.com/rustls/pki-types |
 | powerfmt | 0.2.0 | MIT | https://github.com/jhpratt/powerfmt |
 | hyper-util | 0.1.20 | MIT | https://github.com/hyperium/hyper-util |
 | cpubits | 0.1.1 | MIT | https://github.com/RustCrypto/utils |
@@ -306,7 +306,7 @@ the result instead.
 | system-configuration-sys | 0.6.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | system-configuration | 0.7.0 | MIT | https://github.com/mullvad/system-configuration-rs |
 | primefield | 0.14.0 | MIT | https://github.com/RustCrypto/elliptic-curves |
-| ctutils | 0.4.5 | MIT | https://github.com/RustCrypto/utils |
+| ctutils | 0.4.8 | MIT | https://github.com/RustCrypto/utils |
 | wnaf | 0.14.1 | MIT | https://github.com/RustCrypto/elliptic-curves |
 | annotate-snippets | 0.12.16 | MIT | https://github.com/rust-lang/annotate-snippets-rs |
 | anstream | 1.0.0 | MIT | https://github.com/rust-cli/anstyle.git |
@@ -314,17 +314,17 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.7 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.8 | MIT | https://github.com/clap-rs/clap |
 | clap_builder | 4.6.7 | MIT | https://github.com/clap-rs/clap |
-| clap_complete | 4.6.11 | MIT | https://github.com/clap-rs/clap |
-| clap_derive | 4.6.7 | MIT | https://github.com/clap-rs/clap |
+| clap_complete | 4.6.12 | MIT | https://github.com/clap-rs/clap |
+| clap_derive | 4.6.8 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
-| serde_spanned | 1.1.2 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.2.0+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_datetime | 1.1.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| serde_spanned | 1.1.3 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.2.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_datetime | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_parser | 1.1.5+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_writer | 1.2.0+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | num-conv | 0.2.1 | MIT | https://github.com/jhpratt/num-conv |
@@ -401,12 +401,9 @@ the result instead.
 | windows-strings | 0.5.1 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.52.0 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.59.0 | MIT | https://github.com/microsoft/windows-rs |
-| windows-sys | 0.60.2 | MIT | https://github.com/microsoft/windows-rs |
 | windows-sys | 0.61.2 | MIT | https://github.com/microsoft/windows-rs |
 | windows-targets | 0.52.6 | MIT | https://github.com/microsoft/windows-rs |
-| windows-targets | 0.53.5 | MIT | https://github.com/microsoft/windows-rs |
 | windows_x86_64_gnu | 0.52.6 | MIT | https://github.com/microsoft/windows-rs |
-| windows_x86_64_gnu | 0.53.1 | MIT | https://github.com/microsoft/windows-rs |
 | tokio-stream | 0.1.19 | MIT | https://github.com/tokio-rs/tokio |
 | tokio-util | 0.7.20 | MIT | https://github.com/tokio-rs/tokio |
 | tokio | 1.54.1 | MIT | https://github.com/tokio-rs/tokio |
@@ -446,15 +443,15 @@ the result instead.
 | pin-project-lite | 0.2.17 | MIT | https://github.com/taiki-e/pin-project-lite |
 | pin-project | 1.1.12 | MIT | https://github.com/taiki-e/pin-project |
 | portable-atomic | 1.13.1 | MIT | https://github.com/taiki-e/portable-atomic |
-| proc-macro2 | 1.0.106 | MIT | https://github.com/dtolnay/proc-macro2 |
+| proc-macro2 | 1.0.107 | MIT | https://github.com/dtolnay/proc-macro2 |
 | prost-reflect-derive | 0.16.0 | MIT | https://github.com/andrewhickman/prost-reflect |
 | prost-reflect | 0.16.4 | MIT | https://github.com/andrewhickman/prost-reflect |
-| quote | 1.0.45 | MIT | https://github.com/dtolnay/quote |
-| rustix | 1.1.4 | MIT | https://github.com/bytecodealliance/rustix |
+| quote | 1.0.47 | MIT | https://github.com/dtolnay/quote |
+| rustix | 1.1.6 | MIT | https://github.com/bytecodealliance/rustix |
 | rustversion | 1.0.22 | MIT | https://github.com/dtolnay/rustversion |
 | semver | 1.0.28 | MIT | https://github.com/dtolnay/semver |
 | serde-saphyr | 0.0.29 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
-| serde-saphyr | 2.1.0 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
+| serde-saphyr | 2.1.1 | MIT | https://github.com/bourumir-wyngs/serde-saphyr |
 | serde | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_core | 1.0.229 | MIT | https://github.com/serde-rs/serde |
 | serde_derive | 1.0.229 | MIT | https://github.com/serde-rs/serde |
@@ -464,7 +461,7 @@ the result instead.
 | serde_path_to_error | 0.1.20 | MIT | https://github.com/dtolnay/path-to-error |
 | serde_repr | 0.1.20 | MIT | https://github.com/dtolnay/serde-repr |
 | syn | 2.0.117 | MIT | https://github.com/dtolnay/syn |
-| syn | 3.0.3 | MIT | https://github.com/dtolnay/syn |
+| syn | 3.0.10 | MIT | https://github.com/dtolnay/syn |
 | thiserror-impl | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror-impl | 2.0.21 | MIT | https://github.com/dtolnay/thiserror |
 | thiserror | 1.0.69 | MIT | https://github.com/dtolnay/thiserror |
@@ -502,7 +499,7 @@ the result instead.
 | chunked_transfer | 1.5.0 | MIT | https://github.com/frewsxcv/rust-chunked-transfer |
 | jsonwebtoken | 11.1.0 | MIT | https://github.com/Keats/jsonwebtoken |
 | aws-lc-sys | 0.47.0 | MIT | https://github.com/aws/aws-lc-rs |
-| webbrowser | 1.2.6 | MIT | https://github.com/amodm/webbrowser-rs |
+| webbrowser | 1.2.7 | MIT | https://github.com/amodm/webbrowser-rs |
 | derive_more-impl | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | derive_more | 2.1.1 | MIT | https://github.com/JelteF/derive_more |
 | hdrhistogram | 7.5.4 | MIT | https://github.com/HdrHistogram/HdrHistogram_rust.git |
@@ -549,7 +546,7 @@ the result instead.
 | zerotrie | 0.2.4 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerovec-derive | 0.11.3 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
 | zerovec | 0.11.6 | Unicode-3.0 | https://github.com/unicode-org/icu4x |
-| zlib-rs | 0.6.6 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
+| zlib-rs | 0.6.8 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
 | foldhash | 0.2.0 | Zlib | https://github.com/orlp/foldhash |
 
 ## License texts
@@ -3865,7 +3862,7 @@ limitations under the License.
 
 ```
 
-### rpassword 7.5.4 — Apache-2.0
+### rpassword 7.5.5 — Apache-2.0
 
 Repository: https://github.com/conradkleinespel/rpassword
 
@@ -6193,7 +6190,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### mime 0.3.17 — MIT
+### mime 0.3.18 — MIT
 
 Repository: https://github.com/hyperium/mime
 
@@ -6686,7 +6683,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.29.0 — MIT
+### uuid 1.29.2 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -6808,7 +6805,7 @@ IN THE SOFTWARE.
 
 ```
 
-### flate2 1.1.10 — MIT
+### flate2 1.1.11 — MIT
 
 Repository: https://github.com/rust-lang/flate2-rs
 
@@ -7259,7 +7256,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### is_executable 1.0.5 — MIT
+### is_executable 1.0.6 — MIT
 
 Repository: https://github.com/fitzgen/is_executable
 
@@ -9006,7 +9003,7 @@ SOFTWARE.
 
 ```
 
-### arc-swap 1.9.3 — MIT
+### arc-swap 1.9.5 — MIT
 
 Repository: https://github.com/vorner/arc-swap
 
@@ -12392,7 +12389,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### crypto-bigint 0.7.6 — MIT
+### crypto-bigint 0.7.11 — MIT
 
 Repository: https://github.com/RustCrypto/crypto-bigint
 
@@ -12691,7 +12688,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustls-pki-types 1.15.1 — MIT
+### rustls-pki-types 1.16.0 — MIT
 
 Repository: https://github.com/rustls/pki-types
 
@@ -12964,7 +12961,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### ctutils 0.4.5 — MIT
+### ctutils 0.4.8 — MIT
 
 Repository: https://github.com/RustCrypto/utils
 
@@ -13193,7 +13190,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.7 — MIT
+### clap 4.6.8 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -13247,7 +13244,7 @@ SOFTWARE.
 
 ```
 
-### clap_complete 4.6.11 — MIT
+### clap_complete 4.6.12 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -13274,7 +13271,7 @@ SOFTWARE.
 
 ```
 
-### clap_derive 4.6.7 — MIT
+### clap_derive 4.6.8 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -13409,7 +13406,7 @@ SOFTWARE.
 
 ```
 
-### serde_spanned 1.1.2 — MIT
+### serde_spanned 1.1.3 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -13436,7 +13433,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.2.0+spec-1.1.0 — MIT
+### toml 1.2.1+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -13463,7 +13460,7 @@ SOFTWARE.
 
 ```
 
-### toml_datetime 1.1.2+spec-1.1.0 — MIT
+### toml_datetime 1.1.3+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -15582,32 +15579,6 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### windows-sys 0.60.2 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
 ### windows-sys 0.61.2 — MIT
 
 Repository: https://github.com/microsoft/windows-rs
@@ -15660,59 +15631,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
-### windows-targets 0.53.5 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
 ### windows_x86_64_gnu 0.52.6 — MIT
-
-Repository: https://github.com/microsoft/windows-rs
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### windows_x86_64_gnu 0.53.1 — MIT
 
 Repository: https://github.com/microsoft/windows-rs
 
@@ -16897,7 +16816,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### proc-macro2 1.0.106 — MIT
+### proc-macro2 1.0.107 — MIT
 
 Repository: https://github.com/dtolnay/proc-macro2
 
@@ -16990,7 +16909,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### quote 1.0.45 — MIT
+### quote 1.0.47 — MIT
 
 Repository: https://github.com/dtolnay/quote
 
@@ -17021,7 +16940,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### rustix 1.1.4 — MIT
+### rustix 1.1.6 — MIT
 
 Repository: https://github.com/bytecodealliance/rustix
 
@@ -17145,7 +17064,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### serde-saphyr 2.1.0 — MIT
+### serde-saphyr 2.1.1 — MIT
 
 Repository: https://github.com/bourumir-wyngs/serde-saphyr
 
@@ -17455,7 +17374,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### syn 3.0.3 — MIT
+### syn 3.0.10 — MIT
 
 Repository: https://github.com/dtolnay/syn
 
@@ -18556,7 +18475,7 @@ SOFTWARE.
 
 ```
 
-### webbrowser 1.2.6 — MIT
+### webbrowser 1.2.7 — MIT
 
 Repository: https://github.com/amodm/webbrowser-rs
 
@@ -20770,7 +20689,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 
 ```
 
-### zlib-rs 0.6.6 — Zlib
+### zlib-rs 0.6.8 — Zlib
 
 Repository: https://github.com/trifectatechfoundation/zlib-rs
 

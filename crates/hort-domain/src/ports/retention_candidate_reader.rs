@@ -16,10 +16,31 @@
 //! All live artifacts whose status is retention-eligible: SQL `NULL`
 //! (the stored spelling of
 //! [`QuarantineStatus::None`](crate::entities::artifact::QuarantineStatus::None))
-//! and `released`.
-//! The protected states `quarantined`, `rejected`, and
-//! `scan_indeterminate` and all soft-deleted rows are excluded
-//! SQL-side. The result is keyset-paginated by `artifact.id`.
+//! and `released`, **plus** the held states the caller admits (see
+//! `admit_held` on [`RetentionCandidateReader::list_candidates`]).
+//! Every held state the caller does not admit — and all soft-deleted
+//! rows — are excluded SQL-side. The result is keyset-paginated by
+//! `artifact.id`.
+//!
+//! **One repository, or every one.** A caller may confine the
+//! enumeration to a single repository
+//! (`repository_id` on
+//! [`RetentionCandidateReader::list_candidates`]), which is how a
+//! destructive authority held for one repository can run retention for
+//! it. `None` is the instance-wide sweep and is unchanged. The scope
+//! bounds *which artifact rows are evaluated* and nothing else: a blob
+//! two repositories reference is still only reclaimable when the last
+//! reference to it anywhere goes away, which the purge path's refcount
+//! check over `content_references` decides, not this enumeration.
+//!
+//! **The admitted set is empty unless some active policy opts in.**
+//! That is not decoration: a widened enumeration is not
+//! decision-inert even when no policy would expire a held artifact,
+//! because held rows consume slots in a bounded page and move the
+//! per-policy evaluated / skipped counters. With no opt-in anywhere
+//! the enumeration is the one that shipped before the exception
+//! existed.
+//!
 //! Per-policy-scope SQL
 //! pre-filtering is **deliberately not** done here: the evaluator
 //! does scope matching via the pure
@@ -29,10 +50,18 @@
 //! `evaluate()` — that function only evaluates the predicate). The
 //! eligibility + idempotency + scan-freshness gates bound the work
 //! (query-on-demand, no premature materialization). The reader still
-//! does no scope SQL pre-filter — it only joins `repositories` to
-//! supply the per-artifact `format` input `RetentionScope::matches`
-//! needs, plus the `key` the operator-facing preview names the
-//! repository by (a single query, no extra round-trip).
+//! does no **policy**-scope SQL pre-filter — it only joins
+//! `repositories` to supply the per-artifact `format` input
+//! `RetentionScope::matches` needs, plus the `key` the operator-facing
+//! preview names the repository by (a single query, no extra
+//! round-trip).
+//!
+//! The `repository_id` argument above is a different thing and does not
+//! soften that: it is the **invocation's** boundary, not a policy's
+//! scope. A policy may cover repositories a scoped run does not
+//! evaluate, and `RetentionScope::matches` still decides per policy and
+//! per artifact inside the confined set — so the two compose as AND and
+//! neither stands in for the other.
 //!
 //! ## `resolved_rescan_interval_hours`
 //!
@@ -62,16 +91,21 @@
 //! between two sweeps and expire alternately.
 //!
 //! **Counted set: usable siblings.** `KeepLastN(n)` means n *usable*
-//! artifacts, not n rows. The rank is computed over exactly the
-//! artifacts this reader's own enumeration admits — `deleted_at IS
-//! NULL` **and** a non-GC-protected quarantine status — so the
-//! counted set and the candidate set are one set:
+//! artifacts, not n rows. The rank is computed over the artifacts an
+//! operator could actually download — `deleted_at IS NULL` **and** a
+//! non-held quarantine status — which is the candidate set *minus* any
+//! held candidate the caller admitted. The two sets coincide whenever
+//! `admit_held` is empty, which is every deployment that has not opted
+//! in; where they do not, the ranked set is the narrower one, because
+//! the rank answers "how many usable versions are there?" and a held
+//! artifact is not one:
 //!
 //! - A retired artifact (`deleted_at IS NOT NULL`) occupies no rank
 //!   slot; it would otherwise shield itself and push one extra usable
 //!   artifact over the edge.
-//! - A GC-protected sibling (`quarantined` / `rejected` /
-//!   `scan_indeterminate`) occupies no rank slot either. Counting it
+//! - A held sibling (`quarantined` / `rejected` /
+//!   `scan_indeterminate`) occupies no rank slot either — **including
+//!   one this reader admitted as a candidate**. Counting it
 //!   would let the usable window reach zero: `KeepLastN(3)` over five
 //!   siblings whose three newest are quarantined together would keep
 //!   exactly those three and expire both released ones, leaving the
@@ -83,6 +117,15 @@
 //!   nor collectable. The accepted cost is that a group holds n plus
 //!   its protected siblings rather than n rows — a population
 //!   `KeepLastN` could not collect in any case.
+//!
+//!   An admitted held candidate therefore reaches predicate evaluation
+//!   with **no rank at all** ([`RetentionCandidateRow::keep_rank`] is
+//!   `None`), and that is the only reading that keeps both halves: it
+//!   can be judged on its held-state age bound, and it cannot take a
+//!   slot in a window that counts artifacts an operator could
+//!   download. `None` also fails `KeepLastN` shut, so a count-based
+//!   policy can never be the thing that expires retained evidence —
+//!   the exception is reachable by an age bound and by nothing else.
 //! - Releasing a protected sibling re-enters it in the rank and can
 //!   push an older released sibling out of the window. That is the
 //!   rule working: release is what makes an artifact usable, and a
@@ -123,6 +166,7 @@ use uuid::Uuid;
 use crate::entities::artifact::Artifact;
 use crate::entities::repository::RepositoryFormat;
 use crate::error::DomainResult;
+use crate::retention::HeldState;
 
 use super::BoxFuture;
 
@@ -203,11 +247,53 @@ pub trait RetentionCandidateReader: Send + Sync {
     /// adapter) so per-sweep semantics stay coherent across retries
     /// and tests can pin the comparison time (the established
     /// sweep-handler convention).
+    ///
+    /// `admit_held` names the **held** states to admit beside the
+    /// retention-eligible ones: the union of
+    /// [`RetentionPolicy::held_states`](crate::retention::RetentionPolicy::held_states)
+    /// over the active policies this sweep will evaluate. Empty — the
+    /// steady state, and the state of every deployment that has not
+    /// opted in — is the pre-exception enumeration exactly: no held row
+    /// appears, so none consumes a page slot and no per-policy counter
+    /// moves for one.
+    ///
+    /// It is a **union over policies and nothing finer**, because the
+    /// signature carries no policy: which policy may expire which state
+    /// is decided by the evaluator, which is where the per-policy opt-in
+    /// and the artifact's own stream both are. So this widens *who is
+    /// looked at* and never *what may be expired* — a mixed run admits
+    /// a `rejected` artifact for every policy and the evaluator still
+    /// refuses it for the ones that did not name `rejected`.
+    ///
+    /// An admitted held candidate arrives with
+    /// [`RetentionCandidateRow::keep_rank`] = `None`: it is not a usable
+    /// sibling, so it occupies no `KeepLastN` slot. See the module docs.
+    ///
+    /// `repository_id` confines the enumeration to one repository's
+    /// artifact rows. `None` — the instance-wide sweep, and the shipped
+    /// CronJob's shape — enumerates every repository exactly as before.
+    ///
+    /// The confinement belongs **here** rather than in a filter the
+    /// caller applies to the page it got back, and that is a correctness
+    /// requirement rather than an efficiency one: the page is bounded, so
+    /// a post-filter would spend a scoped run's whole budget on rows it
+    /// then discards, and a page that came back full of other
+    /// repositories' rows and filtered down to nothing is
+    /// indistinguishable from the short page that means "the walk reached
+    /// the end" — which is what tells the caller its pass is complete.
+    ///
+    /// Scoping cannot move a `KeepLastN` rank. The sibling group is
+    /// `(repository_id, name)`, so every member of a ranked group is in
+    /// one repository: a page confined to a repository touches exactly
+    /// the groups it would have touched unconfined, and each of those
+    /// groups is ranked over the same rows.
     fn list_candidates<'a>(
         &'a self,
         batch_size: u32,
         after: Option<Uuid>,
         now: DateTime<Utc>,
+        admit_held: &'a [HeldState],
+        repository_id: Option<Uuid>,
     ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>>;
 }
 
@@ -231,15 +317,22 @@ mod tests {
                 _batch_size: u32,
                 _after: Option<Uuid>,
                 _now: DateTime<Utc>,
+                _admit_held: &'a [HeldState],
+                _repository_id: Option<Uuid>,
             ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
                 Box::pin(async { Ok(Vec::new()) })
             }
         }
         let port: Box<dyn RetentionCandidateReader> = Box::new(Stub);
         let out = port
-            .list_candidates(1000, None, Utc::now())
+            .list_candidates(1000, None, Utc::now(), &[], None)
             .await
             .expect("Ok");
         assert!(out.is_empty());
+        let scoped = port
+            .list_candidates(1000, None, Utc::now(), &[], Some(Uuid::new_v4()))
+            .await
+            .expect("Ok");
+        assert!(scoped.is_empty());
     }
 }

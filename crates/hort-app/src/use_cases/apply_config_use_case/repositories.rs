@@ -155,7 +155,6 @@ fn build_repository_from_spec(
         // `#[serde(default)]` on the spec field makes absence == false
         // (non-breaking for existing gitops configs).
         download_audit_enabled: spec.download_audit_enabled,
-        quota_bytes: spec.quota_bytes,
         replication_priority,
         promotion: spec.promotion.clone(),
         // The spec carries a list of `CurationRule`

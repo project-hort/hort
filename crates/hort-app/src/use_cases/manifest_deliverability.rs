@@ -198,7 +198,58 @@ impl ManifestDeliverabilityUseCase {
         repository_id: Uuid,
         manifest_hash: &ContentHash,
     ) -> AppResult<ManifestDeliverability> {
-        let closure = self.closure(repository_id, manifest_hash).await?;
+        let root_bytes = self.read_root(repository_id, manifest_hash).await?;
+        self.resolve_over(repository_id, manifest_hash, root_bytes)
+            .await
+    }
+
+    /// The same question for a document whose bytes the caller already
+    /// holds and CAS does **not** — a manifest or index being admitted,
+    /// one step before it is minted.
+    ///
+    /// Admission and delivery must answer the same question about the
+    /// same closure. A push that names a child whose own layer carries a
+    /// terminal verdict is a push of a document this registry will
+    /// refuse at every read, so admitting it reports success for an
+    /// image that can never be pulled — and checking only the direct
+    /// children takes the arbitrary one-hop cut this module's own doc
+    /// rejects. Routing admission through here rather than through a
+    /// second traversal is what makes the two sides structurally unable
+    /// to disagree: one walk, one depth cap
+    /// ([`MAX_CHILD_INGEST_DEPTH`], counted from this document exactly
+    /// as the read path counts it from the stored one), one expansion
+    /// budget, one catalog call.
+    ///
+    /// `document_bytes` is the body as received, so `document_hash` must
+    /// be its computed SHA-256 — the hash the document will be stored
+    /// under. It is seeded as already-seen, which is the only thing the
+    /// walk uses it for beyond logging.
+    ///
+    /// The caller is expected to have decided the document's **direct**
+    /// references already: this reports a terminal constituent wherever
+    /// it sits, so a caller that wants its own answer for a direct one
+    /// resolves that first.
+    pub async fn resolve_pending(
+        &self,
+        repository_id: Uuid,
+        document_hash: &ContentHash,
+        document_bytes: Vec<u8>,
+    ) -> AppResult<ManifestDeliverability> {
+        self.resolve_over(repository_id, document_hash, document_bytes)
+            .await
+    }
+
+    /// Resolve the question over a root document whose bytes are in
+    /// hand, whichever way they were obtained.
+    async fn resolve_over(
+        &self,
+        repository_id: Uuid,
+        manifest_hash: &ContentHash,
+        root_bytes: Vec<u8>,
+    ) -> AppResult<ManifestDeliverability> {
+        let closure = self
+            .closure(repository_id, manifest_hash, root_bytes)
+            .await?;
         // A document that binds nothing — an artifact manifest with no
         // config and no layers — has nothing to withhold it.
         if closure.is_empty() {
@@ -234,19 +285,17 @@ impl ManifestDeliverabilityUseCase {
         }
     }
 
-    /// Every content hash the manifest binds, transitively, in closure
-    /// order — config before layers, a parent before its children —
-    /// deduplicated, and excluding the manifest's own hash.
+    /// Read the served document's own bytes out of CAS, fail-closed.
     ///
-    /// The order is load-bearing twice: it decides which constituent a
-    /// refusal names when several share the strongest verdict, and it
-    /// makes that choice identical for `HEAD` and `GET`.
-    async fn closure(
+    /// Only the stored-document path needs this: an admission resolve
+    /// arrives with the body in hand ([`Self::resolve_pending`]), and
+    /// for it this failure mode does not exist.
+    async fn read_root(
         &self,
         repository_id: Uuid,
         manifest_hash: &ContentHash,
-    ) -> AppResult<Vec<ContentHash>> {
-        let root_bytes = read_cas_bounded(&*self.storage, manifest_hash, CLOSURE_READ_CAP_BYTES)
+    ) -> AppResult<Vec<u8>> {
+        read_cas_bounded(&*self.storage, manifest_hash, CLOSURE_READ_CAP_BYTES)
             .await
             .map_err(|e| {
                 tracing::error!(
@@ -257,8 +306,27 @@ impl ManifestDeliverabilityUseCase {
                      read, so its constituents are unknown; refusing to serve it"
                 );
                 e
-            })?;
+            })
+    }
 
+    /// Every content hash the manifest binds, transitively, in closure
+    /// order — config before layers, a parent before its children —
+    /// deduplicated, and excluding the manifest's own hash.
+    ///
+    /// The order is load-bearing twice: it decides which constituent a
+    /// refusal names when several share the strongest verdict, and it
+    /// makes that choice identical for `HEAD` and `GET`.
+    ///
+    /// `root_bytes` arrives from the caller rather than being read here,
+    /// so one walk serves both a stored document and one still being
+    /// admitted — the depth and expansion accounting is then the same
+    /// code for both and cannot drift between them.
+    async fn closure(
+        &self,
+        repository_id: Uuid,
+        manifest_hash: &ContentHash,
+        root_bytes: Vec<u8>,
+    ) -> AppResult<Vec<ContentHash>> {
         let mut closure: Vec<ContentHash> = Vec::new();
         // The manifest's own hash is seeded as seen: its status was
         // already decided by the caller's own gate, and a
@@ -528,6 +596,15 @@ mod tests {
         async fn resolve(&self, manifest: &ContentHash) -> AppResult<ManifestDeliverability> {
             self.use_case.resolve(self.repo, manifest).await
         }
+
+        /// The closure walk over a document already in CAS — the two
+        /// halves [`ManifestDeliverabilityUseCase::resolve`] runs, so a
+        /// test about the walk's *shape* does not have to hand in the
+        /// root bytes it just stored.
+        async fn closure(&self, manifest: &ContentHash) -> AppResult<Vec<ContentHash>> {
+            let root = self.use_case.read_root(self.repo, manifest).await?;
+            self.use_case.closure(self.repo, manifest, root).await
+        }
     }
 
     // -- the deliverable arms ---------------------------------------------
@@ -670,10 +747,7 @@ mod tests {
         let (manifest, config, layer) = (hash_of("m"), hash_of("c"), hash_of("l"));
         f.store(&manifest, image_manifest(&config, &[&layer]));
         assert_eq!(
-            f.use_case
-                .closure(f.repo, &manifest)
-                .await
-                .expect("the closure resolves"),
+            f.closure(&manifest).await.expect("the closure resolves"),
             vec![config, layer]
         );
     }
@@ -693,11 +767,7 @@ mod tests {
         f.store(&index, image_index(&[&first, &second]));
         f.store(&first, image_manifest(&config, &[&shared]));
         f.store(&second, image_manifest(&config, &[&shared]));
-        let closure = f
-            .use_case
-            .closure(f.repo, &index)
-            .await
-            .expect("the closure resolves");
+        let closure = f.closure(&index).await.expect("the closure resolves");
         assert_eq!(
             closure,
             vec![first, second, config, shared],
@@ -713,8 +783,7 @@ mod tests {
         let manifest = hash_of("m");
         f.store(&manifest, image_manifest(&manifest, &[&manifest]));
         assert!(f
-            .use_case
-            .closure(f.repo, &manifest)
+            .closure(&manifest)
             .await
             .expect("the closure resolves")
             .is_empty());
@@ -740,11 +809,7 @@ mod tests {
         f.store(deepest, image_manifest(&deep_layer, &[]));
         f.catalog(&deep_layer, QuarantineStatus::Rejected);
 
-        let closure = f
-            .use_case
-            .closure(f.repo, &levels[0])
-            .await
-            .expect("the closure resolves");
+        let closure = f.closure(&levels[0]).await.expect("the closure resolves");
         assert!(
             closure.contains(deepest),
             "the child at the cap is still judged: {closure:?}"
@@ -1056,5 +1121,110 @@ mod tests {
                 .expect("resolution succeeds"),
             ManifestDeliverability::Deliverable
         );
+    }
+
+    // -- resolve_pending: the same question, one step before the mint ----
+
+    /// The admission entry point answers **identically** to the stored
+    /// one over the same document — asserted on the same tree, read two
+    /// ways, so the two sides of the write/read boundary cannot drift:
+    /// one walk, one bound set, one catalog call.
+    #[tokio::test]
+    async fn resolve_pending_answers_what_resolve_answers_for_the_same_document() {
+        let (index, child, config, layer) =
+            (hash_of("i"), hash_of("c"), hash_of("cfg"), hash_of("l"));
+        let index_body = image_index(&[&child]);
+        let child_body = image_manifest(&config, &[&layer]);
+
+        for status in [
+            QuarantineStatus::Rejected,
+            QuarantineStatus::ScanIndeterminate,
+        ] {
+            let f = fixture();
+            f.store(&index, index_body.clone());
+            f.store(&child, child_body.clone());
+            f.catalog(&layer, status);
+            let stored = f.resolve(&index).await.expect("resolution succeeds");
+            let pending = f
+                .use_case
+                .resolve_pending(f.repo, &index, index_body.clone())
+                .await
+                .expect("resolution succeeds");
+            assert_eq!(
+                stored, pending,
+                "the admission answer and the delivery answer are one answer ({status})"
+            );
+            assert_eq!(
+                pending,
+                ManifestDeliverability::TerminalConstituent(TerminalConstituent {
+                    content_hash: layer.clone(),
+                    status,
+                }),
+                "a terminal constituent below the direct children is reported ({status})"
+            );
+        }
+    }
+
+    /// The whole point of the entry point: the document's own bytes are
+    /// **not** in CAS, because it has not been minted. `resolve` cannot
+    /// answer in that state and `resolve_pending` can.
+    #[tokio::test]
+    async fn resolve_pending_needs_no_cas_object_for_the_document_itself() {
+        let f = fixture();
+        let (index, child, config, layer) =
+            (hash_of("i"), hash_of("c"), hash_of("cfg"), hash_of("l"));
+        let index_body = image_index(&[&child]);
+        f.store(&child, image_manifest(&config, &[&layer]));
+        f.catalog(&layer, QuarantineStatus::Rejected);
+        // Deliberately no `f.store(&index, …)`.
+        assert!(
+            f.resolve(&index).await.is_err(),
+            "the stored entry point fails closed with no bytes to read"
+        );
+        assert_eq!(
+            f.use_case
+                .resolve_pending(f.repo, &index, index_body)
+                .await
+                .expect("resolution succeeds"),
+            ManifestDeliverability::TerminalConstituent(TerminalConstituent {
+                content_hash: layer,
+                status: QuarantineStatus::Rejected,
+            })
+        );
+    }
+
+    /// An index whose closure is clean is deliverable — the arm a push of
+    /// a genuinely deliverable image takes, and the one a refusal built
+    /// on absence would break.
+    #[tokio::test]
+    async fn resolve_pending_admits_a_document_whose_closure_is_clean() {
+        let f = fixture();
+        let (index, child, config, layer) =
+            (hash_of("i"), hash_of("c"), hash_of("cfg"), hash_of("l"));
+        f.store(&child, image_manifest(&config, &[&layer]));
+        f.catalog(&child, QuarantineStatus::Released);
+        f.catalog(&config, QuarantineStatus::Released);
+        f.catalog(&layer, QuarantineStatus::Quarantined);
+        assert_eq!(
+            f.use_case
+                .resolve_pending(f.repo, &index, image_index(&[&child]))
+                .await
+                .expect("resolution succeeds"),
+            ManifestDeliverability::Deliverable,
+            "a hold is `not yet`, not `never`"
+        );
+    }
+
+    /// Fails closed on a body it cannot parse, exactly as the stored path
+    /// does at depth 0: not knowing what a document binds is not knowing
+    /// it is safe (ADR 0007).
+    #[tokio::test]
+    async fn resolve_pending_fails_closed_on_an_unparseable_document() {
+        let f = fixture();
+        assert!(f
+            .use_case
+            .resolve_pending(f.repo, &hash_of("i"), b"not json".to_vec())
+            .await
+            .is_err());
     }
 }

@@ -2592,4 +2592,132 @@ mod tests {
             "expected all 72 DomainEvent test instances to be exercised, got {exercised}"
         );
     }
+
+    // ---- Both ArtifactExpired shapes on one stream ----------------------
+
+    /// A **verbatim** pre-change `ArtifactExpired` payload, as a
+    /// deployment that has already run the expiry sweep has it stored.
+    ///
+    /// Typed out rather than produced by an older `serialize_event_data`
+    /// — the whole question is whether today's code is correct about
+    /// bytes it did not write, and a fixture built by today's producer
+    /// cannot ask it. Key order is `serde_json`'s object order; the
+    /// canonical encoding sorts keys, so the literal's order is
+    /// immaterial and the test is not asserting it.
+    fn legacy_artifact_expired_payload() -> serde_json::Value {
+        serde_json::json!({
+            "type": "ArtifactExpired",
+            "data": {
+                "artifact_id": "7f1d9e2a-0000-4000-8000-000000000001",
+                "policy_id": "7f1d9e2a-0000-4000-8000-000000000002",
+                "policy_name": "retain-90d",
+                "reason": {
+                    "AgeExceeded": {
+                        "published_at": "2026-01-01T00:00:00Z",
+                        "ttl_secs": 7776000
+                    }
+                },
+                "eligible_at": "2026-04-01T00:00:00Z"
+            }
+        })
+    }
+
+    /// The post-change shape: the same event with the held-state
+    /// authority present.
+    fn authorised_artifact_expired_payload() -> serde_json::Value {
+        use crate::events::{stored_payload_envelope, ArtifactExpired, DomainEvent};
+        use crate::retention::{ExpirationReason, HeldState, HeldStateEntry};
+        stored_payload_envelope(&DomainEvent::ArtifactExpired(ArtifactExpired {
+            artifact_id: Uuid::from_u128(0x11),
+            policy_id: Uuid::from_u128(0x22),
+            policy_name: "retain-rejected-90d".into(),
+            reason: ExpirationReason::AgeExceeded {
+                published_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("in range"),
+                ttl_secs: 7_776_000,
+            },
+            eligible_at: chrono::DateTime::from_timestamp(1_800_000_000, 0).expect("in range"),
+            held_state_authority: Some(HeldStateEntry {
+                state: HeldState::Rejected,
+                entered_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).expect("in range"),
+                entry_stream_position: 4,
+            }),
+        }))
+    }
+
+    /// The held-state authority is **additive**: a stream carrying both
+    /// an `ArtifactExpired` written before the field existed and one
+    /// written after it verifies intact end to end.
+    ///
+    /// This is the property that makes the discriminator shippable, and
+    /// it is asserted over a stored pre-change payload rather than
+    /// argued from `serde` attributes. Verification recomputes each
+    /// row's hash from the `event_data` column and never re-serialises
+    /// a typed event, so the older row's bytes are hashed exactly as
+    /// they were written — but "so it must be fine" is the reasoning
+    /// this test replaces.
+    #[test]
+    fn a_stream_mixing_both_artifact_expired_shapes_verifies() {
+        let payloads = vec![
+            legacy_artifact_expired_payload(),
+            authorised_artifact_expired_payload(),
+        ];
+        let stream_id = "artifact-7f1d9e2a-0000-4000-8000-000000000001";
+        let rows = build_rows(&payloads, stream_id);
+        let verdict = verify_stream_chain(&StreamRows::new(&rows));
+        assert!(
+            matches!(verdict, StreamVerdict::Ok { position: 1, .. }),
+            "both shapes must verify on one chain, got {verdict:?}"
+        );
+    }
+
+    /// The pre-change payload decodes, and decodes as carrying **no**
+    /// held-state authority.
+    ///
+    /// The absence is the load-bearing half: a legacy expiry must
+    /// authorise nothing on the held-state axis, and a decode that
+    /// failed outright — or that invented an authority — would make
+    /// every artifact expired before this change either unpurgeable or
+    /// purgeable for the wrong reason.
+    #[test]
+    fn the_legacy_payload_decodes_with_no_held_state_authority() {
+        use crate::events::DomainEvent;
+        let payload = legacy_artifact_expired_payload();
+        let data = payload.get("data").expect("the fixture has a data field");
+        let key = DomainEvent::serde_key_for_event_type("ArtifactExpired");
+        let event: DomainEvent =
+            serde_json::from_value(serde_json::json!({ key: data })).expect("legacy decode");
+        match event {
+            DomainEvent::ArtifactExpired(e) => {
+                assert_eq!(e.policy_name, "retain-90d");
+                assert_eq!(
+                    e.held_state_authority, None,
+                    "a legacy expiry supplies no held-state authority"
+                );
+            }
+            other => panic!("expected ArtifactExpired, got {}", other.event_type()),
+        }
+    }
+
+    /// Re-storing the decoded legacy event reproduces the stored bytes:
+    /// the new field is `skip_serializing_if = "Option::is_none"`, so a
+    /// row rewritten by a replay or a re-emit still hashes to what it
+    /// hashed to.
+    ///
+    /// Without the skip, `held_state_authority: null` would appear in
+    /// the re-serialised payload, the canonical bytes would differ, and
+    /// a re-emit of an untouched fact would read as a different event.
+    #[test]
+    fn re_storing_the_legacy_payload_is_byte_identical() {
+        use crate::events::{stored_payload_envelope, DomainEvent};
+        let payload = legacy_artifact_expired_payload();
+        let data = payload.get("data").expect("the fixture has a data field");
+        let key = DomainEvent::serde_key_for_event_type("ArtifactExpired");
+        let event: DomainEvent =
+            serde_json::from_value(serde_json::json!({ key: data })).expect("legacy decode");
+        assert_eq!(
+            canonical_payload_bytes(&stored_payload_envelope(&event)),
+            canonical_payload_bytes(&payload),
+            "the stored legacy bytes must survive a decode/re-encode round trip"
+        );
+    }
 }

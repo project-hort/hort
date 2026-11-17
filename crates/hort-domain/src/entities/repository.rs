@@ -746,7 +746,6 @@ pub struct Repository {
     /// volume control (there is no throttle); the per-format download
     /// *count* stays Prometheus-only (`hort_download_total`).
     pub download_audit_enabled: bool,
-    pub quota_bytes: Option<i64>,
     pub replication_priority: ReplicationPriority,
     pub promotion: Option<PromotionConfig>,
     /// Names of [`CurationRule`](crate::entities::curation_rule::CurationRule)
@@ -1068,7 +1067,6 @@ mod tests {
             index_upstream_url: None,
             is_public: true,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::OnDemand,
             promotion: None,
             curation_rule_names: Vec::new(),
@@ -1145,7 +1143,6 @@ mod tests {
             index_upstream_url: None,
             is_public: true,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::LocalOnly,
             promotion: None,
             curation_rule_names: Vec::new(),
@@ -1175,7 +1172,6 @@ mod tests {
             index_upstream_url: None,
             is_public: false,
             download_audit_enabled: true,
-            quota_bytes: Some(1_000_000_000),
             replication_priority: ReplicationPriority::Immediate,
             promotion: Some(PromotionConfig {
                 target_id: Uuid::nil(),
@@ -1222,7 +1218,6 @@ mod tests {
             index_upstream_url: index,
             is_public: true,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::OnDemand,
             promotion: None,
             curation_rule_names: Vec::new(),
@@ -1457,7 +1452,6 @@ mod tests {
             index_upstream_url: None,
             is_public: true,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::OnDemand,
             promotion: None,
             curation_rule_names: Vec::new(),

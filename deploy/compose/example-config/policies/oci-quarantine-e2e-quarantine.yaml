@@ -7,10 +7,15 @@ spec:
   # A 24h hold window keeps every pushed blob in `Quarantined` for the whole
   # scenario, so the push-under-quarantine smoke
   # (scripts/native-tests/scenarios/clients/oci-push-under-quarantine.sh) can
-  # drive a pre-flight blob HEAD against a held blob. `scanBackends: []` keeps
-  # the hold purely time-based: the compose stack runs no hort-worker, so no
-  # scan would ever complete anyway — the 24h window, not a scan result, is
-  # what holds the blob. (Repo-scoped, so no other scenario is affected.)
+  # drive a pre-flight blob HEAD against a held blob. The 24h window, not a scan
+  # result, is what holds the blob: the window is far longer than a smoke run, so
+  # the hold stands whatever the scan concludes — and with no release authority
+  # before the deadline there is nothing a scan could release early. (Repo-scoped,
+  # so no other scenario is affected.)
+  #
+  # `scanBackends` is omitted rather than `[]`: an empty list waives scanning for
+  # a format assessed as a composed image, which apply refuses. Omitted inherits
+  # the built-in default `[trivy]`.
   scope:
     repository: oci-quarantine-e2e
   severityThreshold: critical
@@ -18,5 +23,17 @@ spec:
   requireApproval: false
   # Provenance off for e2e (no per-ingest verify job).
   provenanceMode: off
-  scanBackends: []
+  # `enforcement: record` — a Trivy verdict is recorded, never gating. What
+  # this fixture asserts must not depend on which CVEs an upstream tag
+  # happens to carry on the day the suite runs, only on whether each row got
+  # a completed assessment at all. Omitting the field is the opposite
+  # posture, not a quieter one: it inherits the enforcing default, and this
+  # policy scans, so a `critical` finding would replace the time-based hold
+  # this scenario drives with a terminal verdict — and the pull it asserts
+  # fails would then fail for that reason instead, satisfying the assertion
+  # while proving nothing about the hold.
+  #
+  # `record` leaves the 24h hold untouched: `ScanRecorded` is a timer
+  # authority, so nothing releases inside a smoke run.
+  enforcement: record
   licensePolicy: {}

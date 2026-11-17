@@ -863,7 +863,7 @@ async fn do_publish(
                 return Ok(identity_refusal(&divergence.message("npm tarball")));
             }
         }
-        Err(refusal) => return Ok(refusal),
+        Err(refusal) => return Ok(*refusal),
     }
 
     // Pull the per-version packument block — `body["versions"][version]` —
@@ -913,7 +913,7 @@ async fn do_publish(
     // (infrastructure) — see `tempfile_reader` for rationale.
     let read_handle = match streaming_publish::tempfile_reader(&decoded.tarball_file).await {
         Ok(f) => f,
-        Err(response) => return Ok(response),
+        Err(response) => return Ok(*response),
     };
     let stream: Box<dyn tokio::io::AsyncRead + Send + Unpin> = Box::new(read_handle);
 
@@ -1263,7 +1263,7 @@ async fn resolve_dist_tag_write(
 /// server failed to read is not one that agreed.
 async fn read_declared_tarball_identity(
     decoded: &streaming_publish::DecodedPublish,
-) -> Result<hort_formats::npm::NpmTarballIdentity, Response> {
+) -> Result<hort_formats::npm::NpmTarballIdentity, Box<Response>> {
     let file = decoded.tarball_file.reopen().map_err(|e| {
         tracing::error!(error = %e, "publish tempfile reopen-for-identity failed");
         infrastructure_refusal()
@@ -1282,7 +1282,7 @@ async fn read_declared_tarball_identity(
     // established is not an identity that agreed — npm's package format
     // requires `package/package.json`, so its absence or corruption is a
     // malformed publish and not a fact to wave through.
-    joined.map_err(|domain_err| identity_refusal(&domain_err.to_string()))
+    joined.map_err(|domain_err| Box::new(identity_refusal(&domain_err.to_string())))
 }
 
 /// The npm-shaped refusal for a publish whose archive disagrees with its
@@ -4897,7 +4897,6 @@ mod tests {
 
         use axum::body::{to_bytes, Body};
         use axum::http::{Request, StatusCode};
-        use base64::Engine as _;
         use chrono::Utc;
         use metrics_exporter_prometheus::PrometheusBuilder;
         use sha2::{Digest, Sha512};

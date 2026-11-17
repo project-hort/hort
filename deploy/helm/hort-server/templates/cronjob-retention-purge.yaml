@@ -35,22 +35,46 @@ is the most destructive retention task, so opt-in is required for
 safety). The parent `scheduledTasks.adminTasksEnabled` must also be
 true.
 
-DESTRUCTIVE TASK: `retention-purge` is in DESTRUCTIVE_TASK_KINDS, so
-invoking it requires the caller carry the `task:destructive` claim in
-addition to `AdminTaskInvoke`. The bootstrap `{{ release }}-svc-token` is a
-non-admin `cronjob-tasks` svc-token (AdminTaskInvoke only — svc-tokens are
-claimless), so it cannot satisfy `task:destructive` and this CronJob fails
-if run with it. No token can be made to carry the claim: a native token
-resolves no IdP claims at all, so the only token that passes the gate is an
-admin user's, which passes it by the admin short-circuit. Run this kind by
-hand with a Dex-backed admin CliSession instead:
-`hort-cli admin task invoke retention-purge`.
+DESTRUCTIVE TASK: `retention-purge` is in DESTRUCTIVE_TASK_KINDS, so invoking it
+requires `destroy_content` — the authority over artifact content — in
+addition to `AdminTaskInvoke`. A machine identity MAY hold it: an artifact's
+removal leaves a record behind by design (`ArtifactPurged` stays on the
+stream), so scheduled storage reclamation is what the `cronjob-tasks`
+svc-token exists for. Provisioning it is three steps, all required:
+
+  1. Declare the grant in your gitops tree and apply it —
+     `kind: PermissionGrant`, `subject: { kind: serviceAccount, name:
+     cronjob-tasks }`, `permission: destroy_content`, no `repository:`
+     (the gate asks at `repository = None`, so a repo-scoped destructive
+     grant authorises nothing). See
+     docs/architecture/how-to/deploy/enable-admin-task-cronjobs.md section 5.1.
+  2. Add `destroy_content` to this release's
+     `scheduledTasks.svcTokens[].permissions` for the `cronjob-tasks` entry.
+     The bootstrap Job's `--require-authority` preflight then fails loud at
+     install time if step 1 is missing, instead of leaving a token that 403s
+     on every tick.
+  3. ROTATE THE TOKEN. A svc-token's capability is frozen at mint
+     (ADR 0012) and `cronjob-tasks` is PAT-only — no `fallbackRotation`, so
+     nothing re-snapshots it on an interval. An existing token keeps its old
+     cap and the bootstrap Job reports "already exists": the grant is live in
+     the database, the evaluator sees it, and the mounted token still 403s.
+     Set that entry's `rotate: true` for one upgrade, then back to false.
+     `hort-cli auth status --output json` reads the frozen cap
+     (`permissions`), which is the field to check — never the grant set.
+
+**Being an admin does not confer `destroy_content`**: it is held only through
+an explicit PermissionGrant, so an interactive admin is answered `403` until
+one exists for their identity. To run this kind by hand instead:
+`hort-cli admin task invoke retention-purge` as such an identity.
 
 The authority is re-checked a second time when the worker runs the job,
-against the live state of the user it was enqueued under: revoking that
-identity's authority (demote, deactivate, or remove its
-`admin_task_invoke` grant) stops the jobs it has already queued, which
-land as terminal `failed` rows naming the cause. See
+against the live state of the user it was enqueued under: revoking either
+grant (or deactivating the account) stops the jobs it has already queued,
+which land as terminal `failed` rows naming the cause. The grant must be
+reachable from the persisted identity — a `serviceAccount`- or
+`User`-subject grant, or a claims grant on `admin` for an admin user;
+a grant bound to any other claim passes the enqueue and is refused at
+execution, because nothing persists an IdP-resolved claim set. See
 docs/architecture/how-to/deploy/enable-admin-task-cronjobs.md section 5.
 */}}
 {{- if and .Values.scheduledTasks.adminTasksEnabled .Values.scheduledTasks.retentionPurge.enabled }}

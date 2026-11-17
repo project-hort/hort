@@ -300,6 +300,7 @@ async fn a_retracted_vulnerabilitys_history_is_never_returned() {
         !hort_domain::retention::matches_bool(
             &PolicyPredicate::HasFindingDetectedFor(7 * 24 * 3600),
             &hort_domain::retention::EvaluationInputs {
+                held_state_entry: None,
                 now,
                 created_at: now - Duration::days(500),
                 last_downloaded_at: None,

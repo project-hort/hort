@@ -25,5 +25,13 @@ spec:
   requireApproval: false
   # Provenance off for permissive e2e (no per-ingest verify job).
   provenanceMode: off
-  scanBackends: []
+  # `enforcement: record` — a Trivy verdict is recorded, never gating. What
+  # this fixture asserts must not depend on which CVEs an upstream tag
+  # happens to carry on the day the suite runs, only on whether each row got
+  # a completed assessment at all. Omitting the field is the opposite
+  # posture, not a quieter one: it inherits the enforcing default, and this
+  # policy scans, so a `critical` finding would reject a real upstream image
+  # and answer `403` to the cache-miss pull this scenario asserts round-trips
+  # cleanly.
+  enforcement: record
   licensePolicy: {}

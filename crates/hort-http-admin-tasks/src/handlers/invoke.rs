@@ -134,7 +134,8 @@ pub async fn invoke<P: TaskParams>(
     // Step 1 — per-kind authz FIRST.
     //
     // The RBAC check (coarse `Permission::AdminTaskInvoke` AND, for a
-    // destructive invocation, the `task:destructive` claim) runs **before**
+    // destructive invocation, that invocation's destructive permission)
+    // runs **before**
     // param-validation and before the attacker-controlled
     // `Idempotency-Key` ephemeral-store probe. This prevents an
     // unauthenticated/under-privileged caller from probing param-validation
@@ -215,16 +216,20 @@ pub async fn invoke<P: TaskParams>(
     // key. The Redis fast-path stays an additional cheap layer for
     // destructive kinds; the DB layer is the durable one.
     //
-    // The gate is `task_invocation_is_destructive` — the same domain
-    // answer Step 1's `task:destructive` claim check reads, deliberately
-    // NOT the per-kind `task_kind_is_destructive`. The key exists so a
+    // The gate is `task_invocation_destructive_authority` — the same domain
+    // answer Step 1's destructive-authority check reads, deliberately
+    // NOT the per-kind `task_kind_is_destructive`. (The authority that
+    // answer also names is Step 1's business; here only "destroys
+    // anything" matters, which is `is_some()`.) The key exists so a
     // destructive sweep cannot re-fire; an observation has no such hazard
     // and must stay repeatable, because "look again" is the one thing a
     // preview has to support. Asking the per-kind question here would
     // deduplicate the second dry run of a UTC day back to the first and
-    // report a stale observation as a fresh one. Anything that is not a
-    // destructive invocation passes `None`: the DB partial-unique check
-    // is inert and the insert always proceeds.
+    // report a stale observation as a fresh one — and it would also make
+    // the dry run need a destructive permission at Step 1, which an
+    // observation must not. Anything that is not a destructive invocation
+    // passes `None`: the DB partial-unique check is inert and the insert
+    // always proceeds.
     //
     // Both `?`s below are structurally unreachable here. The mode was
     // already parsed once by Step 1's authorization check and once more
@@ -241,14 +246,38 @@ pub async fn invoke<P: TaskParams>(
     // reaches this branch: it costs nothing, it names the dimension the
     // key separates on, and it means a second kind gaining a mode cannot
     // silently collapse two invocations onto one key.
+    //
+    // The repository scope is in the key for exactly that reason, and it
+    // is the same rule applied rather than a new one. The key
+    // single-flights *destroying something*, so two invocations that
+    // would destroy different things must not collapse onto it: without
+    // the segment, a scoped execute for one repository would own the day
+    // for every other scoped execute — and, worse, hand an operator who
+    // then asked for the instance-wide sweep that scoped job's id and a
+    // `200`, so the sweep they asked for never ran and nothing said so.
+    // An unscoped invocation appends no segment, which keeps every key
+    // the shipped CronJob has ever derived byte-identical.
     let db_idempotency_key: Option<IdempotencyKey> =
-        if hort_domain::events::task_invocation_is_destructive(P::KIND, &params_value)? {
+        if hort_domain::events::task_invocation_destructive_authority(P::KIND, &params_value)?
+            .is_some()
+        {
             let utc_today = chrono::Utc::now().format("%Y-%m-%d");
             let derived = if P::KIND == hort_domain::events::RETENTION_EVALUATE_TASK_KIND {
                 let mode = hort_domain::events::retention_evaluate_mode(&params_value)?;
                 format!("cron:{}:{}:{utc_today}", P::KIND, mode.as_str())
             } else {
                 format!("cron:{}:{utc_today}", P::KIND)
+            };
+            // Read through the one domain reader of the scope, the same
+            // call the authorization gate above made, so the key cannot
+            // separate on a different repository from the one the
+            // invocation was authorized for.
+            let derived = match hort_domain::events::task_invocation_repository_scope(
+                P::KIND,
+                &params_value,
+            )? {
+                Some(repository_id) => format!("{derived}:{repository_id}"),
+                None => derived,
             };
             Some(IdempotencyKey::try_from(derived)?)
         } else {

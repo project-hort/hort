@@ -316,7 +316,7 @@ fn collect_reads() -> Vec<Read> {
 /// hole in it. A stance that flips in either direction fails here too,
 /// which is the point: a reader going from filtered to declared is a
 /// review conversation, not an edit made on the way past.
-const CENSUS: [(&str, usize, usize, usize, usize); 16] = [
+const CENSUS: [(&str, usize, usize, usize, usize); 18] = [
     // -- the two proven defects, now filtered -----------------------------
     //
     // One literal, two legs: the `effective_policy_duration` CTE's
@@ -328,12 +328,13 @@ const CENSUS: [(&str, usize, usize, usize, usize); 16] = [
         1,
         0,
     ),
-    // `select_eligible` and `select_stranded`, one literal each.
+    // `select_eligible`, `select_stranded` and
+    // `select_composite_unassessed`, one literal each.
     (
         "crates/hort-adapters-postgres/src/rescan_candidates.rs",
-        2,
-        2,
-        2,
+        3,
+        3,
+        3,
         0,
     ),
     // -- the five readers assessed one at a time alongside them -----------
@@ -392,11 +393,14 @@ const CENSUS: [(&str, usize, usize, usize, usize); 16] = [
     // The 24th filtered statement is `package_file_digests`: a proxy index
     // serve asks it which files hort holds so it can advertise its own
     // digest for them, and a soft-deleted row is not a file hort serves.
+    // The 25th is `find_live_rows_by_repo_and_checksums`, the digest-set
+    // resolver behind the content-addressed curation decisions: a
+    // soft-deleted row is not a row a curator can release or block.
     (
         "crates/hort-adapters-postgres/src/artifact_repo.rs",
-        27,
-        27,
-        24,
+        28,
+        28,
+        25,
         3,
     ),
     // `protected_claimants` is a live read (both legs); the purge worklist,
@@ -462,13 +466,41 @@ const CENSUS: [(&str, usize, usize, usize, usize); 16] = [
         1,
         0,
     ),
+    // The held-pending-signature overview. Both of its statements are
+    // built around ONE membership CTE, so there is one literal reading
+    // the table and one filter — the predicate travels with the fragment
+    // that names `artifacts`, which is the only place it can be seen
+    // from. A curator's worklist is the exact surface a soft-deleted row
+    // must not appear in, which is why this is filtered rather than
+    // declared.
+    (
+        "crates/hort-adapters-postgres/src/held_set_reader.rs",
+        1,
+        1,
+        1,
+        0,
+    ),
+    // The per-repository catalog readout. One statement, one leg
+    // naming the table — the predicate sits in the CTE that reads it,
+    // which is the only place it can be seen from. A catalog weight
+    // counts what the repository actually serves, and a soft-deleted
+    // artifact is not in that catalog: its bytes may well still be
+    // resident, but that is the refcount-gated purge GC's question.
+    // Filtered rather than declared for that reason.
+    (
+        "crates/hort-adapters-postgres/src/repository_inventory_reader.rs",
+        1,
+        1,
+        1,
+        0,
+    ),
 ];
 
 /// The total number of literals the scan found at introduction. A floor,
 /// not an equality: a new reader is expected and is already covered by the
 /// main assertion, whereas a *shrinking* corpus means the scan stopped
 /// seeing things. [`CENSUS`] is what pins the per-file detail.
-const CENSUS_FLOOR: usize = 48;
+const CENSUS_FLOOR: usize = 50;
 
 // ---------------------------------------------------------------------------
 // The property.
@@ -603,10 +635,10 @@ fn the_corrected_defects_carry_the_predicate_in_their_sql() {
         checked += 1;
     }
     assert_eq!(
-        checked, 4,
-        "expected to check the 4 corrected statements (the curation queue's \
-         listing with its CTE, both rescan sweeps, the patch-candidate \
-         listing); checked {checked}"
+        checked, 5,
+        "expected to check the 5 statements in the corrected files (the curation \
+         queue's listing with its CTE, all three rescan-candidate sweeps, the \
+         patch-candidate listing); checked {checked}"
     );
 }
 
@@ -645,7 +677,7 @@ fn stripping_the_predicate_from_a_corrected_statement_trips_the_guard() {
         );
         flipped += 1;
     }
-    assert_eq!(flipped, 4, "expected 4 corrected statements, saw {flipped}");
+    assert_eq!(flipped, 5, "expected 5 corrected statements, saw {flipped}");
 }
 
 /// At least one statement passes through the marker, not the predicate.

@@ -242,6 +242,7 @@ async fn a_clean_last_scan_reads_as_no_findings() {
 
     // And the security-driven predicates that read this list do not fire.
     let inputs = EvaluationInputs {
+        held_state_entry: None,
         now,
         created_at: now - Duration::hours(10),
         last_downloaded_at: None,
@@ -303,6 +304,7 @@ async fn a_retracted_fix_availability_stops_matching() {
     assert!(findings[0].fixed_versions.is_empty());
 
     let inputs = EvaluationInputs {
+        held_state_entry: None,
         now,
         created_at: now - Duration::hours(10),
         last_downloaded_at: None,
@@ -363,6 +365,7 @@ async fn the_last_scans_proper_subset_is_the_answer() {
     assert_eq!(findings[0].vulnerability_id, "CVE-B");
 
     let inputs = EvaluationInputs {
+        held_state_entry: None,
         now,
         created_at: now - Duration::hours(10),
         last_downloaded_at: None,

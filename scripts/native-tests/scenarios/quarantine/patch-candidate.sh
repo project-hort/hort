@@ -14,7 +14,7 @@
 #      → assert exactly one candidate row matching the seeded pair
 #        (vulnerable=pkg@1.0, quarantined=pkg@1.1, severity="high",
 #         finding count=1).
-#   5. `hort-cli curation waive <pkg@1.1 id>
+#   5. `hort-cli curation waive artifact <pkg@1.1 id>
 #         --justification "patch-candidate smoke release"` → assert exit 0.
 #   6. Assert artifacts.quarantine_status='released' for pkg@1.1.
 #   7. Assert the latest `ArtifactReleased` event on the
@@ -448,25 +448,25 @@ else
 fi
 
 # -----------------------------------------------------------------------------
-# [4/5] hort-cli curation waive <Q_ID> --justification ...
+# [4/5] hort-cli curation waive artifact <Q_ID> --justification ...
 # -----------------------------------------------------------------------------
-# `curation waive` is the one manual release (ADR 0007, "One authority
+# `curation waive artifact` is the one manual release (ADR 0007, "One authority
 # owns the manual release"); it is gated by `Permission::Curate` OR
 # `Permission::Admin`, so the admin OIDC token this smoke already holds
 # passes the gate unchanged.
 
 log ""
-log "--> [4/5] hort-cli curation waive ${Q_ID} --justification '${JUSTIFICATION}'"
+log "--> [4/5] hort-cli curation waive artifact ${Q_ID} --justification '${JUSTIFICATION}'"
 
 REL_OUT=""
 REL_RC=0
-REL_OUT="$("$HORT_CLI" curation waive "$Q_ID" \
+REL_OUT="$("$HORT_CLI" curation waive artifact "$Q_ID" \
     --justification "$JUSTIFICATION" \
     --output json 2>&1)" || REL_RC=$?
 if [ "$REL_RC" -eq 0 ]; then
-    pass "hort-cli curation waive exits 0"
+    pass "hort-cli curation waive artifact exits 0"
 else
-    fail "hort-cli curation waive exits 0" \
+    fail "hort-cli curation waive artifact exits 0" \
         "exit=${REL_RC}, output: ${REL_OUT}"
     summary
 fi

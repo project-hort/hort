@@ -3,8 +3,9 @@
 # scripts/native-tests/scenarios/quarantine/trivy-oci-not-applicable.sh .
 #
 # Distinct from the other hosted OCI fixtures on purpose:
-#   - oci-e2e is permissive (no scanning posture),
-#   - oci-quarantine-e2e holds on a 24h timer with `scanBackends: []`
+#   - oci-e2e opts out of the hold entirely (`quarantineDuration: 0s`), so
+#     its rows never enter an observation window to come out of,
+#   - oci-quarantine-e2e holds on a 24h timer that outlasts any smoke run
 #     (its push-under-quarantine scenario depends on the hold never
 #     lifting),
 # and neither can express "the scan runs, every row completes, and the

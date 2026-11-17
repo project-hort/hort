@@ -32,7 +32,8 @@ Every registered `TaskHandler` in `crates/hort-app/src/task_handlers/`:
 `prefetch-ingest`, `prefetch-dependencies`, `staging-sweep`,
 `service-account-rotation`, `prefetch-tick`, `replay-seen-prune`,
 `scan-row-retention-sweep`, `oci-membership-edge-backfill`,
-`oci-index-child-ingest`, `jobs-row-retention-sweep`.
+`oci-index-child-ingest`, `jobs-row-retention-sweep`,
+`api-token-retention-sweep`.
 
 ## Entrypoint
 

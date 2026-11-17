@@ -38,6 +38,15 @@
 //!    rather than silently applying the last value (strictly stricter,
 //!    and the clearest reason to have made the move);
 //! 2. `quotaBytes: 1_000` parses as `1000`;
+//!
+//! `quotaBytes` appears throughout as the repository spec's only
+//! top-level `Option<i64>` field, which makes it this file's probe for
+//! how the parser resolves an **integer** scalar. The field itself is
+//! retired — an apply declaring it is refused
+//! (`hort_config::desired::validate_repository_quota_bytes_retired`) —
+//! so nothing here is a claim about quotas; it is a claim about `i64`
+//! resolution, and a change that drops the field from the spec needs
+//! another typed integer to stand in its place.
 //! 3. **numeric** scalars in an untyped position are YAML-resolved
 //!    (`1_000` → `1000`, `0755` → `755.0`) rather than staying text —
 //!    boolean words there still stay text, because strict booleans reach
@@ -462,14 +471,14 @@ fn a_yaml_1_1_boolean_word_in_a_string_field_stays_verbatim() {
 /// A leading-zero integer is rejected into `i64` — it is **not** read as
 /// octal — and kept verbatim in a string field. Explicit `0o` / `0x`
 /// prefixes do resolve. The rejection is the load-bearing half: a
-/// legacy-octal reading would turn a 755-byte quota into 493 with no
-/// error anywhere.
+/// legacy-octal reading would silently hand an `i64` spec field 493
+/// where the operator wrote 755, with no error anywhere.
 #[test]
 fn a_leading_zero_integer_is_rejected_into_i64_and_kept_verbatim_in_a_string() {
     let numeric = repository("  quotaBytes: 0755\n");
     assert!(
         through_entry_point(parse_repository, &numeric).is_err(),
-        "a legacy-octal reading would turn 755 bytes into 493"
+        "a legacy-octal reading would hand the field 493 for a written 755"
     );
 
     let textual = repository("  description: 0755\n");
@@ -498,8 +507,7 @@ fn a_leading_zero_integer_is_rejected_into_i64_and_kept_verbatim_in_a_string() {
 /// `quotaBytes: 1_000` is 1000. There is no option that restores the
 /// rejection this tree used to answer with, so this is one of the two
 /// loosenings the parser swap took deliberately: the field is typed, the
-/// operator meant 1000, and the value they get is the value the grouping
-/// spells. Pinned so the acceptance is a stated answer rather than an
+/// grouping spells 1000, and 1000 is what the field gets. Pinned so the acceptance is a stated answer rather than an
 /// accident of a default.
 #[test]
 fn a_digit_separator_is_accepted_as_the_grouped_number() {

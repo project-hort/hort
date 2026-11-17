@@ -18,11 +18,11 @@
 //!
 //! Neither subcommand introduces authority. Both go through the existing
 //! `POST /api/v1/admin/tasks/retention-evaluate`, which gates on
-//! `Permission::AdminTaskInvoke` and — for `mode=execute` only — the
-//! `task:destructive` claim. A fresh IdP-backed admin `CliSession`
-//! already carries both; a session without the destructive claim can
-//! still run `preview` and will be refused at `apply`'s execute step by
-//! the server, which is exactly the intended split.
+//! `Permission::AdminTaskInvoke` and — for `mode=execute` only —
+//! `Permission::DestroyContent`. The second is **not** implied by being
+//! an admin: it is held through an explicit grant, so a session without
+//! that grant can still run `preview` and will be refused at `apply`'s
+//! execute step by the server, which is exactly the intended split.
 //!
 //! # Dep-graph invariant
 //!
@@ -60,6 +60,18 @@ const READ_LATER_COMMAND: &str = "hort-cli admin task get";
 /// The exact command line that reads `job_id` later.
 pub fn read_later_command(job_id: &str) -> String {
     format!("{READ_LATER_COMMAND} {job_id}")
+}
+
+/// The same command in the form that prints the whole result.
+///
+/// What a sweep leaves behind is a document, not a field: a dry run's
+/// `result_summary` carries its full `groups` and `sample` arrays. The
+/// table form of `admin task get` shows a readable prefix of it and
+/// names this flag; recommending the table form to someone who is
+/// waiting specifically for that document would send them to the one
+/// rendering that cannot show it.
+pub fn read_later_command_lossless(job_id: &str) -> String {
+    format!("{} --output json", read_later_command(job_id))
 }
 
 // ---------------------------------------------------------------------------
@@ -131,8 +143,8 @@ pub enum RetentionCommand {
     /// `--from-preview <task_job_id>` that fresh preview is compared
     /// against the earlier one you name, and any difference must be
     /// confirmed separately — a proposal you read an hour ago is not
-    /// the one that would run now. Requires the `task:destructive`
-    /// claim, which a fresh admin `CliSession` carries.
+    /// the one that would run now. Requires the `destroy_content`
+    /// permission, held through an explicit grant.
     Apply(apply::ApplyArgs),
 }
 
@@ -291,7 +303,13 @@ fn finish(row: TaskRow, deduplicated: bool) -> Result<FinishedSweep> {
 /// Render the "the job is still running" outcome in both output modes.
 ///
 /// Never reports a result: it says what the CLI last saw, names the job,
-/// and names the command that reads it later.
+/// and names the command that reads it later. The human hint names the
+/// lossless form of that command, because what is being waited for is a
+/// document; `read_later_with` is a wire field and stays the bare
+/// command, so the two spellings below are deliberate.
+///
+/// This is the only place either subcommand renders that hint — `apply`
+/// calls it for both of its timeout points.
 pub fn render_still_running(
     command: &str,
     job_id: &str,
@@ -316,11 +334,12 @@ pub fn render_still_running(
              last seen as        {}\n  \
              waited              {}s\n{}\n  \
              The sweep was not cancelled and nothing here reports its outcome.\n  \
-             Read it when it finishes:\n\n    {}\n",
+             Read it when it finishes — the result is a document, so read it as JSON:\
+             \n\n    {}\n",
             last_status,
             waited.as_secs(),
             note.map(|n| format!("\n  {n}\n")).unwrap_or_default(),
-            read_later_command(job_id),
+            read_later_command_lossless(job_id),
         ),
     }
 }
@@ -436,8 +455,9 @@ mod tests {
         assert!(rendered.contains("STILL RUNNING"), "{rendered}");
         assert!(rendered.contains("job-7"), "{rendered}");
         assert!(
-            rendered.contains("hort-cli admin task get job-7"),
-            "{rendered}"
+            rendered.contains("hort-cli admin task get job-7 --output json"),
+            "the hint names the form that shows the whole result, not the \
+             table form that can only show a prefix of it:\n{rendered}"
         );
         assert!(
             !rendered.contains("expired"),
@@ -473,7 +493,24 @@ mod tests {
         assert_eq!(parsed["task_job_id"], "job-7");
         assert_eq!(parsed["last_observed_status"], "pending");
         assert_eq!(parsed["waited_seconds"], 5);
+        // The wire field is unchanged: `--output json` is the lossless
+        // path and its documents are a contract, so the flag the human
+        // hint gained does not reach this value.
         assert_eq!(parsed["read_later_with"], "hort-cli admin task get job-7");
         assert_eq!(parsed["note"], "the execution was started");
+    }
+
+    /// The two forms of the hint are one command plus a flag, so neither
+    /// the command nor the job id can drift between them.
+    #[test]
+    fn the_lossless_hint_is_the_bare_command_plus_the_flag() {
+        assert_eq!(
+            read_later_command_lossless("job-7"),
+            "hort-cli admin task get job-7 --output json"
+        );
+        assert!(
+            read_later_command_lossless("job-7").starts_with(&read_later_command("job-7")),
+            "one spelling of the command, not two"
+        );
     }
 }

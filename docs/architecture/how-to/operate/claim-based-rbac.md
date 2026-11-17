@@ -320,7 +320,7 @@ visibly opted out in audited gitops config. CI fails on `reject`.
 |---|---|---|
 | `single-claim-grant` | A `Claims(_)` grant whose `required_claims` has exactly one element, and that claim is **not** in `single_claim_allowlist`. | **`reject`** — the allowlist is the opt-out |
 | `wildcard-repo-non-admin` | A `Claims(_)` grant with no `repository` (global) and `permission != admin`. | **`reject`** |
-| `direct-user-grant-without-justification` | A `User(_)` grant with no justification annotation. | **`reject`** when `permission == admin` OR (global AND `permission ∈ {write, delete, admin_task_invoke, curate, prefetch}`); else **`warn`** |
+| `direct-user-grant-without-justification` | A `User(_)` grant with no justification annotation. | **`reject`** when `permission == admin` OR (global AND `permission ∈ {write, delete, admin_task_invoke, curate, prefetch, destroy_content, destroy_record}`); else **`warn`** |
 | `claim-name-collision` | A `ClaimMapping` whose `claim` collides with a reserved name. | **`reject`** |
 
 > **Reserved-name note (as-built).** The reserved set the
@@ -343,6 +343,44 @@ visibly opted out in audited gitops config. CI fails on `reject`.
 > gitops-applied grant carries one, so that reading would make the
 > rule dead. The faithful reading exempts SA-owned grants and flags
 > hand-authored privileged `User` grants.
+
+> **The exemption stops at the two permissions no machine identity may
+> hold** — `admin` and `destroy_record`. An SA-owned `User`-subject
+> grant of either is denied the provenance exemption and rejects
+> exactly like the hand-authored form, which is what reaches the one
+> shape the `serviceAccount`-subject parse gate cannot see: a
+> hand-written `subject: { kind: user }` naming a service account's
+> *backing user* never passes through the `serviceAccount` arm at all.
+> `destroy_content` is **not** in that set — a machine identity may
+> hold it, and the shipped `cronjob-tasks` SA does.
+
+### Declaring the three permissions `admin` does not imply
+
+`read_metrics`, `destroy_content` and `destroy_record` are **admin-orthogonal**:
+an admin principal does not hold them implicitly, so each needs an explicit
+grant. The shape of that grant is constrained, and the constraint is a decision
+rather than an oversight — an authority binds to **one declared identity**, not
+to whoever currently carries a claim, because a claim's holder set is defined by
+the IdP and a group-membership change there would confer the authority silently
+([ADR 0052](../../../adr/0052-scoped-metrics-read-capability.md), carried to the
+destructive permissions by
+[ADR 0067](../../../adr/0067-destructive-authority-is-a-permission-split-by-reversibility.md)).
+
+So a repository-less `Claims` grant of any of the three **rejects**
+(`wildcard-repo-non-admin`), and that cannot be allowlisted away: a single-claim
+grant's opt-out is `singleClaimAllowlist`, and `admin` is a *forbidden*
+allowlist name. What works per permission:
+
+| Permission | Supported declaration |
+|---|---|
+| `read_metrics` | A `serviceAccount`-subject grant, repository-less — see [metrics-scraper-service-account](metrics-scraper-service-account.md). Metrics are instance-wide by nature, so there is no repository-scoped form. |
+| `destroy_content` | Instance-wide: a `serviceAccount`-subject grant (the shipped `cronjob-tasks` SA may hold it — see [enable-admin-task-cronjobs](../deploy/enable-admin-task-cronjobs.md)). Per repository: a repository-scoped grant in **either** subject form, lint-clean with no downgrade, because `retention-evaluate` takes a `repository_id` and confines the run to it. |
+| `destroy_record` | **No lint-clean declaration exists today.** No service account may hold it (`SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS`), and a repository-scoped grant cannot authorize `eventstore-archive`, whose sweep has no repository dimension and whose gate therefore asks at `repository = None`. An operator who needs it takes the audited `PermissionGrantLintConfig` downgrade below, visible in the apply diff. ADR 0067 records that consequence deliberately rather than designing it away. |
+
+> A repository-scoped grant of a permission whose task has **no** repository
+> dimension is accepted at apply and authorizes nothing, because the gate asks
+> at `repository = None`. Today that is every destructive kind except
+> `retention-evaluate`. Scope a grant only where the task is scopable.
 
 **Tuning strictness.** Operators tune the linter **only** through
 explicit, audited gitops config — there is no env var and no global

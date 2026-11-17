@@ -39,6 +39,28 @@ pub struct CurationQueueEntry {
     /// Stored artifact path; identifies OCI blobs and manifests whose
     /// `version` is absent.
     pub path: String,
+    /// SHA-256 of the artifact's bytes, bare 64 lowercase hex — the same
+    /// spelling [`ContentHash`](crate::types::ContentHash) carries, and
+    /// the key a curation decision is addressed by: a curator decides
+    /// over bytes, so the row they decide from names them.
+    ///
+    /// Not an `Option`, and that is a schema fact rather than a
+    /// convenience: `artifacts.checksum_sha256` is
+    /// `character(64) NOT NULL`, so an absent digest is a state no row
+    /// can be in, and modelling one would push an unreachable arm into
+    /// every consumer down to the CLI.
+    pub checksum_sha256: String,
+    /// Mutable refs that currently point at those bytes within the
+    /// artifact's own repository — OCI tags and their per-format
+    /// equivalents. Empty when nothing points at them.
+    ///
+    /// **Display only: a tag is never an addressing key.** It is a
+    /// mutable pointer and can be moved to other bytes the moment after
+    /// a curator reviewed these, so a decision binds to
+    /// [`Self::checksum_sha256`] and the tag is only what a human
+    /// recognises the artifact by. Nothing in the filter, the query
+    /// predicate or any curation verb reads this field.
+    pub tags: Vec<String>,
     pub quarantine_status: QuarantineStatus,
     pub quarantine_window_start: Option<DateTime<Utc>>,
     /// Computed by the adapter from `(window_start, policy.duration)`

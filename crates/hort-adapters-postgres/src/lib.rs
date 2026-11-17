@@ -35,6 +35,11 @@ pub mod artifact_repo;
 // share one transaction, so neither can land without the other.
 pub mod authority_lifecycle;
 pub(crate) mod blob_lock;
+// Multi-row `INSERT` arity: PostgreSQL's per-statement bind-parameter
+// limit, and the chunking that keeps a projection write from reaching
+// it. Crate-internal — the limit is a Postgres wire-protocol fact and
+// must not cross the port boundary (ADR 0008).
+pub(crate) mod bulk_insert;
 pub mod claim_mapping_repo;
 // The constituent-deliverability read behind ADR 0062 on the OCI paths:
 // one statement that turns a manifest's closure into the strongest
@@ -73,6 +78,12 @@ pub mod event_chain_head_reader;
 pub mod event_chain_reader;
 pub mod event_repository_resolver;
 pub mod event_store;
+// The held-pending-signature overview and its drill-down — a NEW read
+// path with its own statements, deliberately not a widening of
+// `retention_candidate_reader`'s query. Invariant 1's GC protection and
+// the operator's view of the held set stay on separate code paths so a
+// change to one cannot silently be a change to the other.
+pub mod held_set_reader;
 pub mod jobs_repository;
 // The list-surface census behind ADR 0062's omission shape: one
 // recursive statement over the `content_references` membership
@@ -107,6 +118,13 @@ pub mod refcount_reconcile;
 pub mod replay_guard_repo;
 pub mod replay_seen_prune;
 pub mod repo_security_score_repository;
+// The per-repository live-catalog readout — rows, distinct contents and
+// the weight of those contents, in one set-based aggregate. Its own
+// statements rather than a widening of `held_set_reader`'s: that query
+// resolves a policy and a quarantine predicate, this one reads every
+// live row, and one query answering both would mean a change to either
+// question was silently a change to the other.
+pub mod repository_inventory_reader;
 pub mod repository_repo;
 pub mod repository_upstream_mapping_repo;
 pub mod rescan_candidates;

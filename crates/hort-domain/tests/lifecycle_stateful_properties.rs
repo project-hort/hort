@@ -145,7 +145,7 @@ use hort_domain::entities::artifact::{
 use hort_domain::entities::quarantine_transitions::{self, QuarantineEvent};
 use hort_domain::entities::scan_policy::{ProvenanceMode, SeverityThreshold};
 use hort_domain::events::{PolicyViolation, RejectionReason, ReleaseReason};
-use hort_domain::policy::ScanOutcome;
+use hort_domain::policy::{derive_quarantine_anchor, AnchorEvidence, DerivedAnchor, ScanOutcome};
 use hort_domain::ports::provenance::{
     IndeterminateReason, ProvenanceRejectReason, ProvenanceVerdict, SignerIdentity,
 };
@@ -175,6 +175,26 @@ fn future_deadline() -> DateTime<Utc> {
 
 fn past_deadline() -> DateTime<Utc> {
     base_time() - Duration::hours(1)
+}
+
+/// The derived anchor a re-entry resolves when the artifact's own mint
+/// instant is the only applicable age evidence — [`base_time`], since
+/// every artifact in this suite is minted there.
+///
+/// Built through the derivation because that is the only way to build a
+/// [`DerivedAnchor`] at all: its anchor is a private field, so no caller
+/// — here or in production — can hand `re_evaluate` an instant nothing
+/// derived, and a wall-clock reading cannot reach the anchor through the
+/// parameter.
+fn mint_anchor() -> DerivedAnchor {
+    derive_quarantine_anchor(&AnchorEvidence {
+        minted_at: base_time(),
+        window: Duration::zero(),
+        explicit_override: None,
+        first_seen_at: None,
+        trusted_upstream_published_at: None,
+        inherits_released_parent_trust: false,
+    })
 }
 
 fn fixed_hash() -> ContentHash {
@@ -469,6 +489,7 @@ fn perform(artifact: &mut Artifact, aux: &Aux, action: Action) -> bool {
                 base_time(),
                 aux.provenance_clearance(),
                 aux.curation_clearance(),
+                mint_anchor(),
             )
             .is_ok(),
         Action::ElapseWindow | Action::SetCurationBlocked(_) | Action::SetProvenanceMode(_) => {
@@ -776,6 +797,7 @@ fn run_walk(actions: &[Action]) {
                         base_time(),
                         aux.provenance_clearance(),
                         aux.curation_clearance(),
+                        mint_anchor(),
                     )
                     .is_ok();
                 assert!(
@@ -797,6 +819,7 @@ fn run_walk(actions: &[Action]) {
                         base_time(),
                         ProvenanceClearance::NotRequired,
                         aux.curation_clearance(),
+                        mint_anchor(),
                     )
                     .is_ok();
                 assert!(
@@ -1141,7 +1164,8 @@ fn re_evaluate_exhaustive_adr_0041_matrix() {
 
                     let expected =
                         expected_re_evaluate(reason.as_ref(), window_open, provenance, curation);
-                    let result = artifact.re_evaluate(base_time(), provenance, curation);
+                    let result =
+                        artifact.re_evaluate(base_time(), provenance, curation, mint_anchor());
 
                     match expected {
                         ReEvalOutcome::Denied => {

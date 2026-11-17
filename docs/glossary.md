@@ -16,6 +16,25 @@ alpha tag builds container images and a Helm chart, published to the
 **internal** registry only (never the public ghcr). See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D1, D2, D4.
 
+### Catalog weight (`live_primary_content_bytes`)
+
+What a repository's **served catalog** weighs: `size_bytes` summed over
+the *distinct* contents its live artifact rows name, each content counted
+once however many rows name it. Reported per repository by
+`GET /api/v1/admin/inventory`, and named at length because it is **not**
+disk usage. It is not additive across repositories (one stored content
+can be held by several of them, so adding the figures double-counts it
+and there is no per-repository physical ownership to report instead), it
+omits CAS-resident metadata and every other kind of referenced content,
+and it is not reclaimable space (a deleted artifact leaves the figure
+while its bytes stay resident until refcount-gated collection). Compare a
+repository against itself over time — that is what a retention
+before/after needs; do not plan capacity with it. The distinctness is on
+the **hash**, never on the size: two different contents can be exactly
+the same length. See [Rows are not bytes](#rows-are-not-bytes),
+[ADR 0054](adr/0054-content-level-age-evidence-anchors-quarantine.md) and
+[using-hort-cli-with-admin-ops.md](architecture/how-to/using-hort-cli-with-admin-ops.md).
+
 ### Closed
 
 The terminal state of an issue. Issues auto-close only on merge to the
@@ -34,37 +53,28 @@ for and removes packages an earlier one carries. See
 [ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
 and [Layer chain ID](#layer-chain-id-chainid).
 
-### Composite verdict mode (`compositeVerdictMode`)
+### Composite verdict mode (`compositeVerdictMode`) — retired
 
-A `ScanPolicy` field (`compositeVerdictMode: observed | promoted`) deciding
-whether a composed OCI image's scan verdict decides its **manifest's**
-release. The composition is assessed on every manifest scan either way and
-every assessment is recorded as a `composite_scan_observations` row; the
-field is what grants the verdict release authority. Under `observed` — the
-default, and the posture of any policy that omits the field — the manifest's
-own assessment is byte-for-byte what it would be with no composite path at
-all. Under `promoted` the composition's findings **are** the manifest row's
-and reach the release gate under the ordinary predicate, and a composition
-that could not be produced is an absent verdict that holds the manifest
-`scan_indeterminate`; an image index and an artifact manifest stay
-non-gating, having no composition to gate on. `promoted` is also what
-moves the obligation **off** the layers: an OCI blob's own filesystem
-findings stop deciding its release and a layer hort has no decoder for
-stops being withheld for that, since the composition that binds it is
-what assesses the filesystem (ADR 0064 D2). The findings stay in the
-record, a claim about the layer's *bytes* still blocks it, non-OCI
-formats are untouched whatever the field says, and an already-rejected
-layer is recovered only by an explicit curation re-evaluation. Distinct
-from
-[enforcement mode](#enforcement-mode) on both axes: that decides what a
-blocking verdict *does*, this decides *whose analysis* produced it, and
-unlike `enforcement` a change re-judges no existing population in either
-direction (promotion takes effect on each manifest's next scan). `promoted`
-with an empty `scanBackends` is an apply-time rejection. See
+A former `ScanPolicy` field (`compositeVerdictMode: observed | promoted`)
+deciding whether a composed OCI image's scan verdict decided its
+**manifest's** release. It is **retired**: the composed verdict now decides
+unconditionally, and a policy envelope declaring either value is refused at
+gitops apply. `observed`, the shipped default, withheld that authority —
+which left the composition assessed and recorded while deciding nothing, and
+a constituent hort could not analyse in isolation holding its manifest with
+no deadline and no authority that could ever clear it. What `promoted`
+granted is what the pipeline now does for every policy: the composition's
+findings **are** the manifest row's and reach the release gate under the
+ordinary predicate, a composition that could not be produced is an absent
+verdict that holds the manifest `scan_indeterminate`, an image index and an
+artifact manifest stay non-gating for want of a composition to gate on, and
+an OCI blob's own filesystem findings no longer decide its release. See
 [ADR 0064](adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
-D6 and
-[declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
-`kind: ScanPolicy`.
+D2, the migration notice in
+[`CHANGELOG.md`](../CHANGELOG.md), and
+[*The composed image is the scan unit*](architecture/explanation/scanning-pipeline.md#the-composed-image-is-the-scan-unit).
+Distinct from [enforcement mode](#enforcement-mode), which decides what a
+blocking verdict *does* and is **not** retired.
 
 ### Curator (`Permission::Curate`)
 
@@ -149,6 +159,59 @@ serves rather than one named repository — the RBAC evaluator treats a
 grant with no repository scope as matching every scope checked against
 it. See [declare-gitops-config.md](architecture/how-to/declare-gitops-config.md)
 `kind: PermissionGrant`.
+
+### Held set (held pending signature)
+
+The artifacts the release gate is holding **because an attestation it
+requires has not arrived**: `quarantined`, past the end of their
+observation window, under an effective `provenanceMode: required`, with
+no verified attestation recorded. A repository that resolves no policy
+has no deadline, so its artifacts are not in the set.
+
+Distinct from the three populations it is routinely confused with: an
+artifact still *inside* its window (young, not held), a `Rejected`
+artifact (a terminal verdict on the scan, curation or provenance axis —
+see [Terminal](#terminal-quarantine-status)) and a
+`scan_indeterminate` one. The hold is **indefinite** by decision: no
+timer resolves it, because no value a timer could carry is better than
+"wait". That decision is argued on the ground that the set and *its
+age* are visible, which is what the held-set overview
+(`GET /api/v1/admin/retention/{overview,held}`) exists to be. Split for
+operator action into the two
+[held-set buckets](#held-set-bucket-constituent--in-own-right). See
+[ADR 0039](adr/0039-keyed-provenance-verification.md) D4 and
+[curator-workflow.md](architecture/how-to/curator-workflow.md) §10.
+
+### Held-pending-signature candidate
+
+One row of the held-set **aggregate**, and the name is a precision
+rather than a hedge. The aggregate resolves the policy and the window
+expiry in SQL and stops: the provenance clearance verdict has exactly one
+implementation in hort, and a second copy inside a counting query is how
+two computations of one rule drift apart. So the count is a declared
+**superset** — it can include an artifact cleared moments ago and not
+yet swept — and the API field, the query and the docs all say
+`held_pending_signature_candidates` rather than naming it as the gate's
+decision. The drill-down beside it resolves every row through the one
+authority and *is* exact. See
+[curator-workflow.md](architecture/how-to/curator-workflow.md) §10.3.
+
+### Held-set bucket (`constituent` / `in_own_right`)
+
+The two halves of a repository's [held set](#held-set-held-pending-signature),
+split because the operator action differs rather than for presentation.
+A **`constituent`** is a config or layer blob whose only inbound
+`content_references` edges are its parent manifest's: a blob cannot carry
+its own attestation, so there is nothing to wait for on that row and the
+thing to fix is the parent. An **`in_own_right`** artifact could still
+acquire an attestation of its own. The rule has one definition in Rust
+(`is_parent_gated_blob_constituent_kinds`), whose two kind lists reach
+the aggregate as query parameters so SQL forms only the boolean; a
+DB-backed parity test drives both paths over the same kind sets. Not the
+same concept as a [signature constituent](#signature-constituent), which
+is a blob of a *signature* manifest. See
+[ADR 0039](adr/0039-keyed-provenance-verification.md) and
+[curator-workflow.md](architecture/how-to/curator-workflow.md) §10.1.
 
 ### In-UAT
 
@@ -237,6 +300,21 @@ staging. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D3, D5.
 suffix. A single promotion can batch-close many issues that had been
 resting in `ready-for-staging` / `in-uat`. See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D1, D5.
+
+### Rows are not bytes
+
+The reason every artifact-population figure hort reports carries a
+**distinct-content count** beside its row count. Content is stored by
+hash, so several artifact rows routinely point at one set of bytes: the
+first real retention dry run on a live instance reported 3 647 rows
+against 3 608 distinct contents. Neither number is reclaimable storage —
+the row count is not bytes, and the distinct-content count is not bytes
+you would get back either, because a held artifact's content may still be
+referenced by something being kept. What a disposal would free is
+answered by the content's reference count. See
+[ADR 0003](adr/0003-streaming-enforced-cas.md),
+[ADR 0054](adr/0054-content-level-age-evidence-anchors-quarantine.md) and
+[curator-workflow.md](architecture/how-to/curator-workflow.md) §10.4.
 
 ### Scan unit
 

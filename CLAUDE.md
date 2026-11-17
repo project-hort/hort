@@ -3,9 +3,9 @@
 Auto-generated from all feature plans. Last updated: 011
 
 ## Active Technologies
-- Rust 1.97+ (backend) + git2, axum
-- Rust 1.97+ + axum, sqlx, tokio, reqwest
-- Rust 1.97+ + axum, serde, serde_json
+- Rust 1.100+ (backend) + git2, axum
+- Rust 1.100+ + axum, sqlx, tokio, reqwest
+- Rust 1.100+ + axum, serde, serde_json
 - Planned, post-v1 (not wired into the build today — see
   `hort-formats/README.md`): wasmtime 21.0+, wasmtime-wasi, wit-bindgen,
   filesystem for WASM binaries. Format handlers are currently compiled-in
@@ -115,13 +115,13 @@ release gate.
 
 ## Code Style
 
-Rust 1.97+ with the following project configuration:
+Rust 1.100+ with the following project configuration:
 
 - **Line width:** 100 characters (see `rustfmt.toml`)
-- **MSRV:** 1.97.0 (see `.clippy.toml`)
+- **MSRV:** 1.100.0 (see `.clippy.toml`)
 - **`unsafe` is forbidden workspace-wide** via `[workspace.lints.rust] unsafe_code = "forbid"` in the root `Cargo.toml`. This cannot be overridden with `#[allow]` — it is a compile error. All dependencies that need `unsafe` handle it within their own crates; no application code in this workspace has a legitimate need for it. If a future edge case requires revisiting this, the change must be made in `Cargo.toml` and reviewed as a policy change.
 - **Clippy lints** are configured in `[workspace.lints.clippy]` in the root `Cargo.toml`. Every crate inherits these via `[lints] workspace = true`. Do not override workspace lints in individual crates without justification.
-- **Sonar quality gate** runs on pushes to `develop` and `main` — never on an MR or PR: GitLab's `quality:sonar` scans the in-cluster SonarQube, GitHub's `ci.yml` `sonarqube-cloud` job scans SonarQube Cloud, and each instance's own server-side gate (coverage and duplication on new code) decides the verdict. Per-change coverage and duplication are gated instead by the `coverage` job's own thresholds.
+- **Sonar quality gate** never runs on an MR or PR, and the two targets differ in which pushes they cover: GitLab's `quality:sonar` scans the in-cluster SonarQube on pushes to `develop` **and** `main`, while GitHub's `ci.yml` `sonarqube-cloud` job scans SonarQube Cloud on pushes to **`main` only** — that organization cannot read quality-gate data for a non-main branch, so a `develop` run uploads and then fails on the gate read, and the cloud project holds no `develop` analysis at all. Each instance's own server-side gate (coverage and duplication on new code) decides its verdict. Per-change coverage and duplication are gated instead by the `coverage` job's own thresholds.
 
 ### Test Coverage Tiers
 
@@ -168,7 +168,7 @@ Two tests sit outside all three modes and are worth knowing about as a reviewer:
 
 Either way every DB-backed test in the workspace runs against **one Postgres server** — inline `#[cfg(test)]` `--lib` tests *and* `crates/*/tests/` integration tests — and within a binary libtest runs tests on many threads at once. The `cargo test --tests` CI job (`test:integration`) builds the lib as a unittest target, so inline tests run there too.
 
-**What the key actually reaches, measured — and what that rests on.** The workspace declares `serial_test = "4"` with default features and `Cargo.lock` contains **no `fslock`**, so the `file_locks` feature is off and `#[serial(key)]` is a **process-local** lock (`once_cell` + `parking_lot`), not a file lock. It therefore orders tests **within one test binary** and nothing else. That is enough today only because cargo runs test binaries **strictly sequentially**: measured on the pinned toolchain (cargo 1.97.1, and again on 1.98.1), three targets sleeping 3 s each ran back to back — binary `a` ended at `…940.077247` and `b` started at `…940.078832`, 1.6 ms later, with no overlap. So the protection against cross-binary collision is a property of **the runner's scheduling**, not of the key: a file-local mutex would reach exactly as far. **`cargo nextest` runs test binaries in parallel by default** — adopting it would void this assumption silently, with every DB-backed test still wearing a key that no longer orders it against the binary next door. Any move to a parallel test runner has to re-establish cross-process serialization first (`serial_test`'s `file_locks` feature is the cheap route) and amend this section.
+**What the key actually reaches, measured — and what that rests on.** The workspace declares `serial_test = "4"` with default features and `Cargo.lock` contains **no `fslock`**, so the `file_locks` feature is off and `#[serial(key)]` is a **process-local** lock (`once_cell` + `parking_lot`), not a file lock. It therefore orders tests **within one test binary** and nothing else. That is enough today only because cargo runs test binaries **strictly sequentially**: measured on the pinned toolchain (cargo 1.100.0, and before it on 1.97.1 and 1.98.1), three targets sleeping 3 s each ran back to back — binary `a` ended at `…662.576817` and `b` started at `…662.581866`, 5.0 ms later, with no overlap. So the protection against cross-binary collision is a property of **the runner's scheduling**, not of the key: a file-local mutex would reach exactly as far. **`cargo nextest` runs test binaries in parallel by default** — adopting it would void this assumption silently, with every DB-backed test still wearing a key that no longer orders it against the binary next door. Any move to a parallel test runner has to re-establish cross-process serialization first (`serial_test`'s `file_locks` feature is the cheap route) and amend this section.
 
 **Therefore: every test in the workspace that acquires a real Postgres connection — whatever the crate, and whether it reaches the server through `maybe_pool()` / `shared_migrated_pool()` / `connect_or_panic()` or through a hand-rolled `PgPool::connect` — MUST carry the workspace-wide `#[serial(hort_pg_db)]` key.** A DB-gated test without it is a **blocking review finding**: it silently reintroduces the identity-shifting flake fixed in `ed79360a`. The rationale is crate-agnostic, and the old crate-scoped wording is exactly how 29 `hort-server` / `hort-worker` tests ran unkeyed for as long as they did.
 

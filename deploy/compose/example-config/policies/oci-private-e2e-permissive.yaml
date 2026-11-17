@@ -14,5 +14,13 @@ spec:
   quarantineDuration: 0s
   requireApproval: false
   provenanceMode: off
-  scanBackends: []
+  # `enforcement: record` — a Trivy verdict is recorded, never gating. What
+  # this fixture asserts must not depend on which CVEs an upstream tag
+  # happens to carry on the day the suite runs, only on whether each row got
+  # a completed assessment at all. Omitting the field is the opposite
+  # posture, not a quieter one: it inherits the enforcing default, and this
+  # policy scans, so a `critical` finding would reject the image and answer
+  # `403` to the reader's pull — the capability proof this scenario exists
+  # for.
+  enforcement: record
   licensePolicy: {}

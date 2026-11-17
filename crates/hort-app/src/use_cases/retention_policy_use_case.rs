@@ -52,6 +52,7 @@
 //! breadcrumb (`RetentionEvaluateHandler`), NOT these lifecycle
 //! mutations.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -66,7 +67,7 @@ use hort_domain::ports::retention_policy_projection_repository::{
     RetentionPolicyProjectionRepository, RetentionPolicyRow,
 };
 use hort_domain::retention::{
-    PolicyPredicate, RetentionPolicy, RetentionPolicyEvent, RetentionScope,
+    HeldState, PolicyPredicate, RetentionPolicy, RetentionPolicyEvent, RetentionScope,
 };
 
 use crate::append_conflict::{append_with_conflict_retry, ConflictCycleOutcome};
@@ -79,6 +80,12 @@ pub struct CreateRetentionPolicyCommand {
     pub name: String,
     pub predicate: PolicyPredicate,
     pub scope: RetentionScope,
+    /// The held quarantine states this policy may expire an artifact
+    /// out of — empty unless the operator says otherwise. Validated
+    /// against the predicate by `RetentionPolicyEvent::validate`
+    /// before the append: a non-empty opt-in requires a predicate
+    /// whose every successful branch carries a positive age bound.
+    pub held_states: BTreeSet<HeldState>,
 }
 
 /// Command to replace an existing retention policy's predicate +
@@ -90,6 +97,10 @@ pub struct UpdateRetentionPolicyCommand {
     pub policy_id: Uuid,
     pub predicate: PolicyPredicate,
     pub scope: RetentionScope,
+    /// The replacement held-state opt-in, re-stated wholesale with the
+    /// predicate and the scope. An update that names no state clears
+    /// the opt-in.
+    pub held_states: BTreeSet<HeldState>,
 }
 
 /// How many read-decide-append attempts one retention-policy mutation
@@ -344,6 +355,7 @@ impl RetentionPolicyUseCase {
             name: cmd.name.clone(),
             predicate: cmd.predicate.clone(),
             scope: cmd.scope.clone(),
+            held_states: cmd.held_states.clone(),
             created_at: now,
         };
         // Domain-validate before the append (defence in depth — the
@@ -369,6 +381,7 @@ impl RetentionPolicyUseCase {
             name: cmd.name,
             predicate: cmd.predicate,
             scope: cmd.scope,
+            held_states: cmd.held_states,
             archived: false,
             stream_version: result.stream_position,
             last_evaluated_at: None,
@@ -451,13 +464,17 @@ impl RetentionPolicyUseCase {
                     ))
                     .into());
                 }
-                if state.predicate == cmd.predicate && state.scope == cmd.scope {
+                if state.predicate == cmd.predicate
+                    && state.scope == cmd.scope
+                    && state.held_states == cmd.held_states
+                {
                     return Ok(None);
                 }
                 Ok(Some(RetentionPolicyEvent::Updated {
                     id: cmd.policy_id,
                     predicate: cmd.predicate.clone(),
                     scope: cmd.scope.clone(),
+                    held_states: cmd.held_states.clone(),
                     updated_at: Utc::now(),
                 }))
             })

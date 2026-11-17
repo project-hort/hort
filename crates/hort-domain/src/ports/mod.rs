@@ -21,10 +21,11 @@ pub mod authority_lifecycle;
 pub mod checkpoint_anchor;
 pub mod checkpoint_emitter;
 pub mod claim_mapping_repository;
-// The shadow composite-scan observation projection (ADR 0064 D6): the
-// durable evidence an operator promotes the composed verdict on. A
+// The composite-scan observation projection (ADR 0064 D2): the durable
+// per-manifest record of what assessing the composition contributed. A
 // projection and not an event, because the artifact's event stream is
-// where release authority is derived from.
+// where release authority is derived from, and this row is that verdict
+// written a second time.
 pub mod composite_scan_observation;
 pub mod constituent_status;
 pub mod content_reference_index;
@@ -43,6 +44,10 @@ pub mod event_repository_resolver;
 pub mod event_store;
 pub mod federated_jwt_validator;
 pub mod format_handler;
+// The operator-facing view of the set the release gate holds pending a
+// signature. ADR 0039 D4 declines to deadline that hold and argues it on
+// the ground that the set and its age are visible; this is that read.
+pub mod held_set_reader;
 // `group_mapping_repository` / `role_repository` are retired
 // (replaced by `claim_mapping_repository` / `permission_grant_repository`,
 // registered above / below — ADR 0012).
@@ -80,6 +85,11 @@ pub mod refcount_reconcile;
 pub mod replay_guard;
 pub mod replay_seen_prune;
 pub mod repo_security_score_repository;
+// The per-repository live-catalog readout: rows, distinct contents, and
+// the weight of those contents. Its own port rather than a widening of
+// `held_set_reader` — a different question over a different population
+// (every live row, no policy resolution, no quarantine predicate).
+pub mod repository_inventory_reader;
 pub mod repository_repository;
 pub mod repository_upstream_mapping_repository;
 pub mod rescan_candidates;

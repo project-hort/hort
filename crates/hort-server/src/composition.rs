@@ -20,6 +20,7 @@ use hort_adapters_postgres::curation_decisions_repository::PgCurationDecisionsRe
 use hort_adapters_postgres::curation_exclusions_repository::PgCurationExclusionsRepository;
 use hort_adapters_postgres::curation_queue_repository::PgCurationQueueRepository;
 use hort_adapters_postgres::curation_rule_repo::PgCurationRuleRepository;
+use hort_adapters_postgres::held_set_reader::PgHeldSetReader;
 use hort_adapters_postgres::jobs_repository::PgJobsRepository;
 use hort_adapters_postgres::oidc_issuer_repo::PgOidcIssuerRepository;
 use hort_adapters_postgres::patch_candidate_repo::PgPatchCandidateRepository;
@@ -28,6 +29,7 @@ use hort_adapters_postgres::policy_projection_repo::PgPolicyProjectionRepository
 use hort_adapters_postgres::ref_lifecycle::PgRefLifecycle;
 use hort_adapters_postgres::ref_registry_repo::PgRefRegistry;
 use hort_adapters_postgres::repo_security_score_repository::PgRepoSecurityScoreRepository;
+use hort_adapters_postgres::repository_inventory_reader::PgRepositoryInventoryReader;
 use hort_adapters_postgres::repository_repo::PgRepositoryRepository;
 use hort_adapters_postgres::repository_upstream_mapping_repo::PgRepositoryUpstreamMappingRepo;
 use hort_adapters_postgres::subscription_repo::PgSubscriptionRepository;
@@ -44,6 +46,7 @@ use hort_app::use_cases::content_reference::ContentReferenceUseCase;
 use hort_app::use_cases::curation_use_case::CurationUseCase;
 use hort_app::use_cases::effective_permissions_use_case::EffectivePermissionsUseCase;
 use hort_app::use_cases::effective_repository_config_use_case::EffectiveRepositoryConfigUseCase;
+use hort_app::use_cases::held_set_use_case::HeldSetUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::manual_rescan_use_case::ManualRescanUseCase;
 use hort_app::use_cases::oci_index_child_enqueue::OciIndexChildEnqueueUseCase;
@@ -51,6 +54,7 @@ use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
 use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
 use hort_app::use_cases::patch_candidate_use_case::PatchCandidateUseCase;
 use hort_app::use_cases::provenance_misrejection_repair::ProvenanceMisrejectionRepairUseCase;
+use hort_app::use_cases::repository_inventory_use_case::RepositoryInventoryUseCase;
 use hort_app::use_cases::scanner_worker_query_use_case::ScannerWorkerQueryUseCase;
 // `PolicyUseCase` is exposed on `AppContext` for
 // the HTTP exclusion write surface
@@ -76,6 +80,7 @@ use hort_app::use_cases::event_visibility::EventVisibilityUseCase;
 use hort_app::use_cases::list_deliverability::ListDeliverabilityUseCase;
 use hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase;
 use hort_app::use_cases::promotion_use_case::PromotionUseCase;
+use hort_app::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::rbac_resolve_use_case::RbacResolveUseCase;
 use hort_app::use_cases::ref_use_case::RefUseCase;
@@ -2883,6 +2888,18 @@ pub async fn build_app_context(
     // expiry backstop. Single Arc shared with `IngestUseCase` +
     // `TaskUseCase` + `ManualRescanUseCase` below.
     let jobs_repo = Arc::new(PgJobsRepository::new(db.clone()));
+    // The one quarantine-anchor assembly every hold path shares (ADR
+    // 0054): the artifact's age evidence, resolved from the ports rather
+    // than from whatever instant the run that took the hold happened to
+    // observe. Threaded into every use case below that returns an
+    // artifact to the hold, so one artifact gets one anchor whichever
+    // path puts it there.
+    let anchor_resolver = Arc::new(QuarantineAnchorResolver::new(
+        artifact_repo.clone(),
+        content_references.clone(),
+        policy_projections.clone(),
+        repository_upstream_mappings.clone(),
+    ));
     let quarantine_use_case = Arc::new(
         QuarantineUseCase::new(
             artifact_repo.clone(),
@@ -2900,6 +2917,7 @@ pub async fn build_app_context(
             // final `provenance-verify` for Required + Pending + expired
             // candidates via this handle.
             jobs_repo.clone(),
+            anchor_resolver.clone(),
         )
         // Inject the upstream-index cache
         // invalidator. The post-`record_scan_result` Reject-branch
@@ -3259,6 +3277,36 @@ pub async fn build_app_context(
     let patch_candidate_repo = Arc::new(PgPatchCandidateRepository::new(db.clone()));
     let patch_candidate_use_case = Arc::new(PatchCandidateUseCase::new(patch_candidate_repo));
 
+    // `HeldSetUseCase` for the held-pending-signature overview
+    // (`GET /api/v1/admin/retention/{overview,held}`) — the surface
+    // ADR 0039 D4 names when it declines to deadline an unsigned hold.
+    //
+    // Its own reader and its own statements, deliberately NOT a widening
+    // of `PgRetentionCandidateReader`: the GC protection of invariant 1
+    // and the operator's view of the held set stay on separate code
+    // paths, so a change to one cannot silently be a change to the
+    // other. The event store and the policy projections come in because
+    // the drill-down re-decides every row through the one provenance
+    // authority in `hort-app` rather than trusting the SQL superset.
+    let held_set_reader = Arc::new(PgHeldSetReader::new(db.clone()));
+    let held_set_use_case = Arc::new(HeldSetUseCase::new(
+        held_set_reader,
+        event_publisher.clone(),
+        policy_projections.clone(),
+    ));
+
+    // `RepositoryInventoryUseCase` for the per-repository live-catalog
+    // readout (`GET /api/v1/admin/inventory`) — the measurement a
+    // retention before/after needs, which nothing in the product
+    // answered until this surface existed.
+    //
+    // One port and nothing else: the readout resolves no policy and
+    // reads no event stream, which is what keeps it a different
+    // question from the held-set overview rather than a widening of it.
+    let repository_inventory_use_case = Arc::new(RepositoryInventoryUseCase::new(Arc::new(
+        PgRepositoryInventoryReader::new(db.clone()),
+    )));
+
     // `ScannerWorkerQueryUseCase` for the admin `GET /admin/workers`
     // endpoint. Wires the READ side of the `scanner_registry`
     // worker-coordination table — the consumer for the worker heartbeat
@@ -3567,6 +3615,7 @@ pub async fn build_app_context(
             // re-evaluation pass use, because that kind is an input to the
             // verdict it re-derives (ADR 0064 D2).
             hort_formats::compiled_in_format_handlers(),
+            anchor_resolver.clone(),
         )
         // Inject the upstream-index cache
         // invalidator. The post-`block_one` hook calls it best-effort
@@ -3587,6 +3636,7 @@ pub async fn build_app_context(
             artifact_repo.clone(),
             lifecycle.clone(),
             curation_queue_repo,
+            anchor_resolver.clone(),
         ));
 
     // `PolicyUseCase` for the HTTP exclusion
@@ -3627,6 +3677,8 @@ pub async fn build_app_context(
         // the scan run uses, so the re-derived verdict reads the row's
         // role the way the scan read it (ADR 0064 D2).
         hort_formats::compiled_in_format_handlers(),
+        // The same anchor assembly every other hold path above takes.
+        anchor_resolver.clone(),
     ));
 
     // `WheelMetadataUseCase`. Composed over the
@@ -3720,6 +3772,8 @@ pub async fn build_app_context(
         task_use_case,
         manual_rescan_use_case,
         patch_candidate_use_case,
+        held_set_use_case,
+        repository_inventory_use_case,
         scanner_worker_query_use_case,
         effective_repository_config_use_case,
         gitops_apply_status: Arc::new(ArcSwap::from_pointee(gitops_apply_status)),
@@ -5176,7 +5230,7 @@ mod tests {
         // change here rather than only in the catalog.
         assert_eq!(
             KIND_SERIES.len() * TaskTier::ALL.len(),
-            26 * 3,
+            27 * 3,
             "the per-kind series are bounded by every value `jobs.kind` can hold \
              (EVENT_TASK_KINDS, held against the column's CHECK by \
              task_kind_check_lockstep_guard) times the three classes"
@@ -5928,8 +5982,8 @@ mod tests {
         archived: bool,
     ) -> hort_domain::entities::scan_policy::ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-            ScanPolicyProjection, SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+            SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
@@ -5949,7 +6003,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),

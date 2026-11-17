@@ -17,9 +17,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use hort_domain::entities::artifact::{is_scan_clearable, ProvenanceClearance};
-use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, ScanPolicyProjection,
-};
+use hort_domain::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
 use hort_domain::events::RejectionReason;
 use hort_domain::policy::{
     decide_rejected_transition, effective_quarantine_deadline, ReEvaluationOutcome,
@@ -89,16 +87,6 @@ pub(crate) enum RejectedDerivation {
 /// [`scan_kind_of`](crate::use_cases::scan_kind_resolution::scan_kind_of)
 /// — the role half of ADR 0064 D2's line.
 ///
-/// `composite_verdict` is **chosen by the caller, not resolved here**,
-/// and it is the one input on which this module's two callers
-/// deliberately differ (ADR 0064 D6): the automatic loosening pass of
-/// the policy-mutation walk pins [`CompositeVerdictMode::Observed`] so a
-/// promotion never un-rejects a terminal constituent by itself, while the
-/// curator's explicit single-artifact re-evaluation passes the resolved
-/// posture, because that is the operator-driven recovery D6 points at.
-/// Each caller states its choice and its reason where it makes it; see
-/// [`decide_rejected_transition`]'s module docs for the full argument.
-///
 /// `Err` only when the paired stream breached the event cap, so the
 /// evidence cannot be read to its tail and no verdict may be derived
 /// from the prefix.
@@ -108,7 +96,6 @@ pub(crate) async fn derive_rejected_outcome(
     policy: Option<&ScanPolicyProjection>,
     exclusions: &[ExclusionProjection],
     kind: ArtifactKind,
-    composite_verdict: CompositeVerdictMode,
     now: DateTime<Utc>,
 ) -> AppResult<RejectedDerivation> {
     let artifact = paired.artifact();
@@ -123,24 +110,34 @@ pub(crate) async fn derive_rejected_outcome(
         return Ok(RejectedDerivation::NoScanCompleted);
     };
 
-    // Per-finding rows when the blob resolved; otherwise the recorded
-    // aggregate, which `decide_rejected_transition` walks as-is.
+    // Per-finding rows when the blob resolved whole; otherwise the
+    // recorded aggregate, which `decide_rejected_transition` walks as-is.
     //
-    // The two kinds of absence collapse to one answer **here and only
-    // here**, and the `ScanCompleted` invariant is what makes that sound:
-    // a scan that recorded no blob has `finding_count == 0`, and the
-    // event's validator requires `finding_count` to equal the sum of the
-    // severity counts — so a genuine absence reaches the domain as an
-    // all-zero summary that walks to clean, while an unreadable blob
-    // reaches it with the counts its scan actually recorded. The summary
-    // distinguishes the cases, so this caller does not have to. The
-    // tighten direction has no such summary in its verdict input and must
-    // branch on the variant itself.
+    // The three kinds of unusable finding list collapse to one answer
+    // **here and only here**, and the `ScanCompleted` invariants are
+    // what make that sound: a scan that recorded no blob has
+    // `finding_count == 0`, and the event's validator requires
+    // `finding_count` to equal the sum of the severity counts — so a
+    // genuine absence reaches the domain as an all-zero summary that
+    // walks to clean, while an unreadable or truncated blob reaches it
+    // with the counts its scan actually recorded, which are of the
+    // complete set in both cases. The summary distinguishes them, so
+    // this caller does not have to. The tighten direction has no such
+    // summary in its verdict input and must branch on the variant
+    // itself.
+    //
+    // A truncated blob belongs on this arm rather than on the
+    // per-finding one precisely because this is the **loosen**
+    // direction: the per-finding arm exists so an exclusion can clear
+    // findings by CVE id, and over a subset it would clear the subset
+    // and release an artifact whose dropped findings name CVEs no
+    // exclusion was asked about.
     let evidence = scan_history::last_findings(stream, storage, artifact.id).await;
     let last_findings = match &evidence {
         scan_history::FindingsEvidence::Resolved(findings) => Some(findings.as_slice()),
         scan_history::FindingsEvidence::Absent
-        | scan_history::FindingsEvidence::Unreadable { .. } => None,
+        | scan_history::FindingsEvidence::Unreadable { .. }
+        | scan_history::FindingsEvidence::Truncated { .. } => None,
     };
 
     let quarantine_deadline = policy.and_then(|p| {
@@ -159,7 +156,6 @@ pub(crate) async fn derive_rejected_outcome(
         last_findings,
         policy,
         exclusions,
-        composite_verdict,
         quarantine_deadline,
         now,
     );

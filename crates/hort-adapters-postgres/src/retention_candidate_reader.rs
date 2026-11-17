@@ -30,6 +30,20 @@
 //!    would instead *drop* such a row silently, which is the shape this
 //!    adapter must not take.
 //!
+//! The optional `repository_id` scope (`$6`) sits in the `page` CTE
+//! beside the keyset bound, which is the only place it belongs: `page`
+//! is what `LIMIT`s, so confining it there spends the bounded page on
+//! the scoped repository's rows instead of discarding most of a page
+//! after the fact — and a short page keeps meaning "the walk reached the
+//! end", which is what tells the handler its pass is complete.
+//! `sibling_groups` is derived from `page`, so the `KeepLastN` ranking
+//! follows the scope without a second predicate: a sibling group is
+//! `(repository_id, name)` and therefore never straddles two
+//! repositories, so a confined page touches exactly the groups it would
+//! have touched unconfined and each is ranked over the same rows. A
+//! second copy of the scope in `ranked` would be inert at best and, if
+//! the two ever disagreed, would rank a group over part of itself.
+//!
 //! The query additionally `JOIN`s `repositories r ON r.id =
 //! a.repository_id` to select `r.format::text` (aliased `repo_format`) — the
 //! required enum-to-text cast lets sqlx decode the per-artifact
@@ -143,8 +157,10 @@ use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::retention_candidate_reader::{
     RetentionCandidateReader, RetentionCandidateRow,
 };
+use hort_domain::retention::HeldState;
 
 use crate::mappers::ArtifactRow;
+use crate::quarantine_status_sql::quarantine_status_to_sql;
 use crate::{gc_protected_quarantine_status_names, map_sqlx_error, BoxFuture};
 
 /// PostgreSQL adapter for the retention candidate-enumeration query.
@@ -194,33 +210,48 @@ fn decode_candidate(row: &PgRow) -> DomainResult<RetentionCandidateRow> {
                 "retention_candidate resolved_rescan_interval_hours decode: {e}"
             ))
         })?;
-    // `ROW_NUMBER()` / `COUNT(*)` are `bigint`. A sibling group that
-    // overflowed `u32` is not reachable in this schema, but the
-    // conversion is still fallible, and the fallible direction is the
-    // safe one: `None` makes the pure evaluator fail `KeepLastN` shut
-    // rather than act on a truncated rank.
-    let rank_raw: i64 = row.try_get("keep_rank").map_err(|e| {
+    // `ROW_NUMBER()` / `COUNT(*)` are `bigint`, and both arrive as
+    // `NULL` for a candidate the `ranked` CTE does not cover — which is
+    // every **held** candidate the caller admitted, because `ranked`
+    // ranks *usable* siblings and a held artifact is not one. That is
+    // the intended reading, not a decode failure: a held candidate must
+    // reach age evaluation without occupying a `KeepLastN` slot, and an
+    // absent rank is exactly "occupies no slot".
+    //
+    // A sibling group that overflowed `u32` is not reachable in this
+    // schema, but the conversion is still fallible, and the fallible
+    // direction is the safe one: `None` makes the pure evaluator fail
+    // `KeepLastN` shut rather than act on a truncated rank. So both
+    // routes to `None` land on the same fail-safe.
+    let rank_raw: Option<i64> = row.try_get("keep_rank").map_err(|e| {
         tracing::warn!(error = %e, "retention_candidate keep_rank decode failed");
         DomainError::Invariant(format!("retention_candidate keep_rank decode: {e}"))
     })?;
-    let total_raw: i64 = row.try_get("usable_sibling_total").map_err(|e| {
+    let total_raw: Option<i64> = row.try_get("usable_sibling_total").map_err(|e| {
         tracing::warn!(error = %e, "retention_candidate usable_sibling_total decode failed");
         DomainError::Invariant(format!(
             "retention_candidate usable_sibling_total decode: {e}"
         ))
     })?;
-    let keep_rank = match (u32::try_from(rank_raw), u32::try_from(total_raw)) {
-        (Ok(rank), Ok(total)) => Some((rank, total)),
-        _ => {
-            tracing::warn!(
-                artifact_id = %artifact.id,
-                rank_raw,
-                total_raw,
-                "retention_candidate sibling ranking does not fit u32 — \
-                 reported as unresolved so KeepLastN fails safe"
-            );
-            None
+    let keep_rank = match (rank_raw, total_raw) {
+        (Some(rank_raw), Some(total_raw)) => {
+            match (u32::try_from(rank_raw), u32::try_from(total_raw)) {
+                (Ok(rank), Ok(total)) => Some((rank, total)),
+                _ => {
+                    tracing::warn!(
+                        artifact_id = %artifact.id,
+                        rank_raw,
+                        total_raw,
+                        "retention_candidate sibling ranking does not fit u32 — \
+                         reported as unresolved so KeepLastN fails safe"
+                    );
+                    None
+                }
+            }
         }
+        // Not a usable sibling (an admitted held candidate), or a rank
+        // the statement could not produce. Either way: no slot.
+        _ => None,
     };
     let tag_targeted: bool = row.try_get("tag_targeted").map_err(|e| {
         tracing::warn!(error = %e, "retention_candidate tag_targeted decode failed");
@@ -242,13 +273,28 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
         batch_size: u32,
         after: Option<Uuid>,
         now: DateTime<Utc>,
+        admit_held: &'a [HeldState],
+        repository_id: Option<Uuid>,
     ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
         Box::pin(async move {
+            // The stored spellings of the held states to admit, derived
+            // from the domain's own `HeldState::status()` and the one
+            // `quarantine_status` encoder, so the names this binds
+            // cannot drift from the names the column holds. Empty — the
+            // default and the steady state — makes the `= ANY($5)`
+            // disjunct below false for every row, so the enumeration is
+            // the pre-exception one.
+            let admit_held_names: Vec<String> = admit_held
+                .iter()
+                .filter_map(|s| quarantine_status_to_sql(s.status()))
+                .collect();
             tracing::debug!(
                 entity = "retention_candidate",
                 batch_size,
                 has_cursor = after.is_some(),
                 %now,
+                admit_held = ?admit_held_names,
+                repository_scope = ?repository_id,
                 "list_candidates"
             );
             // The LATERAL picks the resolved policy per artifact: a
@@ -271,9 +317,11 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                     SELECT a.id
                     FROM artifacts a
                     WHERE (a.quarantine_status IS NULL
-                           OR a.quarantine_status <> ALL($4::text[]))
+                           OR a.quarantine_status <> ALL($4::text[])
+                           OR a.quarantine_status = ANY($5::text[]))
                       AND a.deleted_at IS NULL
                       AND ($3::uuid IS NULL OR a.id > $3)
+                      AND ($6::uuid IS NULL OR a.repository_id = $6)
                     ORDER BY a.id
                     LIMIT $1
                 ),
@@ -315,7 +363,21 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                        {tag_targeted} AS tag_targeted
                 FROM page pg
                 JOIN artifacts a ON a.id = pg.id
-                JOIN ranked rk ON rk.id = a.id
+                -- LEFT, so an admitted held candidate survives the join
+                -- with a NULL rank. The `ranked` CTE above keeps its own
+                -- filter and its own meaning — it ranks *usable*
+                -- siblings, which a held artifact is not — and an INNER
+                -- join here would silently drop every held row the
+                -- `page` CTE just admitted, so widening the page alone
+                -- changes nothing observable. The decoder maps the NULL
+                -- to `keep_rank: None`, which occupies no `KeepLastN`
+                -- slot and fails that predicate shut.
+                --
+                -- Equivalent to the INNER join for every non-held
+                -- candidate: `ranked`'s predicate is the `page`
+                -- predicate minus the held disjunct, so a non-held page
+                -- row always has a `ranked` row.
+                LEFT JOIN ranked rk ON rk.id = a.id
                 JOIN repositories r ON r.id = a.repository_id
                 LEFT JOIN LATERAL (
                     SELECT pp.rescan_interval_hours
@@ -344,6 +406,8 @@ impl RetentionCandidateReader for PgRetentionCandidateReader {
                 .bind(now)
                 .bind(after)
                 .bind(gc_protected_quarantine_status_names())
+                .bind(&admit_held_names)
+                .bind(repository_id)
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| map_sqlx_error(&e, "RetentionCandidate", "list_candidates"))?;
@@ -512,7 +576,7 @@ mod tests {
         let mut cursor: Option<Uuid> = None;
         loop {
             let page = reader
-                .list_candidates(batch, cursor, Utc::now())
+                .list_candidates(batch, cursor, Utc::now(), &[], None)
                 .await
                 .expect("list candidates");
             if page.is_empty() {
@@ -539,7 +603,7 @@ mod tests {
 
     async fn candidate_ids(pool: PgPool) -> HashSet<Uuid> {
         PgRetentionCandidateReader::new(pool)
-            .list_candidates(1000, None, Utc::now())
+            .list_candidates(1000, None, Utc::now(), &[], None)
             .await
             .expect("list candidates")
             .into_iter()
@@ -587,12 +651,12 @@ mod tests {
         let reader = PgRetentionCandidateReader::new(pool);
         // No cursor.
         let none = reader
-            .list_candidates(1000, None, Utc::now())
+            .list_candidates(1000, None, Utc::now(), &[], None)
             .await
             .expect("query runs");
         // With a cursor (exercises the `$3 IS NOT NULL` branch).
         let after = reader
-            .list_candidates(1000, Some(Uuid::new_v4()), Utc::now())
+            .list_candidates(1000, Some(Uuid::new_v4()), Utc::now(), &[], None)
             .await
             .expect("query runs with cursor");
         // The shared test DB may contain rows from other suites; the
@@ -653,7 +717,7 @@ mod tests {
             let id = seed_artifact(&pool, repo_id, Some(raw), false).await;
 
             let err = PgRetentionCandidateReader::new(pool.clone())
-                .list_candidates(1000, None, Utc::now())
+                .list_candidates(1000, None, Utc::now(), &[], None)
                 .await
                 .expect_err("an unclassifiable hold state must not be offered for purge");
             assert!(
@@ -1037,6 +1101,7 @@ mod tests {
                 !matches_bool(
                     &predicate,
                     &EvaluationInputs {
+                        held_state_entry: None,
                         now,
                         created_at: row.artifact.created_at,
                         last_downloaded_at: None,
@@ -1114,6 +1179,7 @@ mod tests {
             matches_bool(
                 &predicate,
                 &EvaluationInputs {
+                    held_state_entry: None,
                     now,
                     created_at: row.artifact.created_at,
                     last_downloaded_at: None,
@@ -1406,6 +1472,7 @@ mod tests {
             matches_bool(
                 &predicate,
                 &EvaluationInputs {
+                    held_state_entry: None,
                     now,
                     created_at: row.artifact.created_at,
                     last_downloaded_at: None,
@@ -1473,6 +1540,7 @@ mod tests {
             .values()
             .filter(|row| {
                 let inputs = EvaluationInputs {
+                    held_state_entry: None,
                     now,
                     created_at: row.artifact.created_at,
                     last_downloaded_at: None,
@@ -1498,5 +1566,399 @@ mod tests {
             HashSet::from([ids[2], ids[1]]),
             "ranks 1-2 are kept, the tag target is exempt, the rest are marked"
         );
+    }
+
+    // =====================================================================
+    // The held-state admission — locks 0 and 1
+    //
+    // Two gates in one statement: the `page` CTE filters status, and the
+    // `ranked` join drops a row the CTE admitted. Widening one without
+    // the other changes nothing an operator can observe, which is why
+    // these tests assert the row arrives AND what rank it arrives with.
+    // =====================================================================
+
+    /// Every candidate the reader yields with `admit_held` set.
+    async fn candidates_admitting(
+        pool: &PgPool,
+        admit: &[HeldState],
+    ) -> HashMap<Uuid, RetentionCandidateRow> {
+        PgRetentionCandidateReader::new(pool.clone())
+            .list_candidates(1000, None, Utc::now(), admit, None)
+            .await
+            .expect("list candidates")
+            .into_iter()
+            .map(|row| (row.artifact.id, row))
+            .collect()
+    }
+
+    /// **With an empty admitted set the old enumeration runs.** No held
+    /// row appears, so none consumes a slot in the bounded page and no
+    /// per-policy counter can move for one.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_empty_admitted_set_enumerates_no_held_row() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let served = seed_artifact(&pool, repo, Some("released"), false).await;
+        let held: Vec<Uuid> = {
+            let mut v = Vec::new();
+            for status in ["quarantined", "rejected", "scan_indeterminate"] {
+                v.push(seed_artifact(&pool, repo, Some(status), false).await);
+            }
+            v
+        };
+
+        let rows = candidates_admitting(&pool, &[]).await;
+
+        assert!(rows.contains_key(&served));
+        for id in &held {
+            assert!(
+                !rows.contains_key(id),
+                "{id} is held and nothing admitted its state"
+            );
+        }
+        assert_eq!(rows.len(), 1, "exactly the one served artifact");
+    }
+
+    /// An admitted held row **is** enumerated — and arrives with no
+    /// rank, so it cannot occupy a `KeepLastN` slot.
+    ///
+    /// The rank assertion is the half that matters: widening the `page`
+    /// CTE alone leaves the `ranked` inner join dropping the row, so a
+    /// test that only checked membership would pass against a build
+    /// where nothing was observable, and a test that only checked
+    /// membership against a *naive* widening of both would pass against
+    /// one where held evidence takes a slot from a downloadable
+    /// artifact.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_admitted_held_row_is_enumerated_with_no_rank() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        for (status, state) in [
+            ("quarantined", HeldState::Quarantined),
+            ("rejected", HeldState::Rejected),
+            ("scan_indeterminate", HeldState::ScanIndeterminate),
+        ] {
+            let held = seed_artifact(&pool, repo, Some(status), false).await;
+
+            let rows = candidates_admitting(&pool, &[state]).await;
+            let row = rows
+                .get(&held)
+                .unwrap_or_else(|| panic!("{status} must be enumerated when admitted"));
+            assert_eq!(
+                row.keep_rank, None,
+                "{status}: a held candidate is not a usable sibling and takes no slot"
+            );
+
+            // And it is gone again when its state is not admitted — so
+            // the admission, not the seeding, is what put it there.
+            assert!(
+                !candidates_admitting(&pool, &[]).await.contains_key(&held),
+                "{status} must disappear when nothing admits it"
+            );
+        }
+    }
+
+    /// An opt-in is per state: admitting `Rejected` does not enumerate
+    /// a quarantined or scan-indeterminate artifact.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn admitting_one_state_does_not_enumerate_the_others() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let rejected = seed_artifact(&pool, repo, Some("rejected"), false).await;
+        let quarantined = seed_artifact(&pool, repo, Some("quarantined"), false).await;
+        let indeterminate = seed_artifact(&pool, repo, Some("scan_indeterminate"), false).await;
+
+        let rows = candidates_admitting(&pool, &[HeldState::Rejected]).await;
+
+        assert!(rows.contains_key(&rejected));
+        assert!(!rows.contains_key(&quarantined));
+        assert!(!rows.contains_key(&indeterminate));
+    }
+
+    /// **The usable-sibling meaning of the rank is preserved.** Three
+    /// released siblings rank 1..3 of 3, and admitting a held sibling
+    /// beside them changes neither number — the held row is a candidate
+    /// but not a usable sibling.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_admitted_held_sibling_does_not_enter_the_rank() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let base = Utc::now();
+        // Newest first: c (base), b (-1d), a (-2d).
+        let a = seed_sibling(
+            &pool,
+            repo,
+            "pkg",
+            "1.0.0",
+            base - chrono::Duration::days(2),
+            &"a".repeat(64),
+            Some("released"),
+            false,
+        )
+        .await;
+        let b = seed_sibling(
+            &pool,
+            repo,
+            "pkg",
+            "2.0.0",
+            base - chrono::Duration::days(1),
+            &"b".repeat(64),
+            Some("released"),
+            false,
+        )
+        .await;
+        let c = seed_sibling(
+            &pool,
+            repo,
+            "pkg",
+            "3.0.0",
+            base,
+            &"c".repeat(64),
+            Some("released"),
+            false,
+        )
+        .await;
+        // The newest version of the group, and rejected — exactly the
+        // sibling a naive widening would let take rank 1.
+        let held = seed_sibling(
+            &pool,
+            repo,
+            "pkg",
+            "4.0.0",
+            base + chrono::Duration::days(1),
+            &"d".repeat(64),
+            Some("rejected"),
+            false,
+        )
+        .await;
+
+        let baseline = candidates_admitting(&pool, &[]).await;
+        assert_eq!(rank_of(&baseline, c), (1, 3));
+        assert_eq!(rank_of(&baseline, b), (2, 3));
+        assert_eq!(rank_of(&baseline, a), (3, 3));
+
+        let widened = candidates_admitting(&pool, &[HeldState::Rejected]).await;
+        assert_eq!(
+            widened
+                .get(&held)
+                .expect("the held sibling is a candidate")
+                .keep_rank,
+            None,
+            "the newest sibling is held, so it holds no slot"
+        );
+        assert_eq!(
+            (
+                rank_of(&widened, c),
+                rank_of(&widened, b),
+                rank_of(&widened, a)
+            ),
+            ((1, 3), (2, 3), (3, 3)),
+            "admitting a held sibling must not shift its usable siblings' ranks"
+        );
+    }
+
+    /// A soft-deleted row stays excluded whatever is admitted: the
+    /// liveness filter is a different gate and this item does not touch
+    /// it.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_soft_deleted_held_row_is_never_enumerated() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let deleted = seed_artifact(&pool, repo, Some("rejected"), true).await;
+
+        let rows = candidates_admitting(&pool, &HeldState::ALL).await;
+
+        assert!(!rows.contains_key(&deleted));
+    }
+
+    /// The scope predicate is in the `page` CTE, so a scoped
+    /// enumeration serves only that repository's rows — and serves them
+    /// in a page it did not spend on anything else.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_scoped_enumeration_serves_only_that_repositorys_rows() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let reader = PgRetentionCandidateReader::new(pool.clone());
+        let mine = seed_repo(&pool).await;
+        let theirs = seed_repo(&pool).await;
+        let a = seed_artifact(&pool, mine, Some("released"), false).await;
+        let b = seed_artifact(&pool, mine, None, false).await;
+        let other = seed_artifact(&pool, theirs, Some("released"), false).await;
+
+        let scoped: HashSet<Uuid> = reader
+            .list_candidates(1000, None, Utc::now(), &[], Some(mine))
+            .await
+            .expect("scoped enumeration")
+            .into_iter()
+            .map(|r| r.artifact.id)
+            .collect();
+        assert_eq!(
+            scoped,
+            [a, b].into_iter().collect::<HashSet<_>>(),
+            "a scoped enumeration serves exactly its own repository's eligible rows",
+        );
+
+        // The counter-assertion: the row that was excluded is one the
+        // unscoped enumeration does serve, so the scope is what kept it
+        // out rather than some other predicate.
+        let unscoped: HashSet<Uuid> = reader
+            .list_candidates(1000, None, Utc::now(), &[], None)
+            .await
+            .expect("unscoped enumeration")
+            .into_iter()
+            .map(|r| r.artifact.id)
+            .collect();
+        assert!(
+            unscoped.contains(&other),
+            "the excluded row is eligible — the scope is the only thing that excluded it",
+        );
+    }
+
+    /// The scope does not spend the bounded page on rows it then drops.
+    /// A post-filter in the caller would: with the page size at one and
+    /// the other repository's row sorting first, it would hand back an
+    /// empty page — which the handler reads as "the walk reached the
+    /// end" and stops.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_scoped_page_is_filled_from_the_scoped_repository() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let reader = PgRetentionCandidateReader::new(pool.clone());
+        let mine = seed_repo(&pool).await;
+        let theirs = seed_repo(&pool).await;
+        // Ten rows in the other repository against one in mine, so a
+        // one-row page taken before the scope was applied would almost
+        // certainly carry none of mine.
+        for _ in 0..10 {
+            seed_artifact(&pool, theirs, Some("released"), false).await;
+        }
+        let mine_artifact = seed_artifact(&pool, mine, Some("released"), false).await;
+
+        let page = reader
+            .list_candidates(1, None, Utc::now(), &[], Some(mine))
+            .await
+            .expect("scoped page");
+        assert_eq!(page.len(), 1, "the page is filled, not filtered down");
+        assert_eq!(page[0].artifact.id, mine_artifact);
+    }
+
+    /// Scoping cannot move a `KeepLastN` rank: the sibling group is
+    /// `(repository_id, name)`, so a confined page touches exactly the
+    /// groups it would have touched unconfined and each is ranked over
+    /// the same rows. Two repositories hold same-named siblings; the
+    /// ranks the scoped read reports are the ranks the unscoped read
+    /// reports.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_scoped_read_reports_the_same_ranks_as_an_unscoped_one() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let reader = PgRetentionCandidateReader::new(pool.clone());
+        let mine = seed_repo(&pool).await;
+        let theirs = seed_repo(&pool).await;
+        let base = Utc::now() - chrono::Duration::days(10);
+        let mut mine_ids = Vec::new();
+        for i in 0..3 {
+            mine_ids.push(
+                seed_sibling(
+                    &pool,
+                    mine,
+                    "shared-name",
+                    &format!("1.0.{i}"),
+                    base + chrono::Duration::hours(i),
+                    &fixture_hash(7),
+                    Some("released"),
+                    false,
+                )
+                .await,
+            );
+        }
+        // Same name in another repository — a different sibling group,
+        // and one a rank must never be computed across.
+        for i in 0..5 {
+            seed_sibling(
+                &pool,
+                theirs,
+                "shared-name",
+                &format!("2.0.{i}"),
+                base + chrono::Duration::hours(i),
+                &fixture_hash(7),
+                Some("released"),
+                false,
+            )
+            .await;
+        }
+
+        let ranks = |rows: Vec<RetentionCandidateRow>| {
+            rows.into_iter()
+                .filter(|r| mine_ids.contains(&r.artifact.id))
+                .map(|r| (r.artifact.id, r.keep_rank))
+                .collect::<HashMap<_, _>>()
+        };
+
+        let scoped = ranks(
+            reader
+                .list_candidates(1000, None, Utc::now(), &[], Some(mine))
+                .await
+                .expect("scoped"),
+        );
+        let unscoped = ranks(
+            reader
+                .list_candidates(1000, None, Utc::now(), &[], None)
+                .await
+                .expect("unscoped"),
+        );
+        assert_eq!(scoped.len(), 3);
+        assert_eq!(
+            scoped, unscoped,
+            "the sibling group never straddles two repositories, so confining the page \
+             cannot change a rank",
+        );
+        assert!(
+            scoped
+                .values()
+                .all(|r| r.map(|(_, total)| total) == Some(3)),
+            "the usable-sibling total counts my three, never the other repository's \
+             five: {scoped:?}",
+        );
+    }
+
+    /// A scope naming no repository enumerates nothing. It is not an
+    /// error here — the authorization gate asked about that id too, so
+    /// only a repository-less grant admitted the run — and an empty
+    /// enumeration is the narrow answer rather than a wide one.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn a_scope_naming_no_repository_enumerates_nothing() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        seed_artifact(&pool, repo, Some("released"), false).await;
+        let rows = PgRetentionCandidateReader::new(pool.clone())
+            .list_candidates(1000, None, Utc::now(), &[], Some(Uuid::new_v4()))
+            .await
+            .expect("an absent repository is not an error");
+        assert!(rows.is_empty());
     }
 }

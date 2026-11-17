@@ -492,12 +492,12 @@ mod tests {
             r#"INSERT INTO repositories
                    (id, key, name, description, format, repo_type,
                     storage_backend, storage_path, upstream_url,
-                    is_public, quota_bytes, replication_priority,
+                    is_public, replication_priority,
                     created_at, updated_at)
                VALUES ($1, $2, $2, NULL, 'npm'::repository_format,
                        'hosted'::repository_type,
                        'filesystem', $3, NULL,
-                       true, NULL,
+                       true,
                        'on_demand'::replication_priority,
                        NOW(), NOW())"#,
         )

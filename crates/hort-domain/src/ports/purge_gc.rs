@@ -120,7 +120,7 @@ use super::BoxFuture;
 /// One artifact with a pending byte-release work item — an
 /// `ArtifactExpired` or an
 /// [`ArtifactDeleted`](crate::events::ArtifactDeleted) with no following
-/// `ArtifactPurged` — that the GC walk must process. Carries the four
+/// `ArtifactPurged` — that the GC walk must process. Carries the six
 /// facts the two protection rules
 /// ([`Self::is_gc_protected`], [`Self::is_tag_exempt`]) are computed
 /// from.
@@ -197,29 +197,130 @@ pub struct PendingPurge {
     /// age- or security-driven policy, and a mutable ref left pointing
     /// at a row no read path can resolve does not countermand it.
     pub user_deleted: bool,
+    /// `true` iff a pending
+    /// [`ArtifactExpired`](crate::events::ArtifactExpired) on this
+    /// artifact's stream carries a `held_state_authority` that matches
+    /// **this occupancy** of the artifact's **current** held state:
+    /// same state, and an `entry_stream_position` equal to the stream
+    /// position of the latest entry event for that state.
+    ///
+    /// Only [`Self::is_gc_protected`] reads it, and only when the
+    /// status is held — for a `none` / `released` artifact the value
+    /// decides nothing, because there is no protection for it to lift.
+    ///
+    /// ## Why the authority and not the status
+    ///
+    /// A held status says what the artifact *is*. It never says that
+    /// anything authorised disposing of it, which is why the bare
+    /// status could only ever be a refusal. The authority is the
+    /// opposite kind of fact: a retention policy named this held state,
+    /// evaluated this artifact, found its age bound elapsed **in that
+    /// state**, and recorded the decision immutably on the stream. So
+    /// this is the one thing that may lift the refusal, and an artifact
+    /// that reached the pending set without it is still refused —
+    /// which is the defence against the accidental case that the status
+    /// filter used to be.
+    ///
+    /// ## Why "this occupancy" and not "this state"
+    ///
+    /// All three held states are re-enterable. An artifact rejected in
+    /// March, expired by a policy whose span had run, released by a
+    /// curator and rejected again in September is `rejected` both
+    /// times, and the March decision says nothing about the September
+    /// occupancy — whose own span has not elapsed. Matching on the
+    /// state name alone would purge it. The position is per-stream,
+    /// monotonic and append-only, so a match on it cannot be satisfied
+    /// by a later entry.
+    ///
+    /// A legacy `ArtifactExpired` — one written before the authority
+    /// field existed — carries none, so it reads `false`: it
+    /// authorises nothing on the held-state axis.
+    pub held_state_authorised: bool,
+    /// `true` iff the **only** thing on this artifact's stream that
+    /// authorises collecting it is a held-state expiry: some pending
+    /// `ArtifactExpired` carries a `held_state_authority`, and no work
+    /// item authorises collection unconditionally — no
+    /// [`ArtifactDeleted`](crate::events::ArtifactDeleted) and no
+    /// `ArtifactExpired` without an authority.
+    ///
+    /// `false` for every artifact that reached the pending set before
+    /// the held-state exception existed, and `false` for an artifact
+    /// with no work item at all, so the arm that reads it
+    /// ([`Self::is_gc_protected`]'s serving-status arm) decides exactly
+    /// as it always did for them.
+    ///
+    /// ## What it is for
+    ///
+    /// A held-state expiry is a **conditional** work item: it
+    /// authorises collection only while the occupancy it names holds.
+    /// An artifact whose only work item is one, and which is no longer
+    /// in that state, therefore has nothing authorising its
+    /// collection — and the commonest way for an occupancy to end is a
+    /// curator *releasing* the artifact, which is a human saying "serve
+    /// this". Reading the serving status alone would collect it,
+    /// because a `released` artifact is collectable and a pending
+    /// `ArtifactExpired` is a work item; this fact is what
+    /// distinguishes "something decided to collect these bytes" from
+    /// "something decided to collect these bytes **while they were
+    /// evidence**".
+    ///
+    /// Stated as "only a held-state expiry authorises this" rather than
+    /// as "nothing unconditional authorises this" so that an artifact
+    /// with **no** work item reads `false`. Such an artifact is never
+    /// offered by [`PurgeGcPort::list_pending_purge`], so the value
+    /// decides nothing in the sweep — but
+    /// [`PurgeGcPort::purge_artifact_refs`] is also reachable directly,
+    /// and answering `Protected` there would report an absent work item
+    /// as retained evidence, which is a different fact.
+    ///
+    /// Fail-safe in the direction that keeps bytes: an `ArtifactExpired`
+    /// whose `held_state_authority` is present but unreadable counts as
+    /// conditional, so it authorises nothing by itself.
+    pub collection_needs_held_state_authority: bool,
 }
 
 impl PendingPurge {
-    /// `true` iff this artifact is **retained scan evidence** and must
-    /// never be purged: `quarantined`, `rejected` or
-    /// `scan_indeterminate`.
+    /// `true` iff this artifact is **retained scan evidence** that
+    /// nothing authorised disposing of, and must therefore never be
+    /// purged: a held status (`quarantined`, `rejected` or
+    /// `scan_indeterminate`) with no matching
+    /// [`Self::held_state_authorised`].
     ///
-    /// Stage one already filters these before appending an
-    /// `ArtifactExpired`, and [`PurgeGcPort::list_pending_purge`]
-    /// excludes them from the work set as well — so a `true` here means
-    /// one of those filters was bypassed or the status changed after
-    /// they ran. Both are reasons to stop, not to investigate first:
-    /// the next step is destructive.
+    /// The status is what makes an artifact evidence; the authority is
+    /// what makes disposing of it a decision somebody recorded. Neither
+    /// alone is the rule, and the composition is deliberately
+    /// asymmetric: a `none` / `released` artifact is collectable
+    /// whatever the authority says (there was nothing to authorise),
+    /// and a held artifact is refused unless the authority names its
+    /// current occupancy.
+    ///
+    /// Stage one already refuses a held artifact no policy opted in
+    /// for, and [`PurgeGcPort::list_pending_purge`] excludes one from
+    /// the work set as well — so a `true` here means one of those
+    /// filters was bypassed, or the status changed after they ran, or
+    /// the artifact re-entered its held state after the expiry was
+    /// recorded. Every one of those is a reason to stop rather than to
+    /// investigate first: the next step is destructive.
     ///
     /// Exhaustive by construction — no wildcard arm — so a new
     /// [`QuarantineStatus`] variant is a compile error here rather than
     /// a state that silently defaults to collectable.
     pub fn is_gc_protected(&self) -> bool {
         match self.quarantine_status {
+            // Held: evidence, unless a policy named this very
+            // occupancy and its span has run.
             QuarantineStatus::Quarantined
             | QuarantineStatus::Rejected
-            | QuarantineStatus::ScanIndeterminate => true,
-            QuarantineStatus::None | QuarantineStatus::Released => false,
+            | QuarantineStatus::ScanIndeterminate => !self.held_state_authorised,
+            // Serving: collectable, unless the only thing authorising
+            // collection is a held-state expiry — whose occupancy, for
+            // an artifact in a serving status, has by definition ended.
+            // A curator releasing a rejected artifact is the commonest
+            // way for that to happen, and it is the one case where a
+            // serving status must still refuse.
+            QuarantineStatus::None | QuarantineStatus::Released => {
+                self.collection_needs_held_state_authority
+            }
         }
     }
 
@@ -931,6 +1032,8 @@ mod tests {
             tag_targeted: true,
             expired_only_by_keep_last_n: true,
             user_deleted: true,
+            held_state_authorised: false,
+            collection_needs_held_state_authority: false,
         };
         assert_eq!(pp.clone(), pp);
         assert_eq!(pp.artifact_id, a);
@@ -964,10 +1067,12 @@ mod tests {
             tag_targeted: false,
             expired_only_by_keep_last_n: false,
             user_deleted: false,
+            held_state_authorised: false,
+            collection_needs_held_state_authority: false,
         };
 
-        // Exactly the three evidence states protect, and the two
-        // serving states do not.
+        // Exactly the three evidence states protect with no authority,
+        // and the two serving states do not.
         for status in [
             QuarantineStatus::Quarantined,
             QuarantineStatus::Rejected,
@@ -977,14 +1082,48 @@ mod tests {
                 quarantine_status: status,
                 ..base.clone()
             };
-            assert!(item.is_gc_protected(), "{status} is retained evidence");
+            assert!(
+                item.is_gc_protected(),
+                "{status} is retained evidence with nothing authorising its disposal"
+            );
+            // …and a matching held-state authority is what lifts it,
+            // for each of the three states independently.
+            let authorised = PendingPurge {
+                quarantine_status: status,
+                held_state_authorised: true,
+                ..base.clone()
+            };
+            assert!(
+                !authorised.is_gc_protected(),
+                "{status} with a matching authority is collectable"
+            );
         }
         for status in [QuarantineStatus::None, QuarantineStatus::Released] {
             let item = PendingPurge {
                 quarantine_status: status,
                 ..base.clone()
             };
-            assert!(!item.is_gc_protected(), "{status} is collectable");
+            assert!(
+                !item.is_gc_protected(),
+                "{status} with an unconditional work item is collectable"
+            );
+            // …and so is one with no work item at all, which is what
+            // the "only a held-state expiry" wording preserves.
+            assert!(!base.is_gc_protected());
+            // The one case where a serving status still refuses: the
+            // artifact's only work item is a held-state expiry whose
+            // occupancy has ended, which is what a curator release
+            // looks like from here. Nothing authorised collecting
+            // these bytes outside the state they are no longer in.
+            let only_conditional = PendingPurge {
+                quarantine_status: status,
+                collection_needs_held_state_authority: true,
+                ..base.clone()
+            };
+            assert!(
+                only_conditional.is_gc_protected(),
+                "{status} whose only work item is a lapsed held-state expiry must refuse"
+            );
         }
 
         // The tag exemption is a conjunction of three facts, and

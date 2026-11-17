@@ -10,7 +10,7 @@
 //! than over the kind:
 //!
 //! ```text
-//! task_invocation_is_destructive(P::KIND, params) == true
+//! task_invocation_destructive_authority(P::KIND, params) == true
 //!     <=> db_idempotency_key.is_some()
 //! ```
 //!
@@ -100,36 +100,41 @@ fn build_test_router(ctx: Arc<AppContext>) -> axum::Router {
         .with_state(ctx)
 }
 
-/// Permit grant that AUTHORISES the destructive kinds — `Permission::AdminTaskInvoke`
-/// for callers carrying `task-admin`, exercised through a principal whose
-/// claim set also includes `task:destructive` (see ADR 0012 / ADR 0028).
+/// Permit grants that AUTHORISE the destructive kinds —
+/// `Permission::AdminTaskInvoke` for callers carrying `task-admin`, plus
+/// both destructive permissions for callers carrying `destructive` (see
+/// ADR 0012 / ADR 0028).
 fn task_use_case_permit_destructive(
     mocks: &MockPorts,
     events: Arc<hort_app::event_store_publisher::EventStorePublisher>,
 ) -> Arc<TaskUseCase> {
-    let grant = PermissionGrant {
+    let grant = |required: &[&str], permission| PermissionGrant {
         id: Uuid::new_v4(),
-        subject: GrantSubject::Claims(vec!["task-admin".into()]),
+        subject: GrantSubject::Claims(required.iter().map(|c| (*c).to_string()).collect()),
         repository_id: None,
-        permission: Permission::AdminTaskInvoke,
+        permission,
         created_at: Utc::now(),
         managed_by: ManagedBy::Local,
         managed_by_digest: None,
     };
-    let evaluator = RbacEvaluator::new(vec![grant]);
+    let evaluator = RbacEvaluator::new(vec![
+        grant(&["task-admin"], Permission::AdminTaskInvoke),
+        grant(&["destructive"], Permission::DestroyContent),
+        grant(&["destructive"], Permission::DestroyRecord),
+    ]);
     let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(evaluator));
     Arc::new(TaskUseCase::new(mocks.jobs.clone(), events, rbac))
 }
 
-/// Caller authorised for destructive kinds (both `task-admin` and
-/// `task:destructive` claims).
+/// Caller authorised for destructive kinds — carries the claims both
+/// factors' grants are bound to.
 fn destructive_principal() -> CallerPrincipal {
     CallerPrincipal {
         user_id: Uuid::new_v4(),
         external_id: "destructive-admin".into(),
         username: "destructive-admin".into(),
         email: "destructive@example.com".into(),
-        claims: vec!["task-admin".into(), "task:destructive".into()],
+        claims: vec!["task-admin".into(), "destructive".into()],
         token_kind: None,
         issued_at: Utc::now(),
         token_cap: None,
@@ -137,8 +142,9 @@ fn destructive_principal() -> CallerPrincipal {
 }
 
 /// Caller authorised only for ordinary (non-destructive) kinds — holds
-/// `task-admin` but NOT `task:destructive`. Used by the spot test on a
-/// non-destructive kind (which doesn't need the destructive claim).
+/// `task-admin` but not the claim the destructive grants are bound to.
+/// Used by the spot test on a non-destructive kind (which needs no
+/// destructive permission).
 fn ordinary_principal() -> CallerPrincipal {
     CallerPrincipal {
         user_id: Uuid::new_v4(),
@@ -170,7 +176,7 @@ fn ordinary_principal() -> CallerPrincipal {
 ///
 /// Closed-set semantics: adding a fourth destructive kind to
 /// `DESTRUCTIVE_TASK_KINDS` without routing the new kind through the
-/// `task_invocation_is_destructive` branch in `invoke.rs` fails this test
+/// `task_invocation_destructive_authority` branch in `invoke.rs` fails this test
 /// on the new iteration.
 #[tokio::test]
 async fn destructive_kinds_carry_db_idempotency() {
@@ -207,7 +213,7 @@ async fn destructive_kinds_carry_db_idempotency() {
             StatusCode::ACCEPTED,
             "destructive kind {kind:?} must enqueue successfully when the caller is authorised; \
              status={status} (RBAC denial here usually means the test fixture forgot the \
-             task:destructive claim)",
+             destructive permission grant)",
             status = resp.status(),
         );
 
@@ -334,13 +340,163 @@ async fn retention_preview_takes_no_durable_key_and_execute_keeps_its_own() {
     );
 }
 
+/// Two scoped executions of the same UTC day must not collapse onto one
+/// durable key, and neither may a scoped one and the instance-wide
+/// sweep.
+///
+/// The key single-flights *destroying something*, so the dimensions that
+/// decide what an invocation destroys belong in it — the mode already
+/// does, for exactly this reason. Without the scope segment the first
+/// scoped execute of a day owns the day for every other repository, and
+/// an operator who then asked for the instance-wide sweep would be
+/// handed that scoped job's id and a `200`: the sweep they asked for
+/// never ran, and nothing said so.
+#[tokio::test]
+async fn a_scoped_execution_keys_on_its_repository() {
+    let (ctx, mocks) = new_ctx();
+    let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
+    let uc = task_use_case_permit_destructive(&mocks, events);
+    let ctx = with_task_use_case(&ctx, uc);
+    let router = build_test_router(ctx);
+
+    let before = Utc::now().format("%Y-%m-%d").to_string();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+
+    for body in [
+        format!(r#"{{"mode":"execute","repository_id":"{first}"}}"#),
+        format!(r#"{{"mode":"execute","repository_id":"{second}"}}"#),
+        r#"{"mode":"execute"}"#.to_owned(),
+    ] {
+        let mut req = Request::post("/api/v1/admin/tasks/retention-evaluate")
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .expect("request");
+        auth_test::inject_principal(&mut req, destructive_principal());
+        assert_eq!(
+            router
+                .clone()
+                .oneshot(req)
+                .await
+                .expect("response")
+                .status(),
+            StatusCode::ACCEPTED,
+            "body {body} must enqueue",
+        );
+    }
+
+    let after = Utc::now().format("%Y-%m-%d").to_string();
+    let keys: Vec<String> = mocks
+        .jobs
+        .enqueue_idem_keys()
+        .into_iter()
+        .map(|k| {
+            k.expect("every execution claims a durable key")
+                .as_str()
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(keys.len(), 3);
+    assert_eq!(
+        keys.iter().collect::<std::collections::BTreeSet<_>>().len(),
+        3,
+        "three invocations that destroy three different things must take three keys: {keys:?}",
+    );
+    // Midnight UTC can roll over mid-test; both same-day shapes pass.
+    let acceptable = |suffix: String| {
+        [
+            format!("cron:retention-evaluate:execute:{before}{suffix}"),
+            format!("cron:retention-evaluate:execute:{after}{suffix}"),
+        ]
+    };
+    assert!(
+        acceptable(format!(":{first}")).contains(&keys[0]),
+        "{keys:?}"
+    );
+    assert!(
+        acceptable(format!(":{second}")).contains(&keys[1]),
+        "{keys:?}"
+    );
+    assert!(
+        acceptable(String::new()).contains(&keys[2]),
+        "the instance-wide key is unchanged — no segment is appended when nothing was \
+         confined, so every key the shipped CronJob has ever derived stays identical: \
+         {keys:?}",
+    );
+}
+
+/// A scoped dry run is still an observation: it claims no durable key,
+/// so it stays repeatable the way an unscoped one does.
+#[tokio::test]
+async fn a_scoped_preview_claims_no_durable_key() {
+    let (ctx, mocks) = new_ctx();
+    let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
+    let uc = task_use_case_permit_destructive(&mocks, events);
+    let ctx = with_task_use_case(&ctx, uc);
+    let router = build_test_router(ctx);
+
+    let repository = Uuid::new_v4();
+    let mut req = Request::post("/api/v1/admin/tasks/retention-evaluate")
+        .header("content-type", "application/json")
+        .body(Body::from(format!(
+            r#"{{"mode":"dry_run","repository_id":"{repository}"}}"#
+        )))
+        .expect("request");
+    auth_test::inject_principal(&mut req, ordinary_principal());
+    assert_eq!(
+        router.oneshot(req).await.expect("response").status(),
+        StatusCode::ACCEPTED,
+        "a scoped preview needs no destructive authority",
+    );
+
+    let keys = mocks.jobs.enqueue_idem_keys();
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].is_none(), "got Some({:?})", keys[0]);
+}
+
+/// A sweep that cannot be confined refuses the field at the HTTP
+/// boundary, rather than accepting it and sweeping the instance.
+/// Authorization runs first, so this is asserted on a caller who holds
+/// the authority: the refusal is about the request, not the grant. The
+/// status is the one every `TaskParams::validate` refusal already
+/// carries — `DomainError::Validation` → `400` — so this adds no new
+/// shape for a client to learn.
+#[tokio::test]
+async fn an_unconfinable_destructive_kind_rejects_a_repository_scope() {
+    for kind in ["retention-purge", "eventstore-archive"] {
+        let (ctx, mocks) = new_ctx();
+        let events = hort_app::event_store_publisher::wrap_for_test(mocks.events.clone());
+        let uc = task_use_case_permit_destructive(&mocks, events);
+        let ctx = with_task_use_case(&ctx, uc);
+        let router = build_test_router(ctx);
+
+        let mut req = Request::post(format!("/api/v1/admin/tasks/{kind}"))
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"repository_id":"{}"}}"#,
+                Uuid::new_v4()
+            )))
+            .expect("request");
+        auth_test::inject_principal(&mut req, destructive_principal());
+        assert_eq!(
+            router.oneshot(req).await.expect("response").status(),
+            StatusCode::BAD_REQUEST,
+            "kind {kind:?} sweeps the instance and must refuse a repository scope",
+        );
+        assert!(
+            mocks.jobs.enqueue_calls().is_empty(),
+            "kind {kind:?}: nothing may be enqueued",
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Spot test — non-destructive kinds pass `None`
 // ---------------------------------------------------------------------------
 
 /// Acceptance (7b): for at least one non-destructive kind (`noop`), the
 /// handler passes `idempotency_key = None`. Pins the negative side of
-/// the `task_invocation_is_destructive` branch for a kind that has no
+/// the `task_invocation_destructive_authority` branch for a kind that has no
 /// mode at all — without it, a future change that always passes
 /// `Some(...)` would still pass the closed-set walker above.
 #[tokio::test]

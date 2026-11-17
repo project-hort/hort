@@ -23,6 +23,7 @@
 //! which this parse once did — is what let both callers take the skipping
 //! posture without either of them choosing it.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::Duration;
 
@@ -50,6 +51,32 @@ pub const COSIGN_SIMPLESIGNING_MEDIA_TYPE: &str =
 /// The OCI layer annotation key carrying the base64 detached cosign signature
 /// over a [`COSIGN_SIMPLESIGNING_MEDIA_TYPE`] payload layer.
 pub const COSIGN_SIGNATURE_ANNOTATION: &str = "dev.cosignproject.cosign/signature";
+
+/// The media type of an **in-toto Statement** carried in a DSSE envelope:
+/// `application/vnd.in-toto+json`, the envelope media type the in-toto
+/// Attestation Framework defines and the value a cosign attestation's DSSE
+/// `payloadType` carries (see [`crate::provenance_bundle`]).
+///
+/// It is also the layer `mediaType` of a **BuildKit attestation manifest** —
+/// the SLSA-provenance sibling every multi-arch index `docker buildx` produces
+/// binds beside its platform children. That manifest's config is image-shaped
+/// (`rootfs.type: layers`, one `diff_id` per payload), so nothing about the
+/// config distinguishes it from a runnable image; the layer's declared payload
+/// format is the only thing in either document that does. See
+/// [`layer_media_type_is_non_filesystem_payload`].
+pub const IN_TOTO_STATEMENT_MEDIA_TYPE: &str = "application/vnd.in-toto+json";
+
+/// The media type of an SPDX software bill of materials in its JSON
+/// serialisation: `application/spdx+json`, the value the SPDX specification
+/// registers for that serialisation and the layer `mediaType` an SBOM
+/// attachment manifest carries its document under.
+pub const SPDX_JSON_MEDIA_TYPE: &str = "application/spdx+json";
+
+/// The media type of a CycloneDX software bill of materials in its JSON
+/// serialisation: `application/vnd.cyclonedx+json` — the SBOM format's
+/// registered media type, and the other spelling an SBOM attachment manifest
+/// declares its payload layer with.
+pub const CYCLONEDX_JSON_MEDIA_TYPE: &str = "application/vnd.cyclonedx+json";
 
 /// The `Artifact.path` prefix every OCI **blob** row carries —
 /// `blobs/sha256:<hex>`, the OCI Distribution URL minus its
@@ -86,10 +113,12 @@ pub const DOCKER_MANIFEST_LIST_MEDIA_TYPE: &str =
     "application/vnd.docker.distribution.manifest.list.v2+json";
 
 /// Upper bound on the number of child descriptors [`index_child_descriptors`]
-/// returns from a single image index. Mirrors the write-path
-/// `MAX_BLOB_REFERENCES` cap (`hort-http-oci`) so a pathological
-/// `manifests[]` array cannot force the caller to hold an unbounded reference
-/// set. A real multi-arch index has a handful of children; 1024 is a generous
+/// returns from a single image index, so a pathological `manifests[]` array
+/// cannot force the caller to hold an unbounded reference set. Sized with
+/// [`MAX_MANIFEST_BLOBS`], the other bound on what a manifest parse returns,
+/// and like it a bound on a **read**: an index is not a composition, so the
+/// whole-image assessment budget has nothing to say about how many children it
+/// may bind. A real multi-arch index has a handful of children; 1024 is a generous
 /// ceiling. An index declaring more than the cap is **rejected**
 /// ([`DomainError::Validation`] from [`index_child_descriptors`]), never
 /// truncated — an over-cap index is refused rather than silently accepted with
@@ -395,12 +424,32 @@ pub fn simplesigning_signature_layers(
 }
 
 /// Upper bound on the number of blob digests [`manifest_blob_digests`]
-/// returns from a single image manifest (`config` + `layers[]`). Mirrors the
-/// write-path `MAX_BLOB_REFERENCES` cap (`hort-http-oci` `manifests_write.rs`)
-/// so a pathological manifest cannot force the provenance cascade to hold an
+/// returns from a single image manifest (`config` + `layers[]`), so a
+/// pathological manifest cannot force the provenance cascade to hold an
 /// unbounded reference set. A manifest declaring more is **rejected**
 /// ([`DomainError::Validation`]), never truncated — mirroring
 /// [`index_child_descriptors`]'s over-cap posture.
+///
+/// **This is a bound on a *read*, and it deliberately does not track the
+/// admission gate downward.** It used to say it mirrored the write path's own
+/// cap, and that stopped being true when admission began deriving from
+/// [`ImageBudget::max_manifest_blob_references`] — a tighter number, because an
+/// artifact hort cannot assess is one it must not accept. Two things keep this
+/// one where it is:
+///
+/// - The relation that matters is this bound against the **assessment budget**,
+///   and it is deliberate: 256 constituents refuses the shape this parse admits
+///   as well-formed, because the parse accepting a manifest is a statement
+///   about the manifest being describable and not about hort agreeing to
+///   assemble it. `the_shipped_budget_is_the_whole_images_and_not_a_blobs` pins
+///   it. Collapsing the two numbers would make that relation false by
+///   construction.
+/// - The cascade reads manifests hort did **not** admit — already-stored rows,
+///   and pull-through-registered ones. Lowering this would begin refusing
+///   provenance resolution for legacy manifests carrying more references than
+///   admission now accepts, which is a behaviour change on data already in the
+///   catalog. Those manifests were admitted under a past cap and must stay
+///   readable.
 const MAX_MANIFEST_BLOBS: usize = 1024;
 
 /// Minimal single-image-manifest projection for
@@ -591,6 +640,15 @@ const ROOTFS_TYPE_LAYERS: &str = "layers";
 ///   narrowing the decoding reason must not be allowed to collapse the two.
 /// - an unrecognised type names a container nothing has stated it can read.
 ///
+///
+/// One kind of declared type never reaches here at all, and the exception is
+/// what keeps the three bullets above about *images*: a layer declaring a
+/// payload format that is not a filesystem — an attestation, a signature, an
+/// SBOM — is refused one stage earlier, by
+/// [`layer_media_type_is_non_filesystem_payload`], because that manifest was
+/// never an image and the question this function asks does not apply to it.
+/// That is an enumeration of named types, in the opposite direction and for the
+/// opposite outcome; the two docs explain each other.
 /// All of them must refuse rather than drop: a dropped layer yields a **strict
 /// subset** of the image, which a scanner then analyses and reports as the
 /// image — a clean verdict about the wrong subject.
@@ -604,6 +662,64 @@ fn layer_media_type_is_openable(media_type: &str) -> bool {
             | OCI_LAYER_TAR_GZIP_MEDIA_TYPE
             | OCI_LAYER_TAR_ZSTD_MEDIA_TYPE
             | DOCKER_LAYER_TAR_GZIP_MEDIA_TYPE
+    )
+}
+
+/// Whether a layer's declared `mediaType` names a payload format that is **not
+/// a filesystem at all** — an attestation, a signature, an SBOM document.
+///
+/// The counterpart of [`layer_media_type_is_openable`] and deliberately not its
+/// complement. Both read the same field and they answer different questions:
+///
+/// - *openable* asks whether a composed image's layer can be **read out of**
+///   the container it declares. Everything outside that set is withheld by
+///   absence, and the manifest is still an image hort holds an incomplete
+///   composition of — which is a fault worth reporting, and gates.
+/// - this one asks whether the manifest is **an image at all**. A payload
+///   format here is not a container with a missing decoder; it is a document
+///   that was never a root filesystem, so the manifest declaring it is an OCI
+///   *artifact* manifest. There is nothing to compose, nothing to assess and
+///   nothing for a hold to wait on.
+///
+/// **The spec is the authority, in two steps.** The image spec defines an image
+/// layer as a *filesystem changeset serialised as a tar archive*, and defines
+/// exactly the `tar`, `tar+gzip` and `tar+zstd` media types plus their
+/// `nondistributable` variants for it. Every member of the set below is, by its
+/// own specification, a JSON document — each carries RFC 6839's `+json`
+/// structured-syntax suffix, which states that its underlying syntax *is*
+/// JSON. A tar archive is not a JSON document, so the two sets are disjoint by
+/// construction rather than by this function's arrangement, and
+/// `the_two_layer_media_type_sets_are_disjoint` asserts it.
+///
+/// **Why a cited list and not "anything `+json`".** The suffix argument above
+/// would also run as a predicate, and it would be wrong to use it as one. This
+/// set moves a manifest from *held, fail-closed* to *released with no composite
+/// assessment*, which is the permissive direction: an entry added in error
+/// takes a runnable image out of the gate, and the mistake is invisible —
+/// nothing is left to look at. Refusing to decide is the safe answer, and an
+/// unrecognised `+json` layer therefore keeps the openable set's
+/// withheld-by-absence treatment ([`ConfigRefusal::UnsupportedLayer`]) until
+/// somebody can name the format it belongs to. So growing this set is the
+/// mirror image of growing the openable one: that one needs a measurement
+/// against the pinned scanner, this one needs a specification that says the
+/// payload is a document.
+///
+/// **Not an index-entry question.** A BuildKit attestation manifest is also
+/// recognisable from the index that binds it — `platform: unknown/unknown`, the
+/// `vnd.docker.reference.type=attestation-manifest` annotation — and neither is
+/// reachable here. A composition is resolved from a manifest row's own bytes
+/// and its config (ADR 0064 D1); the index descriptor that referenced it is not
+/// an input, and a child manifest is a scan unit whether or not an index in this
+/// registry still names it. The layer's declared payload format is the only
+/// statement either document in hand makes about this.
+fn layer_media_type_is_non_filesystem_payload(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        IN_TOTO_STATEMENT_MEDIA_TYPE
+            | COSIGN_SIMPLESIGNING_MEDIA_TYPE
+            | SIGSTORE_BUNDLE_MEDIA_TYPE
+            | SPDX_JSON_MEDIA_TYPE
+            | CYCLONEDX_JSON_MEDIA_TYPE
     )
 }
 
@@ -697,11 +813,18 @@ impl DescriptorProblem {
 pub struct ImageLayoutLayer {
     /// CAS content hash of the layer blob.
     pub hash: ContentHash,
-    /// The declared layer `mediaType`, always one
-    /// [`layer_media_type_is_openable`] admitted — an unopenable container is a
-    /// refusal, so it never reaches this struct. Carried so the value that
-    /// decided the layer is openable travels with the layer instead of being
-    /// re-derived from the manifest bytes downstream.
+    /// The declared layer `mediaType`, exactly as the descriptor spelled it.
+    /// Carried so the value that decides whether the layer is openable travels
+    /// with the layer instead of being re-derived from the manifest bytes
+    /// downstream.
+    ///
+    /// On a layer reached through an [`ImageLayout`] it is always one
+    /// [`layer_media_type_is_openable`] admitted — that is
+    /// [`ManifestNomination::complete_with_config`]'s last refusal. On one
+    /// reached through a [`ManifestNomination`] it is whatever was declared:
+    /// the nomination exists so that a caller can acquire the config blob, and
+    /// the config is what establishes that an openable container is even the
+    /// right question to ask.
     pub media_type: String,
 }
 
@@ -853,6 +976,275 @@ impl ImageBudget {
             max_duration: MAX_IMAGE_LAYOUT_DURATION,
         }
     }
+
+    /// The most `config` + `layers[]` descriptors a single-image manifest may
+    /// declare and still name a composition this budget can assess.
+    ///
+    /// **This is what an admission gate answers to**, and it is a derivation
+    /// rather than a second number on purpose: a registry that accepts a
+    /// manifest the composite scan can never compose has accepted an artifact
+    /// it can never answer about, and the only way out of that state is a
+    /// curator override. Two independently-chosen constants that happen to
+    /// agree are exactly how the accepted set and the assessable set came
+    /// apart in the first place, so admission reads [`max_blobs`](Self::
+    /// max_blobs) through here and declares nothing of its own.
+    ///
+    /// The `- 1` is a change of unit and not a margin: `max_blobs` counts the
+    /// **constituents** of a composition — the manifest, the config and every
+    /// layer, which is what
+    /// [`ManifestNomination::constituent_count`] reports and what both the
+    /// acquisition and the layout writer spend — while a manifest's own
+    /// descriptors name every one of those *except the manifest itself*. So a
+    /// manifest declaring `n` blob references nominates `n + 1` constituents,
+    /// and the two bounds are inclusive on both sides.
+    ///
+    /// Saturating because a budget is a plain struct a test may tighten to
+    /// anything: a `max_blobs` of 0 admits no manifest at all, which is the
+    /// honest answer rather than an arithmetic panic.
+    #[must_use]
+    pub const fn max_manifest_blob_references(&self) -> usize {
+        self.max_blobs.saturating_sub(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The admission gate the budget derives
+// ---------------------------------------------------------------------------
+
+/// Minimal single-image-manifest projection for
+/// [`refuse_manifest_past_assessment_budget`]: the two quantities a whole-image
+/// bound is over — how many `config` + `layers[]` descriptors a manifest
+/// declares, and what each one says it weighs.
+///
+/// A projection of its own, for the reason every other one in this module is:
+/// widening it must not perturb the parsers the others share. It is also the
+/// only one that reads `size`, a field the scan-side parses deliberately
+/// ignore — a declared size is a claim about bytes nobody has read, which is
+/// exactly what an *admission* gate has to work from and exactly what an
+/// assessment must not.
+#[derive(Deserialize)]
+struct OciManifestDeclaredCost {
+    #[serde(default)]
+    config: Option<OciSizedDescriptor>,
+    #[serde(default)]
+    layers: Vec<OciSizedDescriptor>,
+}
+
+/// A `config` / `layers[]` descriptor as the admission gate reads it: what it
+/// addresses and what it claims to weigh.
+#[derive(Deserialize)]
+struct OciSizedDescriptor {
+    #[serde(default)]
+    digest: Option<String>,
+    /// Read **leniently**, the same way [`OciIndexChild::size`] is, and the
+    /// lenient read is what makes the refusal reachable rather than a
+    /// convenience. A value hort cannot read as an exact `i64` must arrive
+    /// here as `None` — "no readable size", which
+    /// [`refuse_manifest_past_assessment_budget`] refuses by slot. A strict
+    /// read would instead fail the whole deserialisation, and that gate's
+    /// escape hatch for a body that is not a manifest at all answers `Ok(())`
+    /// — so every `"size": "a lot"` document would be **admitted** by the one
+    /// path meant for bodies that declare no composition.
+    #[serde(default, deserialize_with = "lenient_i64")]
+    size: Option<i64>,
+}
+
+/// Why a single-image manifest declares a composition no composite scan under
+/// a given [`ImageBudget`] could ever assess — the refusal side of
+/// [`refuse_manifest_past_assessment_budget`].
+///
+/// The two **bound** variants carry **the actual, then the bound**, because
+/// that pair is what an operator acts on: the bound alone says a wall exists
+/// and not how far past it they are. The third is a conformance refusal and
+/// carries neither — there is no bound a missing field is past — so it names
+/// the offending slot instead, and never the declarant's value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionRefusal {
+    /// More `config` + `layers[]` descriptors than
+    /// [`ImageBudget::max_manifest_blob_references`] allows.
+    TooManyBlobReferences {
+        /// `config` + `layers[]` descriptors the manifest declared.
+        declared: usize,
+        /// The bound, derived from the budget's constituent ceiling.
+        max: usize,
+    },
+    /// The manifest, its config and its layers declare more bytes between them
+    /// than [`ImageBudget::max_bytes`] allows.
+    DeclaredBytes {
+        /// Bytes the manifest body plus its distinct declared constituents come
+        /// to.
+        declared: u64,
+        /// The bound ([`ImageBudget::max_bytes`]).
+        max: u64,
+    },
+    /// A `config` or `layers[]` descriptor declares no `size` hort can read:
+    /// the field is absent, is not an exact integer, or is negative. `size` is
+    /// REQUIRED on every descriptor by the OCI image spec, so this is a
+    /// malformed document rather than a composition that is too large — which
+    /// is why it is the one variant carrying no bound.
+    ///
+    /// Carries the slot and **never the value**, the discipline
+    /// [`DescriptorProblem`] records for the same reason: when the field is
+    /// absent there is nothing to withhold, and a negative one is a
+    /// declarant-supplied value a refusal is not the place to carry.
+    UnreadableDeclaredSize {
+        /// Which descriptor — `config`, or `layers[N]` zero-based in manifest
+        /// order.
+        slot: ImageDescriptorSlot,
+    },
+}
+
+/// Refuse a manifest body whose declared composition no composite scan under
+/// `budget` could ever assess — **the admission gate**, decided from the
+/// manifest's own declarations with nothing fetched and no catalog read.
+///
+/// # Why admission answers to the assessment budget
+///
+/// A manifest hort accepts but can never compose leaves an artifact in a state
+/// only a curator override can leave: the composite verdict is permanently
+/// absent, so the release authority never arrives, and the hold is
+/// deadline-less rather than "not yet". A refusal at admission is honest and
+/// immediately visible; a permanently stuck accepted image is not. So the
+/// accepted set is derived from the assessable set — one declaration, read by
+/// both — rather than bounded by a number of its own that agrees today.
+///
+/// # What it is over
+///
+/// Both of the budget's input-shaped bounds, from the bytes in hand:
+///
+/// - **Count.** `config` + `layers[]` descriptors, against
+///   [`ImageBudget::max_manifest_blob_references`]. Not deduplicated, because
+///   the count bound it answers to is not either: the acquisition and the
+///   layout writer both spend it on [`ManifestNomination::constituent_count`],
+///   which counts declared descriptors and not distinct objects.
+/// - **Bytes.** The manifest body's own length plus each **distinct**
+///   constituent's declared `size`, against [`ImageBudget::max_bytes`].
+///   Deduplicated, because the layout writer charges one file on disk once —
+///   a manifest repeating a 2 GiB layer five times costs 2 GiB there, and an
+///   admission gate that charged 10 GiB would refuse an image the writer would
+///   have assembled. Deduplicated by the digest **as declared**, which is the
+///   same partition the writer's [`ContentHash`] set makes for any manifest
+///   that can get past the digest grammar admission already enforces.
+///
+/// Both bounds are **inclusive**, matching the two they derive from: a
+/// composition that exactly fits the budget assembles, so one that exactly
+/// fits it is admitted.
+///
+/// # A declaration hort cannot read is refused, not charged as zero
+///
+/// **`size` is REQUIRED on every `config` and `layers[]` descriptor** by the
+/// OCI image spec, so a descriptor declaring none — absent, not an exact
+/// integer, or negative — is refused by slot
+/// ([`AdmissionRefusal::UnreadableDeclaredSize`]). Charging it zero instead
+/// let a manifest declaring **one** layer of unstated weight clear the byte
+/// bound whatever it really weighed, and the count bound does not catch that:
+/// one enormous layer is one reference. Such a manifest was admitted and then
+/// refused by the assessment over its real bytes — accepted, then permanently
+/// unassessable, which is the exact state this gate exists to prevent.
+///
+/// Refusing it is not a false positive against a valid document — it is
+/// malformed input, the same thing
+/// [`IndexChildDescriptor::declared_size`]'s `None` already records one
+/// descriptor type over, where the admission-side consumer refuses the index
+/// rather than reading past it. The refusal names hort's own slot and never
+/// the declarant's value.
+///
+/// Checked for **every** descriptor, ahead of the deduplication above: whether
+/// a sibling happens to repeat this digest is not what decides conformance,
+/// and a refusal that depended on it would name a slot an operator cannot
+/// predict from their own document.
+///
+/// `size: 0` is **readable, conformant and admitted**. The empty config blob
+/// is two bytes and a genuinely empty layer is describable, so refusing a zero
+/// would be an off-by-one into the valid range.
+///
+/// # What it is deliberately not over
+///
+/// **A readable declaration is a claim, and this gate holds the declarant to
+/// nothing but it.** A descriptor that *understates* its `size` contributes
+/// what it said and is admitted — so **the byte bound is over declarations,
+/// not over bytes**, and an admitted manifest is not one whose content has
+/// been shown to fit the budget. That is the residual. Closing it means
+/// holding each descriptor against its stored row's `size_bytes`: a catalog
+/// read per constituent on the manifest-`PUT` path, which is what lets this
+/// gate run ahead of the mint with nothing fetched at all. That cost is a
+/// decision of its own and it has not been taken. What stands without it is
+/// that a manifest which under-declares is refused later by the assessment's
+/// own byte accounting over the real bytes — the honest-but-late answer the
+/// cheap check above no longer has to make for an *absent* declaration.
+///
+/// # The parse
+///
+/// A body that is not a JSON object of manifest shape is `Ok(())`: this gate
+/// answers about a manifest that declares a composition, and a body that
+/// declares nothing is a question for whoever parses it next — on the manifest
+/// `PUT` path a `MANIFEST_INVALID`, on the pull-through path a mint with no
+/// membership edges. Neither answer is this function's to pre-empt.
+///
+/// An image index is `Ok(())` for the same reason it is not a composition: it
+/// has no `config` and no `layers[]`, so it declares a cost of its own body and
+/// nothing else, and each child it binds is admitted as its own scan unit.
+pub fn refuse_manifest_past_assessment_budget(
+    manifest_json: &[u8],
+    budget: &ImageBudget,
+) -> Result<(), AdmissionRefusal> {
+    let Ok(manifest) = serde_json::from_slice::<OciManifestDeclaredCost>(manifest_json) else {
+        return Ok(());
+    };
+
+    let declared = manifest.layers.len() + usize::from(manifest.config.is_some());
+    let max_references = budget.max_manifest_blob_references();
+    if declared > max_references {
+        return Err(AdmissionRefusal::TooManyBlobReferences {
+            declared,
+            max: max_references,
+        });
+    }
+
+    // The manifest blob is a constituent too — the layout writer copies it
+    // first and charges it — so the body in hand is the first term, and no
+    // constituent can collide with it (a manifest's digest is over the bytes
+    // that would have to name it).
+    let mut declared_bytes = manifest_json.len() as u64;
+    let mut seen: HashSet<&str> = HashSet::new();
+    let config = manifest
+        .config
+        .iter()
+        .map(|descriptor| (ImageDescriptorSlot::Config, descriptor));
+    let layers = manifest
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(index, descriptor)| (ImageDescriptorSlot::Layer(index), descriptor));
+    for (slot, descriptor) in config.chain(layers) {
+        // Every descriptor, ahead of the deduplication below: the image spec
+        // requires a `size` on each one, so a sibling repeating this digest
+        // does not make this descriptor conformant, and a refusal that
+        // depended on it would name a slot the declarant cannot predict from
+        // their own document. A negative value lands here with an absent one —
+        // `u64::try_from` yields `None` for both, and neither is a weight.
+        let Some(size) = descriptor.size.and_then(|s| u64::try_from(s).ok()) else {
+            return Err(AdmissionRefusal::UnreadableDeclaredSize { slot });
+        };
+        // A descriptor naming nothing cannot be shown to be the same object as
+        // any other, so it is charged on its own. It is also a manifest the
+        // digest grammar refuses one step later, so this is the conservative
+        // reading of a document that is not going to be admitted anyway.
+        if let Some(digest) = descriptor.digest.as_deref() {
+            if !seen.insert(digest) {
+                continue;
+            }
+        }
+        declared_bytes = declared_bytes.saturating_add(size);
+    }
+    if declared_bytes > budget.max_bytes {
+        return Err(AdmissionRefusal::DeclaredBytes {
+            declared: declared_bytes,
+            max: budget.max_bytes,
+        });
+    }
+
+    Ok(())
 }
 
 /// Minimal single-image-manifest projection for
@@ -945,10 +1337,24 @@ struct OciConfigRootfs {
 /// [`strict_manifest_nomination`], which is what lets the completion stage —
 /// and therefore every
 /// [`ComposedImage`](crate::ports::scanner::ComposedImage) — carry the
-/// manifest-side guarantees: a resolved config digest, a resolved digest and
-/// an openable container for every declared layer, not an index, at least one
-/// layer, and a descriptor count under [`MAX_MANIFEST_BLOBS`]. A hand-built
-/// nomination could carry a layer nobody vetted.
+/// manifest-side guarantees: a resolved config digest, a resolved digest and a
+/// declared container for every layer, not an index, at least one layer, and a
+/// descriptor count under [`MAX_MANIFEST_BLOBS`]. A hand-built nomination
+/// could carry a layer nobody vetted.
+///
+/// Whether those containers are ones the materialisation can **open** is
+/// deliberately *not* among them: that is a statement about the composed
+/// layout, and the completion stage is where the config has established that a
+/// composed layout is what this artifact is. So a nomination may name a layer
+/// that will be refused.
+///
+/// What a nomination can **never** name is a layer declaring a payload format
+/// that is not a filesystem: that refusal belongs to the producer
+/// ([`ManifestRefusal::NonFilesystemLayer`]), so an OCI *artifact* manifest —
+/// an attestation, a signature, an SBOM attachment — is recognised as
+/// not-an-image from its own descriptors, rather than being carried forward as
+/// an image with a bad layer. Private fields and one producer are what make
+/// that a guarantee the completion stage can stand on instead of a convention.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManifestNomination {
     /// CAS content hash of the image config blob.
@@ -993,11 +1399,25 @@ impl ManifestNomination {
     /// The config-completion stage: read the image config blob the nomination
     /// names and either produce the composition or refuse it.
     ///
-    /// Only three things are decided here, and all three are statements the
-    /// **config bytes** make: that they are an image config document at all,
-    /// that they describe a layered root filesystem, and that they describe
-    /// one with as many layers as the manifest declared. Everything else was
-    /// settled by [`strict_manifest_nomination`] with no config blob in hand.
+    /// Three of the four things decided here are statements the **config
+    /// bytes** make: that they are an image config document at all, that they
+    /// describe a layered root filesystem, and that they describe one with as
+    /// many layers as the manifest declared. Everything else was settled by
+    /// [`strict_manifest_nomination`] with no config blob in hand.
+    ///
+    /// The fourth is the one statement about the *manifest's* descriptors that
+    /// belongs on this side of the seam: whether the materialisation can
+    /// **open** every declared layer container. An unopenable container is a
+    /// statement about what a scanner reads out of the composed layout, so it
+    /// is only answerable once the config has established that a composed
+    /// layout is what this artifact is.
+    ///
+    /// Which is **not** the same question as whether the declared payload is a
+    /// filesystem at all, and conflating the two is what made an OCI *artifact*
+    /// manifest report as an image with an unsupported layer instead of as
+    /// something that was never an image. That question needs no config, so
+    /// [`strict_manifest_nomination`] answers it and a nomination reaching here
+    /// has already passed it.
     ///
     /// Consuming `self` is the point: the nominated layers *are* the
     /// composition's layers, and moving them means no copy of the list
@@ -1025,6 +1445,20 @@ impl ManifestNomination {
                 diff_ids,
             });
         }
+        // Last, and after the arity disagreement for the same reason a
+        // descriptor fault outranks this one stage up: a layer list the config
+        // is not about is not a list whose containers are worth naming.
+        if let Some((index, layer)) = self
+            .layers
+            .iter()
+            .enumerate()
+            .find(|(_, layer)| !layer_media_type_is_openable(&layer.media_type))
+        {
+            return Err(ConfigRefusal::UnsupportedLayer {
+                index,
+                media_type: layer.media_type.clone(),
+            });
+        }
 
         Ok(ImageLayout {
             config: self.config,
@@ -1039,11 +1473,9 @@ impl ManifestNomination {
 ///
 /// Separate variants rather than one error string, because they do not lead to
 /// the same place: [`NotAnImage`](Self::NotAnImage) sends the caller to the
-/// index's children (ADR 0064 D5),
-/// [`UnsupportedLayer`](Self::UnsupportedLayer) is a capability gap to surface
-/// with the media type that caused it, and the descriptor refusals are
-/// statements that the manifest disagrees with the OCI image spec. A caller
-/// must be able to tell them apart without matching on prose.
+/// index's children (ADR 0064 D5), and the descriptor refusals are statements
+/// that the manifest disagrees with the OCI image spec. A caller must be able
+/// to tell them apart without matching on prose.
 ///
 /// A type of its own — rather than arms of a wider outcome shared with the
 /// config stage — is what makes this stage's *reach* readable: these are
@@ -1060,6 +1492,27 @@ pub enum ManifestRefusal {
     /// A single-image manifest declaring no layers: there is no composed
     /// filesystem to scan. Never "fine, zero layers".
     NoLayers,
+    /// A layer declaring a payload format that is **not a filesystem** — an
+    /// in-toto attestation, a cosign signature, an SBOM document (see
+    /// [`layer_media_type_is_non_filesystem_payload`]). The manifest is an OCI
+    /// *artifact* manifest, so like [`Self::NotAnImage`] there is nothing to
+    /// compose; unlike it, the thing it binds is a payload of its own rather
+    /// than references to other manifests.
+    ///
+    /// Decided from the manifest's descriptors alone, and therefore here rather
+    /// than one stage on: the config bytes cannot change the answer. A BuildKit
+    /// attestation manifest is the case that proves it has to be — its config
+    /// is image-shaped, declaring `rootfs.type: layers` with one `diff_id` per
+    /// payload, so every config-side check passes and the stage that reads them
+    /// would report a runnable image hort cannot finish composing.
+    ///
+    /// Carries no media type, for [`DescriptorProblem`]'s reason: nothing
+    /// renders one. The population is a legitimate and large one — every
+    /// multi-arch index `docker buildx` builds carries an attestation child per
+    /// platform — so its refusal is a steady state an operator must not be
+    /// warned about once per row, and the declared value is in the manifest
+    /// bytes the caller already holds.
+    NonFilesystemLayer,
     /// More `config` + `layers[]` descriptors than [`MAX_MANIFEST_BLOBS`].
     /// Rejected, never truncated — a truncated layer list is exactly the strict
     /// subset this parse exists to refuse.
@@ -1079,18 +1532,6 @@ pub enum ManifestRefusal {
         /// What is wrong with it.
         problem: DescriptorProblem,
     },
-    /// A layer whose declared container the materialisation cannot open — an
-    /// unsupported compression, or a `nondistributable` / `foreign` layer whose
-    /// bytes are held elsewhere. Carries the declared media type so the caller
-    /// can say which layer it withheld for. That string is
-    /// declarant-controlled and unbounded, so it belongs in a message, never in
-    /// a metric label.
-    UnsupportedLayer {
-        /// Zero-based index in manifest order.
-        index: usize,
-        /// The declared `mediaType`.
-        media_type: String,
-    },
     /// The manifest bytes are not a JSON object of manifest shape. Distinct
     /// from [`ConfigRefusal::NotParseable`] by *type* rather than by variant,
     /// so "which document was junk" — the difference between a bad push and a
@@ -1102,14 +1543,26 @@ pub enum ManifestRefusal {
 /// nominated — the refusal side of
 /// [`ManifestNomination::complete_with_config`].
 ///
-/// Every variant is a statement the **config bytes** make, which is what puts
-/// them on this side of the split: each is decidable only with the config blob
-/// in hand, and on a pull-through manifest that means only once it has been
-/// acquired. Two of the three are additionally the ordinary shape of a large,
-/// legitimate population — an OCI *artifact* manifest, whose config is
-/// deliberately not an image config — rather than a defect, which is why a
-/// caller must be able to tell them apart from the third without matching on
-/// prose.
+/// Each is decidable only with the config blob in hand, which is what puts them
+/// on this side of the split: on a pull-through manifest that means only once
+/// it has been acquired. Three are statements the **config bytes** themselves
+/// make; [`UnsupportedLayer`](Self::UnsupportedLayer) is a statement about the
+/// *manifest's* layer descriptors that nevertheless needs the config, because
+/// what a scanner can read out of a composed layout is only a question about
+/// an artifact the config has established *is* a composed layout.
+///
+/// The converse is the other half of the same split, and it is a
+/// [`ManifestRefusal`] rather than one of these: whether a declared layer is a
+/// filesystem **at all** is answerable from the manifest alone, so it is
+/// answered there (see [`ManifestRefusal::NonFilesystemLayer`]). A refusal that
+/// does not need the config must not wait for it — on a pull-through row,
+/// waiting means fetching a blob from upstream before a decision that never
+/// depended on it, and being held when that fetch fails.
+///
+/// Two of the four are additionally the ordinary shape of a large, legitimate
+/// population — an OCI *artifact* manifest, whose config is deliberately not
+/// an image config — rather than a defect, which is why a caller must be able
+/// to tell them apart from the other two without matching on prose.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigRefusal {
     /// The config bytes are not a JSON object of image-config shape. See
@@ -1128,6 +1581,40 @@ pub enum ConfigRefusal {
         layers: usize,
         /// `diff_ids` the config declared.
         diff_ids: usize,
+    },
+    /// A layer whose declared container the materialisation cannot open — an
+    /// unsupported compression, or a `nondistributable` / `foreign` layer whose
+    /// bytes are held elsewhere. Carries the declared media type so the caller
+    /// can say which layer it withheld for. That string is
+    /// declarant-controlled and unbounded, so it belongs in a message, never in
+    /// a metric label.
+    ///
+    /// Reached only over a config that has already said "layered root
+    /// filesystem, and this many layers", **and** over a layer list the
+    /// manifest stage has already cleared of known non-filesystem payloads
+    /// ([`ManifestRefusal::NonFilesystemLayer`]). So the container is one hort
+    /// has no decoder for or one whose bytes live elsewhere — not a payload
+    /// format that was never a filesystem.
+    ///
+    /// This comment used to claim the first half alone made it "never an
+    /// artifact manifest that was never an image", and that was false: a
+    /// BuildKit attestation manifest's synthesised config declares a layered
+    /// rootfs with one `diff_id` per payload, so it passed both config-side
+    /// checks and landed here — reported as a runnable image with an
+    /// unsupported layer, held, and terminal. The guarantee now rests on
+    /// [`ManifestNomination`]'s single producer rather than on this paragraph:
+    /// there is no way to reach this function with a layer list the earlier
+    /// refusal would have rejected.
+    ///
+    /// It is still not a claim that the manifest *was* meant to be an image —
+    /// a payload format nobody has named yet lands here too, which is the
+    /// deliberately fail-closed direction (see
+    /// [`layer_media_type_is_non_filesystem_payload`]).
+    UnsupportedLayer {
+        /// Zero-based index in manifest order.
+        index: usize,
+        /// The declared `mediaType`.
+        media_type: String,
     },
 }
 
@@ -1155,14 +1642,28 @@ pub enum ConfigRefusal {
 /// (their `rootfs`), which is the stronger statement about the same blob and
 /// belongs to the second stage.
 ///
-/// What is *not* decided here is whether a manifest was meant to be a runnable
-/// image at all: an artifact or attestation manifest is the caller's call
-/// before it asks, and the only manifest kind refused on sight is an index,
-/// which binds references rather than a filesystem. The manifest's own
-/// `mediaType` is otherwise not required to be a known image type, because OCI
-/// made it optional before it made it required and a Docker-schema push spells
-/// it differently — the `config` + `layers[]` shape is what is actually
-/// load-bearing.
+/// A **layer** descriptor's media type is read here and judged **only** for
+/// what the manifest alone can settle. The split is between two questions that
+/// look like one:
+///
+/// - *is the declared payload a filesystem at all?* An attestation, a
+///   signature or an SBOM document is not, whatever any config says, so this
+///   stage refuses it ([`ManifestRefusal::NonFilesystemLayer`]).
+/// - *can the materialisation open the container it declares?* That is a
+///   statement about the composed layout, and only the config establishes that
+///   a composed layout is what this artifact is, so that refusal is
+///   [`ConfigRefusal::UnsupportedLayer`] and not one of this stage's.
+///
+/// So **two** manifest kinds are refused on sight, and for one reason: neither
+/// binds a runnable filesystem. An index binds references to other manifests;
+/// an artifact manifest binds a payload document. Everything else about
+/// "was this meant to be an image?" is still the caller's call before it asks.
+/// The manifest's own `mediaType` in particular is not required to be a known
+/// image type, because OCI made it optional before it made it required and a
+/// Docker-schema push spells it differently — the `config` + `layers[]` shape
+/// is what is actually load-bearing. A BuildKit attestation manifest declares
+/// the ordinary image-manifest `mediaType` and an image-shaped config, and is
+/// recognised by neither.
 pub fn strict_manifest_nomination(
     manifest_json: &[u8],
 ) -> Result<ManifestNomination, ManifestRefusal> {
@@ -1180,6 +1681,27 @@ pub fn strict_manifest_nomination(
     );
     if declares_index || !manifest.manifests.is_empty() {
         return Err(ManifestRefusal::NotAnImage);
+    }
+
+    // And next, for the same reason in the same words: a manifest whose layer
+    // list declares a payload format that is not a filesystem binds a document,
+    // not a runnable root filesystem, so every later check would describe it as
+    // some kind of defective image instead. This is the one layer-media-type
+    // question that belongs on this side of the seam — not "can the
+    // materialisation open this container?", which needs the config to have
+    // established that a composed layout is even what this artifact is, but "is
+    // this a filesystem at all?", which the manifest's own descriptors answer
+    // and no config can overturn. Deciding it here is also what keeps the
+    // nomination from being completed, acquired or budgeted: an attestation
+    // child of a proxied index costs no upstream config fetch and cannot be
+    // held for one that fails.
+    if manifest.layers.iter().any(|descriptor| {
+        descriptor
+            .media_type
+            .as_deref()
+            .is_some_and(layer_media_type_is_non_filesystem_payload)
+    }) {
+        return Err(ManifestRefusal::NonFilesystemLayer);
     }
 
     if manifest.layers.is_empty() {
@@ -1225,16 +1747,15 @@ pub fn strict_manifest_nomination(
         };
         // A descriptor fault is a statement about the manifest; an unopenable
         // container is a statement about what the scanner reads out of the
-        // composed layout. Both refuse, and the first is reported first because
-        // it is the more precise thing to say about the input: a layer whose
-        // digest names nothing is not a layer whose container could be shown to
-        // compose later.
-        if !layer_media_type_is_openable(media_type) {
-            return Err(ManifestRefusal::UnsupportedLayer {
-                index,
-                media_type: media_type.to_owned(),
-            });
-        }
+        // composed layout. Only the first belongs here: this stage runs with
+        // no config blob in hand, and "the scanner cannot open this" is a
+        // question about an artifact nothing has yet established is a composed
+        // layout at all. The declared container travels forward on the layer
+        // and `ManifestNomination::complete_with_config` decides it, once the
+        // config has said there is a layered root filesystem to compose.
+        // (A payload format that is not a filesystem is the exception, and it
+        // was decided above: that one needs no config, so waiting for one would
+        // be waiting for bytes that cannot change the answer.)
         layers.push(ImageLayoutLayer {
             hash,
             media_type: media_type.to_owned(),
@@ -1561,11 +2082,10 @@ pub fn is_image_index(manifest_json: &[u8]) -> bool {
 /// [`DescriptorProblem::MalformedSha256`], an invalid document).
 ///
 /// An index declaring more than [`MAX_INDEX_CHILDREN`] children is **rejected**
-/// as [`crate::error::DomainError::Validation`] — never silently truncated —
-/// mirroring the single-image reference-count cap the write path enforces
-/// (`manifests_write.rs` `MAX_BLOB_REFERENCES`), so an over-cap index is refused
-/// rather than accepted with un-linked children. Unchanged by the correction
-/// above: it is a statement about the array, not about one descriptor.
+/// as [`crate::error::DomainError::Validation`] — never silently truncated — so
+/// an over-cap index is refused rather than accepted with un-linked children.
+/// Unchanged by the correction above: it is a statement about the array, not
+/// about one descriptor.
 ///
 /// A single-image manifest (no `manifests[]`) or an empty `manifests: []`
 /// yields an empty [`IndexChildren`] with no faults. Malformed / non-object
@@ -3180,12 +3700,189 @@ mod tests {
         );
     }
 
+    /// **A BuildKit attestation manifest is an artifact manifest, decided from
+    /// its own descriptors.** The shape in evidence: an index child whose
+    /// config is image-shaped — `rootfs.type: layers` with one `diff_id` for
+    /// one layer, which BuildKit synthesises — and whose single layer declares
+    /// `application/vnd.in-toto+json`.
+    ///
+    /// Both halves are asserted, because only together do they say why this
+    /// needed a second refusal rather than a wider config check:
+    ///
+    /// 1. the manifest stage refuses it, with **no config document in sight**;
+    /// 2. the config it would have been completed with is one that *passes* —
+    ///    exhibited by composing the identical manifest with a gzip layer
+    ///    against the very same config bytes.
+    ///
+    /// Before this, (2) was what the row got: `rootfs` and arity both passed,
+    /// the layer container was then found unopenable, and the result was
+    /// `ConfigRefusal::UnsupportedLayer` — a runnable image hort holds an
+    /// incomplete composition of, which gates. Eight such manifests from one
+    /// proxied `redis:7-alpine` sat terminally `scan_indeterminate`.
+    #[test]
+    fn an_attestation_manifest_is_refused_from_the_manifest_bytes_alone() {
+        let in_toto = serde_json::json!([{
+            "mediaType": IN_TOTO_STATEMENT_MEDIA_TYPE,
+            "digest": format!("sha256:{}", hex64('a')),
+            "size": 1337,
+            "annotations": { "in-toto.io/predicate-type": "https://slsa.dev/provenance/v0.2" },
+        }]);
+        assert_eq!(
+            manifest_refusal(&image_manifest(&in_toto)),
+            ManifestRefusal::NonFilesystemLayer,
+            "an attestation payload is not a filesystem, and the manifest says so on its own"
+        );
+
+        // The config that would have completed it — and does complete the same
+        // manifest with a filesystem layer in place of the attestation. So
+        // nothing on the config side distinguishes the two documents, which is
+        // why the discriminator cannot live there.
+        let config = image_config(1);
+        let layout = composed(&image_manifest(&gzip_layers(1)), &config);
+        assert_eq!(layout.layers.len(), 1);
+    }
+
+    /// Every payload format the vocabulary names, over the same image-shaped
+    /// config — an attestation, both cosign signature carriages, and both SBOM
+    /// serialisations. One table, because the claim is about the set and not
+    /// about in-toto: each of these is a document by its own specification, so
+    /// a manifest declaring one as a layer was never an image.
+    #[test]
+    fn every_known_non_filesystem_payload_makes_the_manifest_an_artifact_manifest() {
+        for media_type in [
+            IN_TOTO_STATEMENT_MEDIA_TYPE,
+            COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+            SIGSTORE_BUNDLE_MEDIA_TYPE,
+            SPDX_JSON_MEDIA_TYPE,
+            CYCLONEDX_JSON_MEDIA_TYPE,
+        ] {
+            let m = image_manifest(&serde_json::json!([
+                { "mediaType": media_type, "digest": format!("sha256:{}", hex64('a')) },
+            ]));
+            assert_eq!(
+                manifest_refusal(&m),
+                ManifestRefusal::NonFilesystemLayer,
+                "{media_type} is a document, so a manifest declaring it is not an image"
+            );
+        }
+    }
+
+    /// **The two refusals do not collapse, in either direction**, and this is
+    /// the pair the whole distinction rests on. One manifest carries a
+    /// `nondistributable` layer beside an ordinary one; the other carries an
+    /// in-toto payload in exactly the same position. Same stage-one shape, same
+    /// config, opposite answers:
+    ///
+    /// - the `nondistributable` one is a **runnable image** whose bytes live
+    ///   behind the descriptor's `urls`, so hort holds an incomplete
+    ///   composition of a real image and withholds fail-closed;
+    /// - the in-toto one was **never an image**, so there is nothing to
+    ///   withhold and nothing to wait for.
+    ///
+    /// Collapsing them either way loses something that cannot be recovered
+    /// downstream: one direction holds every attestation manifest for ever, the
+    /// other releases a real image whose filesystem nobody can read.
+    #[test]
+    fn a_non_filesystem_payload_and_an_unopenable_container_stay_separate_answers() {
+        let with = |media_type: &str| {
+            image_manifest(&serde_json::json!([
+                { "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('a')) },
+                { "mediaType": media_type, "digest": format!("sha256:{}", hex64('b')) },
+            ]))
+        };
+
+        // Fail-closed, unchanged: a real image hort cannot finish composing.
+        let nondistributable = "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
+        assert_eq!(
+            config_refusal(&with(nondistributable), &image_config(2)),
+            ConfigRefusal::UnsupportedLayer {
+                index: 1,
+                media_type: nondistributable.to_owned(),
+            },
+            "a foreign layer is still an image hort holds an incomplete composition of"
+        );
+
+        // Not an image at all — and refused a stage earlier, so the config is
+        // never even read.
+        assert_eq!(
+            manifest_refusal(&with(IN_TOTO_STATEMENT_MEDIA_TYPE)),
+            ManifestRefusal::NonFilesystemLayer,
+            "an attestation payload beside a filesystem layer still makes this an artifact \
+             manifest"
+        );
+    }
+
+    /// And the precedence between them, on one manifest that carries both: a
+    /// `nondistributable` layer first, an in-toto payload second. "This was
+    /// never an image" outranks "this is an image hort cannot finish", because
+    /// the second question is only meaningful about an artifact the first has
+    /// admitted is an image — the same order the index refusal already has over
+    /// every later check.
+    #[test]
+    fn being_an_artifact_manifest_outranks_an_unopenable_container() {
+        let m = image_manifest(&serde_json::json!([
+            { "mediaType": "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+              "digest": format!("sha256:{}", hex64('a')) },
+            { "mediaType": IN_TOTO_STATEMENT_MEDIA_TYPE,
+              "digest": format!("sha256:{}", hex64('b')) },
+        ]));
+        assert_eq!(manifest_refusal(&m), ManifestRefusal::NonFilesystemLayer);
+    }
+
+    /// The counter-assertion under both: the two sets are **disjoint**, so
+    /// neither predicate can be widened into the other's territory by
+    /// accident. A member of one that is also a member of the other would make
+    /// the order of the two checks decide the answer, which is exactly the
+    /// coupling the spec rules out — an image layer is a tar archive and every
+    /// payload format here is, by its own specification, a JSON document.
+    #[test]
+    fn the_two_layer_media_type_sets_are_disjoint() {
+        for openable in [
+            OCI_LAYER_TAR_MEDIA_TYPE,
+            OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+            OCI_LAYER_TAR_ZSTD_MEDIA_TYPE,
+            DOCKER_LAYER_TAR_GZIP_MEDIA_TYPE,
+        ] {
+            assert!(layer_media_type_is_openable(openable), "{openable}");
+            assert!(
+                !layer_media_type_is_non_filesystem_payload(openable),
+                "{openable} is a filesystem container, not a payload document"
+            );
+        }
+        for payload in [
+            IN_TOTO_STATEMENT_MEDIA_TYPE,
+            COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+            SIGSTORE_BUNDLE_MEDIA_TYPE,
+            SPDX_JSON_MEDIA_TYPE,
+            CYCLONEDX_JSON_MEDIA_TYPE,
+        ] {
+            assert!(
+                layer_media_type_is_non_filesystem_payload(payload),
+                "{payload}"
+            );
+            assert!(
+                !layer_media_type_is_openable(payload),
+                "{payload} is a document; nothing composes a root filesystem out of it"
+            );
+        }
+        // And the fail-closed middle is still empty of both: a container
+        // nobody has named belongs to neither set, which is what keeps it
+        // withheld rather than released.
+        assert!(!layer_media_type_is_openable(UNRECOGNISED_LAYER_MEDIA_TYPE));
+        assert!(!layer_media_type_is_non_filesystem_payload(
+            UNRECOGNISED_LAYER_MEDIA_TYPE
+        ));
+    }
+
     #[test]
     fn a_non_distributable_layer_is_withheld_with_its_media_type() {
         // A foreign / non-distributable layer's bytes are by declaration held
         // somewhere else, so the registry does not hold the composition at
         // all. Both spellings must be withheld, and the media type must travel
         // with the refusal so the caller can say what it withheld for.
+        //
+        // Withheld by the **config** stage: this is a genuine image — its
+        // config says so — that hort holds an incomplete composition of.
         for (index, media_type) in [
             "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
             "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
@@ -3198,8 +3895,8 @@ mod tests {
                 { "mediaType": media_type, "digest": format!("sha256:{}", hex64('b')) },
             ]));
             assert_eq!(
-                manifest_refusal(&m),
-                ManifestRefusal::UnsupportedLayer {
+                config_refusal(&m, &image_config(2)),
+                ConfigRefusal::UnsupportedLayer {
                     index: 1,
                     media_type: media_type.to_owned(),
                 },
@@ -3237,8 +3934,8 @@ mod tests {
               "digest": format!("sha256:{}", hex64('a')) },
         ]));
         assert_eq!(
-            manifest_refusal(&m),
-            ManifestRefusal::UnsupportedLayer {
+            config_refusal(&m, &image_config(1)),
+            ConfigRefusal::UnsupportedLayer {
                 index: 0,
                 media_type: UNRECOGNISED_LAYER_MEDIA_TYPE.to_owned(),
             }
@@ -3258,8 +3955,8 @@ mod tests {
             { "mediaType": NONDISTRIBUTABLE_ZSTD_MEDIA_TYPE, "digest": format!("sha256:{}", hex64('b')) },
         ]));
         assert_eq!(
-            manifest_refusal(&m),
-            ManifestRefusal::UnsupportedLayer {
+            config_refusal(&m, &image_config(2)),
+            ConfigRefusal::UnsupportedLayer {
                 index: 1,
                 media_type: NONDISTRIBUTABLE_ZSTD_MEDIA_TYPE.to_owned(),
             }
@@ -3273,8 +3970,8 @@ mod tests {
               "digest": format!("sha256:{}", hex64('a')) },
         ]));
         assert_eq!(
-            manifest_refusal(&m),
-            ManifestRefusal::UnsupportedLayer {
+            config_refusal(&m, &image_config(1)),
+            ConfigRefusal::UnsupportedLayer {
                 index: 0,
                 media_type: "application/vnd.example.unknown.layer".to_owned(),
             }
@@ -3554,19 +4251,43 @@ mod tests {
         ));
     }
 
-    // -- the two stages, and the ten outcomes they own between them --------
+    #[test]
+    fn non_filesystem_payload_media_type_constants_are_the_registered_types() {
+        // Pinned against the specifications that define each one — the
+        // in-toto Attestation Framework's envelope type, cosign's two
+        // signature carriages, and the two SBOM serialisations. A typo here
+        // does **not** fail safe: it leaves the manifest on the fail-closed
+        // arm, which is where the eight held attestation manifests came from.
+        assert_eq!(IN_TOTO_STATEMENT_MEDIA_TYPE, "application/vnd.in-toto+json");
+        assert_eq!(SPDX_JSON_MEDIA_TYPE, "application/spdx+json");
+        assert_eq!(CYCLONEDX_JSON_MEDIA_TYPE, "application/vnd.cyclonedx+json");
+        // The two the vocabulary already had, reused rather than re-spelled:
+        // a second copy of either is a place for the provenance path and the
+        // composition path to disagree about one manifest.
+        assert_eq!(
+            COSIGN_SIMPLESIGNING_MEDIA_TYPE,
+            "application/vnd.dev.cosign.simplesigning.v1+json"
+        );
+        assert_eq!(
+            SIGSTORE_BUNDLE_MEDIA_TYPE,
+            "application/vnd.dev.sigstore.bundle.v0.3+json"
+        );
+        assert!(!layer_media_type_is_non_filesystem_payload(""));
+    }
+
+    // -- the two stages, and the eleven outcomes they own between them -----
     //
     // The split exists because a composition's **config is itself a
     // constituent**: on a pull-through manifest it is as absent as the layers
     // are, so a caller has to decide every manifest-side refusal before it
     // goes and acquires one, and only then read the config bytes. These tests
     // pin the seam — which stage owns which outcome, over a table that
-    // reaches all ten of them.
+    // reaches all eleven of them.
 
     /// Which stage decides a corpus entry's outcome, and which outcome that
     /// is.
     ///
-    /// Compared by **variant**: two of the nine refusals quote serde's own
+    /// Compared by **variant**: two of the ten refusals quote serde's own
     /// complaint, which no test should spell out, and the values each refusal
     /// carries are pinned by its own test above. What this table is for is
     /// *reach* and *ownership*.
@@ -3583,7 +4304,7 @@ mod tests {
     }
 
     /// Every outcome the two stages reach between them — six
-    /// [`ManifestRefusal`]s, three [`ConfigRefusal`]s and a composition —
+    /// [`ManifestRefusal`]s, four [`ConfigRefusal`]s and a composition —
     /// with the documents that reach it and the stage that owns it.
     ///
     /// A manifest-side entry carries **no config document at all** (`b""`),
@@ -3617,6 +4338,16 @@ mod tests {
                 Owned::Manifest(ManifestRefusal::NoLayers),
             ),
             (
+                "a BuildKit attestation manifest, whose config is image-shaped",
+                image_manifest(&serde_json::json!([{
+                    "mediaType": IN_TOTO_STATEMENT_MEDIA_TYPE,
+                    "digest": format!("sha256:{}", hex64('1')),
+                    "size": 1337,
+                }])),
+                b"".to_vec(),
+                Owned::Manifest(ManifestRefusal::NonFilesystemLayer),
+            ),
+            (
                 "one descriptor over the cap",
                 manifest(&serde_json::json!({
                     "config": { "digest": format!("sha256:{}", hex64('c')) },
@@ -3638,19 +4369,6 @@ mod tests {
                 Owned::Manifest(ManifestRefusal::MalformedDescriptor {
                     slot: ImageDescriptorSlot::Layer(0),
                     problem: DescriptorProblem::MissingDigest,
-                }),
-            ),
-            (
-                "a layer container nothing can open",
-                image_manifest(&serde_json::json!([{
-                    "mediaType": UNRECOGNISED_LAYER_MEDIA_TYPE,
-                    "digest": format!("sha256:{}", hex64('1')),
-                    "size": 100,
-                }])),
-                b"".to_vec(),
-                Owned::Manifest(ManifestRefusal::UnsupportedLayer {
-                    index: 0,
-                    media_type: UNRECOGNISED_LAYER_MEDIA_TYPE.to_owned(),
                 }),
             ),
             (
@@ -3678,6 +4396,19 @@ mod tests {
                 Owned::Config(ConfigRefusal::DiffIdArity {
                     layers: 2,
                     diff_ids: 1,
+                }),
+            ),
+            (
+                "a layer container nothing can open",
+                image_manifest(&serde_json::json!([{
+                    "mediaType": UNRECOGNISED_LAYER_MEDIA_TYPE,
+                    "digest": format!("sha256:{}", hex64('1')),
+                    "size": 100,
+                }])),
+                image_config(1),
+                Owned::Config(ConfigRefusal::UnsupportedLayer {
+                    index: 0,
+                    media_type: UNRECOGNISED_LAYER_MEDIA_TYPE.to_owned(),
                 }),
             ),
         ]
@@ -3736,9 +4467,15 @@ mod tests {
     }
 
     /// **Every outcome through the stage that owns it.** The manifest stage
-    /// reaches each of its six refusals from the manifest bytes alone, with no
+    /// reaches each of its five refusals from the manifest bytes alone, with no
     /// config document in the entry at all — and the completion stage reaches
-    /// its three only over a nomination the manifest stage accepted.
+    /// its four only over a nomination the manifest stage accepted.
+    ///
+    /// An unopenable layer container sits on the **config** side, and its entry
+    /// carrying a real config document is the proof: it is the one refusal
+    /// about a manifest descriptor that cannot be reached without one, because
+    /// an artifact manifest whose config describes no root filesystem must
+    /// answer "never an image" instead.
     ///
     /// The first half is the property the composite scan stands on: it
     /// refuses with no config blob in hand, and no config bytes it might
@@ -3779,14 +4516,14 @@ mod tests {
     }
 
     /// The counter-assertion the test above needs in order not to be vacuous:
-    /// the corpus **reaches** all ten outcomes — six manifest-side refusals,
-    /// three config-side, one composition. Without it a variant could leave
+    /// the corpus **reaches** all ten outcomes — five manifest-side refusals,
+    /// four config-side, one composition. Without it a variant could leave
     /// the table, or be renamed out of reach, and the ownership test would
     /// still pass over whatever was left.
     #[test]
     fn the_corpus_reaches_every_outcome_of_both_stages() {
-        let mut manifest_side = std::collections::HashSet::new();
-        let mut config_side = std::collections::HashSet::new();
+        let mut manifest_side = HashSet::new();
+        let mut config_side = HashSet::new();
         let mut compositions = 0usize;
         for run in corpus_runs() {
             match run.reached {
@@ -3806,7 +4543,7 @@ mod tests {
         );
         assert_eq!(
             config_side.len(),
-            3,
+            4,
             "every ConfigRefusal variant must be reached by the corpus"
         );
         assert_eq!(
@@ -3929,6 +4666,445 @@ mod tests {
             "the whole-image bound must be tighter than what a manifest may declare"
         );
     }
+    // -- the admission gate the budget derives ---------------------------
+
+    /// **The derivation, stated once.** `max_blobs` counts constituents and a
+    /// manifest's descriptors name every one but the manifest itself, so the
+    /// two differ by exactly one — a change of unit, not a margin.
+    #[test]
+    fn the_admission_bound_is_the_constituent_ceiling_less_the_manifest() {
+        let budget = ImageBudget::default_for_composite_scan();
+        assert_eq!(budget.max_manifest_blob_references(), budget.max_blobs - 1);
+        assert_eq!(budget.max_manifest_blob_references(), 255);
+
+        // And it is the count a nomination at the bound actually reports: a
+        // manifest declaring `max_manifest_blob_references()` descriptors
+        // nominates exactly `max_blobs` constituents.
+        let references = budget.max_manifest_blob_references();
+        let at_bound = image_manifest(&gzip_layers(references - 1));
+        let nomination = strict_manifest_nomination(&at_bound).expect("nominates");
+        assert_eq!(nomination.constituent_count(), budget.max_blobs);
+        refuse_manifest_past_assessment_budget(&at_bound, &budget)
+            .expect("the largest composable image is admitted");
+    }
+
+    /// A budget tightened to nothing admits no manifest rather than panicking
+    /// on the unit conversion. A budget is a plain struct a test may set to
+    /// anything, so the honest answer is a bound of zero.
+    #[test]
+    fn a_budget_with_no_room_admits_no_manifest() {
+        let none = ImageBudget {
+            max_blobs: 0,
+            ..ImageBudget::default_for_composite_scan()
+        };
+        assert_eq!(none.max_manifest_blob_references(), 0);
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(&image_manifest(&gzip_layers(1)), &none),
+            Err(AdmissionRefusal::TooManyBlobReferences {
+                declared: 2,
+                max: 0
+            })
+        );
+    }
+
+    /// The count bound is **not** deduplicated, because the bound it answers
+    /// to is not either: both the acquisition and the layout writer spend
+    /// theirs on `constituent_count()`, which counts declared descriptors.
+    #[test]
+    fn the_count_bound_counts_declared_descriptors_and_not_distinct_objects() {
+        let repeated = hex64('1');
+        let layers: Vec<serde_json::Value> = (0..4)
+            .map(|_| {
+                serde_json::json!({
+                    "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                    "digest": format!("sha256:{repeated}"),
+                    "size": 1,
+                })
+            })
+            .collect();
+        let m = image_manifest(&serde_json::json!(layers));
+        let budget = ImageBudget {
+            max_blobs: 5,
+            ..ImageBudget::default_for_composite_scan()
+        };
+        // Four layers + config = five references against a bound of four.
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(&m, &budget),
+            Err(AdmissionRefusal::TooManyBlobReferences {
+                declared: 5,
+                max: 4
+            }),
+            "one distinct object, five declared descriptors — and the count is five"
+        );
+    }
+
+    /// The **byte** bound *is* deduplicated, because the layout writer charges
+    /// one file on disk once. A manifest repeating a large layer costs that
+    /// layer once there, so an admission gate that charged it per occurrence
+    /// would refuse an image the writer would have assembled — the one failure
+    /// this gate must not introduce.
+    #[test]
+    fn the_byte_bound_charges_one_object_once() {
+        let repeated = hex64('1');
+        let layers: Vec<serde_json::Value> = (0..5)
+            .map(|_| {
+                serde_json::json!({
+                    "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                    "digest": format!("sha256:{repeated}"),
+                    "size": 1_000,
+                })
+            })
+            .collect();
+        let m = image_manifest(&serde_json::json!(layers));
+        // Body + the config's 7 + one 1000-byte layer.
+        let exact = m.len() as u64 + 7 + 1_000;
+        refuse_manifest_past_assessment_budget(
+            &m,
+            &ImageBudget {
+                max_bytes: exact,
+                ..ImageBudget::default_for_composite_scan()
+            },
+        )
+        .expect("five declarations of one object cost that object once");
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(
+                &m,
+                &ImageBudget {
+                    max_bytes: exact - 1,
+                    ..ImageBudget::default_for_composite_scan()
+                }
+            ),
+            Err(AdmissionRefusal::DeclaredBytes {
+                declared: exact,
+                max: exact - 1
+            }),
+            "and one byte less of budget refuses it, so the sum above is the real one"
+        );
+    }
+
+    /// The manifest body is itself a constituent — the layout writer copies it
+    /// first and charges it — so it is the first term of the sum.
+    #[test]
+    fn the_byte_bound_charges_the_manifest_body_itself() {
+        let m = image_manifest(&serde_json::json!([]));
+        // No layers at all: whatever is charged is the body plus the config.
+        let budget = ImageBudget {
+            max_bytes: m.len() as u64 + 6,
+            ..ImageBudget::default_for_composite_scan()
+        };
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(&m, &budget),
+            Err(AdmissionRefusal::DeclaredBytes {
+                declared: m.len() as u64 + 7,
+                max: m.len() as u64 + 6
+            }),
+            "the body is charged, and so is the config's declared 7"
+        );
+    }
+
+    /// **A size hort cannot read is not a size of zero.** `size` is REQUIRED
+    /// on every descriptor by the OCI image spec, so a declaration that is
+    /// absent, not an exact integer, or negative is refused by slot rather
+    /// than charged as nothing.
+    ///
+    /// Charging it zero is what let a manifest declaring **one** layer of
+    /// unstated weight clear the byte bound whatever it really weighed — and
+    /// the count bound does not catch that, because one enormous layer is one
+    /// reference. The budget below is the shipped one, so each refusal here is
+    /// about the declaration and not about a bound the fixture is near.
+    #[test]
+    fn a_size_hort_cannot_read_is_refused_rather_than_charged_as_zero() {
+        for size in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!("a lot")),
+            Some(serde_json::json!(1.5)),
+            Some(serde_json::json!(-4096)),
+            // Past `i64`, so `lenient_i64`'s `as_i64` cannot read it either.
+            Some(serde_json::json!(u64::MAX)),
+        ] {
+            let mut layer = serde_json::json!({
+                "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                "digest": format!("sha256:{}", hex64('1')),
+            });
+            if let Some(size) = &size {
+                layer["size"] = size.clone();
+            }
+            let m = manifest(&serde_json::json!({
+                "schemaVersion": 2,
+                "config": { "digest": format!("sha256:{}", hex64('c')), "size": 7 },
+                "layers": [layer],
+            }));
+            assert_eq!(
+                refuse_manifest_past_assessment_budget(
+                    &m,
+                    &ImageBudget::default_for_composite_scan()
+                ),
+                Err(AdmissionRefusal::UnreadableDeclaredSize {
+                    slot: ImageDescriptorSlot::Layer(0)
+                }),
+                "a `size` of {size:?} is a declaration the image spec forbids"
+            );
+        }
+    }
+
+    /// The refusal names **which** descriptor, in hort's own slot vocabulary,
+    /// and reaches the `config` descriptor as well as a layer — the two
+    /// descriptor kinds this gate is over. The first offender in manifest
+    /// order is the one named, config before layers, so a document with
+    /// several gets one actionable answer rather than a list.
+    #[test]
+    fn the_unreadable_size_refusal_names_the_offending_slot() {
+        let sized_layer = |c: char| {
+            serde_json::json!({
+                "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                "digest": format!("sha256:{}", hex64(c)),
+                "size": 10,
+            })
+        };
+        let unsized_layer = |c: char| {
+            serde_json::json!({
+                "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                "digest": format!("sha256:{}", hex64(c)),
+            })
+        };
+
+        // A layer in the middle of the list: the slot is its zero-based index
+        // in manifest order.
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": format!("sha256:{}", hex64('c')), "size": 7 },
+            "layers": [sized_layer('1'), sized_layer('2'), unsized_layer('3')],
+        }));
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(&m, &ImageBudget::default_for_composite_scan()),
+            Err(AdmissionRefusal::UnreadableDeclaredSize {
+                slot: ImageDescriptorSlot::Layer(2)
+            })
+        );
+
+        // The config descriptor, which the index-child counterpart of this
+        // refusal has no equivalent of.
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": format!("sha256:{}", hex64('c')) },
+            "layers": [unsized_layer('1')],
+        }));
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(&m, &ImageBudget::default_for_composite_scan()),
+            Err(AdmissionRefusal::UnreadableDeclaredSize {
+                slot: ImageDescriptorSlot::Config
+            }),
+            "config is read before layers, so it is the slot named"
+        );
+    }
+
+    /// **The counter-assertion: `size: 0` is readable, conformant and
+    /// admitted.** The empty config blob weighs two bytes and a genuinely
+    /// empty layer is describable, so refusing a zero would be an off-by-one
+    /// into the valid range — and it is charged as the nothing it declares,
+    /// asserted by a budget that leaves no room for anything else.
+    #[test]
+    fn a_zero_declared_size_is_conformant_and_admitted() {
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": format!("sha256:{}", hex64('c')), "size": 0 },
+            "layers": [{
+                "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                "digest": format!("sha256:{}", hex64('1')),
+                "size": 0,
+            }],
+        }));
+        refuse_manifest_past_assessment_budget(
+            &m,
+            &ImageBudget {
+                max_bytes: m.len() as u64,
+                ..ImageBudget::default_for_composite_scan()
+            },
+        )
+        .expect("two conformant zero-byte declarations cost the body and nothing more");
+    }
+
+    /// **The conformance check is per descriptor, not per distinct object.**
+    /// A repeated digest is charged once, but the repetition does not make the
+    /// second descriptor conformant: the spec requires a `size` on each one,
+    /// and a refusal that depended on which sibling came first would name a
+    /// slot the declarant cannot predict from their own document.
+    #[test]
+    fn a_repeated_digest_does_not_excuse_a_missing_size() {
+        let repeated = hex64('1');
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": format!("sha256:{}", hex64('c')), "size": 7 },
+            "layers": [
+                {
+                    "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                    "digest": format!("sha256:{repeated}"),
+                    "size": 10,
+                },
+                {
+                    "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                    "digest": format!("sha256:{repeated}"),
+                },
+            ],
+        }));
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(&m, &ImageBudget::default_for_composite_scan()),
+            Err(AdmissionRefusal::UnreadableDeclaredSize {
+                slot: ImageDescriptorSlot::Layer(1)
+            }),
+            "the repeat contributes no bytes and is still a non-conformant descriptor"
+        );
+    }
+
+    /// **The residual, stated as a test so it is not mistaken for a
+    /// guarantee.** A descriptor that declares a *readable but false* size is
+    /// admitted on its declaration: the byte bound is over declarations, not
+    /// over bytes. Closing it means a catalog read per constituent on the
+    /// manifest-`PUT` path and is a decision that has not been taken; what
+    /// stands is the assessment's own accounting over the real bytes.
+    #[test]
+    fn an_understated_size_is_admitted_on_its_declaration() {
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": format!("sha256:{}", hex64('c')), "size": 1 },
+            "layers": [{
+                "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE,
+                "digest": format!("sha256:{}", hex64('1')),
+                // One byte claimed for what may weigh gigabytes. Nothing here
+                // has read the blob, and that is what lets this gate run with
+                // nothing fetched.
+                "size": 1,
+            }],
+        }));
+        refuse_manifest_past_assessment_budget(
+            &m,
+            &ImageBudget {
+                max_bytes: m.len() as u64 + 2,
+                ..ImageBudget::default_for_composite_scan()
+            },
+        )
+        .expect("a readable declaration is taken at its word");
+    }
+
+    /// A descriptor naming no content cannot be shown to be the same object as
+    /// any other, so it is charged on its own — the conservative reading of a
+    /// document the digest grammar refuses one step later anyway.
+    #[test]
+    fn descriptors_with_no_digest_are_each_charged() {
+        let m = manifest(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": { "digest": format!("sha256:{}", hex64('c')), "size": 1 },
+            "layers": [
+                { "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE, "size": 10 },
+                { "mediaType": OCI_LAYER_TAR_GZIP_MEDIA_TYPE, "size": 10 },
+            ],
+        }));
+        let charged = m.len() as u64 + 1 + 10 + 10;
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(
+                &m,
+                &ImageBudget {
+                    max_bytes: charged - 1,
+                    ..ImageBudget::default_for_composite_scan()
+                }
+            ),
+            Err(AdmissionRefusal::DeclaredBytes {
+                declared: charged,
+                max: charged - 1
+            })
+        );
+    }
+
+    /// An **image index** declares no composition: no `config`, no `layers[]`,
+    /// so it costs its own body and nothing else, and each child it binds is
+    /// admitted as its own scan unit. The gate is a no-op for it, and must be:
+    /// an index is not the thing the whole-image budget is over.
+    #[test]
+    fn an_index_declares_no_composition_and_is_admitted() {
+        let oci = index(&serde_json::json!([{
+            "mediaType": OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+            "digest": format!("sha256:{}", hex64('b')),
+            "size": 100,
+        }]));
+        refuse_manifest_past_assessment_budget(
+            &oci,
+            &ImageBudget {
+                max_blobs: 1,
+                max_bytes: oci.len() as u64,
+                ..ImageBudget::default_for_composite_scan()
+            },
+        )
+        .expect("an index costs its own body and declares no constituents");
+    }
+
+    /// A body that declares nothing is `Ok(())`: this gate answers about a
+    /// manifest that declares a composition, and whoever parses the body next
+    /// answers for a body that is not one — a `MANIFEST_INVALID` on the push
+    /// path, a mint with no membership edges on the pull-through path.
+    #[test]
+    fn a_body_that_is_not_a_manifest_is_not_this_gates_refusal() {
+        for body in [b"not json at all".to_vec(), b"[1, 2, 3]".to_vec()] {
+            assert_eq!(
+                refuse_manifest_past_assessment_budget(
+                    &body,
+                    &ImageBudget::default_for_composite_scan()
+                ),
+                Ok(()),
+                "a body declaring no composition is a question for the next parse"
+            );
+        }
+    }
+
+    /// The two **bound** refusals carry the actual, then the bound — the pair
+    /// an operator acts on, since the bound alone says a wall exists and not
+    /// how far past it they are. Pinned by value because two crates render
+    /// them.
+    ///
+    /// The conformance refusal carries **neither**, and that is the assertion:
+    /// there is no bound a missing field is past, and the declarant's value is
+    /// not in the refusal to be rendered. A `Debug` over the whole enum is
+    /// what a log line or a test failure prints, so it is where an accidental
+    /// value field would show up.
+    #[test]
+    fn an_admission_refusal_carries_the_actual_and_the_bound() {
+        let count = AdmissionRefusal::TooManyBlobReferences {
+            declared: 256,
+            max: 255,
+        };
+        assert_eq!(count, count);
+        assert!(format!("{count:?}").contains("declared: 256"));
+        let bytes = AdmissionRefusal::DeclaredBytes {
+            declared: 9_000_000_000,
+            max: 8 * 1024 * 1024 * 1024,
+        };
+        assert_ne!(
+            bytes,
+            AdmissionRefusal::DeclaredBytes {
+                declared: 1,
+                max: 2
+            }
+        );
+        assert!(format!("{bytes:?}").contains("8589934592"));
+
+        let unreadable = AdmissionRefusal::UnreadableDeclaredSize {
+            slot: ImageDescriptorSlot::Layer(2),
+        };
+        assert_eq!(unreadable, unreadable);
+        assert_ne!(
+            unreadable,
+            AdmissionRefusal::UnreadableDeclaredSize {
+                slot: ImageDescriptorSlot::Config
+            }
+        );
+        let rendered = format!("{unreadable:?}");
+        assert!(rendered.contains("Layer(2)"), "{rendered}");
+        assert!(
+            !rendered.contains("declared") && !rendered.contains("max"),
+            "a conformance refusal has no actual and no bound: {rendered}"
+        );
+    }
+
     /// The slot vocabulary every phase of a composite scan names a constituent
     /// by. Pinned because two phases in two crates render it, and a reader
     /// correlating their log lines is relying on the spelling matching.

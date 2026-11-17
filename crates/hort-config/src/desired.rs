@@ -17,7 +17,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use hort_domain::entities::scan_policy::CompositeVerdictMode;
 use hort_domain::retention::PolicyPredicate;
 
 use crate::claim_mapping::{parse_claim_mapping, ClaimMappingSpec};
@@ -1444,68 +1443,74 @@ pub fn validate_scan_policy_max_artifact_age_not_implemented(
     errors
 }
 
-/// Row 15 — a `ScanPolicy` that promotes the composed-image verdict to
-/// release authority while declaring **no scanner backends**
-/// (ADR 0064 D6 × ADR 0016's cross-opt-in matrix, closed under ADR 0015).
+/// Row 15 — a `ScanPolicy` declaring the **retired**
+/// `compositeVerdictMode` (ADR 0064 D2, closed under ADR 0015).
 ///
-/// Two operator opt-ins that each change which analysis decides the
-/// release gate, and together they cancel. `scanBackends: []` is the
-/// explicit scan waiver: `ScanOrchestrationUseCase::run_scan` returns
-/// `SkippedNoBackends` on it **before** a composition is resolved, so no
-/// manifest in the policy's scope ever carries a composite assessment —
-/// and `compositeVerdictMode: promoted` then grants release authority to
-/// a verdict that is never produced. The operator has declared a control
-/// and configured away the only thing that could exercise it, which is
-/// precisely the accepted-but-inert field ADR 0015 treats as a hard
-/// block, reached through a pair of fields rather than through one.
+/// A composed OCI image's scan verdict decides its manifest's release
+/// unconditionally: the composition is the unit of filesystem assessment
+/// (ADR 0064 D1), so a constituent's isolated findings are evidence and
+/// the composite verdict is the decision (D2). There is no posture left
+/// for this field to select, and nothing reads it.
 ///
-/// Decidable from a **single envelope** — both fields live on the same
-/// `ScanPolicy` spec, and policy resolution picks one whole policy
-/// (repo-scoped wins over global), so the mode and the backend list the
-/// orchestrator reads always come from the same row. That is why this is
-/// a per-envelope rule here rather than a cross-envelope one in
-/// `hort-app::lint::static_validate`, where its nearest sibling
-/// [`validate_trust_upstream_publish_time_requires_scan_backends`] has to
-/// live because the two halves of *that* collapse sit on an
-/// `UpstreamMapping` and a `ScanPolicy` respectively.
+/// **Why it is a reject and not silence.** The field used to decide
+/// whether the composed verdict reached the artifact at all, and its
+/// shipped default withheld that authority — an operator who typed
+/// `promoted` was granting a control, and one who typed `observed` was
+/// declining it. Accepting either now while nothing reads it is exactly
+/// the *"policy field accepted at apply, inert at runtime"* hard block:
+/// the operator's threat-model decision would be silently void. So the
+/// stop-reading change and this refusal ship together.
 ///
-/// **Not a missing-control row**, so it has no retirement trigger: the
-/// composite verdict's consumer exists and is enforced the moment apply
-/// accepts `promoted`. The combination stays wrong under any future
-/// implementation, because a waived scan has nothing to promote.
+/// **Why the field stays in the schema.** `ScanPolicySpec` carries
+/// `deny_unknown_fields`, so deleting it would make an envelope that
+/// still declares `compositeVerdictMode` fail with ``unknown field
+/// `compositeVerdictMode` `` — which tells an operator they may have
+/// mistyped something or be running the wrong version, and nothing
+/// about why. Keeping the field and refusing it is what produces an
+/// error that explains itself. Mirrors
+/// [`validate_repository_quota_bytes_retired`], the other retirement in
+/// this shape.
 ///
-/// **Fail-closed, never a runtime fallback.** The structural close is an
-/// apply-time rejection of the dangerous combination (ADR 0016), not a
-/// degraded-authority path that silently treats `promoted` as `observed`
-/// for a scope with no backends — an operator reading the policy back
-/// would see a promotion that is not in effect.
+/// **The inert default is the absent field.** `composite_verdict_mode`
+/// is an `Option<String>` with **no serde default**, so `None` means the
+/// document never named it and any `Some` is the rejection — including
+/// `observed`, the value that used to be the default. That is not
+/// over-reach: a document setting `observed` is declining a control that
+/// no longer exists to decline, and leaving it accepted would tell its
+/// author the composite verdict is still being withheld. Removing the
+/// serde default is what made the two cases distinguishable at all; with
+/// it, a refusal could only reject every existing tree or none of them.
+///
+/// **Fail-closed.** No escape hatch: the operator removes the line. A
+/// tree that never named the field applies exactly as before.
+///
+/// **Retirement trigger.** Delete this function, its `LinterRule` row,
+/// its metric constant and its metrics-catalog entry **in the same
+/// commit** that removes the field from the spec — a rejection of a
+/// field that no longer parses is unreachable code a later reader has to
+/// re-derive.
 ///
 /// Pure function of `DesiredState`; one error per offending envelope.
-pub fn validate_scan_policy_promoted_composite_requires_scan_backends(
+pub fn validate_scan_policy_composite_verdict_mode_retired(
     state: &DesiredState,
 ) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     for env in &state.scan_policies {
-        // Read off the parsed domain value, not the wire string: a
-        // mis-spelled mode is `validate_scan_policy`'s typed reject and
-        // must not be read here as either posture.
-        let promoted = CompositeVerdictMode::from_str(&env.spec.composite_verdict_mode)
-            .is_ok_and(|mode| mode.carries_release_authority());
-        if !promoted || !env.spec.scan_backends.is_empty() {
+        let Some(declared) = env.spec.composite_verdict_mode.as_deref() else {
             continue;
-        }
+        };
         errors.push(ValidationError::Invalid {
             kind: Kind::ScanPolicy,
             name: env.metadata.name.clone(),
             detail: format!(
-                "`compositeVerdictMode: promoted` with an empty `scanBackends` promotes a \
-                 verdict that is never produced: an empty backend list waives scanning for \
-                 every artifact this policy governs, and the scan returns before a composed \
-                 image is resolved — so no manifest ever carries a composite assessment for \
-                 the promotion to act on. Declare the backends that should assess the \
-                 composition (`scanBackends: [trivy]`), or leave \
-                 `compositeVerdictMode: observed` while the scan stays waived. (scan policy: \
-                 `{name}`)",
+                "`compositeVerdictMode` is retired: a composed OCI image's scan verdict \
+                 now decides its manifest's release unconditionally, so neither value \
+                 selects anything and nothing reads the field. A constituent layer's \
+                 isolated filesystem findings are evidence; the composition's verdict is \
+                 the decision. The field is kept in the schema only so this message can \
+                 replace an `unknown field` parse error. Remove the field to apply; a \
+                 different value does not change this. (scan policy: `{name}`, declared: \
+                 `{declared}`)",
                 name = env.metadata.name,
             ),
         });
@@ -1603,6 +1608,83 @@ pub fn validate_repository_storage_path_deprecated(
         });
     }
     findings
+}
+
+/// Apply-time linter rejecting a declared `ArtifactRepository.spec.quota_bytes`.
+///
+/// **The field is retired, not deferred.** A quota was never enforced:
+/// no use case in the system has ever compared `repositories.quota_bytes`
+/// to a usage figure, so a declared limit admitted every byte past it.
+/// That is ADR 0015's "accepted at apply, inert at runtime" block, and
+/// the canonical exemplar is
+/// [`validate_prefetch_max_age_days_not_implemented`].
+///
+/// **Sharper than that exemplar, because this field was *validated*.**
+/// `maxAgeDays` was merely accepted; `quotaBytes` was range-checked at
+/// apply (`quotaBytes must be > 0`), echoed back by the admin
+/// effective-config response and persisted to its column. An operator
+/// could declare a quota, watch the apply validate it, read it back from
+/// the API — and have it decide nothing. Validating a field is a
+/// stronger claim that it works than merely accepting one.
+///
+/// **Why the field stays in the schema.** The repository spec carries
+/// `deny_unknown_fields`, so deleting the field would make an envelope
+/// that still declares `quotaBytes` fail with ``unknown field
+/// `quotaBytes` `` — which tells an operator they may have mistyped
+/// something or be running the wrong version, and nothing about why.
+/// Keeping the field and refusing it is what produces an error that
+/// explains itself. It also makes re-enabling a **visible act**:
+/// enforcing a quota later means deleting a named linter rule, not
+/// quietly populating a column that was already being accepted.
+///
+/// **And why this is not a deprecation.** The sibling `storage.path`
+/// warns rather than rejects (see
+/// [`validate_repository_storage_path_deprecated`]) because that field
+/// is in every pre-existing envelope, so a reject would park the first
+/// apply after an upgrade for every operator at once. `quotaBytes` is in
+/// no documentation, no example and no deploy file — there is no install
+/// base to spare — and a deprecation that keeps accepting an inert field
+/// is the anti-pattern rather than a retirement of it.
+///
+/// The per-envelope `quotaBytes must be > 0` shape check stays where it
+/// is: it is reached first for a non-positive value, and both refusals
+/// land on an apply that must not commit either way.
+///
+/// **Fail-closed.** No escape hatch. The operator-actionable error names
+/// the offending `repo_key` and the recourse is to drop the field; once
+/// removed the apply re-runs cleanly. The column itself survives this
+/// change — removing the last code reference is what ADR 0030's
+/// expand/contract requires *before* a drop, so a later release can
+/// schedule one.
+///
+/// **Retirement trigger.** Delete this function, its `LinterRule` row,
+/// its metric constant and its metrics-catalog entry **in the same
+/// commit** that either removes the field from the spec or gives it a
+/// real consumer — a rejection of a field that no longer parses is
+/// unreachable code a later reader has to re-derive.
+///
+/// Pure function of `DesiredState`; runs alongside
+/// [`validate_prefetch_max_age_days_not_implemented`] after the
+/// snapshot-validation stage. One error per offending repository.
+pub fn validate_repository_quota_bytes_retired(state: &DesiredState) -> Vec<ValidationError> {
+    let mut errors = Vec::new();
+    for env in &state.repositories {
+        if env.spec.quota_bytes.is_some() {
+            errors.push(ValidationError::Invalid {
+                kind: Kind::ArtifactRepository,
+                name: env.metadata.name.clone(),
+                detail: format!(
+                    "`quotaBytes` is retired and was never enforced: nothing in hort has \
+                     ever compared it to a usage figure, so every byte past the declared \
+                     limit was admitted. The field is going; it is kept in the schema only \
+                     so this message can replace an `unknown field` parse error. Remove \
+                     the field to apply. (repository: `{repo_key}`)",
+                    repo_key = env.metadata.name,
+                ),
+            });
+        }
+    }
+    errors
 }
 
 /// Every `UpstreamMapping.spec.repository` must resolve to a declared
@@ -4724,10 +4806,10 @@ spec:
         );
     }
 
-    // -- ScanPolicy.compositeVerdictMode x scanBackends (row 15) ----------
+    // -- ScanPolicy.compositeVerdictMode, retired (row 15) --------------
 
-    /// A `ScanPolicy` envelope with both halves of the cross-opt-in
-    /// stated. `backends` goes in verbatim, so a caller can write `[]`.
+    /// A `ScanPolicy` envelope declaring the retired field. `backends`
+    /// goes in verbatim, so a caller can write `[]`.
     fn sp_yaml_with_composite(name: &str, mode: &str, backends: &str) -> Vec<u8> {
         format!(
             "apiVersion: project-hort.de/v1
@@ -4747,69 +4829,82 @@ spec:
         .into_bytes()
     }
 
+    /// **The refusal names the retirement**, not merely the field. An
+    /// operator who set this deliberately was granting or declining a
+    /// control, and the message has to say that the control is gone and
+    /// what decides now — otherwise it reads as a version mismatch.
     #[test]
-    fn promoting_the_composite_verdict_with_no_scan_backends_is_rejected() {
+    fn a_declared_composite_verdict_mode_is_rejected_naming_the_retirement() {
         let state = DesiredState::parse_files(vec![(
             p("sp.yaml"),
-            sp_yaml_with_composite("waived-but-promoted", "promoted", "[]"),
+            sp_yaml_with_composite("promoted-policy", "promoted", "[trivy]"),
         )])
         .unwrap();
-        let errors = validate_scan_policy_promoted_composite_requires_scan_backends(&state);
+        let errors = validate_scan_policy_composite_verdict_mode_retired(&state);
         assert_eq!(errors.len(), 1, "got: {errors:?}");
         let rendered = errors[0].to_string();
         assert!(
-            rendered.contains("waived-but-promoted"),
+            rendered.contains("promoted-policy"),
             "must name the envelope: {rendered}"
         );
         assert!(
-            rendered.contains("compositeVerdictMode: promoted")
-                && rendered.contains("scanBackends"),
-            "must name BOTH halves of the collapse, not one: {rendered}"
+            rendered.contains("compositeVerdictMode") && rendered.contains("retired"),
+            "must name the field and say it is retired, not just that it is wrong: \
+             {rendered}"
         );
         assert!(
-            rendered.contains("never produced"),
-            "must say why the combination is inert rather than merely refusing it: {rendered}"
+            rendered.contains("unconditionally"),
+            "must say what decides now, so an operator can tell this from a \
+             version mismatch: {rendered}"
         );
         assert!(
-            rendered.contains("scanBackends: [trivy]")
-                && rendered.contains("compositeVerdictMode: observed"),
-            "must name both ways out — declare backends, or do not promote: {rendered}"
+            rendered.contains("Remove the field"),
+            "must name the recourse: {rendered}"
+        );
+        assert!(
+            rendered.contains("a different value does not change this"),
+            "must foreclose the obvious wrong move — switching the value: {rendered}"
+        );
+        assert!(
+            rendered.contains("promoted"),
+            "must quote what was declared: {rendered}"
         );
     }
 
-    /// Each half is load-bearing on its own, which is what makes this a
-    /// cross-opt-in collapse rather than an inert field: neither value
-    /// alone is refused.
+    /// **Both values are refused, including the one that used to be the
+    /// default.** A document setting `observed` is declining a control
+    /// that no longer exists to decline, and accepting it would tell its
+    /// author the composite verdict is still being withheld.
+    ///
+    /// A bare `compositeVerdictMode:` with no value is deliberately
+    /// **not** in this corpus: YAML reads it as `null`, which is the
+    /// absent field, and the test below is where it belongs.
     #[test]
-    fn either_half_of_the_collapse_alone_is_accepted() {
-        let promoted_with_backends = DesiredState::parse_files(vec![(
-            p("sp.yaml"),
-            sp_yaml_with_composite("promoted-scanning", "promoted", "[trivy]"),
-        )])
-        .unwrap();
-        assert!(
-            validate_scan_policy_promoted_composite_requires_scan_backends(&promoted_with_backends)
-                .is_empty(),
-            "a promotion with a backend to produce the verdict is the supported posture"
-        );
-
-        let waived_unpromoted = DesiredState::parse_files(vec![(
-            p("sp.yaml"),
-            sp_yaml_with_composite("waived", "observed", "[]"),
-        )])
-        .unwrap();
-        assert!(
-            validate_scan_policy_promoted_composite_requires_scan_backends(&waived_unpromoted)
-                .is_empty(),
-            "the scan waiver is an existing, supported posture and this row must not touch it"
-        );
+    fn every_declared_value_is_rejected_including_the_old_default() {
+        for declared in ["promoted", "observed", "PROMOTED", "promotd"] {
+            let state = DesiredState::parse_files(vec![(
+                p("sp.yaml"),
+                sp_yaml_with_composite("p", declared, "[trivy]"),
+            )])
+            .unwrap();
+            assert_eq!(
+                validate_scan_policy_composite_verdict_mode_retired(&state).len(),
+                1,
+                "`{declared}` must be refused: the field is gone, not re-valued"
+            );
+        }
     }
 
-    /// The default posture is the accepted one, so no tree that predates
-    /// the field can be rejected by this row — including a tree that
-    /// waives scanning.
+    /// **Absence is the accepted case**, which is the whole reason the
+    /// field lost its serde default: a tree that never named it applies
+    /// exactly as before, including a tree that waives scanning.
+    ///
+    /// A bare key with no value is the same case — YAML reads it as
+    /// `null`, so it deserialises to `None` and is an omission rather
+    /// than a declaration. Asserted here so the boundary between this
+    /// test's corpus and the refusal's is stated rather than implied.
     #[test]
-    fn an_omitted_composite_verdict_mode_is_accepted_even_with_no_backends() {
+    fn an_omitted_composite_verdict_mode_is_accepted() {
         let state = DesiredState::parse_files(vec![
             (p("a.yaml"), sp_yaml("defaults")),
             (
@@ -4832,67 +4927,63 @@ spec:
         ])
         .unwrap();
         assert!(
-            validate_scan_policy_promoted_composite_requires_scan_backends(&state).is_empty(),
-            "the field's absence is the inert posture; a pre-existing tree applies unchanged"
+            validate_scan_policy_composite_verdict_mode_retired(&state).is_empty(),
+            "the field's absence is the inert case; a pre-existing tree applies unchanged"
+        );
+
+        // A bare key, which YAML reads as `null`.
+        let null_valued = DesiredState::parse_files(vec![(
+            p("sp.yaml"),
+            sp_yaml_with_composite("p-bare-key", "", "[trivy]"),
+        )])
+        .unwrap();
+        assert_eq!(
+            null_valued.scan_policies[0].spec.composite_verdict_mode, None,
+            "a bare key is `null`, which is the absent field"
+        );
+        assert!(
+            validate_scan_policy_composite_verdict_mode_retired(&null_valued).is_empty(),
+            "so it is accepted, exactly as an omission is"
         );
     }
 
     /// One error per offending envelope, so an operator fixes every
     /// offender in one pass rather than being sent round the loop.
     #[test]
-    fn every_offending_policy_is_reported() {
+    fn every_policy_declaring_the_retired_field_is_reported() {
         let state = DesiredState::parse_files(vec![
             (
                 p("a.yaml"),
-                sp_yaml_with_composite("alpha", "promoted", "[]"),
+                sp_yaml_with_composite("alpha", "promoted", "[trivy]"),
             ),
             (
                 p("b.yaml"),
-                sp_yaml_with_composite("beta", "promoted", "[]"),
+                sp_yaml_with_composite("beta", "observed", "[trivy]"),
             ),
-            (
-                p("c.yaml"),
-                sp_yaml_with_composite("gamma", "promoted", "[trivy]"),
-            ),
+            (p("c.yaml"), sp_yaml("gamma")),
         ])
         .unwrap();
-        let rendered: Vec<String> =
-            validate_scan_policy_promoted_composite_requires_scan_backends(&state)
-                .iter()
-                .map(ToString::to_string)
-                .collect();
+        let rendered: Vec<String> = validate_scan_policy_composite_verdict_mode_retired(&state)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
         assert_eq!(rendered.len(), 2, "one per offender: {rendered:?}");
         assert!(rendered.iter().any(|e| e.contains("alpha")));
         assert!(rendered.iter().any(|e| e.contains("beta")));
         assert!(
             !rendered.iter().any(|e| e.contains("gamma")),
-            "the compliant policy is untouched: {rendered:?}"
+            "the policy that never named the field is untouched: {rendered:?}"
         );
     }
 
-    /// A mis-spelled mode is `validate_scan_policy`'s typed reject and
-    /// must not be read here as *either* posture: reading it as
-    /// `promoted` would reject a bundle on a second, confusing ground,
-    /// and the parse failure is the actionable message.
     #[test]
-    fn a_malformed_mode_is_left_to_the_per_envelope_validator() {
-        let state = DesiredState::parse_files(vec![(
-            p("sp.yaml"),
-            sp_yaml_with_composite("typo", "promotd", "[]"),
-        )])
-        .unwrap();
+    fn no_scan_policies_is_no_composite_verdict_mode_error() {
         assert!(
-            validate_scan_policy_promoted_composite_requires_scan_backends(&state).is_empty(),
-            "an unparseable mode is not a promotion"
-        );
-        let row_0 = state
-            .validate()
-            .expect_err("a malformed mode is still a row-0 error");
-        assert!(
-            row_0.to_string().contains("compositeVerdictMode"),
-            "and that is the message the operator gets: {row_0}"
+            validate_scan_policy_composite_verdict_mode_retired(&DesiredState::default())
+                .is_empty()
         );
     }
+
     // ---- row 16: the deprecated `storage.path` -----------------------
     //
     // The detector's whole job is to tell a declared `path` apart from
@@ -5001,5 +5092,151 @@ spec:
     #[test]
     fn no_repositories_is_silent() {
         assert!(validate_repository_storage_path_deprecated(&DesiredState::default()).is_empty());
+    }
+
+    // ---- quotaBytes: retired, not deferred -----------------------------
+    //
+    // The field stays in the `deny_unknown_fields` spec so this
+    // rejection can replace an `unknown field` parse error, which means
+    // every test here goes through the real parser: "it still parses"
+    // and "the apply refuses it" are both load-bearing.
+
+    /// A repository envelope with the given `quotaBytes:` body (pass
+    /// `""` for an envelope that declares none).
+    fn repo_yaml_with_quota(name: &str, quota_line: &str) -> Vec<u8> {
+        format!(
+            "apiVersion: project-hort.de/v1
+kind: ArtifactRepository
+metadata:
+  name: {name}
+spec:
+  name: {name}
+  format: npm
+  type: hosted
+  storage: {{ backend: filesystem }}
+{quota_line}  isPublic: true
+  replicationPriority: immediate
+"
+        )
+        .into_bytes()
+    }
+
+    /// One error per declaring repository, carrying that repository's
+    /// key — and the message says the field is **retired** and was never
+    /// enforced, not that enforcement is pending, because the two tell
+    /// an operator to do opposite things with the line.
+    #[test]
+    fn declared_quota_bytes_is_refused_once_per_repository() {
+        let state = DesiredState::parse_files(vec![
+            (
+                p("a.yaml"),
+                repo_yaml_with_quota("alpha", "  quotaBytes: 1073741824\n"),
+            ),
+            (
+                p("b.yaml"),
+                repo_yaml_with_quota("beta", "  quotaBytes: 1\n"),
+            ),
+            (p("c.yaml"), repo_yaml_with_quota("gamma", "")),
+        ])
+        .unwrap();
+
+        let errors = validate_repository_quota_bytes_retired(&state);
+        assert_eq!(errors.len(), 2, "one per declaring repo: {errors:?}");
+
+        let rendered: Vec<String> = errors.iter().map(ToString::to_string).collect();
+        assert!(
+            rendered[0].contains("alpha") && rendered[1].contains("beta"),
+            "each error names its own offender: {rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|m| m.contains("gamma")),
+            "the repository that declares none is untouched: {rendered:?}"
+        );
+        assert!(
+            rendered[0].contains("retired"),
+            "the message says retired: {}",
+            rendered[0]
+        );
+        assert!(
+            rendered[0].contains("never enforced"),
+            "the message says it never worked, not that it is pending: {}",
+            rendered[0]
+        );
+        assert!(
+            !rendered[0].contains("not yet"),
+            "`not yet` would promise a future the maintainer decided against: {}",
+            rendered[0]
+        );
+        assert!(
+            rendered[0].contains("Remove the field to apply"),
+            "the message names the operator's recourse: {}",
+            rendered[0]
+        );
+    }
+
+    /// A **positive** value is the shape that used to pass every check
+    /// in the system, so it is the one the retirement exists for: the
+    /// per-envelope `quotaBytes must be > 0` validator accepts it and
+    /// this rule is what refuses the apply.
+    #[test]
+    fn a_positive_quota_bytes_passes_envelope_validation_and_is_refused_here() {
+        let state = DesiredState::parse_files(vec![(
+            p("a.yaml"),
+            repo_yaml_with_quota("alpha", "  quotaBytes: 1073741824\n"),
+        )])
+        .unwrap();
+
+        assert!(
+            validate_repository(&state.repositories[0]).is_empty(),
+            "the per-envelope pass has no objection to a positive value — \
+             which is why the retirement is an apply-time rule"
+        );
+        assert_eq!(validate_repository_quota_bytes_retired(&state).len(), 1);
+    }
+
+    /// A non-positive value is refused twice over: the pre-existing
+    /// per-envelope shape check still fires (its own tests in
+    /// `crate::repository` pin the message), and this rule fires too —
+    /// so no shape of the field reaches a committing apply.
+    #[test]
+    fn a_non_positive_quota_bytes_is_refused_by_both_passes() {
+        for line in ["  quotaBytes: 0\n", "  quotaBytes: -100\n"] {
+            let state =
+                DesiredState::parse_files(vec![(p("a.yaml"), repo_yaml_with_quota("alpha", line))])
+                    .unwrap();
+            assert!(
+                validate_repository(&state.repositories[0])
+                    .iter()
+                    .any(|e| e.to_string().contains("quotaBytes must be > 0")),
+                "the pre-existing shape check still fires on {line:?}"
+            );
+            assert_eq!(
+                validate_repository_quota_bytes_retired(&state).len(),
+                1,
+                "the retirement does not care which value it is: {line:?}"
+            );
+        }
+    }
+
+    /// An envelope **without** the field applies cleanly — the
+    /// counter-assertion that the refusal is not over-broad. Without
+    /// this, a rule that rejected every repository would pass every
+    /// assertion above.
+    #[test]
+    fn an_envelope_without_quota_bytes_is_silent() {
+        let state =
+            DesiredState::parse_files(vec![(p("a.yaml"), repo_yaml_with_quota("alpha", ""))])
+                .unwrap();
+        assert!(
+            validate_repository_quota_bytes_retired(&state).is_empty(),
+            "dropping the line is the remedy, so it cannot be a finding"
+        );
+    }
+
+    /// An empty desired state produces nothing — the counter-assertion
+    /// that the tests above are not passing on an empty corpus.
+    #[test]
+    fn no_repositories_yields_no_quota_finding() {
+        assert!(validate_repository_quota_bytes_retired(&DesiredState::default()).is_empty());
     }
 }

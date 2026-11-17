@@ -11,8 +11,8 @@ pub mod authenticate_use_case;
 pub(crate) mod cas_bounded_read;
 pub mod cas_scrub_use_case;
 // The composed scan unit of an OCI image manifest (ADR 0064 D1):
-// resolving it from the manifest's own bytes, and the shadow assessment
-// that runs it with no release authority (D6).
+// resolving it from the manifest's own bytes, and running it as the
+// manifest's own filesystem verdict (D2).
 pub(crate) mod composite_scan;
 pub(crate) mod constituent_acquisition;
 pub mod content_reference;
@@ -52,6 +52,11 @@ pub mod effective_permissions_use_case;
 pub mod event_visibility;
 pub mod eventstore_retention_use_case;
 pub mod group_reconcile_use_case;
+// The operator-facing view of the set the release gate holds pending a
+// signature — the surface ADR 0039 D4's "no deadline" argument points
+// at. Read-only over the artifact set; disposal is operator-confirmed
+// and is not part of it.
+pub mod held_set_use_case;
 // Shared `IndexFilter` implementations
 // (`NonServableStatusFilter` + `IndexModeFilter`) used by the
 // per-format unified serve handlers. The
@@ -74,6 +79,12 @@ pub mod index_serve;
 // `VersionOrdering` implementations.
 pub mod index_serve_filter;
 pub mod ingest_use_case;
+// "Do any of hort's own manifests make this blob a layer of a composed
+// image?" — the role ADR 0064 D6 scopes the root-filesystem
+// materialisation by, read off the manifests' `oci_layer` membership
+// edges and their own strict parse. See the module docs for why an
+// absent nomination is not a negative.
+pub(crate) mod layer_role_resolution;
 // ADR 0062's **omission** shape for the OCI surfaces hort builds out of
 // manifest digests (the referrers index, `tags/list`): which of the
 // entries a document is about to name would the pull refuse? The closure
@@ -107,6 +118,10 @@ pub mod patch_candidate_use_case;
 // Shared active-scan-policy resolver (issue #76, item 1/2) — extracted
 // from seven private, byte-identical copies. See module docs.
 pub(crate) mod policy_resolution;
+// The two — and only two — places an `AnchorEvidence` is assembled: one
+// for a row being minted, one for an artifact re-entering the hold. See
+// the module docs.
+pub mod quarantine_anchor_assembly;
 // The one place the application layer asks an artifact's own format
 // handler what its bytes are. Four verdict-adjacent call sites need the
 // answer and all four must get the same one for a given row; see the
@@ -161,11 +176,22 @@ pub mod self_service_prefetch_use_case;
 // HARD PREREQUISITE for `PurgeUseCase`, whose start-gate
 // refuses to run until this sweep has converged at least once.
 pub mod refcount_reconcile_use_case;
-// Shared referenced-tree-descendant predicate (issue #115 item 3) —
-// one definition for BOTH the ingest zero-window anchor carve-out (#46)
-// and the provenance orchestrator's `NoAttestation × Required` hold.
-pub(crate) mod referenced_descendant;
+// Shared referenced-tree-descendant predicate — one definition for the
+// ingest zero-window anchor carve-out, the release sweep's final
+// `provenance-verify` skip, and the held-set overview's
+// constituent/in-own-right bucket split. `pub` for the last of those
+// three only: the bucket rule's kind lists and its kind-based primitive
+// are read by the Postgres adapter that binds them as query parameters
+// and by the parity test that drives both paths. Everything else in the
+// module stays `pub(crate)`.
+pub mod referenced_descendant;
 pub mod repository_access;
+// The admin readout of what each repository's live catalog holds —
+// rows, distinct contents, and the weight of those contents. A readout
+// and not a gauge: it emits no metric and answers an interactive
+// operator question, which is what makes a retention before/after
+// verifiable at all.
+pub mod repository_inventory_use_case;
 pub mod repository_use_case;
 // Seed-import cutover path.
 // Bulk-registers an operator-supplied dependency set with backdated
@@ -234,9 +260,10 @@ pub mod virtual_resolution;
 // from CAS. See `docs/architecture/how-to/pypi-pull-through.md`.
 pub mod wheel_metadata_use_case;
 
-// The shadow composite assessment's evidence sink (ADR 0064 D6). The
-// module stays crate-private — `ShadowCompositeScan` and the resolution
-// are internal — but the composition root has to hand the orchestrator
+// Where the composite assessment's durable evidence goes (ADR 0064 D2) —
+// a projection beside the verdict, never the path the verdict travels.
+// The module stays crate-private — `CompositeScan` and the resolution are
+// internal — but the composition root has to hand the orchestrator
 // somewhere to write, so the sink itself is part of the public surface.
 pub use composite_scan::ShadowObservationSink;
 pub use group_reconcile_use_case::{GroupReconcileUseCase, ReconcileReport};

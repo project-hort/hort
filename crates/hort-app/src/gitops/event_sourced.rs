@@ -63,8 +63,8 @@ use hort_config::exclusion::ExclusionSpec;
 use hort_config::scan_policy::{ScanPolicySpec, SignerIdentitySpec};
 use hort_config::scope::ScopeSpec;
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
-    ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::entities::scan_policy_fold::policy_config_snapshot;
 use hort_domain::events::{
@@ -205,8 +205,6 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
             parse_provenance_identities(&desired.spec.provenance_identities);
         let desired_negligible_action = parse_negligible_action(&desired.spec.negligible_action);
         let desired_enforcement = parse_scan_enforcement(&desired.spec.enforcement);
-        let desired_composite_verdict_mode =
-            parse_composite_verdict_mode(&desired.spec.composite_verdict_mode);
 
         match projection {
             None => {
@@ -237,7 +235,6 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                     rescan_interval_hours: desired.spec.rescan_interval_hours,
                     negligible_action: desired_negligible_action,
                     enforcement: desired_enforcement,
-                    composite_verdict_mode: desired_composite_verdict_mode,
                     // Not part of the config surface the snapshot
                     // records; this projection exists only to be encoded.
                     stream_version: 0,
@@ -421,26 +418,6 @@ impl ApplyEventSourcedKind for ScanPolicyApplier {
                         field: PolicyField::Enforcement,
                         previous_value: serde_json::Value::String(proj.enforcement.to_string()),
                         new_value: serde_json::Value::String(desired_enforcement.to_string()),
-                    }));
-                }
-
-                // -- CompositeVerdictMode (ADR 0064 D6) --
-                // Lowercase wire strings on the payload. Unlike
-                // `Enforcement`, neither direction is gate-affecting: a
-                // promoted composite verdict's findings come from
-                // scanning an assembled image, so re-deriving from
-                // *stored* findings would un-reject the population it
-                // rejected without assessing anything afresh.
-                if proj.composite_verdict_mode != desired_composite_verdict_mode {
-                    events.push(DomainEvent::PolicyUpdated(PolicyUpdated {
-                        policy_id: pid,
-                        field: PolicyField::CompositeVerdictMode,
-                        previous_value: serde_json::Value::String(
-                            proj.composite_verdict_mode.to_string(),
-                        ),
-                        new_value: serde_json::Value::String(
-                            desired_composite_verdict_mode.to_string(),
-                        ),
                     }));
                 }
 
@@ -730,19 +707,6 @@ fn parse_scan_enforcement(s: &str) -> ScanEnforcement {
     })
 }
 
-/// Map the validated `compositeVerdictMode` wire string into the domain
-/// enum. `hort-config`'s `validate_scan_policy` ran first, so a parse
-/// failure here is a bypassed-validator programming error.
-fn parse_composite_verdict_mode(s: &str) -> CompositeVerdictMode {
-    CompositeVerdictMode::from_str(s).unwrap_or_else(|err| {
-        panic!(
-            "INVARIANT: composite verdict mode '{s}' must have been validated by \
-             hort_config::scan_policy::validate_scan_policy before reaching the \
-             applier (parse error: {err})"
-        )
-    })
-}
-
 /// Map the validated `provenanceIdentities` wire specs to
 /// the domain pattern type. Each entry already passed the per-element
 /// constructor validator in `validate_scan_policy`, so a construction
@@ -851,7 +815,7 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: "ignore".into(),
             enforcement: "reject".into(),
-            composite_verdict_mode: "observed".into(),
+            composite_verdict_mode: None,
         }
     }
 
@@ -877,7 +841,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 7,
             created_at: now,
             updated_at: now,
@@ -1044,16 +1007,6 @@ mod tests {
         let applier = ScanPolicyApplier::default();
         let mut spec = baseline_spec();
         spec.quarantine_duration = "12garbage".into();
-        let env = policy_envelope(spec);
-        let _ = applier.diff(&env, None);
-    }
-
-    #[test]
-    #[should_panic(expected = "INVARIANT: composite verdict mode")]
-    fn scan_policy_malformed_composite_verdict_mode_panics_with_invariant_prefix() {
-        let applier = ScanPolicyApplier::default();
-        let mut spec = baseline_spec();
-        spec.composite_verdict_mode = "enforce".into();
         let env = policy_envelope(spec);
         let _ = applier.diff(&env, None);
     }
@@ -2427,7 +2380,6 @@ mod tests {
         spec.rescan_interval_hours = 48;
         spec.negligible_action = "block".into();
         spec.enforcement = "record".into();
-        spec.composite_verdict_mode = "promoted".into();
 
         let DomainEvent::PolicyCreated(payload) = &applier.diff(&policy_envelope(spec), None)[0]
         else {
@@ -2450,10 +2402,16 @@ mod tests {
             "rescan_interval_hours",
             "negligible_action",
             "enforcement",
-            "composite_verdict_mode",
         ] {
             assert!(snap.get(key).is_some(), "missing key {key}");
         }
+        // And the retired field is not written: the applier has no
+        // projection field to encode it from, and a snapshot that still
+        // carried the key would state a posture no decision reads.
+        assert!(
+            snap.get("composite_verdict_mode").is_none(),
+            "a new PolicyCreated must not carry the retired field: {snap}"
+        );
         assert_eq!(snap["name"], "prod-default");
         assert_eq!(snap["severity_threshold"], "Low");
         assert_eq!(snap["quarantine_duration_secs"], 60);
@@ -2473,7 +2431,6 @@ mod tests {
         // The lowercase wire strings the YAML and SQL surfaces share.
         assert_eq!(snap["negligible_action"], "block");
         assert_eq!(snap["enforcement"], "record");
-        assert_eq!(snap["composite_verdict_mode"], "promoted");
     }
 
     #[test]
@@ -2543,69 +2500,35 @@ mod tests {
         )));
     }
 
+    /// **A document declaring the retired `compositeVerdictMode` never
+    /// reaches this applier**, because the apply-time linter rejects it
+    /// before any diff is computed
+    /// (`validate_scan_policy_composite_verdict_mode_retired`). So the
+    /// applier has nothing to read, emits no event for the field, and the
+    /// walk that would have emitted one no longer visits it — asserted
+    /// here rather than reasoned about, because an applier that quietly
+    /// started emitting a `PolicyField::CompositeVerdictMode` again would
+    /// be writing an event for a posture nothing reads.
     #[test]
-    fn scan_policy_composite_verdict_mode_change_emits_one_event() {
+    fn scan_policy_apply_emits_no_composite_verdict_mode_event() {
         let policy_id = Uuid::new_v4();
         let applier = ScanPolicyApplier::new(HashMap::new());
         let mut spec = baseline_spec();
-        spec.composite_verdict_mode = "promoted".into();
+        // The one shape that could still reach the applier: an operator
+        // who typed the field and whose document the linter refused.
+        // Threaded through anyway, so that a future applier reading the
+        // wire string directly fails here.
+        spec.composite_verdict_mode = Some("promoted".into());
         let events = applier.diff(
             &policy_envelope(spec),
             Some(&baseline_projection(policy_id)),
         );
-        let updated: Vec<&PolicyUpdated> = events
-            .iter()
-            .filter_map(|e| match e {
-                DomainEvent::PolicyUpdated(p) if p.field == PolicyField::CompositeVerdictMode => {
-                    Some(p)
-                }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(updated.len(), 1, "exactly one CompositeVerdictMode event");
-        assert_eq!(updated[0].previous_value, serde_json::json!("observed"));
-        assert_eq!(updated[0].new_value, serde_json::json!("promoted"));
-        // Deliberately NOT gate-affecting (ADR 0064 D6): the ADR 0041
-        // pass re-derives verdicts from stored findings, and a composite
-        // verdict's findings come from scanning an assembled image — so
-        // demoting that way would un-reject the population a promoted
-        // composite had correctly rejected with nothing fresh having
-        // looked at it.
-        assert!(!updated[0].field.is_gate_affecting());
-    }
-
-    #[test]
-    fn scan_policy_unchanged_composite_verdict_mode_emits_no_event() {
-        // Both the baseline projection and the baseline spec carry the
-        // default `observed`; an apply that does not touch the field
-        // must emit nothing, or every re-apply would write a policy
-        // event for a posture nobody changed.
-        let policy_id = Uuid::new_v4();
-        let applier = ScanPolicyApplier::new(HashMap::new());
-        let events = applier.diff(
-            &policy_envelope(baseline_spec()),
-            Some(&baseline_projection(policy_id)),
-        );
-        assert!(!events.iter().any(|e| matches!(
-            e,
-            DomainEvent::PolicyUpdated(p) if p.field == PolicyField::CompositeVerdictMode
-        )));
-    }
-
-    /// The created-policy snapshot carries the posture, so the
-    /// operator-visible record of what was applied names it.
-    #[test]
-    fn scan_policy_created_snapshot_carries_the_composite_verdict_mode() {
-        let applier = ScanPolicyApplier::new(HashMap::new());
-        let mut spec = baseline_spec();
-        spec.composite_verdict_mode = "promoted".into();
-        let events = applier.diff(&policy_envelope(spec), None);
-        let DomainEvent::PolicyCreated(created) = &events[0] else {
-            panic!("expected PolicyCreated, got {:?}", events[0]);
-        };
-        assert_eq!(
-            created.config_snapshot["composite_verdict_mode"],
-            "promoted"
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                DomainEvent::PolicyUpdated(p) if p.field == PolicyField::CompositeVerdictMode
+            )),
+            "the retired field emits nothing: {events:?}"
         );
     }
 }

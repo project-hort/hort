@@ -216,10 +216,15 @@ token and writes a fresh value.
 Token-cap permission notes:
 
 - `admin_task_invoke` is the right cap for cron-job tokens. It gates
-  `POST /api/v1/admin/tasks/:kind` and nothing else. It does **not** confer
-  the `task:destructive` claim, so it cannot run the destructive tasks
+  `POST /api/v1/admin/tasks/:kind` and nothing else. It confers **no**
+  destructive authority, so it cannot run the destructive tasks
   (`retention-purge`, `eventstore-archive`, `retention-evaluate`) — those
-  need a fresh admin session (§5.1).
+  additionally need `destroy_content` / `destroy_record`, which is a
+  separate grant and is not implied by `admin` either. `destroy_content`
+  **can** be added to a svc-token cap (with the matching grant, and
+  `--rotate` to reach an already-issued token); `destroy_record` cannot —
+  `issue-svc-token` refuses it, as do the gitops apply and both runtime
+  authority checks.
 - `admin` is **not** mintable as a svc-token cap (`issue-svc-token` rejects
   `--permission=admin`, ADR 0038). HTTP admin endpoints (token-mint, user
   management, gitops apply) need the bootstrap-session token from §5.1 or an
@@ -408,7 +413,7 @@ canonical cadence (matches the Helm chart's CronJob defaults — see
 | `cron-rescan-tick` | `*-*-* 02:00:00` (nightly) | Re-scans artifacts against current advisory DB |
 | `advisory-watch-tick` | `*-*-* 03:00:00` (nightly) | Pulls fresh advisory feed |
 
-> **Destructive tasks** (`eventstore-archive`, `retention-purge`, `retention-evaluate`) are **not** set up as unattended timers — an `admin_task_invoke` svc-token cannot run them (they need the `task:destructive` claim — see §5.2). Run them by hand with the bootstrap-session admin token (§5.1), or track the approval-workflow follow-on (GitLab issue #2). The invoking identity's authority is re-checked again when the worker runs the job, so revoking it (deactivating the `bootstrap-admin` user, or clearing its `is_admin`) also stops the destructive jobs it already queued — they land as terminal `failed` rows whose `last_error` begins `destructive task refused at execution`.
+> **Destructive tasks** (`eventstore-archive`, `retention-purge`, `retention-evaluate`) are **not** set up as unattended timers — an `admin_task_invoke` svc-token cannot run them (they additionally need `destroy_content` / `destroy_record`, which is a separate grant and is not implied by `admin` — see §5.2). The retention pair *can* be made unattended by granting the token's own identity `destroy_content` and rotating the token; `eventstore-archive` cannot, because `destroy_record` is refused to a machine identity outright. Run them by hand with an identity that holds the grant, or track the approval-workflow follow-on (GitLab issue #2). The invoking identity's authority is re-checked again when the worker runs the job, so revoking it (deactivating the user, or removing either grant) also stops the destructive jobs it already queued — they land as terminal `failed` rows whose `last_error` begins `destructive task refused at execution`. Bind the destructive grant to the identity (`kind: user`): the re-check carries no IdP-resolved claims, so a claim-bound destructive grant is refused at execution every time.
 
 Enable:
 

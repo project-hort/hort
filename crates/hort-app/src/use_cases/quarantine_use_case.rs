@@ -32,6 +32,7 @@ use hort_domain::ports::upstream_index_cache_invalidator::UpstreamIndexCacheInva
 use crate::event_store_publisher::EventStorePublisher;
 use crate::use_cases::ingest_use_case::{CLEARANCE_TRIGGER_SOURCE, PROVENANCE_VERIFY_KIND};
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::referenced_descendant::is_parent_gated_blob_constituent;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use hort_domain::ports::repository_repository::RepositoryRepository;
@@ -40,8 +41,8 @@ use hort_domain::ports::storage::StoragePort;
 use hort_domain::types::sbom::Sbom;
 use hort_domain::types::task_tier::queue_priority;
 use hort_domain::types::{
-    highest_severity, severity_label, severity_summary_from_findings, ArtifactCoords, ArtifactKind,
-    ContentHash, Finding,
+    highest_severity, largest_fitting_prefix, ordered_most_severe_first, severity_label,
+    severity_summary_from_findings, ArtifactCoords, ArtifactKind, ContentHash, Finding,
 };
 use tokio::io::AsyncReadExt;
 
@@ -337,7 +338,92 @@ fn build_scan_findings_rows(
 /// Cap on the serialised `findings_blob` byte length. This consumer is
 /// the single CAS write site for the findings blob, so this cap is the
 /// canonical enforcement point. 8 MiB.
+///
+/// **It bounds the blob; it does not refuse the scan.** A finding set is
+/// unbounded, so for a large enough one there is no complete blob — and
+/// refusing to write one ended the scan with no verdict at all, worst
+/// for precisely the artifacts with the most findings (measured: twelve
+/// jobs dead at the attempt cap inside one 71-minute window, blobs of
+/// 10.9 to 19.5 MB against this 8 MiB). So
+/// [`QuarantineUseCase::persist_findings_blob`] fills the blob with the
+/// most severe findings that fit and records how many it kept on
+/// `ScanCompleted.findings_blob_retained`; raising the cap would only
+/// move the artifact that does not fit it.
 const FINDINGS_BLOB_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The on-disk bytes of a findings blob: a JSON array of the
+/// already-serialised findings, ordered by their complete JSON value.
+///
+/// Sorting on the serialised bytes keeps distinct findings distinct and
+/// makes the blob hash independent of the scanner's arrival order. It is
+/// deliberately **not** the severity order the *selection* uses:
+/// *which* findings a bounded blob holds is a severity question
+/// ([`hort_domain::types::most_severe_first`]), and what order they then
+/// sit in is a determinism one.
+///
+/// One function, because it is both what the fill measures and what the
+/// write stores. An arithmetic estimate beside it — "two brackets plus
+/// the separators plus the element lengths" — would be a second voice
+/// about the same bytes, and the whole reason the fill measures rather
+/// than counts is that a finding's own length is not knowable from its
+/// count.
+fn findings_blob_bytes(serialised: &[Vec<u8>]) -> Vec<u8> {
+    let mut elements: Vec<&[u8]> = serialised.iter().map(Vec::as_slice).collect();
+    elements.sort_unstable();
+    let mut json = Vec::with_capacity(elements.iter().map(|e| e.len() + 1).sum::<usize>() + 1);
+    json.push(b'[');
+    for (index, finding) in elements.iter().enumerate() {
+        if index > 0 {
+            json.push(b',');
+        }
+        json.extend_from_slice(finding);
+    }
+    json.push(b']');
+    json
+}
+
+/// The CAS findings blob one scan recorded, as
+/// [`QuarantineUseCase::persist_findings_blob`] wrote it.
+///
+/// The two halves travel together because they are one fact about one
+/// blob, and the half that fails open is the one a caller can forget:
+/// a `ContentHash` on its own says nothing about whether the blob behind
+/// it is the whole finding set, and a reader handed a short blob as a
+/// complete one decides a CVE-level question over a subset. Returning
+/// the pair is what makes the `ScanCompleted` field impossible to leave
+/// unset at the one site that builds the event.
+struct FindingsBlob {
+    hash: ContentHash,
+    /// `Some(n)` when the blob holds only the `n` most severe findings
+    /// of the scan; `None` when it holds all of them. Lands verbatim on
+    /// [`ScanCompleted::findings_blob_retained`].
+    retained: Option<u32>,
+}
+
+/// What the prior `ScanCompleted`'s blob can tell this scan about which
+/// of its findings are **new** —
+/// [`QuarantineUseCase::hydrate_prior_findings`]'s answer.
+///
+/// Two variants rather than a `Vec<Finding>`, because a baseline that
+/// holds only its most severe findings is not a baseline that found
+/// fewer things, and `compute_added_findings` cannot tell those apart:
+/// it keys on `(purl, vulnerability_id)` and reports everything in the
+/// current scan whose key the baseline does not carry, so a short
+/// baseline reports findings as new that the prior scan had. On a set
+/// large enough to be bounded that is most of them, on every rescan,
+/// forever — and `ArtifactBecameVulnerable.previously_clean_at` asserts
+/// the artifact "was provably clean of these specific findings" from
+/// that point, which a short baseline cannot prove. An append-only
+/// audit record that claims an unproven transition is worse than one
+/// with a logged gap, so the gap is what this variant buys.
+enum PriorFindings {
+    /// Every finding the prior scan recorded: the blob held all of them,
+    /// or the prior scan was clean and recorded none.
+    Complete(Vec<Finding>),
+    /// The prior scan recorded more findings than its blob holds, so
+    /// which findings it had cannot be established from it.
+    Incomplete,
+}
 
 /// Wire string for the `ingest_source` label.
 /// Mirrors the `IngestSource` enum (`Direct` / `Proxied`). Returns
@@ -413,6 +499,15 @@ pub struct QuarantineUseCase {
     /// (see the call site) — for them the enqueued verify is
     /// state-neutral by construction.
     jobs: Arc<dyn JobsRepository>,
+    /// The one place a re-entry's quarantine anchor is assembled
+    /// ([`QuarantineAnchorResolver`]). Both this use case's hold paths
+    /// need it: `handle_non_rejecting_verdict`'s
+    /// `supersede_absent_verdict`, and
+    /// [`Self::hold_for_unproduced_composition`], which used to take
+    /// `paired.artifact().created_at` directly — the mint instant is
+    /// *one* candidate inside the derivation, and reading it here was a
+    /// second rule for deciding an anchor sitting beside the first.
+    anchor_resolver: Arc<QuarantineAnchorResolver>,
 }
 
 /// Shared read-only context threaded into the
@@ -485,6 +580,7 @@ impl QuarantineUseCase {
         content_references: Arc<dyn ContentReferenceIndex>,
         storage: Arc<dyn StoragePort>,
         jobs: Arc<dyn JobsRepository>,
+        anchor_resolver: Arc<QuarantineAnchorResolver>,
     ) -> Self {
         Self {
             artifacts,
@@ -497,6 +593,7 @@ impl QuarantineUseCase {
             include_repository_label: true,
             upstream_index_cache_invalidator: None,
             jobs,
+            anchor_resolver,
         }
     }
 
@@ -548,7 +645,7 @@ impl QuarantineUseCase {
     pub async fn quarantine_artifact(
         &self,
         artifact_id: Uuid,
-        until: DateTime<Utc>,
+        window_start: DateTime<Utc>,
         actor: Actor,
     ) -> AppResult<()> {
         let stream_id = StreamId::artifact(artifact_id);
@@ -573,7 +670,7 @@ impl QuarantineUseCase {
         // sitting exactly on it past.
         refuse_append_past_cap(paired.stream_id(), paired.stream_len(), 1)?;
         let repository_id = paired.artifact().repository_id;
-        let event_payload = paired.artifact_mut().quarantine(until)?;
+        let event_payload = paired.artifact_mut().quarantine(window_start)?;
         let artifact = paired.into_artifact();
 
         // Bump quarantined_count in the same tx.
@@ -661,7 +758,8 @@ impl QuarantineUseCase {
         // design — the two events are deliberately distinct.
         let returned_to_hold = if artifact.quarantine_status == QuarantineStatus::ScanIndeterminate
         {
-            let quarantined = artifact.supersede_absent_verdict(ctx.now)?;
+            let derived = self.anchor_resolver.derive_for_re_entry(artifact).await;
+            let quarantined = artifact.supersede_absent_verdict(derived)?;
             tracing::info!(
                 artifact_id = %ctx.artifact_id,
                 correlation_id = %ctx.correlation_id,
@@ -1196,9 +1294,12 @@ impl QuarantineUseCase {
     ///    hydrate its findings from CAS.
     /// 5. Compute `new_findings` via
     ///    [`compute_added_findings`] — feeds
-    ///    `ArtifactBecameVulnerable.new_findings`.
-    /// 6. Serialise `findings` to JSON, enforce 8 MiB cap, write to
-    ///    CAS via [`StoragePort::put`] → `findings_blob` hash.
+    ///    `ArtifactBecameVulnerable.new_findings`. Skipped when the
+    ///    prior scan's blob was bounded, which cannot answer it (see
+    ///    [`PriorFindings`]).
+    /// 6. Serialise `findings` to JSON, fill a blob up to the 8 MiB cap
+    ///    most-severe-first, write to CAS via [`StoragePort::put`] →
+    ///    `findings_blob` hash + `findings_blob_retained`.
     /// 7. Build the event batch:
     ///    - `ScanCompleted` always.
     ///    - `PolicyEvaluated` always — exactly one per verdict,
@@ -1382,22 +1483,47 @@ impl QuarantineUseCase {
         let outcome =
             evaluate_scan_result(&coords, kind, &findings, policy.as_ref(), &exclusions, now);
 
-        let prior_findings: Vec<Finding> = match prior.as_ref() {
+        let prior_findings = match prior.as_ref() {
             Some((event, _ts)) => self.hydrate_prior_findings(event).await?,
-            None => Vec::new(),
+            None => PriorFindings::Complete(Vec::new()),
         };
-        let new_findings = compute_added_findings(&prior_findings, &findings);
+        // An empty delta is what a caller downstream reads as "no
+        // transition to report": `maybe_push_became_vulnerable` appends
+        // nothing and the metric does not fire. That is the right answer
+        // for an unestablishable transition as well as for an absent
+        // one, and the log line is what tells the two apart — see
+        // `PriorFindings::Incomplete` for why the alternative is an
+        // audit record that claims the artifact was clean of findings it
+        // may well have had.
+        let new_findings = match &prior_findings {
+            PriorFindings::Complete(prior) => compute_added_findings(prior, &findings),
+            PriorFindings::Incomplete => {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    "prior scan's findings_blob holds only its most severe findings, so which \
+                     findings are new since it cannot be established; no \
+                     artifact_became_vulnerable for this scan",
+                );
+                Vec::new()
+            }
+        };
 
-        // Step 6 — serialise + size-cap-check + CAS write.
-        let blob_hash = self.persist_findings_blob(&findings).await?;
+        // Step 6 — serialise + bound to the cap + CAS write.
+        let blob = self.persist_findings_blob(&findings).await?;
 
         // Step 7 — assemble ScanCompleted (validate before persist).
+        // `finding_count` and `severity_summary` are of the COMPLETE set
+        // whatever the blob holds, so the true total rides the event and
+        // a threshold walk over the counts is unaffected by a bounded
+        // blob; `findings_blob_retained` is the only thing that says the
+        // per-finding evidence behind them is short.
         let scan_event = ScanCompleted {
             artifact_id,
             scanner,
             finding_count,
             severity_summary: severity.clone(),
-            findings_blob: blob_hash.clone(),
+            findings_blob: blob.as_ref().map(|b| b.hash.clone()),
+            findings_blob_retained: blob.as_ref().and_then(|b| b.retained),
             assessment,
         };
         scan_event.validate()?;
@@ -1560,15 +1686,26 @@ impl QuarantineUseCase {
 
     /// Hydrate the per-finding `Vec<Finding>` referenced by a prior
     /// `ScanCompleted`. A prior with `findings_blob = None`
-    /// (clean scan) returns `vec![]`. A prior with
+    /// (clean scan) returns an empty complete set. A prior with
     /// `findings_blob = Some(_)` reads the blob from CAS and
     /// deserialises. Surfaces a clean Validation error if the blob
     /// is absent or malformed (a `findings_blob = Some(_)`
     /// pointing at missing CAS content is corruption — fail loud).
-    async fn hydrate_prior_findings(&self, prior: &ScanCompleted) -> AppResult<Vec<Finding>> {
+    ///
+    /// A prior whose blob holds only its most severe findings
+    /// ([`ScanCompleted::findings_blob_is_complete`]) returns
+    /// [`PriorFindings::Incomplete`] **without reading it**: the one
+    /// question this hydration serves is "which findings are new since
+    /// the prior scan", a short baseline cannot answer it, and the bytes
+    /// would only invite an answer over a subset. See
+    /// [`PriorFindings`] for what the caller does with that.
+    async fn hydrate_prior_findings(&self, prior: &ScanCompleted) -> AppResult<PriorFindings> {
         let Some(blob_hash) = prior.findings_blob.as_ref() else {
-            return Ok(Vec::new());
+            return Ok(PriorFindings::Complete(Vec::new()));
         };
+        if !prior.findings_blob_is_complete() {
+            return Ok(PriorFindings::Incomplete);
+        }
         let mut reader = self.storage.get(blob_hash).await?;
         let mut buf = Vec::new();
         reader.read_to_end(&mut buf).await.map_err(|e| {
@@ -1579,46 +1716,74 @@ impl QuarantineUseCase {
                 "prior findings_blob {blob_hash} malformed: {e}"
             )))
         })?;
-        Ok(findings)
+        Ok(PriorFindings::Complete(findings))
     }
 
-    /// Serialise `findings` to JSON, enforce the 8 MiB cap, and write
-    /// to CAS. Returns `None` when `findings.is_empty()` (clean scans
+    /// Write the per-finding blob for `findings` to CAS, holding as many
+    /// of them as [`FINDINGS_BLOB_MAX_BYTES`] fits, **most severe
+    /// first**. Returns `None` when `findings.is_empty()` (clean scans
     /// never allocate a blob — clean scans have no findings to store).
-    async fn persist_findings_blob(&self, findings: &[Finding]) -> AppResult<Option<ContentHash>> {
+    ///
+    /// **Order before filling**, so that what survives is what matters:
+    /// [`ordered_most_severe_first`] is the one order a retained set may
+    /// be a prefix of, shared with
+    /// [`ArtifactBecameVulnerable::retaining_most_severe`] so the
+    /// retained evidence and the retained audit record cannot disagree
+    /// about the same scan. Leading with the severity tier is what makes
+    /// the short blob answer every *threshold* question the complete set
+    /// would — see [`hort_domain::types::most_severe_first`] for why
+    /// nothing may be promoted above it.
+    ///
+    /// **The fill is measured, not estimated**, through
+    /// [`largest_fitting_prefix`] against [`findings_blob_bytes`] — the
+    /// bytes this function then stores. A cap on the *count* would not
+    /// bound the bytes: `title`, `references` and `fixed_versions` are
+    /// variable-length, and the blobs measured on a running instance ran
+    /// from 1.3x to 2.3x this cap. The probes differ only in how many
+    /// findings they carry, which is the monotonicity the bisection
+    /// needs: the array's length is its elements' lengths plus one
+    /// separator each, so it is strictly increasing in the retained
+    /// count whatever order the elements are stored in.
+    ///
+    /// Returns [`DomainError::Validation`] for the one input shape no
+    /// retained set can represent: a single finding that exceeds the cap
+    /// on its own. That is a different defect from the one this fill
+    /// exists for — `Finding`'s `references` and `fixed_versions`
+    /// entries carry no per-entry length cap, so one finding can be
+    /// arbitrarily large, and the fix for it is a per-entry cap on
+    /// `Finding` rather than a smaller blob here.
+    async fn persist_findings_blob(&self, findings: &[Finding]) -> AppResult<Option<FindingsBlob>> {
         if findings.is_empty() {
             return Ok(None);
         }
-        // Each finding's complete JSON value is its sort key. This keeps
-        // distinct findings distinct and makes the blob hash independent
-        // of the scanner's arrival order.
-        let mut serialized = findings
+        let serialised = ordered_most_severe_first(findings)
             .iter()
             .map(serde_json::to_vec)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| AppError::Storage(format!("serialise findings_blob failed: {e}")))?;
-        serialized.sort_unstable();
-        let mut json = Vec::new();
-        json.push(b'[');
-        for (index, finding) in serialized.iter().enumerate() {
-            if index > 0 {
-                json.push(b',');
-            }
-            json.extend_from_slice(finding);
-        }
-        json.push(b']');
-        if json.len() > FINDINGS_BLOB_MAX_BYTES {
+        let total = serialised.len();
+        let retained = largest_fitting_prefix(total, |retained| {
+            findings_blob_bytes(&serialised[..retained]).len() <= FINDINGS_BLOB_MAX_BYTES
+        });
+        if retained == 0 {
             return Err(AppError::Domain(DomainError::Validation(format!(
-                "findings_blob {} bytes exceeds {} byte cap",
-                json.len(),
+                "findings_blob: the most severe of {total} findings exceeds the {} byte \
+                 cap on its own",
                 FINDINGS_BLOB_MAX_BYTES,
             ))));
         }
+        let json = findings_blob_bytes(&serialised[..retained]);
         let put_result = self
             .storage
             .put(Box::new(std::io::Cursor::new(json)))
             .await?;
-        Ok(Some(put_result.hash))
+        Ok(Some(FindingsBlob {
+            hash: put_result.hash,
+            // A complete blob records no retained count: `None` is the
+            // only spelling of "all of them", and the event's validator
+            // refuses a count that does not describe a short blob.
+            retained: (retained < total).then_some(retained as u32),
+        }))
     }
 
     /// Append an `ArtifactBecameVulnerable` event when a prior
@@ -1642,12 +1807,18 @@ impl QuarantineUseCase {
         let Some(previously_clean_at) = previously_clean_at else {
             return Ok(false);
         };
-        let event = ArtifactBecameVulnerable {
+        // The domain constructor, not a struct literal: `new_findings`
+        // is unbounded and the stored envelope is capped, so a literal
+        // built here could be an event the append path refuses — which
+        // ended the scans of the most vulnerable artifacts in the fleet
+        // with no verdict at all. It orders by severity before filling
+        // to the budget and records the true total when it drops
+        // anything, and it validates what it returns.
+        let event = ArtifactBecameVulnerable::retaining_most_severe(
             artifact_id,
-            new_findings: new_findings.to_vec(),
+            new_findings,
             previously_clean_at,
-        };
-        event.validate()?;
+        )?;
         events_vec.push(EventToAppend::new(DomainEvent::ArtifactBecameVulnerable(
             event,
         )));
@@ -2176,11 +2347,14 @@ impl QuarantineUseCase {
             // next tick and the backstop resumes — so a blob whose parent
             // no longer exists still settles terminally.
             //
-            // The skip set is deliberately narrower than the hold arm's
-            // `is_referenced_descendant`: an artifact an attestation
+            // The skip set is deliberately narrower than what the hold
+            // itself covers, and "held" is not what distinguishes these
+            // rows: an absent attestation holds every shape (ADR 0039
+            // D1/D3). What distinguishes them is whether a verify could
+            // still change the outcome — an artifact an attestation
             // points at (`oci_subject`) or a child *manifest*
-            // (`oci_index_member`) can still be cleared by a verify, so
-            // it keeps the backstop.
+            // (`oci_index_member`) can still be cleared by one, so it
+            // keeps the backstop.
             let provenance_pending = matches!(provenance, ProvenanceClearance::Pending);
             if provenance_pending {
                 // INVARIANT: this lookup PROPAGATES its error, matching
@@ -2527,6 +2701,176 @@ impl QuarantineUseCase {
 
         Ok(())
     }
+
+    /// Put an artifact whose scan reached **no verdict for a condition
+    /// that may clear** into the recoverable hold, and leave it there.
+    ///
+    /// The one caller is
+    /// [`ScanOrchestrationUseCase::record_outcome`](crate::use_cases::scan_orchestration::ScanOrchestrationUseCase::record_outcome)'s
+    /// `CompositionNotProduced` arm: the manifest's composition — its
+    /// unit of filesystem assessment (ADR 0064 D1) — was never produced
+    /// inside the job's attempt budget, because a store or an upstream
+    /// did not answer.
+    ///
+    /// # Why this is not [`Self::record_scan_indeterminate`]
+    ///
+    /// Both withhold the artifact and neither mints release authority,
+    /// so fail-closed is satisfied either way; what differs is how the
+    /// hold lifts. `ScanIndeterminate` is the one withheld state with
+    /// **no ADR 0039 hold-read exemption for any caller, including
+    /// write-granted**, and no `Retry-After`. On a pull-through
+    /// repository the client's own authenticated pull is one of the two
+    /// things that drive the absent constituents into CAS — the other
+    /// being hort's own acquisition on the next scan — so that state
+    /// closes the half that does not wait on a sweep the chart ships
+    /// disabled, and closes it for an operator holding `Write` as firmly
+    /// as for an anonymous client. `Quarantined` withholds an ordinary
+    /// client just as strictly, carries the exemption, advertises a
+    /// `Retry-After`, and is re-asked by
+    /// `RescanCandidatesRepository::select_stranded` (whose predicate is
+    /// "quarantined, last scan job failed or absent" — and this run's row
+    /// is `failed`). ADR 0065 D4: where both directions look restrictive,
+    /// recoverability decides.
+    ///
+    /// # What it does per prior status
+    ///
+    /// - **`None`** — the permissive ingest default
+    ///   (`quarantineDuration: 0`), where the artifact is downloadable
+    ///   and has no window to fall back into. One `ArtifactQuarantined`
+    ///   is appended and the status transitions, because leaving it alone
+    ///   would serve an image whose filesystem nothing assessed. The
+    ///   window anchor is **derived**, through the one assembly every
+    ///   other hold path uses
+    ///   ([`QuarantineAnchorResolver::derive_for_re_entry`]): the row's
+    ///   own ingest instant is the unconditional candidate inside that
+    ///   derivation, and ADR 0054's content-level evidence may move the
+    ///   result earlier. Reading `created_at` here instead — which this
+    ///   method used to do — was a second rule for deciding an anchor
+    ///   sitting beside the first, and it anchored this population later
+    ///   than the evidence warranted. The
+    ///   deadline is not a release authority in any case: with no
+    ///   `ScanCompleted` on the stream the timer release's fail-closed
+    ///   predicate refuses however long ago the window elapsed.
+    /// - **`Quarantined`** — already in the hold this method exists to
+    ///   reach. Nothing is appended and nothing is written, exactly as
+    ///   the retry-exhausted scanner-outage path leaves such an artifact:
+    ///   a second `ArtifactQuarantined` would claim a transition that did
+    ///   not happen.
+    /// - **Terminal (`Released` / `Rejected` / `ScanIndeterminate`)** — a
+    ///   recoverable skip. The artifact already carries a verdict (or an
+    ///   earlier absent one), and a scan that reached none has no
+    ///   standing to overwrite it; `Artifact::quarantine` refuses these
+    ///   states by construction and this method does not ask it to.
+    ///
+    /// No actor parameter — [`system_actor`], because a hold taken for
+    /// want of an assessment is a system-driven reaction and not an
+    /// operator action (mirrors [`Self::record_scan_indeterminate`]).
+    ///
+    /// `reason` is the operator-visible text the job row already carries
+    /// on `last_error`; it is logged here and deliberately not persisted
+    /// on the event, because `ArtifactQuarantined` records a hold and not
+    /// a verdict. The durable per-run record of *why* the composition was
+    /// absent is the `composite_scan_observations` row the composite path
+    /// writes on every run, including this one (ADR 0064 D2).
+    #[tracing::instrument(skip(self, reason))]
+    pub async fn hold_for_unproduced_composition(
+        &self,
+        artifact_id: Uuid,
+        reason: String,
+    ) -> AppResult<()> {
+        let stream_id = StreamId::artifact(artifact_id);
+        let correlation_id = Uuid::new_v4();
+
+        // Version paired with the load: `Artifact::quarantine`'s
+        // source-state guard — and the status check below it — decide
+        // from the state this load observed, so the append has to be
+        // ordered against the same observation.
+        let mut paired = ArtifactAtVersion::load(
+            &*self.artifacts,
+            &*self.events,
+            artifact_id,
+            OverCapStream::Refuse,
+        )
+        .await?;
+        let expected_version = paired.expected_version();
+        let prior_status = paired.artifact().quarantine_status;
+
+        // Already held, or already carrying a verdict: nothing to write.
+        // Asked before `Artifact::quarantine` rather than after, because
+        // the three terminal states and `Quarantined` all reach the same
+        // `Invariant` from that guard and only one of them is the
+        // "already where this wanted it" case an operator should read in
+        // the log.
+        if prior_status != QuarantineStatus::None {
+            tracing::debug!(
+                artifact_id = %artifact_id,
+                status = %prior_status,
+                reason = %truncate_reason(&reason),
+                "a scan that produced no composition leaves the artifact's existing \
+                 state alone — it is already withheld, or already carries a verdict \
+                 a verdict-less run may not overwrite"
+            );
+            return Ok(());
+        }
+
+        // One `ArtifactQuarantined`, and a repeatable one: the sweep or a
+        // curator can release this artifact and a later exhausted
+        // composite scan reaches here again, so the cap is checked at the
+        // append rather than assumed away. `OverCapStream::Refuse` above
+        // rejects a stream already past the cap; this rejects the append
+        // that would take a stream sitting exactly on it past.
+        refuse_append_past_cap(paired.stream_id(), paired.stream_len(), 1)?;
+        let repository_id = paired.artifact().repository_id;
+        // Composed with the artifact's stored window rather than read
+        // raw, even though the status check above means there is none (a
+        // `None`-status artifact carries no window — see
+        // `quarantine_transitions::tests::no_transition_returns_an_artifact_to_the_none_status`
+        // and the entity's `every_anchor_write_leaves_the_artifact_quarantined`).
+        // The composed form is the one that cannot lengthen a window if
+        // that invariant ever stops holding, and it costs nothing.
+        let window_start = self
+            .anchor_resolver
+            .derive_for_re_entry(paired.artifact())
+            .await
+            .re_entry_anchor(paired.artifact().quarantine_window_start);
+        let event_payload = paired.artifact_mut().quarantine(window_start)?;
+        let artifact = paired.into_artifact();
+
+        // none → quarantined: the same count bump every other entry into
+        // the hold makes.
+        let score_delta = RepoSecurityScoreProjector::compute_quarantined_delta();
+
+        self.lifecycle
+            .commit_transition_with_score(
+                &artifact,
+                AppendEvents {
+                    stream_id,
+                    expected_version,
+                    events: vec![EventToAppend::new(DomainEvent::ArtifactQuarantined(
+                        event_payload,
+                    ))],
+                    correlation_id,
+                    causation_id: None,
+                    actor: system_actor(),
+                },
+                None, // a hold does not overwrite ingest metadata
+                Some((repository_id, score_delta)),
+            )
+            .await?;
+
+        // A withheld artifact is a security-relevant state change and an
+        // expected outcome, not an error — the same posture
+        // `record_scan_indeterminate`'s audit line takes.
+        tracing::info!(
+            artifact_id = %artifact_id,
+            reason = %truncate_reason(&reason),
+            "artifact quarantined: its composed image was never produced within the \
+             scan's attempt budget, so no verdict exists to release it on \
+             (fail-closed, recoverable)"
+        );
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2592,8 +2936,8 @@ mod tests {
 
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode,
-        ScanPolicyProjection, SeverityThreshold,
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanPolicyProjection,
+        SeverityThreshold,
     };
     use hort_domain::events::{
         system_actor, Actor, DomainEvent, PersistedEvent, PolicyResult, PolicyScope, ReleaseReason,
@@ -2723,6 +3067,12 @@ mod tests {
             content_references.clone(),
             storage.clone(),
             jobs,
+            Arc::new(QuarantineAnchorResolver::new(
+                artifacts.clone(),
+                content_references.clone(),
+                projections.clone(),
+                Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+            )),
         );
         (
             uc,
@@ -2801,6 +3151,12 @@ mod tests {
             content_references.clone(),
             storage.clone(),
             jobs.clone(),
+            Arc::new(QuarantineAnchorResolver::new(
+                artifacts.clone(),
+                content_references.clone(),
+                projections.clone(),
+                Arc::new(MockRepositoryUpstreamMappingRepository::new()),
+            )),
         );
         (
             uc,
@@ -2987,6 +3343,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
@@ -3046,6 +3403,7 @@ mod tests {
                 } else {
                     None
                 },
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
@@ -3166,7 +3524,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -3295,6 +3652,7 @@ mod tests {
                 negligible: 0,
             },
             findings_blob: None,
+            findings_blob_retained: None,
             assessment: ScanAssessment::Analysed,
         });
         lifecycle
@@ -3378,6 +3736,7 @@ mod tests {
                     .parse()
                     .expect("static valid SHA-256 hex"),
             ),
+            findings_blob_retained: None,
             assessment: ScanAssessment::Analysed,
         });
         let err = lifecycle
@@ -3417,8 +3776,8 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
-        uc.quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+        let window_start = Utc::now() - chrono::Duration::hours(24);
+        uc.quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap();
 
@@ -3430,7 +3789,7 @@ mod tests {
             saved_artifact.quarantine_status,
             QuarantineStatus::Quarantined
         );
-        assert_eq!(saved_artifact.quarantine_window_start, Some(until));
+        assert_eq!(saved_artifact.quarantine_window_start, Some(window_start));
         assert_eq!(batch.events.len(), 1);
         assert!(matches!(
             &batch.events[0].event,
@@ -3444,9 +3803,9 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
+        let window_start = Utc::now() - chrono::Duration::hours(24);
         let err = uc
-            .quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+            .quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap_err();
         assert!(err.to_string().contains("cannot quarantine"));
@@ -3465,9 +3824,9 @@ mod tests {
             .collect();
         events.set_stream(&stream_id, dummy_events);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
+        let window_start = Utc::now() - chrono::Duration::hours(24);
         let err = uc
-            .quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+            .quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap_err();
         assert!(err
@@ -3488,8 +3847,8 @@ mod tests {
             .collect();
         events.set_stream(&stream_id, dummy_events);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
-        uc.quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+        let window_start = Utc::now() - chrono::Duration::hours(24);
+        uc.quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap();
 
@@ -3504,8 +3863,8 @@ mod tests {
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
 
-        let until = Utc::now() + chrono::Duration::hours(24);
-        uc.quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+        let window_start = Utc::now() - chrono::Duration::hours(24);
+        uc.quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap();
 
@@ -8712,6 +9071,7 @@ spec:
                     negligible: 0,
                 },
                 findings_blob: None,
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
@@ -10289,6 +10649,225 @@ spec:
         }
     }
 
+    // -- the recoverable hold for an unproduced composition ---------------
+    //
+    // `hold_for_unproduced_composition`'s counterpart to the three
+    // `record_scan_indeterminate` tests above, and the contrast is the
+    // whole point: both withhold the artifact and neither mints release
+    // authority, but only one of them leaves a state a write-granted
+    // read and a later scan can both still reach (ADR 0065 D4).
+
+    /// Permissive mode (`quarantineDuration: 0`): the artifact is
+    /// downloadable with no window to fall back into, so the hold is
+    /// *taken* — anything else would serve an image whose filesystem
+    /// nothing assessed. It is the recoverable hold, not the terminal
+    /// one, and its window is anchored at the ingest instant.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_takes_a_hold_from_the_permissive_default() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
+        let ingested_at = artifacts.get(artifact_id).expect("artifact").created_at;
+
+        uc.hold_for_unproduced_composition(artifact_id, "upstream:timeout".into())
+            .await
+            .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, metadata) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_status,
+            QuarantineStatus::Quarantined,
+            "the recoverable hold, never the terminal one — the condition that \
+             refused the composition may clear"
+        );
+        assert!(
+            !saved.is_downloadable(),
+            "and it is a hold: nothing is served unassessed"
+        );
+        assert_eq!(saved.quarantine_window_start, Some(ingested_at));
+        assert_eq!(batch.events.len(), 1);
+        // The whole event rather than two of its fields: the payload has
+        // exactly those two, so equality pins the variant and both of
+        // them in one assertion — and leaves no unexercised
+        // wrong-variant arm behind.
+        assert_eq!(
+            batch.events[0].event,
+            DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: ingested_at,
+            }),
+        );
+        // System actor — a hold taken for want of an assessment is a
+        // system reaction, not an operator action (mirrors
+        // `record_scan_indeterminate`).
+        assert_eq!(batch.actor, system_actor());
+        assert!(
+            metadata.is_none(),
+            "a hold does not overwrite ingest metadata"
+        );
+        assert_eq!(
+            lifecycle.score_deltas().len(),
+            1,
+            "none → quarantined is the same count bump every other entry into the \
+             hold makes"
+        );
+    }
+
+    /// **The anchor is derived, not read off `created_at`.** This site
+    /// used to take `paired.artifact().created_at` directly — a second
+    /// rule for deciding an anchor, standing beside
+    /// `derive_quarantine_anchor` and blind to every source but one. With
+    /// an earlier observation of the same bytes in another repository,
+    /// ADR 0054's content-level evidence moves the anchor there, and the
+    /// hold this method takes is already elapsed instead of starting a
+    /// fresh full window on content hort has held for months.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_anchors_on_the_content_age_evidence() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
+        let artifact = artifacts.get(artifact_id).expect("artifact");
+        // The same content, held in another repository since long before
+        // this row was minted.
+        let mut older = artifact.clone();
+        older.id = Uuid::new_v4();
+        older.repository_id = Uuid::new_v4();
+        older.created_at = artifact.created_at - chrono::Duration::days(90);
+        artifacts.insert(older.clone());
+
+        uc.hold_for_unproduced_composition(artifact_id, "upstream:timeout".into())
+            .await
+            .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _metadata) = &transitions[0];
+        assert_eq!(
+            saved.quarantine_window_start,
+            Some(older.created_at),
+            "the window begins where hort can prove the bytes were already              published, not at the instant this row happened to be minted"
+        );
+        assert_eq!(
+            batch.events[0].event,
+            DomainEvent::ArtifactQuarantined(hort_domain::events::ArtifactQuarantined {
+                artifact_id,
+                quarantine_window_start: older.created_at,
+            }),
+            "and the event announcing the hold carries the same anchor the row does"
+        );
+    }
+
+    /// No `ScanCompleted` is written, which is what keeps the release
+    /// gate closed however long the observation window has been elapsed:
+    /// the timer release is authorized by a scan-axis authority and the
+    /// hold supplies none.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_mints_no_release_authority() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
+
+        uc.hold_for_unproduced_composition(artifact_id, "storage did not answer".into())
+            .await
+            .unwrap();
+
+        let committed: Vec<DomainEvent> = lifecycle
+            .committed_transitions()
+            .into_iter()
+            .flat_map(|(_, batch, _)| batch.events.into_iter().map(|e| e.event))
+            .collect();
+        assert!(
+            !committed
+                .iter()
+                .any(|e| matches!(e, DomainEvent::ScanCompleted(_))),
+            "a run that produced no composition records no verdict: {committed:?}"
+        );
+        assert!(
+            !committed
+                .iter()
+                .any(|e| matches!(e, DomainEvent::ArtifactReleased(_))),
+            "and releases nothing: {committed:?}"
+        );
+    }
+
+    /// An artifact already in the hold is already where this method
+    /// wants it: nothing is appended and the observation window is not
+    /// restarted. A second `ArtifactQuarantined` would claim a transition
+    /// that did not happen.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_leaves_an_existing_hold_untouched() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        let before = artifacts.get(artifact_id).expect("artifact");
+
+        uc.hold_for_unproduced_composition(artifact_id, "upstream:timeout".into())
+            .await
+            .unwrap();
+
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "no second hold on an artifact that is already held"
+        );
+        let after = artifacts.get(artifact_id).expect("artifact");
+        assert_eq!(after.quarantine_status, QuarantineStatus::Quarantined);
+        assert_eq!(
+            after.quarantine_window_start,
+            before.quarantine_window_start
+        );
+    }
+
+    /// An artifact that already carries a verdict — including an earlier
+    /// absent one — is a recoverable skip. A scan that reached no verdict
+    /// has no standing to overwrite one that was reached, and
+    /// `scan_indeterminate` specifically has its own exits (the curator's
+    /// re-evaluation, the provenance-misrejection repair, a later scan
+    /// that supersedes it); this is not one of them.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_leaves_a_terminal_artifact_alone() {
+        for status in [
+            QuarantineStatus::ScanIndeterminate,
+            QuarantineStatus::Rejected,
+            QuarantineStatus::Released,
+        ] {
+            let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
+            let artifact_id = seed_artifact_with_repo(&artifacts, &repositories, status);
+
+            uc.hold_for_unproduced_composition(artifact_id, "upstream:timeout".into())
+                .await
+                .unwrap();
+
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "no transition on an already-{status} artifact"
+            );
+            assert_eq!(
+                artifacts
+                    .get(artifact_id)
+                    .expect("artifact")
+                    .quarantine_status,
+                status,
+            );
+        }
+    }
+
+    /// A missing artifact propagates, exactly as the terminal path's load
+    /// failure does: the orchestrator reports a retryable failure rather
+    /// than recording a hold that never landed.
+    #[tokio::test]
+    async fn hold_for_unproduced_composition_load_failure_propagates() {
+        let (uc, _artifacts, _events, lifecycle, _repositories, _projections) = make_use_case();
+
+        let err = uc
+            .hold_for_unproduced_composition(Uuid::new_v4(), "upstream:timeout".into())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("artifact"));
+        assert!(lifecycle.committed_transitions().is_empty());
+    }
+
     /// Load failure (artifact not found) propagates as an error — the
     /// orchestrator must not silently swallow a missing artifact.
     #[tokio::test]
@@ -10586,12 +11165,15 @@ spec:
     /// is a window of zero length" property the provenance-misrejection
     /// repair's permissive-strand test pins.
     ///
-    /// The anchor is `now` and not the artifact's ingest time, which is
-    /// the fail-closed direction: an earlier anchor would be a default
-    /// substituted for missing evidence on the permissive side of a
-    /// release gate (ADR 0065 D2). Under a zero window the two agree,
-    /// and under a non-zero one the artifact serves a window instead of
-    /// skipping it.
+    /// The anchor is the artifact's own ingest instant and not a clock
+    /// reading taken at the hold: a quarantine window begins where hort
+    /// can prove the artifact was already published, so the anchor is a
+    /// property of the artifact rather than of the run that happened to
+    /// look at it, and `created_at` is the evidence hort always holds.
+    /// Under a zero window the two agree; under a non-zero one the
+    /// difference is the whole duration, which
+    /// [`scan_indeterminate_with_an_elapsed_ingest_window_heals_in_the_same_batch`]
+    /// pins.
     #[tokio::test]
     async fn scan_indeterminate_with_no_window_anchor_heals_in_a_permissive_repository() {
         let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
@@ -10639,11 +11221,98 @@ spec:
         let DomainEvent::ArtifactQuarantined(ev) = &batch.events[2].event else {
             panic!("expected ArtifactQuarantined third");
         };
+        assert_eq!(
+            ev.quarantine_window_start,
+            artifacts.get(artifact_id).unwrap().created_at,
+            "an artifact that never had a window is anchored at its ingest instant"
+        );
         assert!(
             ev.quarantine_window_start >= started,
-            "an artifact that never had a window is anchored now, not earlier"
+            "this fixture's ingest instant is itself after `started`, so the \
+             assertion above is the one carrying the anchor's identity"
         );
         assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+    }
+
+    /// **The availability claim.** An artifact whose ingest instant is
+    /// long past the matched policy's `quarantineDuration`, held in
+    /// `scan_indeterminate` with no window of its own, is released
+    /// **inline in the same batch** as the non-rejecting verdict that
+    /// lifts the hold: anchored at `created_at`, its deadline has
+    /// already elapsed, so the fast path's candidacy check passes and a
+    /// scan-axis authority is constructible from the verdict beside it.
+    ///
+    /// This is the case a wall-clock anchor got wrong, and it is not a
+    /// corner: the population is every artifact that was downloadable
+    /// under `quarantineDuration: 0` and whose repository later carries
+    /// a real window — anchored at the moment of the hold it answers
+    /// `503` for a full duration, and because a fresh fallback is taken
+    /// on every pass, each rescan tick restarts it. Here the window is
+    /// an entire month elapsed and the artifact has served for that
+    /// long, so withholding it is the wrong answer by any reading.
+    #[tokio::test]
+    async fn scan_indeterminate_with_an_elapsed_ingest_window_heals_in_the_same_batch() {
+        let (uc, artifacts, events, lifecycle, repositories, projections) = make_use_case();
+        let artifact_id =
+            seed_scan_indeterminate_artifact(&artifacts, &repositories, &events, Utc::now());
+        // The permissive-ingest population: never time-held, so no
+        // window of its own — and ingested long before the window its
+        // repository now carries.
+        let ingested_at = Utc::now() - chrono::Duration::days(30);
+        artifacts.insert({
+            let mut a = artifacts.get(artifact_id).unwrap();
+            a.quarantine_window_start = None;
+            a.created_at = ingested_at;
+            a
+        });
+        let repo_id = artifacts.get(artifact_id).unwrap().repository_id;
+        // A real, non-zero observation window — 24 h, against an
+        // artifact ingested 30 days ago.
+        seed_windowed_policy(&projections, repo_id);
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            Vec::new(),
+            ScanAssessment::NotApplicable,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (saved, batch, _meta) = &transitions[0];
+        let kinds: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "ScanCompleted",
+                "PolicyEvaluated",
+                "ArtifactQuarantined",
+                "ArtifactReleased"
+            ],
+            "the hold is lifted and the elapsed window decided in one append — a \
+             wall-clock anchor leaves this at three events and the artifact \
+             `Quarantined` for another full duration"
+        );
+        let DomainEvent::ArtifactQuarantined(ev) = &batch.events[2].event else {
+            panic!("expected ArtifactQuarantined third");
+        };
+        assert_eq!(
+            ev.quarantine_window_start, ingested_at,
+            "the anchor is the artifact's own ingest instant"
+        );
+        let DomainEvent::ArtifactReleased(released) = &batch.events[3].event else {
+            panic!("expected ArtifactReleased fourth");
+        };
+        assert_eq!(released.released_by, ReleaseReason::Timer);
+        assert_eq!(saved.quarantine_status, QuarantineStatus::Released);
+        assert!(
+            saved.is_downloadable(),
+            "the artifact an operator has been serving for a month is servable again"
+        );
     }
 
     /// The same chain where the window is still open: the verdict leaves
@@ -11380,8 +12049,8 @@ spec:
         let (uc, artifacts, _events, lifecycle, repositories, _projections) = make_use_case();
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::None);
-        let until = Utc::now() + chrono::Duration::hours(24);
-        uc.quarantine_artifact(artifact_id, until, Actor::Api(api_actor()))
+        let window_start = Utc::now() - chrono::Duration::hours(24);
+        uc.quarantine_artifact(artifact_id, window_start, Actor::Api(api_actor()))
             .await
             .unwrap();
 
@@ -11671,75 +12340,389 @@ spec:
         );
     }
 
-    /// `record_scan_result` is the single
-    /// CAS write site for the findings blob (the orchestrator-side
-    /// duplicate write was removed). The 8 MiB cap from
-    /// `FINDINGS_BLOB_MAX_BYTES` enforces here, in `persist_findings_blob`.
-    /// This test pins the cap path: a finding set whose JSON-serialised
-    /// representation exceeds the cap returns `DomainError::Validation`
-    /// rather than persisting the oversize blob.
+    // ---- the findings blob is bounded, and a bounded one says so ---------
+    //
+    // `record_scan_result` is the single CAS write site for the findings
+    // blob, so `FINDINGS_BLOB_MAX_BYTES` is enforced here, in
+    // `persist_findings_blob`. A finding set is unbounded, so for a
+    // large enough one there is no complete blob — and refusing to
+    // write one ended the scan with no verdict at all, worst for
+    // precisely the artifacts with the most findings.
+
+    /// A finding at every length `Finding::validate` permits — a
+    /// 1024-byte title, 32 references of 256 bytes, 32 fixed versions —
+    /// so its serialisation is a little over 10 KB and a corpus can be
+    /// built just past the cap without a magic number. This is also the
+    /// shape the measured defect had: runaway scanner output at the
+    /// per-field caps, times several hundred findings.
     ///
-    /// Migrated from `scan_orchestration_tests::run_scan_returns_failed_when_blob_exceeds_size_cap`,
-    /// which exercised an orchestrator-side cap that no longer exists.
+    /// `index` separates the identity keys; `severity` and `cvss_score`
+    /// are what the retained order turns on.
+    fn bulky_finding(
+        index: usize,
+        severity: SeverityThreshold,
+        cvss_score: Option<f32>,
+    ) -> Finding {
+        Finding {
+            purl: format!("pkg:npm/p{index:06}@1"),
+            vulnerability_id: format!("CVE-2026-{index:06}"),
+            severity,
+            cvss_score,
+            title: "t".repeat(1024),
+            fixed_versions: (0..32).map(|i| format!("{i:032}")).collect(),
+            source_scanner: "trivy".into(),
+            references: (0..32)
+                .map(|i| format!("https://example.test/{i}{}", "r".repeat(230)))
+                .collect(),
+            aliases: vec![],
+            informational_class: None,
+            severity_basis: hort_domain::types::SeverityBasis::Assessed,
+            component_relation: ComponentRelation::NotEstablished,
+            statement: hort_domain::types::FindingStatement::Unstated,
+            advisory_published_at: None,
+        }
+    }
+
+    /// `count` bulky `High` findings, descending `cvss_score` so the
+    /// within-tier key is exercised, plus one trailing `Critical`
+    /// carrying the LOWEST score in the set.
+    ///
+    /// The corpus bites on purpose: the only finding that exceeds a
+    /// `Critical` threshold arrives **last**, so a prefix of the arrival
+    /// order drops it, and it carries the lowest score, so any order
+    /// that let the score outrank the tier drops it too.
+    fn over_cap_corpus(count: usize) -> Vec<Finding> {
+        let mut findings: Vec<Finding> = (0..count)
+            .map(|i| bulky_finding(i, SeverityThreshold::High, Some(9.9 - (i as f32) / 1000.0)))
+            .collect();
+        findings.push(bulky_finding(
+            999_999,
+            SeverityThreshold::Critical,
+            Some(0.1),
+        ));
+        findings
+    }
+
+    /// The complete set's serialised blob, for the "this corpus is the
+    /// defect's shape" precondition each test below states before
+    /// invoking the use case.
+    fn complete_blob_len(findings: &[Finding]) -> usize {
+        let serialised: Vec<Vec<u8>> = findings
+            .iter()
+            .map(|f| serde_json::to_vec(f).unwrap())
+            .collect();
+        findings_blob_bytes(&serialised).len()
+    }
+
+    /// The one `ScanCompleted` of the one committed batch.
+    fn committed_scan_completed(lifecycle: &Arc<MockArtifactLifecycle>) -> ScanCompleted {
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1, "exactly one commit");
+        let (_saved, batch, _metadata) = &transitions[0];
+        let scans: Vec<ScanCompleted> = batch
+            .events
+            .iter()
+            .filter_map(|e| match &e.event {
+                DomainEvent::ScanCompleted(scan) => Some(scan.clone()),
+                _ => None,
+            })
+            .collect();
+        let shape: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert_eq!(
+            scans.len(),
+            1,
+            "exactly one ScanCompleted per scan result, got {shape:?}",
+        );
+        scans.into_iter().next().expect("checked above")
+    }
+
+    /// The `Vec<Finding>` behind a `ScanCompleted.findings_blob`, read
+    /// back through the port the production readers use.
+    async fn read_blob(
+        storage: &Arc<MockStoragePort>,
+        scan: &ScanCompleted,
+    ) -> (Vec<u8>, Vec<Finding>) {
+        let hash = scan
+            .findings_blob
+            .as_ref()
+            .expect("a scan with findings records a blob");
+        let port: Arc<dyn StoragePort> = storage.clone();
+        let mut reader = port.get(hash).await.expect("the blob was written");
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).await.expect("blob reads");
+        let findings: Vec<Finding> = serde_json::from_slice(&bytes).expect("blob deserialises");
+        (bytes, findings)
+    }
+
+    /// **The defect.** A finding set whose complete serialisation
+    /// exceeds the cap produces a blob that is *written*, a verdict that
+    /// is *recorded*, and a marker that tells a reader the blob is short
+    /// — where it previously produced `DomainError::Validation`, burned
+    /// the attempt budget and left the artifact with no verdict at all.
+    ///
+    /// The aggregates are of the COMPLETE set: `finding_count` is the
+    /// true total and the severity counts are untouched, so a threshold
+    /// walk over them is unaffected by the bounded blob.
     #[tokio::test]
-    async fn record_scan_result_returns_validation_error_when_findings_blob_exceeds_size_cap() {
-        let (uc, artifacts, _events, _lifecycle, repositories, _projections) = make_use_case();
+    async fn record_scan_result_bounds_an_over_cap_findings_blob_and_records_the_true_total() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
         let artifact_id =
             seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
 
-        // Build ~1000 max-size findings. Each finding carries a 1024-byte
-        // title, a 512-byte purl, a 128-byte vulnerability_id, 32 references
-        // of 256 bytes, and 32 fixed_versions of 32 bytes. JSON-serialised
-        // size is well over 9 KiB per finding, so 1000 entries clear the
-        // 8 MiB cap with margin.
-        let max_purl = "p".repeat(512);
-        let max_vuln = "v".repeat(128);
-        let max_title = "t".repeat(1024);
-        let mut refs = Vec::with_capacity(32);
-        for _ in 0..32 {
-            refs.push("r".repeat(256));
-        }
-        let mut fixed = Vec::with_capacity(32);
-        for _ in 0..32 {
-            fixed.push("f".repeat(32));
-        }
-        let mut findings: Vec<Finding> = Vec::with_capacity(1000);
-        for i in 0..1000u32 {
-            findings.push(Finding {
-                purl: format!("{max_purl}{i:04}")[..512].to_string(),
-                vulnerability_id: format!("{max_vuln}{i:04}")[..128].to_string(),
-                severity: SeverityThreshold::High,
-                cvss_score: Some(7.5),
-                title: max_title.clone(),
-                fixed_versions: fixed.clone(),
-                source_scanner: "trivy".into(),
-                references: refs.clone(),
-                aliases: vec![],
-                informational_class: None,
-                severity_basis: hort_domain::types::SeverityBasis::Assessed,
-                component_relation: ComponentRelation::NotEstablished,
-                statement: hort_domain::types::FindingStatement::Unstated,
-                advisory_published_at: None,
-            });
-        }
-        // Sanity: confirm we cleared the cap before invoking the use case.
-        let serialised_len = serde_json::to_vec(&findings).unwrap().len();
+        let findings = over_cap_corpus(1000);
+        let total = findings.len();
+        let complete_len = complete_blob_len(&findings);
         assert!(
-            serialised_len > FINDINGS_BLOB_MAX_BYTES,
-            "test fixture must exceed the 8 MiB cap; got {serialised_len} bytes"
+            complete_len > FINDINGS_BLOB_MAX_BYTES,
+            "the corpus must be the defect's shape; measured {complete_len} bytes against \
+             the {FINDINGS_BLOB_MAX_BYTES} byte cap"
         );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("an over-cap finding set must still record a verdict");
+
+        let scan = committed_scan_completed(&lifecycle);
+        assert_eq!(
+            scan.finding_count, total as u32,
+            "the recorded total is the complete set's, whatever the blob holds"
+        );
+        assert_eq!(scan.severity_summary.critical, 1);
+        assert_eq!(scan.severity_summary.high, total as u32 - 1);
+        let retained = scan
+            .findings_blob_retained
+            .expect("a bounded blob records how many findings it holds");
+        assert!(
+            retained >= 1 && (retained as usize) < total,
+            "{retained} retained of {total}: a bounded blob holds some but not all"
+        );
+        assert!(!scan.findings_blob_is_complete());
+        scan.validate()
+            .expect("the event the scan path built is valid");
+
+        let (bytes, decoded) = read_blob(&storage, &scan).await;
+        assert!(
+            bytes.len() <= FINDINGS_BLOB_MAX_BYTES,
+            "the written blob must fit the cap; got {} bytes",
+            bytes.len()
+        );
+        assert_eq!(
+            decoded.len(),
+            retained as usize,
+            "the recorded retained count must be what the blob actually holds"
+        );
+        assert!(
+            decoded
+                .iter()
+                .any(|f| f.severity == SeverityThreshold::Critical),
+            "the trailing, lowest-scored Critical must survive a truncation that \
+             dropped Highs ahead of it"
+        );
+    }
+
+    /// The retained count is the largest one that fits — the fill is a
+    /// measurement, not a guess. One more finding in the retained order
+    /// would cross the cap.
+    #[tokio::test]
+    async fn the_retained_blob_is_as_large_as_the_cap_allows() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, _storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let findings = over_cap_corpus(1000);
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("record_scan_result");
+
+        let retained = committed_scan_completed(&lifecycle)
+            .findings_blob_retained
+            .expect("bounded") as usize;
+        let serialised: Vec<Vec<u8>> = ordered_most_severe_first(&findings)
+            .iter()
+            .map(|f| serde_json::to_vec(f).unwrap())
+            .collect();
+        assert!(
+            findings_blob_bytes(&serialised[..retained]).len() <= FINDINGS_BLOB_MAX_BYTES,
+            "the retained prefix must fit"
+        );
+        assert!(
+            findings_blob_bytes(&serialised[..retained + 1]).len() > FINDINGS_BLOB_MAX_BYTES,
+            "retaining one more finding must exceed the cap"
+        );
+    }
+
+    /// **The property the retained order exists for**, over the blob the
+    /// use case actually wrote: for *every* [`SeverityThreshold`], if
+    /// the complete set contains a finding that exceeds it, so does the
+    /// retained set.
+    ///
+    /// Asserted through
+    /// [`finding_exceeds_threshold`](hort_domain::policy::threshold::finding_exceeds_threshold)
+    /// itself — the function a policy decision actually calls — so this
+    /// test and the policy cannot drift.
+    #[tokio::test]
+    async fn the_retained_blob_answers_every_threshold_as_the_complete_set_does() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let findings = over_cap_corpus(1000);
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("record_scan_result");
+
+        let scan = committed_scan_completed(&lifecycle);
+        assert!(
+            scan.findings_blob_retained.is_some(),
+            "the corpus is bounded"
+        );
+        let (_bytes, decoded) = read_blob(&storage, &scan).await;
+        assert!(
+            decoded.len() < findings.len(),
+            "the blob is genuinely short"
+        );
+
+        for threshold in [
+            SeverityThreshold::Critical,
+            SeverityThreshold::High,
+            SeverityThreshold::Medium,
+            SeverityThreshold::Low,
+        ] {
+            use hort_domain::policy::threshold::finding_exceeds_threshold;
+
+            let complete_exceeds = findings
+                .iter()
+                .any(|f| finding_exceeds_threshold(f.severity, threshold));
+            let retained_exceeds = decoded
+                .iter()
+                .any(|f| finding_exceeds_threshold(f.severity, threshold));
+            assert_eq!(
+                complete_exceeds, retained_exceeds,
+                "threshold {threshold:?}: the retained blob must answer every threshold \
+                 the way the complete set does",
+            );
+        }
+    }
+
+    /// A set that fits is not truncated, records no retained count, and
+    /// is **not reordered away from the documented order**: the blob's
+    /// elements are sorted by their complete JSON value, which is what
+    /// keeps the blob hash independent of the scanner's arrival order.
+    ///
+    /// The corpus's severity order and its byte order disagree, so a
+    /// blob written in the selection order would fail this.
+    #[tokio::test]
+    async fn record_scan_result_leaves_a_fitting_findings_blob_complete_and_byte_ordered() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        // `z` is the most severe and sorts LAST by bytes; `a` is the
+        // least severe and sorts first.
+        let findings = vec![
+            bulky_finding(1, SeverityThreshold::Low, Some(1.0)),
+            bulky_finding(3, SeverityThreshold::Critical, Some(9.0)),
+            bulky_finding(2, SeverityThreshold::Medium, Some(5.0)),
+        ];
+        let complete_len = complete_blob_len(&findings);
+        assert!(
+            complete_len <= FINDINGS_BLOB_MAX_BYTES,
+            "this corpus must fit; measured {complete_len} bytes"
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            findings.clone(),
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("record_scan_result");
+
+        let scan = committed_scan_completed(&lifecycle);
+        assert_eq!(
+            scan.findings_blob_retained, None,
+            "a complete blob records no retained count"
+        );
+        assert!(scan.findings_blob_is_complete());
+
+        let (bytes, decoded) = read_blob(&storage, &scan).await;
+        assert_eq!(decoded.len(), 3, "nothing was dropped");
+        let mut serialised: Vec<Vec<u8>> = decoded
+            .iter()
+            .map(|f| serde_json::to_vec(f).unwrap())
+            .collect();
+        serialised.sort_unstable();
+        assert_eq!(
+            bytes,
+            findings_blob_bytes(&serialised),
+            "the blob's elements are ordered by their serialisation, not by severity \
+             and not by arrival"
+        );
+        assert_eq!(
+            decoded[0].vulnerability_id, "CVE-2026-000001",
+            "the byte order puts the least severe finding first, which is exactly why \
+             the severity order is the SELECTION order and not the stored one"
+        );
+    }
+
+    /// The one input shape no retained set can represent: a single
+    /// finding that exceeds the cap on its own. A `Finding`'s
+    /// `references` entries carry no per-entry length cap, so one
+    /// finding can be arbitrarily large — and that is a different
+    /// defect, whose fix is a per-entry cap on `Finding` rather than a
+    /// smaller blob here. Until then the scan fails loudly instead of
+    /// storing an empty array and calling it evidence.
+    #[tokio::test]
+    async fn record_scan_result_refuses_one_finding_that_exceeds_the_cap_on_its_own() {
+        let (uc, artifacts, _events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+
+        let mut huge = bulky_finding(1, SeverityThreshold::Critical, Some(9.8));
+        huge.references = vec!["r".repeat(FINDINGS_BLOB_MAX_BYTES + 1)];
+        huge.validate()
+            .expect("no per-entry length cap exists on references; this finding is valid");
 
         let err = uc
             .record_scan_result(
                 artifact_id,
                 "trivy".into(),
-                findings,
+                vec![huge],
                 ScanAssessment::Analysed,
                 TEST_SCAN_KIND,
                 None,
             )
             .await
-            .expect_err("oversize findings blob must surface as an error");
+            .expect_err("a single finding over the cap has no representable blob");
         match err {
             AppError::Domain(DomainError::Validation(msg)) => {
                 assert!(
@@ -11753,5 +12736,168 @@ spec:
             }
             other => panic!("expected Domain(Validation), got {other:?}"),
         }
+        assert_eq!(
+            storage.put_call_count(),
+            0,
+            "nothing is written when no retained set can represent the input"
+        );
+        assert!(
+            lifecycle.committed_transitions().is_empty(),
+            "the refusal happens before the commit"
+        );
+    }
+
+    // ---- a bounded PRIOR blob cannot establish a transition -------------
+
+    /// A prior `ScanCompleted` at position 1 whose blob holds only
+    /// `retained` of its `finding_count` findings, preceded by the
+    /// genesis event so the pairing resolves a non-`NoStream` version.
+    fn seed_prior_scan(
+        events: &Arc<MockEventStore>,
+        artifact_id: Uuid,
+        finding_count: u32,
+        retained: Option<u32>,
+    ) {
+        let stream_id = StreamId::artifact(artifact_id);
+        let prior = PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: stream_id.clone(),
+            stream_position: 1,
+            global_position: 2,
+            event: DomainEvent::ScanCompleted(ScanCompleted {
+                artifact_id,
+                scanner: "trivy".into(),
+                finding_count,
+                severity_summary: SeveritySummary {
+                    critical: 0,
+                    high: finding_count,
+                    medium: 0,
+                    low: 0,
+                    negligible: 0,
+                },
+                findings_blob: Some(
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                        .parse()
+                        .expect("static valid SHA-256 hex"),
+                ),
+                findings_blob_retained: retained,
+                assessment: ScanAssessment::Analysed,
+            }),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: Utc::now(),
+        };
+        events.set_stream(
+            &stream_id,
+            vec![dummy_persisted_event(&stream_id, artifact_id, 0), prior],
+        );
+    }
+
+    /// **The third reader of the blob, and the one the bound changes.**
+    /// `ArtifactBecameVulnerable` fires only when the current findings
+    /// contain pairs absent from the prior scan — and a prior blob
+    /// holding only its most severe findings cannot establish absence.
+    /// Every finding it dropped would read as new, on every rescan,
+    /// forever, and the event's `previously_clean_at` would assert the
+    /// artifact was "provably clean of these specific findings" when it
+    /// was not.
+    ///
+    /// So no event: an append-only audit record with a logged gap beats
+    /// one that claims an unproven transition.
+    ///
+    /// The prior blob **is** seeded in CAS, and holds a finding the
+    /// current scan does not report — so a path that read it would
+    /// compute a non-empty delta and append the event, which is the
+    /// shape `a_complete_prior_blob_still_appends_became_vulnerable`
+    /// below pins. The unread `get_call_count` is the other half: the
+    /// answer comes from the record, not from up to 8 MiB nobody may
+    /// decide over.
+    #[tokio::test]
+    async fn a_bounded_prior_blob_appends_no_became_vulnerable() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        seed_prior_scan(&events, artifact_id, 2, Some(1));
+        storage.insert_content(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .expect("static valid SHA-256 hex"),
+            serde_json::to_vec(&vec![bulky_finding(7, SeverityThreshold::High, Some(7.5))])
+                .unwrap(),
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            vec![bulky_finding(42, SeverityThreshold::High, Some(7.5))],
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("the scan still records its verdict");
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(transitions.len(), 1);
+        let (_saved, batch, _metadata) = &transitions[0];
+        let shape: Vec<&str> = batch.events.iter().map(|e| e.event.event_type()).collect();
+        assert!(
+            !shape.contains(&"ArtifactBecameVulnerable"),
+            "a transition that cannot be established must not be claimed; got {shape:?}",
+        );
+        assert_eq!(
+            storage.get_call_count(),
+            0,
+            "a bounded prior blob is answered from the record, not from a read of up to \
+             8 MiB nobody may decide over"
+        );
+    }
+
+    /// The other half, so the suppression above is not simply "this path
+    /// never fires": the same shape with a COMPLETE prior blob does
+    /// append the event. The prior blob is seeded in CAS and holds a
+    /// finding the current scan no longer reports, so the delta is
+    /// genuinely non-empty.
+    #[tokio::test]
+    async fn a_complete_prior_blob_still_appends_became_vulnerable() {
+        let (uc, artifacts, events, lifecycle, repositories, _projections, _refs, storage) =
+            make_use_case_with_storage();
+        let artifact_id =
+            seed_artifact_with_repo(&artifacts, &repositories, QuarantineStatus::Quarantined);
+        seed_prior_scan(&events, artifact_id, 1, None);
+        let prior_findings = vec![bulky_finding(7, SeverityThreshold::High, Some(7.5))];
+        storage.insert_content(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .parse()
+                .expect("static valid SHA-256 hex"),
+            serde_json::to_vec(&prior_findings).unwrap(),
+        );
+
+        uc.record_scan_result(
+            artifact_id,
+            "trivy".into(),
+            vec![bulky_finding(42, SeverityThreshold::High, Some(7.5))],
+            ScanAssessment::Analysed,
+            TEST_SCAN_KIND,
+            None,
+        )
+        .await
+        .expect("record_scan_result");
+
+        let transitions = lifecycle.committed_transitions();
+        let (_saved, batch, _metadata) = &transitions[0];
+        let became = batch
+            .events
+            .iter()
+            .find_map(|e| match &e.event {
+                DomainEvent::ArtifactBecameVulnerable(p) => Some(p.clone()),
+                _ => None,
+            })
+            .expect("a complete prior baseline establishes the transition");
+        assert_eq!(became.new_findings.len(), 1);
+        assert_eq!(became.new_findings[0].vulnerability_id, "CVE-2026-000042");
     }
 }

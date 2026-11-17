@@ -14,22 +14,51 @@ this guide covers the resilience mechanism issue #6 added on top of it.
 
 ## 1. What "stranded" means
 
-An artifact's **initial** scan can fail for two structurally different
+An artifact's **initial** scan can fail for three structurally different
 reasons:
 
 - **The scan couldn't run at all** — every configured scanner backend
-  errored (unreachable, crashed, timed out). This is a
-  **scanner-execution / infrastructure failure**: transient, and
-  recoverable once the scanner comes back.
-- **The scan ran but no verdict came out of it** — the scanner executed
-  and produced output hort could not parse or classify, or every backend
-  abstained about the artifact. The artifact transitions to
+  errored (unreachable, crashed, timed out, or returned output hort
+  could not parse). This is a **scanner-execution / infrastructure
+  failure**: transient, and recoverable once the scanner comes back.
+- **The scan ran and answered that there was nothing to analyse** —
+  every configured backend executed and none of them examined the
+  artifact: no analyzer matched its kind, or the payload was an archive
+  the adapter refused to materialise. The artifact transitions to
   `scan_indeterminate`. Under ADR 0007 that is a **hold, not a dead
-  end**: the same sweep re-picks it, and a verdict that is reached
-  supersedes the absent one — a non-blocking verdict returns the
-  artifact to `quarantined` and the ordinary release sweep decides from
-  there, a blocking one condemns it. The curator's manual release and
-  post-exclusion policy re-evaluation reach it as well.
+  end** — a verdict that is reached supersedes the absent one, so a
+  non-blocking verdict returns the artifact to `quarantined` and the
+  ordinary release sweep decides from there, while a blocking one
+  condemns it. The curator's manual release and post-exclusion policy
+  re-evaluation reach it as well.
+- **The scan never got as far as having something to assess** — an OCI
+  image manifest whose **composition** could not be produced within the
+  job's attempt budget, because a store or the repository's upstream did
+  not answer. The artifact is held `quarantined`, not
+  `scan_indeterminate`, and that is deliberate: `scan_indeterminate` is
+  the one withheld state no caller's hold-read reaches, write-granted
+  included, so on a pull-through repository it would withhold the very
+  client pull that drives the absent layers into CAS. The job row is
+  `failed`, so the sweep below re-asks. This is the shape of a
+  `hort_scan_record_outcome_failures_total{result="composition_not_produced"}`
+  tick, and in a permissive (`quarantineDuration: 0`) repository the hold
+  is *taken* by this path rather than inherited — see §6.
+
+**They differ in what is owed, and that is what this guide is about.**
+The first and the third are owed another scan attempt — the scan never
+ran, or never got far enough to assess anything, so running it again is
+the fix, and hort records that with a **`failed`** `kind='scan'` row and
+re-drives it on the next tick. The second is owed nothing *immediately*:
+it ran and reported, so its row **completes**, and re-running the
+identical scan on the next tick would only repeat the identical answer.
+
+What it is owed is a re-ask on a longer cadence, and the sweep gives it
+one — once its resolved rescan interval has elapsed (§2a), because the
+cause can go away without anything emitting an event to say so. So
+removing the cause (§4) is what makes that re-ask produce a verdict
+rather than the same abstention; a manual rescan (§3) only gets the
+answer sooner than the interval would. §2 below covers all three
+populations; §2a is the second one specifically.
 
 Before issue #6, both failure modes collapsed onto the same outcome: on
 retry exhaustion (`HORT_SCANNER_MAX_ATTEMPTS`, default 6), the artifact
@@ -43,16 +72,84 @@ exhausts retries now leaves the artifact **exactly where it was**:
 still `quarantine_status='quarantined'`, downloads still blocked (the
 status is the gate — ADR 0007), but with a persisted "last scan
 errored" fact (`jobs.status='failed'` on its most recent `kind='scan'`
-row). **This is the "stranded" state this guide is about.** A scan that
-produced no verdict still goes to the `scan_indeterminate` path, and as
-of ADR 0007's "A reached verdict supersedes an absent one" the same
-sweep recovers that state too — the two differ in which status the
-artifact waits in, not in whether anything re-scans it.
+row). **This is the "stranded" state this guide is about**, and that
+`failed` row is both its definition and its discovery key.
+
+A scan that **answered** "nothing to analyse" goes to the
+`scan_indeterminate` path and leaves a **`completed`** row instead. ADR
+0007's "A reached verdict supersedes an absent one" still holds for it —
+a reached verdict is accepted and decides the artifact — but the
+stranded sweep is not what delivers one: `select_stranded` requires the
+most recent `kind='scan'` job to be `failed` or absent, so a completed
+row takes the artifact out of it. That is deliberate. A deterministic
+abstention re-answers the same way on every attempt, so re-enqueueing it
+every tick spent batch capacity to re-record one fact forever, and
+`jobs.status='failed'` claimed an error that never happened. This
+population is listed and recovered by the mechanisms in §4, not by the
+sweep in §2.
 
 **No new release authority was added.** A recovered scan releases the
 artifact via the existing `ScanSucceeded` authority (or rejects it on
 findings) — this mechanism only gives the scan another chance to
 actually run. It does not release anything on a timer.
+
+## 1a. Reporting one — the five facts that make it decidable
+
+If you are escalating a held or verdict-less artifact rather than
+recovering it yourself, gather these five before you write the report.
+The **reason** for the abstention selects the mitigation path, not the
+artifact's identity — the three causes in §1 are structurally different
+and recover differently, so a report without the reason cannot be acted
+on and costs a round trip to collect it.
+
+1. **Identity — repository key, path or coordinate, and the content
+   digest.** `--output json` carries the digest whole; the table view
+   abbreviates it.
+
+   ```bash
+   hort-cli curation queue --repo <key> --status scan_indeterminate --output json
+   ```
+
+2. **The abstention reason, verbatim.** The worker log line carries both
+   `reason=` and `abstention=`:
+
+   ```
+   trivy adapter: refusing to materialise archive; no scan will run
+     reason="archive entry path is not contained in the workspace"
+     abstention="unusable_archive"
+   ```
+
+   That field separates `unusable_archive` from `no_analyzer_matched`
+   from `incomplete_composition`, and each has a different path. Quote
+   the line per distinct artifact; do not summarise it and do not report
+   a count instead.
+
+3. **The artifact kind** (`oci_blob`, `oci_manifest`, `npm_tarball`,
+   `cargo_crate`, `py_wheel`, `py_sdist`, `maven_jar`, `maven_pom`). It
+   decides whether the artifact gates at all: an abstention gates release
+   unless the kind is a composition constituent, and `oci_blob` is the
+   only constituent — so an image layer does not hold up its image, while
+   everything else holds up itself.
+
+4. **Whether the artifact was ever released.** Two situations look
+   identical from outside and have opposite answers: never assessed
+   (`scan_indeterminate`, not downloadable, exit only via a curator
+   waive) versus already released and a *later* rescan abstained (still
+   served on the existing verdict, not blocked). Read it off the
+   artifact's event stream — is there an `ArtifactReleased`? — or from
+   whether the download answers `200` or `503`/`403`.
+
+5. **The scan job's `last_error` and `attempts`.**
+
+   ```bash
+   hort-cli admin task list --kind scan --status failed --output json
+   ```
+
+   `--output json` is not optional here: the table view does not show the
+   error. And `attempts` equal to the attempt cap is a **terminally dead
+   job**, which is a different defect class from an abstention — the scan
+   never reached a verdict because it never finished, not because there
+   was nothing to assess.
 
 ## 2. The sweep self-heals — once the tick is scheduled
 
@@ -62,7 +159,9 @@ schedule `*/5 * * * *`) also re-picks stranded artifacts every tick, via
 `RescanCandidatesRepository::select_stranded`: `quarantine_status IN
 ('quarantined', 'scan_indeterminate')`
 artifacts whose last scan errored — or that have no `kind='scan'` job at
-all — and have no in-flight `kind='scan'`
+all, or that are held with no verdict and were last asked longer ago
+than their resolved rescan interval (§2a) — and have no in-flight
+`kind='scan'`
 job. Once the scanner is back, the very next tick re-enqueues a fresh
 scan for every stranded artifact — no operator action required. The
 recovered scan releases the artifact normally (`ScanSucceeded`) or
@@ -96,9 +195,12 @@ undriven deployment is discoverable without reading this guide first.
   `> 0` means artifacts are stuck behind a scanner outage; a healthy
   scanner drains this to zero as the sweep re-enqueues each one. See
   `docs/metrics-catalog.md` → *Rescan and advisory watch*.
-- **Logs**: `cron rescan tick: re-enqueued a stranded artifact` (`info!`,
-  per artifact) fires whenever the sweep re-enqueues one — the
-  `artifact_id` field gives you the per-artifact audit trail.
+- **Logs**: `cron rescan tick: re-enqueued an artifact no sweep would
+  otherwise reach` (`info!`, per artifact) fires whenever the sweep
+  re-enqueues one — the `artifact_id` field gives you the per-artifact
+  audit trail and the `source` field says which predicate found it
+  (`stranded` or `composite_unassessed`; the routine `interval` source
+  is deliberately silent per artifact).
 - **Admin API**: `GET /api/v1/admin/tasks?kind=scan&status=failed` lists
   the `kind='scan'` jobs sitting in `failed` status — cross-reference
   against `GET /api/v1/admin/quarantine/patch-candidates` or a direct
@@ -106,6 +208,83 @@ undriven deployment is discoverable without reading this guide first.
   listing requires `Permission::Admin`; the patch-candidate listing
   requires `Permission::Curate` or `Permission::Admin` — it is the read
   that grounds the manual release, which the curator owns (ADR 0007).
+
+  **This listing is the stranded population and only it.** A scan that
+  answered "nothing to analyse" completed its row, so it is absent
+  here — by design: this listing is keyed on the **job's** status, and
+  that scan answered. The sweep reaches such an artifact by its own
+  predicate instead (§2a). Use
+  `GET /api/v1/admin/curation/queue?status=scan_indeterminate`
+  (`Permission::Curate` or `Permission::Admin`) to list artifacts held
+  without a verdict whatever the reason, and the
+  `hort_scan_jobs_total{result="nothing_analysable"}` counter to see the
+  abstentions happening. A metric sustained above zero there is a
+  repository paired with backends that cannot adjudicate its format —
+  a `scanBackends` fix, not a scanner outage.
+
+## 2a. The same tick is the existing-estate reassessment
+
+A change to what a *new* scan concludes repairs nothing already stored,
+and three populations have no other selection signal at all. The
+`cron-rescan-tick` task is where they are reached, which is why an
+**upgrade** can be a reason to drive this tick even on a deployment with
+no scanner outage and no interest in interval rescanning.
+
+The three sources the tick drives, and which population each exists for:
+
+| Source | Population | Why nothing else reaches it |
+|---|---|---|
+| `select_eligible` | live artifacts whose policy interval elapsed, measured on both `last_scan_at` **and** the most recent `kind='scan'` request | the routine case. The second half of the interval test is what ends the re-presentation of an artifact whose scan ran and reached no verdict: `last_scan_at` is written only by the scan-result commit, and on a `released` artifact a verdictless run may not move the status either, so the artifact satisfied the predicate again on every tick |
+| `select_stranded` | the two holds whose scan errored or was never requested, **and** an artifact held `scan_indeterminate` whose last scan request is older than its resolved rescan interval | a `scan_indeterminate` artifact is outside `select_eligible`'s statuses entirely. The second half matters because a scan in which every backend ran and reported *nothing to analyse* produces a **completed** job: a predicate reading only the job's status cannot see the artifact it left held |
+| `select_composite_unassessed` | live OCI **image manifests** with no composite assessment on record whose most recent `kind='scan'` request is older than the resolved interval | they are serving, so `select_stranded` does not apply; their own evidence may be minutes old, so `select_eligible`'s interval does not either — while the evidence was reached under a rule in which a composed image's verdict carried no release authority. The interval bound is a backstop, not a cadence: a manifest whose scan recorded its assessment has already left the set, and the bound only governs the manifest whose best-effort observation write did not land |
+
+**What drives it on an upgrade.** Nothing automatic: the chart ships
+`scheduledTasks.cronRescanTick.enabled: false`, so either schedule the
+tick or drive it by hand:
+
+```bash
+hort-cli admin task invoke cron-rescan-tick
+```
+
+**The bound, and how to resume.** One invocation selects at most
+`BATCH_SIZE = 1000` rows **per source** and enqueues one scan each —
+there is no unbounded burst and no long-running pass. Repeat the
+invocation while the counts in the task's `result_summary` are non-zero:
+
+```json
+{ "eligible": 0, "stranded_eligible": 4, "composite_unassessed": 37, "enqueued": 41 }
+```
+
+Each population leaves its own predicate as it is reassessed, so the
+counts fall monotonically and the reassessment terminates without any
+cursor to keep:
+
+- a hold whose reassessment reaches a verdict leaves
+  `scan_indeterminate` (ADR 0007, *a reached verdict supersedes an absent
+  one*) and the ordinary release gate decides from there;
+- a hold whose reassessment reaches **no** verdict again stays held, and
+  the resolved rescan interval is what keeps the question from being
+  re-asked every five minutes — the artifact's shape and the backend's
+  analysers are both fixed, so there is nothing to gain from asking
+  sooner. The §1 third case is the exception, and deliberately so: an
+  unproduced composition leaves a `failed` job row, which
+  `select_stranded`'s first arm re-picks on every tick with no interval
+  — there the thing that refused is an upstream or a store, which is
+  precisely what *does* change between ticks;
+- a manifest's reassessment records a composite assessment whatever it
+  concluded, which is what takes it out of the third source.
+
+Watch `hort_cron_rescan_composite_unassessed_artifacts` and
+`hort_cron_rescan_stranded_eligible_artifacts` drain to zero if you
+prefer metrics to the summary.
+
+**What the reassessment does not do.** It drives a scan; the live gate
+decides. In particular a **released** artifact whose reassessment
+reaches no verdict stays released — `released` is terminal and
+`fail_scan_indeterminate` is forbidden from it (ADR 0007), so an absent
+verdict cannot un-release something. What the reassessment does deliver
+for that population is the recorded composite assessment, and a
+rejection where the composite verdict blocks.
 
 ## 3. Manual recovery — the non-admin operator path
 
@@ -139,9 +318,12 @@ next scan-completion notification to see the outcome.
 
 This endpoint already refuses to double-enqueue: if the artifact has
 an in-flight `kind='scan'` job, it returns `409 Conflict` with the
-existing job id instead of creating a duplicate. A stranded artifact
-(no in-flight job — its last attempt already failed terminally) is
-always a valid rescan target.
+existing job id instead of creating a duplicate. **Only an in-flight
+job refuses it** — the previous job's result is not consulted, so both
+populations from §1 are valid targets: a stranded artifact whose last
+attempt failed terminally, and an artifact whose last scan completed
+having found nothing to analyse. For the second this is the instrument
+to reach for once the cause is removed (§4), since no sweep selects it.
 
 ### 3b. Admin — the raw `enqueue_scan` insert (legacy fallback)
 
@@ -157,22 +339,37 @@ a last resort if the HTTP surface itself is unreachable.
 
 ## 4. What does NOT recover a stranded artifact
 
-- **Nothing, if the abstention is deterministic.** Everything above
+- **The sweep, if the abstention is deterministic.** Everything in §2
   gives the scan another chance to run; none of it changes what the scan
   says. A `scan_indeterminate` artifact whose backends abstain about its
-  kind re-answers the same way on every tick, so the sweep alone will
-  not move it — what moves it is removing the cause (a `ScanPolicy`
-  change, a backend that can analyse the format), after which the next
-  tick's verdict lands and the release sweep decides. The curator's
+  kind would re-answer the same way every time, so its scan job
+  completed and `select_stranded` does not select it at all — the sweep
+  is not a slow exit for this population, it is not an exit. What moves
+  it is **removing the cause** (a `ScanPolicy` change: a backend that
+  can analyse the format) and
+  then a rescan — §3a's `POST /api/v1/artifacts/:id/rescan` reaches it,
+  since a completed last job is not an in-flight one — after which the
+  verdict lands and the release sweep decides. The curator's
   manual release is the immediate exit
-  (`hort-cli curation waive <artifact_id> --justification '…'`, or
-  `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`), which
+  (`hort-cli curation waive artifact <artifact_id> --justification '…'`,
+  or `POST /api/v1/admin/curation/quarantine/:artifact_id/waive`), which
   reaches `ScanIndeterminate` as well as `Quarantined`: one authority
   owns the manual release, and what it requires is the source state
   rather than a second permission tier. The gate is
   `Permission::Curate` OR `Permission::Admin`, so an admin credential
   works too. Post-exclusion policy re-evaluation is another. See
   [the curator workflow guide](curator-workflow.md).
+
+  **`compositeVerdictMode: promoted` is not a lever here, and reaching for
+  it costs an outage rather than a no-op.** A composed image's verdict
+  decides its manifest's release unconditionally
+  ([ADR 0064](../../adr/0064-a-filesystem-finding-is-about-the-composed-filesystem.md)
+  D2), so neither value of the field selects anything — and declaring it at
+  all is an apply-time rejection
+  (`scan_policy_composite_verdict_mode_retired`). The gitops apply runs at
+  boot before any route is mounted, so a `ScanPolicy` carrying the field
+  parks the process on the config-invalid router and readiness never flips.
+  Remove the line from every policy document.
 - **Waiting past `quarantine_until` does nothing on its own.** The
   release predicate has no timer-only authority (ADR 0007); a stranded
   artifact only releases once a scan actually succeeds.
@@ -372,6 +569,14 @@ a repository that is permissive *now*:
 - **A corrective path returned it to the hold.** The §5 repair is the
   one that exists today, and it returns the artifact on its **original**
   anchor — restored, not restarted.
+- **A scan took the hold because it had nothing to assess.** An OCI image
+  manifest whose composition could not be produced within the scan job's
+  attempt budget is quarantined by the scan path itself (§1's third
+  bullet), anchored at the artifact's ingest instant. Under
+  `quarantineDuration: 0` the resulting window is already elapsed, which
+  is the recognition shape below — and correctly so: the hold is waiting
+  on a verdict, not on time, and nothing releases an artifact with no
+  scan-axis authority however long its window has been over.
 
 ### Recognition shape
 

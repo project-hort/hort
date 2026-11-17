@@ -42,11 +42,12 @@ Three qualifiers carry the whole security argument, and none is decorative:
    qualifier governs the **resolution document** qualifier 2 names — an OCI
    manifest, a cargo sparse-index entry, an npm packument's `versions{}` /
    `dist-tags` — not the refusal a caller receives when they ask for one
-   directly. A verdict already reached (`Rejected`, `ScanIndeterminate`) is
-   terminal: it makes the version unresolvable in that document, for
-   everyone, publisher included, exactly as `Quarantined` does — neither
-   status ever yields a manifest, an index entry, or a packument entry that
-   resolves to bytes.
+   directly. A verdict already reached (`Rejected`) is terminal: it makes
+   the version unresolvable in that document, for everyone, publisher
+   included — it never yields a manifest, an index entry, or a packument
+   entry that resolves to bytes. *(Amended 2026-11-11: `ScanIndeterminate`
+   was sorted here and is now held, for the reason given in the amendment
+   at the end of this ADR. `Rejected` is unchanged.)*
 
    Resolvability is gated by this qualifier; diagnosability is not. *Why* a
    version cannot be resolved is information, not access, and every byte
@@ -180,13 +181,14 @@ authorization decision keeps the two-leg AND.
   consults the caller; the OCI blob path keeps its existence probe `HEAD`-only.
   A held `.crate` is `503` to its own publisher. If a change ever makes held
   content downloadable, the exemption has been broken rather than extended.
-- **Terminal verdicts.** `Rejected` and `ScanIndeterminate` are decisions, not
-  holds. `HeldVisibility::admits` matches exhaustively over `QuarantineStatus`
+- **Terminal verdicts.** `Rejected` is a decision, not a hold.
+  `HeldVisibility::admits` matches exhaustively over `QuarantineStatus`
   with no wildcard arm, so a future variant is a compile error at the truth
   table rather than a silent inheritance of either answer. *(Amended
   2026-10-21: this continues to govern every resolution document. The
   pre-upload existence probe is not one — see the amendment at the end of this
-  ADR.)*
+  ADR. Amended 2026-11-11: `ScanIndeterminate` is no longer one of the
+  terminal verdicts this bullet covers.)*
 - **Aggregated reads.** The rule says a writer may resolve held metadata
   *there* — in the repository it may write. A virtual repository holds no
   artifacts of its own (ADR 0031); its entries belong to members. A Write grant
@@ -333,6 +335,10 @@ to refuse, with its axis, for every caller.
 
 ### D2 — the probe answers existence on terminal verdicts too
 
+*(Amended 2026-11-11: "terminal verdicts" in this D2 meant `Rejected` and
+`ScanIndeterminate` when it was written. The probe's behaviour is unchanged
+for both; what changed is that only `Rejected` is still a terminal verdict.)*
+
 A `HEAD` from a principal with **granted** write authority on the repository
 (`resolve_granted_write`, the grants leg alone — qualifier 1 is unchanged)
 reports existence for `Rejected` and `ScanIndeterminate` exactly as it already
@@ -342,7 +348,10 @@ Bounded to what the probe is:
 
 - `HEAD` only. On the manifest route the `Quarantined` exemption deliberately
   also serves the `GET`; that extension is **not** carried to terminal
-  verdicts. A rejected artifact's body is never served to anyone.
+  verdicts. A rejected artifact's body is never served to anyone. *(Amended
+  2026-11-11: `ScanIndeterminate` left the terminal group, so the `GET`
+  reaches it through the hold-read exemption itself rather than through this
+  probe. `Rejected` is as stated.)*
 - The content `GET` is untouched on both routes, for every caller.
 - A caller without the Write grant, and a caller the repository read gate does
   not admit, are untouched.
@@ -401,3 +410,72 @@ prompted this amendment, where the terminal row is a two-byte
 policy timeout. ADR 0039 D1 already says such a rejection may never be
 terminal. **The repair therefore belongs on that row, not on this rule**, and
 nothing in this amendment should be read as relaxing the mint-time check.
+
+## Amendment, 2026-11-11 — `ScanIndeterminate` is a hold, not a verdict
+
+**Status:** Accepted. Amends *The rule* qualifier 3 and the *Scope* bullet
+"Terminal verdicts". Everything else in this ADR stands unchanged.
+
+### Why an amendment and not a new ADR
+
+The rule's direction is untouched: a principal that may write to a repository
+may resolve held metadata there, and held bytes never leave quarantine, for
+anyone. What changes is which statuses qualifier 3 counts as *held*, and it
+changes because the domain moved rather than because the argument did.
+Re-deciding the rule would need a new ADR; re-sorting a status the rule
+already classifies is this ADR's own business.
+
+### What moved underneath the original classification
+
+Qualifier 3 sorted `ScanIndeterminate` alongside `Rejected` as a verdict
+already reached. That was accurate for how the state then behaved: nothing
+but a curator's waive led out of it, so no workflow available to the
+publisher could make the version resolvable, and admitting them to the
+resolution document would have bought nothing.
+
+The state no longer behaves that way. `QuarantineEvent::SupersedeAbsentVerdict`
+admits `ScanIndeterminate` and reaches `Quarantined`
+(`crates/hort-domain/src/entities/quarantine_transitions.rs`): a verdict that
+arrives later supersedes the absent one and the artifact rejoins the ordinary
+timed hold. A state an arriving verdict leads out of is, in qualifier 3's own
+words, a hold *pending* a verdict.
+
+The gap this left is not hypothetical, and it falls on the one workflow the
+exemption exists to serve. ADR 0039 §10 admits a write-granted caller to a
+held manifest body so that a held subject can be **signed** — keyed signing
+resolves the subject before attaching to it. A publisher whose own upload is
+held for want of a verdict could therefore not sign it, while the same
+publisher could sign an artifact held by the timed quarantine. The two holds
+differ in what is known about the artifact, not in whether the publisher may
+complete the act of publishing it.
+
+### D1 — `ScanIndeterminate` is held
+
+It is a hold pending a verdict and qualifier 3 counts it as such. `Rejected`
+is unchanged and remains terminal: a verdict has been reached there, and no
+workflow makes that version deliverable.
+
+### D2 — it is admitted exactly where `Quarantined` is, and nowhere else
+
+A granted-Write principal may resolve a `ScanIndeterminate` version's
+**resolution document** in a repository it may write — an OCI manifest, a
+cargo sparse-index entry, an npm packument entry — on the same terms, with
+the same three qualifiers, as a `Quarantined` one. The exemption is not
+widened in any other direction: every *Scope* exclusion this ADR lists
+continues to apply unchanged, aggregated reads and `IndexMode` included.
+
+Two enforcement points carry this, and they are the same two that carry the
+`Quarantined` case: `HeldVisibility::admits`
+(`crates/hort-app/src/use_cases/index_filters.rs`) for entries in a
+resolution document, and the write-authorized hold-read predicate in
+`crates/hort-http-oci/src/manifests.rs` for an OCI manifest fetched by name.
+
+### D3 — held bytes are untouched
+
+The second sentence of the rule stands word for word. A `ScanIndeterminate`
+artifact's content is refused to every caller, its publisher included, and
+the OCI blob route's existence probe stays `HEAD`-only. Resolving a document
+is not obtaining bytes; nothing here releases an artifact, and the release
+predicate (ADR 0007) is unchanged. A signature attached to a held subject
+leaves it held — the scan axis still owes a verdict, and the artifact waits
+for it.

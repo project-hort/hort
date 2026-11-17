@@ -132,8 +132,8 @@ mod tests {
     use super::*;
     use crate::use_cases::apply_config_use_case::tests::*;
     use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode,
-        ScanEnforcement, ScanPolicyProjection,
+        ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
+        ScanPolicyProjection,
     };
 
     // ===================================================================
@@ -186,7 +186,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: now,
             updated_at: now,
@@ -248,7 +247,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: now,
             updated_at: now,
@@ -356,7 +354,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: now,
             updated_at: now,

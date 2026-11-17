@@ -190,16 +190,35 @@ fn default_retention_evaluate_mode() -> String {
 /// Omitting `mode` preserves the shipped CronJob behavior by selecting
 /// `execute`. `dry_run` follows the same evaluator path without appending
 /// expiry events.
+///
+/// `repository_id` confines the run to one repository, in **both** modes.
+/// Omitting it is the instance-wide sweep, unchanged. The field is a
+/// repository **id** rather than a key because it is what the destructive
+/// authority is asked about and what a `PermissionGrant`'s scope is, and
+/// because it must mean the same thing at the `POST` and again at the
+/// worker's execution-time re-check — a key is a mutable, re-usable
+/// handle that can resolve to two different ids across that gap. See
+/// `hort_domain::events::task_invocation_repository_scope`, the one
+/// reader of this convention.
+///
+/// `skip_serializing_if` is load-bearing rather than tidiness: the
+/// serialised params are what the `jobs` row stores, what `TaskInvoked`'s
+/// digest is taken over, and what the `Idempotency-Key` replay compares,
+/// so an unscoped invocation's params stay byte-identical to the ones the
+/// shipped CronJob has always produced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionEvaluateParams {
     #[serde(default = "default_retention_evaluate_mode")]
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<uuid::Uuid>,
 }
 
 impl Default for RetentionEvaluateParams {
     fn default() -> Self {
         Self {
             mode: default_retention_evaluate_mode(),
+            repository_id: None,
         }
     }
 }
@@ -214,8 +233,65 @@ impl TaskParams for RetentionEvaluateParams {
     }
 }
 
-raw_kind!(RetentionPurgeRawParams, "retention-purge");
-raw_kind!(EventstoreArchiveRawParams, "eventstore-archive");
+/// Macro variant for a destructive kind whose sweep **cannot** be
+/// confined to a repository.
+///
+/// `retention-evaluate` is the one destructive kind that can be scoped,
+/// and `hort_domain::events::task_invocation_repository_scope` reads the
+/// scope for that kind only — so a `repository_id` in one of these
+/// bodies is inert, and inert is the dangerous half here. An operator
+/// who already holds repository-less `destroy_content` and believes they
+/// confined a purge to one repository is authorized and sweeps the whole
+/// instance. Refusing the field is the operator-facing half of the same
+/// fail-closed rule the domain dispatch enforces for the gate: a
+/// destructive surface does not accept a field that reads as narrowing
+/// it and then ignore it.
+macro_rules! raw_kind_unconfinable {
+    ($name:ident, $kind:literal) => {
+        /// Raw (untyped) task params for the `$kind` kind, which sweeps
+        /// the whole instance and so refuses a repository scope.
+        #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+        pub struct $name {
+            #[serde(flatten)]
+            pub inner: serde_json::Value,
+        }
+
+        impl $name {
+            /// Construct from an arbitrary JSON value.
+            pub fn from_value(v: serde_json::Value) -> Self {
+                Self { inner: v }
+            }
+        }
+
+        impl TaskParams for $name {
+            const KIND: &'static str = $kind;
+            fn validate(&self) -> Result<(), ValidationError> {
+                reject_repository_scope($kind, &self.inner)
+            }
+        }
+    };
+}
+
+/// The refusal [`raw_kind_unconfinable!`] installs.
+///
+/// A free function rather than macro-expanded body so the message and
+/// the key read from one place for every kind that carries the rule.
+fn reject_repository_scope(
+    kind: &'static str,
+    inner: &serde_json::Value,
+) -> Result<(), ValidationError> {
+    let key = hort_domain::events::RETENTION_EVALUATE_REPOSITORY_SCOPE_KEY;
+    if inner.get(key).is_some_and(|v| !v.is_null()) {
+        return Err(ValidationError::new(format!(
+            "{kind} sweeps the whole instance and cannot be confined to one repository, so \
+             {key} is refused rather than silently ignored; only retention-evaluate accepts it"
+        )));
+    }
+    Ok(())
+}
+
+raw_kind_unconfinable!(RetentionPurgeRawParams, "retention-purge");
+raw_kind_unconfinable!(EventstoreArchiveRawParams, "eventstore-archive");
 // The worker's `ServiceAccountRotationHandler` (registered in
 // `hort-worker::composition`) consumes the row this route enqueues.
 // Body is empty; the handler reads the target SA set from the database
@@ -345,6 +421,116 @@ mod tests {
         assert_eq!(
             invalid.validate().unwrap_err().0,
             "mode must be one of: execute, dry_run"
+        );
+    }
+
+    /// `Default` is the unscoped execute shape — the same invocation an
+    /// empty body deserialises to. The two are built by different code
+    /// (`Default::default` versus serde's per-field `#[serde(default)]`),
+    /// so a field added to one and not the other would make them
+    /// disagree about what "no params" means.
+    #[test]
+    fn retention_evaluate_default_is_the_unscoped_execute_invocation() {
+        let d = RetentionEvaluateParams::default();
+        assert_eq!(d.mode, "execute");
+        assert_eq!(d.repository_id, None);
+        assert!(d.validate().is_ok());
+        assert_eq!(
+            serde_json::to_value(&d).unwrap(),
+            serde_json::to_value(
+                serde_json::from_value::<RetentionEvaluateParams>(serde_json::json!({})).unwrap()
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn retention_evaluate_repository_scope_defaults_to_none_and_serialises_away() {
+        let params: RetentionEvaluateParams =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(params.repository_id, None);
+        // The serialised params are what the `jobs` row stores and what
+        // `TaskInvoked`'s digest is taken over, so an unscoped
+        // invocation's body must stay exactly what it has always been.
+        assert_eq!(
+            serde_json::to_value(&params).unwrap(),
+            serde_json::json!({ "mode": "execute" }),
+        );
+    }
+
+    #[test]
+    fn retention_evaluate_carries_a_repository_scope_through_the_round_trip() {
+        let repository = uuid::Uuid::new_v4();
+        let params: RetentionEvaluateParams = serde_json::from_value(serde_json::json!({
+            "mode": "dry_run",
+            "repository_id": repository.to_string(),
+        }))
+        .unwrap();
+        assert_eq!(params.repository_id, Some(repository));
+        assert!(params.validate().is_ok());
+        let wire = serde_json::to_value(&params).unwrap();
+        assert_eq!(wire["repository_id"], serde_json::json!(repository));
+        // The one reader of the convention agrees with the typed field,
+        // which is what keeps the gate and this surface from drifting.
+        assert_eq!(
+            hort_domain::events::task_invocation_repository_scope(
+                RetentionEvaluateParams::KIND,
+                &wire,
+            )
+            .expect("the serialised shape is the one the gate reads"),
+            Some(repository),
+        );
+    }
+
+    #[test]
+    fn retention_evaluate_rejects_a_repository_scope_that_is_not_a_uuid() {
+        let err = serde_json::from_value::<RetentionEvaluateParams>(serde_json::json!({
+            "repository_id": "npm-proxy",
+        }))
+        .expect_err("a repository key is not an id and must not be guessed at");
+        assert!(err.to_string().contains("UUID"), "{err}");
+    }
+
+    /// A sweep that cannot be confined refuses the field rather than
+    /// ignoring it. Accepting it would let an operator who holds
+    /// repository-less `destroy_content` believe they confined a purge
+    /// to one repository while the whole instance was swept.
+    #[test]
+    fn an_unconfinable_destructive_kind_refuses_a_repository_scope() {
+        for params in [
+            RetentionPurgeRawParams::from_value(serde_json::json!({
+                "repository_id": uuid::Uuid::new_v4().to_string(),
+            })),
+            RetentionPurgeRawParams::from_value(serde_json::json!({ "repository_id": 7 })),
+        ] {
+            let err = params
+                .validate()
+                .expect_err("retention-purge cannot be confined to a repository");
+            assert!(err.0.contains("repository_id"), "{}", err.0);
+            assert!(err.0.contains("whole instance"), "{}", err.0);
+        }
+        let archive = EventstoreArchiveRawParams::from_value(serde_json::json!({
+            "repository_id": uuid::Uuid::new_v4().to_string(),
+        }));
+        assert!(archive.validate().is_err());
+    }
+
+    /// The bodies those kinds actually receive stay accepted: the
+    /// shipped CronJob posts `{}`, and an explicit `null` says nothing
+    /// was confined.
+    #[test]
+    fn an_unconfinable_destructive_kind_still_accepts_the_bodies_it_is_sent() {
+        assert!(RetentionPurgeRawParams::default().validate().is_ok());
+        assert!(EventstoreArchiveRawParams::default().validate().is_ok());
+        assert!(
+            RetentionPurgeRawParams::from_value(serde_json::json!({ "repository_id": null }))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            RetentionPurgeRawParams::from_value(serde_json::json!({ "horizon_days": 30 }))
+                .validate()
+                .is_ok()
         );
     }
 }

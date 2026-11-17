@@ -6,8 +6,9 @@
   reason given for the rootfs-empty mapping is replaced (the mapping itself
   stands), and the code-level definition of a non-gating abstention becomes
   `NotAnalysable::gates_release` answering `false` rather than the
-  `NotApplicable` variant alone, since `UnsupportedContainer` joins it on a
-  constituent under a promoted composite verdict. [0043](0043-oci-image-index-support.md) — its per-layer
+  `NotApplicable` variant alone, since `UnsupportedContainer` and
+  `NoAnalyzerMatched` join it on a composition constituent.
+  [0043](0043-oci-image-index-support.md) — its per-layer
   consumption-safety argument becomes per-composition on the filesystem axis;
   the conclusion is unchanged. Both ADRs carry the amended text in place.
 - **Enforced by:** the composite scan unit's completeness precondition — a
@@ -20,6 +21,12 @@
   places that claim against the artifact's kind. That it is answered in one
   place is held by
   `crates/hort-app/tests/condemning_rule_is_single_sourced.rs`.
+- **Amended 2026-11-10** — D6's loosening control (a per-policy posture an
+  operator promoted) is retired; the sequencing rule it served is unchanged
+  and is now held by the configuration gate D6 states. See the amendment
+  below. Enforced by the apply-time refusal
+  `LinterRule::OciRepositoryRequiresScanBackends` over an OCI repository's
+  effective `ScanPolicy`, taking effect at boot before any route is mounted.
 - **Relates to:**
   [0039](0039-keyed-provenance-verification.md) §11 (the subject → constituent
   cascade, examined and not mirrored) ·
@@ -195,11 +202,13 @@ A transient refusal is routed through the path the scan job **already** has for
 a retryable backend failure, and that job's existing attempt budget is its
 bound: a transient classification never means unbounded attempts, and no
 parallel retry mechanism exists. Exhausting the budget lands back on the
-deterministic outcome — still no verdict, and now also no more tries — so the
-composite path can never reach the retry-exhausted arm that transitions an
-artifact, which is what keeps it free of release authority (D6). The
-classification is read off the upstream port's own error vocabulary and off the
-typed storage error, never off a rendered message.
+deterministic outcome — still no verdict, and now also no more tries — so a
+composite refusal reaches the release gate as an *absent assessment*
+(`NotAnalysable::IncompleteComposition`, which gates unconditionally) rather
+than through the scan job's retry-exhausted arm: a scan run whose composite
+target abstained is a result, not an execution failure. The classification is
+read off the upstream port's own error vocabulary and off the typed storage
+error, never off a rendered message.
 
 **D2 — A constituent's isolated filesystem findings are evidence, not the
 verdict.** The layer scan keeps running and keeps recording what it sees; what
@@ -275,24 +284,57 @@ index binds references, not a runnable filesystem
 own generic-manifest lifecycle, including its own scan assessment and release
 authority, is unchanged.
 
-**D6 — Order the rollout, and let the operator promote it.** Two different
-hazards, two different controls.
+**D6 — The loosening follows the authority and never precedes it.** One
+sequencing rule, and a tightening direction that does not reach backwards.
 
-*The loosening direction needs ordering.* D2 removes a condemnation that is
-blocking images today. If it lands before the composite verdict carries
-authority, an image becomes pullable with nothing having assessed it. So a
-constituent's filesystem findings may stop gating **only under a policy that
-has promoted the composite verdict** — the loosening follows the authority and
-never precedes it.
+*Never remove a safeguard before its replacement is in force.* D2 removes a
+condemnation that is blocking images today. If a constituent's filesystem
+findings stop gating before the composite verdict carries authority, an image
+becomes pullable with nothing having assessed it. That is the hazard, and the
+rule against it is the decision: the loosening follows the authority and never
+precedes it.
 
-That condition is about the **policy**, not about a per-constituent lookup to
-the manifests above it, and the difference matters in both directions. For a
-layer of an image it is the same statement: under a promoted policy a manifest
-is either assessed or held, so there is no promoted, deliverable image whose
-filesystem went unexamined, and the obligation has somewhere to move to. For a
-blob that is **not** part of an image — an OCI artifact's layer, or a blob
-nothing in the registry references — nothing takes the obligation over, and
-nothing should. A package-vulnerability finding is a statement about an
+**The configuration gate is what holds the rule.** Every OCI repository a
+running hort serves resolves a `ScanPolicy` naming at least one scan backend,
+so there is no configuration in which an image is deliverable with nothing
+having assessed it:
+
+- An empty `scanBackends` governing an OCI repository is **refused at gitops
+  apply** (`LinterRule::OciRepositoryRequiresScanBackends`,
+  `crates/hort-app/src/lint/static_validate.rs`), judged per effective
+  (policy, repository) pairing — a global waiver is refused against each OCI
+  repository it actually governs, and never against one that declares a
+  repository-scoped policy of its own, because repo-scoped wins resolution.
+  The waiver stays supported for every other format, where the artifact hort
+  stores is the artifact it assesses.
+- A repository no declared policy governs resolves the built-in
+  `DefaultPolicy`, whose backends are `["trivy"]`
+  (`crates/hort-domain/src/policy/scan.rs`). Falling through resolution is not
+  a waiver.
+- gitops apply is the only writer of a `ScanPolicy` in production
+  (`PolicyUseCase::{create_policy, update_policy}` are reached from
+  `apply_config_use_case/scan_policies.rs` and from nowhere else), and it runs
+  **at boot, before a single route is mounted**. The refusal is provably
+  pre-write, so the process parks on the config-invalid router — `/healthz`
+  `200` so the kubelet cannot loop a bad config, `/readyz` `503`, and no data
+  or API route mounted at all — and readiness never flips
+  (`crates/hort-server/src/gitops_boot.rs`,
+  `crates/hort-server/src/cli/serve_parked.rs`). Restart-to-apply is the
+  contract, so no live path installs a refused policy into a serving process
+  afterwards.
+
+The gate sits at the configuration because the hazard is one: "an image hort
+serves with nothing having assessed it" is a property of how a repository is
+configured, not of the artifact being decided. A rule enforced where the
+hazard lives cannot be left unapplied on an individual decision.
+
+**The obligation moves by the row's own kind, never by a per-constituent
+lookup to the manifests above it**, and the difference matters in both
+directions. For a layer of an image the two coincide: the composition that
+binds it is either assessed or held, so the obligation has somewhere to move
+to. For a blob that is **not** part of an image — an OCI artifact's layer, or
+a blob nothing in the registry references — nothing takes the obligation over,
+and nothing should. A package-vulnerability finding is a statement about an
 installed package tree that runs; such a blob has none, so a finding read out
 of it is a statement about nothing. hort assesses it today only because every
 tar-shaped blob is materialised as a root filesystem — correct for an image
@@ -307,22 +349,19 @@ enqueued, before the manifest exists; the walk would find no parent for the
 whole push population, hold the layer, and reinstate exactly the terminal hold
 this decision exists to remove — non-deterministically, by job ordering.
 
-*The tightening direction needs an operator.* A composite verdict adds
+*The tightening direction does not reach backwards.* A composite verdict adds
 rejections across an existing estate — on the measured image alone, 92
-previously unassessed advisories. The reason it must be readable before it is
-enforcing is not the finding count: `Rejected` is terminal and **the periodic
-rescan never revisits it** — the candidate queries admit `released` / NULL and
-`quarantined` only
-(`crates/hort-adapters-postgres/src/rescan_candidates.rs:124-125,256`) — so a
-wrong verdict from a new analysis path on its first production run leaves an
-estate only an explicit operator re-evaluation can recover. A new pipeline
-whose first act can be irreversible is the thing to avoid; the rejections
-themselves are the point.
-
-It is therefore a **manifest-scoped shadow assessment carrying no release
-authority**, promoted by the operator against named criteria: baseline
-completion and coverage, error and indeterminate rates, incremental findings
-and the images they affect, false-positive review, and capacity.
+previously unassessed advisories — and `Rejected` is terminal while **the
+periodic rescan never revisits it**: the candidate queries admit `released` /
+NULL and `quarantined` only
+(`crates/hort-adapters-postgres/src/rescan_candidates.rs:124-125,256`). So a
+verdict this pipeline reaches is not one the pipeline can later undo, and a new
+pipeline whose first act can be irreversible is the thing to avoid. The
+decision therefore claims only the assessments taken after it: the rejections
+themselves are the point, and what is withheld is retroactive reach. A
+composite finding joins the run's accumulator and is judged by the resolved
+policy's own `enforcement`, exactly as any other backend's finding over that
+manifest is, and this decision introduces no mode of its own.
 
 **Constituents already terminally rejected on filesystem findings are not
 un-rejected automatically.** D2 governs what a *new* assessment gates; it does
@@ -333,30 +372,28 @@ through the curation re-evaluation
 `crates/hort-http-core/src/handlers/admin/curation/mod.rs:70-75`) — and it is
 right that it is: automatically un-rejecting a population with no fresh
 assessment is exactly the hazard that disqualified `ScanEnforcement::Record`
-below. The same ordering applies as for the loosening direction: a constituent
-is re-evaluated only once the manifests binding it carry a completed composite
-assessment.
+below.
 
 **Already-released manifests need no backfill mechanism.** The rescan candidate
 query filters on status and staleness and has no kind or media-type predicate
 (`crates/hort-adapters-postgres/src/rescan_candidates.rs:100-140`), so a
 released manifest is already in the pool: its next ordinary rescan runs the
 composite. Building a backfill would be a second mechanism for what the
-existing one does, and the verdict carries no authority until promoted
-anyway.
+existing one does.
 
-Explicitly **not** `ScanEnforcement::Record`. That is a resolved policy-scope
-mode, not a manifest-scoped observation setting: it withholds `ArtifactRejected`
-for every blocking verdict in its scope, and switching a scope from `reject` to
-`record` re-evaluates the already-rejected population to released with no
-rescan — a test pins exactly that
-(`crates/hort-app/src/use_cases/policy_use_case.rs:6084-6124`). Using it here
-would release the images quarantine had correctly rejected in exchange for
-observing the new ones.
+Explicitly **not** `ScanEnforcement::Record` as a way to stage this. It is a
+resolved policy-scope mode and withholds `ArtifactRejected` for every blocking
+verdict in that scope, and switching a scope from `reject` to `record`
+re-evaluates the already-rejected population to released with no rescan — a
+test pins exactly that
+(`crates/hort-app/src/use_cases/policy_use_case.rs:6084-6124`). Reaching for
+it here would release the images quarantine had correctly rejected in exchange
+for observing the new ones, which is precisely the retroactive reach the
+paragraphs above withhold.
 
 ## Consequences
 
-- **The false positive is removed for everything assessed after promotion.** A
+- **The false positive is removed for every new assessment.** A
   package a later layer deletes no longer condemns anything: the layer's
   finding is evidence and the composition it is absent from is clean. The
   **existing** rejected estate is not swept along — `Rejected` is terminal and
@@ -417,16 +454,63 @@ reader of this decision knows what moved with it.
    never reaches a release authority of its own — and no eighth authority is
    added. Third, the code-level definition of a non-gating abstention becomes
    `NotAnalysable::gates_release` answering `false` rather than the
-   `NotApplicable` variant alone: `UnsupportedContainer` joins it on a
-   constituent under a promoted composite verdict, for the same
-   "assessed elsewhere" reason, so the predicate now reads the artifact's
-   kind and the resolved `compositeVerdictMode` alongside the reason.
+   `NotApplicable` variant alone: `UnsupportedContainer` and
+   `NoAnalyzerMatched` join it on a composition constituent, for the same
+   "assessed elsewhere" reason, so the predicate reads the artifact's kind
+   alongside the reason.
 2. **[ADR 0043](0043-oci-image-index-support.md)** — its per-layer
    consumption-safety argument becomes per-composition on the filesystem axis,
    and its "degenerate but consistent with how single-image manifests are
    already scanned" comparison is corrected: that is now true only of an index.
    The conclusion survives — each platform child is a composition and is gated
    as one.
+
+## Amendment (2026-11-10, issue #428) — D6 states the principle, not the mechanism
+
+**D6's loosening control is retired; the sequencing rule it served is
+unchanged.** What D6 wrote down as the rule was a mechanism: a per-policy
+posture (`ScanPolicy.compositeVerdictMode: observed | promoted`) under which —
+and only under which — a constituent's filesystem findings stopped gating. The
+composite verdict now decides unconditionally (D2),
+`NotAnalysable::gates_release` takes the artifact's kind alone, and a
+`ScanPolicy` declaring the field is refused at gitops apply
+(`LinterRule::ScanPolicyCompositeVerdictModeRetired`). The principle —
+*never remove a safeguard before its replacement is in force* — holds, and D6
+now states it with the mechanism that enforces it today.
+
+**The replacement is stricter than the posture, not weaker.** The hazard D6
+names, an image becoming pullable with nothing having assessed it, is closed by
+the configuration gate: an empty `scanBackends` governing an OCI repository is
+refused at apply, a repository no policy governs resolves the built-in
+`["trivy"]` default, and the apply runs at boot before any route is mounted, so
+the loosened code can never run against a configuration in which the loosening
+would be unsafe. A posture had to be read correctly per policy and could sit at
+whatever value shipped; a configuration that would make the loosening unsafe
+does not serve at all.
+
+**Why the mechanism is gone rather than re-defaulted.** Its shipped default
+withheld the authority, which left the composition assessed and recorded while
+deciding nothing — and a constituent hort cannot analyse in isolation then
+held its manifest with no deadline and no authority that could ever arrive to
+clear it, which is the hold
+[0062](0062-never-advertise-what-you-will-not-serve.md) exists to prevent,
+reached through the one case 0062 deliberately does not propagate. Inverting
+the default would have left that hold reachable by configuration.
+
+**The tightening direction is unchanged in substance**, and is restated without
+the shadow-assessment framing: the decision claims only the assessments taken
+after it, the already-terminal estate is recovered by the operator's curation
+re-evaluation, and `ScanEnforcement::Record` is still not the way to stage it.
+
+**Amended in place with it, for the same reason:** this record's header summary
+and `## Amendments this decision carries` entry 1 (both read the
+`gates_release` join as conditional on a promoted composite verdict, and the
+predicate as taking the posture); D1's attempt-budget paragraph, which cited D6
+for the composite path carrying no release authority; the first *Consequences*
+bullet, which scoped the removed false positive to "everything assessed after
+promotion"; and in the amended record itself,
+[ADR 0007](0007-fail-closed-quarantine-release-predicate.md)'s code-level
+definition of a non-gating abstention.
 
 ## Not decided here
 

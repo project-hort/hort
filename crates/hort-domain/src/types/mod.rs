@@ -20,6 +20,7 @@ pub use artifact_kind::ArtifactKind;
 pub use checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 pub use finding::{
     cap_finding_title, component_relation_label, highest_severity, is_informational_class,
+    largest_fitting_prefix, most_severe_first, ordered_most_severe_first,
     parse_advisory_published_at, severity_label, severity_summary_from_findings, ComponentRelation,
     Finding, FindingStatement, SeverityBasis,
 };

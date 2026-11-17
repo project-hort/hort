@@ -65,7 +65,8 @@ where
 /// The column's CHECK bounds it to `[0, u32::MAX]`, so a value outside
 /// that range is a row no writer of this table produced — refused rather
 /// than clamped, because a silently-clamped count is a wrong answer to
-/// the promotion question that reads as a right one.
+/// "what did assessing the composition contribute?" that reads as a right
+/// one.
 fn count_column(row: &PgRow, name: &'static str) -> DomainResult<u32> {
     let raw: i64 = column(row, name)?;
     u32::try_from(raw).map_err(|_| {

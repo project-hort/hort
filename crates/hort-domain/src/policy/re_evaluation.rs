@@ -31,34 +31,27 @@
 //! is what leaves an artifact held on a verdict a fresh scan of the same
 //! findings would not reach.
 //!
-//! **The identical question, not identical inputs.** Both functions put
-//! the same predicate to the same finding list; one of the predicate's
-//! inputs differs between the paths *that drive this one*, deliberately,
-//! and the difference is ADR 0064 D6's. `composite_verdict` is a
-//! parameter here rather than resolved from `policy`, because the two
-//! callers of a re-evaluation are not the same act:
+//! **The identical question, and identical inputs.** Both functions put
+//! the same predicate to the same finding list with the same arguments,
+//! and that is now the whole statement. It used to carry an asymmetry:
+//! whether a *constituent's* isolated filesystem findings may condemn it
+//! took a second input — the per-policy composite-verdict posture — and
+//! the automatic loosening pass pinned the posture that made them
+//! condemn, so that an operator's promotion could not un-reject an
+//! already-rejected estate as a side effect of an unrelated loosening.
 //!
-//! * the **automatic loosening** pass — an exclusion added, a threshold
-//!   raised, a policy archived — pins
-//!   [`CompositeVerdictMode::Observed`]. D6 reserves recovery of the
-//!   existing estate to the operator: "constituents already terminally
-//!   rejected on filesystem findings are not un-rejected
-//!   automatically". With the statement persisted, a resolved posture
-//!   here would un-reject exactly that population as a side effect of an
-//!   unrelated loosening, with no fresh assessment behind it.
-//! * the **operator's explicit curation re-evaluation** passes the
-//!   resolved posture, because that is the sanctioned recovery D6 points
-//!   at. Nothing is silent about it: a curator asked for this artifact to
-//!   be judged again.
-//! * the **tighten** direction goes through
-//!   [`crate::policy::evaluate_scan_result`], which resolves the posture
-//!   from the policy it is already under — the same way a fresh scan
-//!   does, and necessarily so: a pinned `Observed` there would re-reject
-//!   the constituent a promoted fresh scan had just let through, on the
-//!   next threshold change, terminally.
+//! That posture is retired: a composed image's verdict is the only
+//! verdict (ADR 0064 D2), unconditionally, so there is nothing left to
+//! pin and no driver that may decline to honour it. Keeping the
+//! asymmetry under another name would be worse than removing it — a pass
+//! that condemned on a constituent's isolated filesystem claim would
+//! hold the artifact on a verdict a fresh scan of the identical findings
+//! would not reach, which is exactly the stranding the shared narrowing
+//! above exists to prevent.
 //!
-//! So the asymmetry is between *drivers*, not between the two verdict
-//! functions, and it is stated at each call site with its reason.
+//! What recovers the **already**-rejected estate is therefore a
+//! deliberate reassessment of those rows and not this pass, which only
+//! ever reaches an artifact whose policy was mutated.
 //!
 //! The one place the two functions knowingly differ is the
 //! aggregate-summary mode, which has no per-finding data to narrow and
@@ -98,9 +91,7 @@
 use chrono::{DateTime, Utc};
 
 use crate::entities::artifact::Artifact;
-use crate::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, ScanPolicyProjection,
-};
+use crate::entities::scan_policy::{ExclusionProjection, ScanPolicyProjection};
 use crate::events::SeveritySummary;
 use crate::types::{severity_summary_from_findings, ArtifactCoords, ArtifactKind, Finding};
 
@@ -154,9 +145,11 @@ pub enum ReEvaluationOutcome {
 /// 2. **Aggregate-summary mode** — when `last_findings` is `None`, the
 ///    `ScanCompleted` aggregate the caller loaded is the verdict input
 ///    **as recorded**, and [`evaluate_scan_summary`] walks it. Reached
-///    when the per-finding blob could not be resolved: a scan that
-///    recorded no blob because it found nothing, a `findings_blob`
-///    absent from CAS, or one that did not deserialise.
+///    when the per-finding blob could not be resolved *whole*: a scan
+///    that recorded no blob because it found nothing, a `findings_blob`
+///    absent from CAS, one that did not deserialise, or one holding only
+///    the most severe of a finding set too large to store whole
+///    (`ScanCompleted::findings_blob_retained`).
 ///
 ///    **The exclusion set does not reach this input, and that is the
 ///    rule rather than an omission.** An exclusion names one CVE; a
@@ -170,6 +163,19 @@ pub enum ReEvaluationOutcome {
 ///    about, so it subtracts nothing. An operator whose exclusion should
 ///    clear this artifact gets that through a rescan, which rebuilds the
 ///    blob and re-enters mode 1.
+///
+///    **A truncated blob is the one cause a rescan does not fix**, and
+///    the consequence is worth stating plainly: the finding set still
+///    will not fit, so the rebuilt blob is short again and this mode is
+///    where the artifact stays. An artifact with that many findings
+///    therefore cannot be released by excluding CVEs — not because the
+///    exclusions are wrong, but because the input an exclusion matches
+///    against is not all there. What moves it is the finding count
+///    coming down (a fix, a patched version, a narrowed SBOM) or a
+///    curator waiver, which is an operator decision taken with the
+///    counts in front of them rather than a verdict derived from
+///    evidence that is missing its tail. That is the conservative
+///    direction and it is the intended one.
 ///
 ///    **This path also cannot narrow the condemning set, and that
 ///    residual is fail-closed.** Per-tier counts carry no per-finding
@@ -187,14 +193,15 @@ pub enum ReEvaluationOutcome {
 ///    and the fail-closed reading of absent evidence is that the finding
 ///    still counts (ADR 0007); the correctable path is the same rescan.
 ///
-///    **An absent blob and an unreadable one are not told apart here,
-///    and need not be.** A `ScanCompleted` that recorded no blob has
-///    `finding_count == 0`, and its own validator requires
-///    `finding_count` to equal the sum of the severity counts — so a
-///    genuine absence arrives as an all-zero summary that walks to
-///    `Clean`, while an unreadable blob arrives with the counts its scan
-///    actually recorded and is judged on them. The summary is what
-///    distinguishes the two cases, so the caller does not have to.
+///    **An absent blob, an unreadable one and a truncated one are not
+///    told apart here, and need not be.** A `ScanCompleted` that
+///    recorded no blob has `finding_count == 0`, and its own validator
+///    requires `finding_count` to equal the sum of the severity counts —
+///    so a genuine absence arrives as an all-zero summary that walks to
+///    `Clean`, while an unreadable or truncated blob arrives with the
+///    counts its scan actually recorded, which are of the complete set
+///    either way, and is judged on them. The summary is what
+///    distinguishes the cases, so the caller does not have to.
 ///
 /// The caller has already loaded the artifact's last `ScanCompleted`
 /// summary (`last_scan_summary`), the resolved active scan policy
@@ -223,17 +230,6 @@ pub enum ReEvaluationOutcome {
 /// is the role half of ADR 0064 D2's line — see
 /// [`crate::types::Finding::may_condemn_artifact`].
 ///
-/// `composite_verdict` is a **parameter, not a resolution**, and that is
-/// the one input on which the drivers of a re-evaluation deliberately
-/// differ: the automatic loosening pass pins
-/// [`CompositeVerdictMode::Observed`] so that promotion never un-rejects
-/// a terminal constituent by itself, while the operator's explicit
-/// curation re-evaluation passes
-/// [`crate::policy::composite_verdict_mode_of`]'s answer so the
-/// sanctioned recovery still works. The module rustdoc gives the full
-/// reason (ADR 0064 D6); a caller choosing between them is choosing which
-/// act this is, and must say so where it chooses.
-///
 /// See module rustdoc for the boundary semantics
 /// (`quarantine_deadline <= now` favours `ResetToReleased`).
 #[allow(clippy::too_many_arguments)]
@@ -244,7 +240,6 @@ pub fn decide_rejected_transition(
     last_findings: Option<&[Finding]>,
     policy: Option<&ScanPolicyProjection>,
     updated_exclusions: &[ExclusionProjection],
-    composite_verdict: CompositeVerdictMode,
     quarantine_deadline: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> ReEvaluationOutcome {
@@ -309,18 +304,16 @@ pub fn decide_rejected_transition(
             // `hort-app/tests/condemning_rule_is_single_sourced.rs`
             // rejects.
             //
-            // `kind` and `composite_verdict` are the two inputs the
-            // predicate's second question needs (ADR 0064 D2): what each
-            // finding's statement is about depends on the row's role as
-            // well as on what the producer read. Both arrive from the
-            // caller — `kind` resolved from the artifact's own format
-            // handler, the posture *chosen* rather than resolved, because
-            // the loosening pass and the operator's curation
-            // re-evaluation are different acts with different answers.
-            // See this function's rustdoc and the module docs.
+            // `kind` is the input the predicate's second question needs
+            // (ADR 0064 D2): what each finding's statement is about
+            // depends on the row's role as well as on what the producer
+            // read. It arrives from the caller, resolved from the
+            // artifact's own format handler — the same value
+            // `evaluate_scan_result` is handed, so the two verdict
+            // functions narrow identically. See the module docs.
             let filtered = filter_excluded_findings(findings, updated_exclusions, &coords, now);
             let mut condemning = filtered.remaining_findings;
-            condemning.retain(|f| f.may_condemn_artifact(kind, composite_verdict));
+            condemning.retain(|f| f.may_condemn_artifact(kind));
             severity_summary_from_findings(&condemning)
         }
         // No readable per-finding evidence. The recorded aggregate is
@@ -363,12 +356,11 @@ mod tests {
     use super::*;
     use crate::entities::artifact::QuarantineStatus;
     use crate::entities::repository::RepositoryFormat;
-    use crate::entities::scan_policy::CompositeVerdictMode;
     use crate::entities::scan_policy::{
         NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
     };
     use crate::events::PolicyScope;
-    use crate::policy::{composite_verdict_mode_of, evaluate_scan_result, ScanOutcome};
+    use crate::policy::{evaluate_scan_result, ScanOutcome};
     use crate::types::{ComponentRelation, ContentHash, Finding};
     use chrono::TimeZone;
     use uuid::Uuid;
@@ -441,7 +433,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),
@@ -478,7 +469,6 @@ mod tests {
             None, // last_findings: the aggregate-summary arm
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -511,7 +501,6 @@ mod tests {
             None, // the findings blob did not resolve
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)), // window elapsed: nothing else holds it
             ts(2_000_000),
         );
@@ -540,7 +529,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -564,7 +552,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -584,7 +571,6 @@ mod tests {
             None,
             Some(&policy),
             &[],
-            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -610,7 +596,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             Some(ts(2_000_000)), // computed deadline
             ts(1_000_000),       // now < deadline
         );
@@ -631,7 +616,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)), // computed deadline
             ts(2_000_000),       // now > deadline
         );
@@ -652,7 +636,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -674,7 +657,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             Some(now),
             now,
         );
@@ -696,7 +678,6 @@ mod tests {
             None,
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(2_000_000)),
             ts(1_000_000),
         );
@@ -713,7 +694,6 @@ mod tests {
             None,
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -750,7 +730,6 @@ mod tests {
             Some(&findings),
             Some(&policy),
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -773,7 +752,6 @@ mod tests {
             Some(&findings),
             Some(&policy),
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(2_000_000)),
             ts(1_000_000),
         );
@@ -796,7 +774,6 @@ mod tests {
             Some(&findings),
             Some(&policy),
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -828,7 +805,6 @@ mod tests {
             Some(&findings),
             Some(&policy),
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -849,7 +825,6 @@ mod tests {
             Some(&findings),
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -909,7 +884,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -947,38 +921,26 @@ mod tests {
         f
     }
 
-    /// **ADR 0064 D6: the loosening does not reach the already-rejected
-    /// estate.** A constituent rejected on its own filesystem findings
-    /// stays rejected when the *automatic* loosening pass recomputes its
-    /// verdict, even where the policy that governs it has promoted the
-    /// composite verdict.
+    /// **Both drivers reach the same verdict on a constituent, and it is
+    /// the verdict a fresh scan reaches.** A constituent rejected on its
+    /// own isolated filesystem findings is released by a re-evaluation,
+    /// whichever driver asked for one.
     ///
-    /// **This passes for a different reason than it used to, and the
-    /// reason is the point of the change.** It used to pass because the
-    /// statement did not persist: a hydrated finding read `Unstated`, so
-    /// there was nothing for a loosening to key on — and the same absence
-    /// made the tighten pass terminally reject constituents a promoted
-    /// fresh scan had just released. The statement now persists, so the
-    /// stored finding below really does say `Filesystem` and the row
-    /// really is a constituent; what holds D6 is the posture this path
-    /// **pins**, `CompositeVerdictMode::Observed`, which is the input the
-    /// caller chooses rather than resolves. A test that still passed
-    /// after its mechanism changed is a test nobody re-read, so: the
-    /// assertion below is now about the pin.
-    ///
-    /// Asserted against the same input under both *policies*, because the
-    /// claim is that the policy's posture makes no difference on this
-    /// path — the pin is what answers. An un-rejection here would be a
-    /// population released with no fresh assessment, which is the hazard
-    /// that disqualified `ScanEnforcement::Record` for this job in the
-    /// first place.
-    ///
-    /// Recovering the estate is the operator's, through the curation
-    /// re-evaluation, which passes the resolved posture instead —
-    /// `the_operators_curation_re_evaluation_can_recover_the_same_row`
-    /// is the other half of the pair.
+    /// This used to be the opposite assertion, and the reason it flipped
+    /// is the whole of the change. The composite-verdict posture was an
+    /// operator grant whose shipped default withheld authority, so the
+    /// automatic loosening pass *pinned* the withholding posture: a
+    /// promotion must not un-reject an existing estate as a side effect
+    /// of an unrelated loosening. With the posture retired the composed
+    /// image's verdict is the only verdict (ADR 0064 D2), so a
+    /// constituent's isolated filesystem claim is evidence on every path
+    /// — and a pass that still condemned on one would hold the artifact
+    /// on a verdict a fresh scan of the identical findings would not
+    /// reach, clearable only by a rescan. That stranding is what the
+    /// shared narrowing exists to prevent, so the two assertions below
+    /// are one claim: the re-evaluation and the fresh scan agree.
     #[test]
-    fn a_promoted_policy_does_not_un_reject_a_constituent_over_its_stored_findings() {
+    fn a_constituent_rejected_on_its_isolated_filesystem_findings_is_released() {
         let artifact = rejected_artifact("lodash");
         let summary = summary(1, 0, 0, 0);
         // What the stored findings blob yields, through the blob: a
@@ -992,106 +954,70 @@ mod tests {
         assert_eq!(
             stored[0].statement,
             crate::types::FindingStatement::Filesystem,
-            "the premise: the loosening now has a real statement in front of it",
+            "the premise: the narrowing has a real statement in front of it",
         );
-
-        let promoted = ScanPolicyProjection {
-            composite_verdict_mode: CompositeVerdictMode::Promoted,
-            ..projection(SeverityThreshold::Critical)
-        };
-        for policy in [projection(SeverityThreshold::Critical), promoted] {
-            let outcome = decide_rejected_transition(
-                &artifact,
-                // A constituent — the one kind whose filesystem claim
-                // could move at all, so the pin is what is being tested
-                // rather than the kind.
-                ArtifactKind::OciBlob,
-                &summary,
-                Some(&stored),
-                Some(&policy),
-                &[],
-                // The automatic loosening pass's pin.
-                CompositeVerdictMode::Observed,
-                None,
-                ts(1_000_000),
-            );
-            assert_eq!(
-                outcome,
-                ReEvaluationOutcome::StillRejected,
-                "composite_verdict_mode = {} must not move a terminal row",
-                policy.composite_verdict_mode
-            );
-        }
-    }
-
-    /// The other half of the pair D6 requires: the operator's explicit
-    /// curation re-evaluation passes the **resolved** posture, so the
-    /// sanctioned recovery of the same row works.
-    ///
-    /// Without this, the pin above would not be an asymmetry between two
-    /// drivers — it would be a dead end, and D6's "recovering the existing
-    /// estate is operator-driven, through the curation re-evaluation"
-    /// would name a path that cannot do it.
-    #[test]
-    fn the_operators_curation_re_evaluation_can_recover_the_same_row() {
-        let artifact = rejected_artifact("lodash");
-        let summary = summary(1, 0, 0, 0);
-        let stored = vec![filesystem_finding(
-            "CVE-2021-23337",
-            SeverityThreshold::Critical,
-        )];
-        let promoted = ScanPolicyProjection {
-            composite_verdict_mode: CompositeVerdictMode::Promoted,
-            ..projection(SeverityThreshold::Critical)
-        };
+        let policy = projection(SeverityThreshold::Critical);
 
         let outcome = decide_rejected_transition(
             &artifact,
+            // A constituent — the one kind whose filesystem claim moves.
             ArtifactKind::OciBlob,
             &summary,
             Some(&stored),
-            Some(&promoted),
+            Some(&policy),
             &[],
-            // What the curation endpoint passes: the posture the policy
-            // actually resolves to.
-            composite_verdict_mode_of(Some(&promoted)),
             None,
             ts(1_000_000),
         );
         assert_eq!(
             outcome,
             ReEvaluationOutcome::ResetToReleased,
-            "a curator asked for this row to be judged again, and under the \
-             policy's own promoted posture its isolated package set is \
-             evidence rather than the verdict",
+            "the layer's isolated package set is evidence; the composition \
+             that binds it carries the verdict",
+        );
+
+        // And the fresh scan over the identical findings agrees, which is
+        // the property that makes the release above correct rather than
+        // merely permissive: a disagreement in either direction leaves
+        // one of the two holding an artifact on a verdict the other would
+        // not reach.
+        let fresh_scan = evaluate_scan_result(
+            &coords_of(&artifact),
+            ArtifactKind::OciBlob,
+            &stored,
+            Some(&policy),
+            &[],
+            ts(1_000_000),
+        );
+        assert_eq!(
+            fresh_scan,
+            ScanOutcome::Clean,
+            "the re-evaluation and the fresh scan must answer one question",
         );
     }
 
-    /// And the kind still scopes it: the operator's re-evaluation of a
-    /// **non**-constituent row under the same promoted policy keeps the
-    /// rejection. The recovery D6 sanctions is of constituents, not of
-    /// everything a global policy reaches.
+    /// And the kind still scopes it: a re-evaluation of a **non**-
+    /// constituent row over the same stored filesystem finding keeps the
+    /// rejection. What moved is a constituent's claim about a tree that
+    /// belongs to the composition above it; a row with no composition
+    /// above it keeps its own filesystem findings.
     #[test]
-    fn the_operators_re_evaluation_does_not_recover_a_non_constituent_row() {
+    fn a_re_evaluation_does_not_release_a_non_constituent_row() {
         let artifact = rejected_artifact("lodash");
         let summary = summary(1, 0, 0, 0);
         let stored = vec![filesystem_finding(
             "CVE-2021-23337",
             SeverityThreshold::Critical,
         )];
-        let promoted = ScanPolicyProjection {
-            composite_verdict_mode: CompositeVerdictMode::Promoted,
-            ..projection(SeverityThreshold::Critical)
-        };
+        let policy = projection(SeverityThreshold::Critical);
 
         let outcome = decide_rejected_transition(
             &artifact,
             TEST_KIND,
             &summary,
             Some(&stored),
-            Some(&promoted),
+            Some(&policy),
             &[],
-            composite_verdict_mode_of(Some(&promoted)),
             None,
             ts(1_000_000),
         );
@@ -1137,7 +1063,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -1166,7 +1091,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -1223,7 +1147,6 @@ mod tests {
             Some(&findings),
             Some(&policy),
             &exclusions,
-            CompositeVerdictMode::Observed,
             // Deadline in the future — irrelevant under Block, the
             // outcome must be StillRejected regardless.
             Some(ts(2_000_000)),
@@ -1256,7 +1179,6 @@ mod tests {
             Some(&findings),
             Some(&policy),
             &exclusions,
-            CompositeVerdictMode::Observed,
             // Deadline elapsed → ResetToReleased.
             Some(ts(1_000_000)),
             ts(2_000_000),
@@ -1284,7 +1206,6 @@ mod tests {
             Some(&[]),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             None,
             ts(1_000_000),
         );
@@ -1355,7 +1276,6 @@ mod tests {
             Some(&findings),
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1384,7 +1304,6 @@ mod tests {
             Some(&findings),
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1410,7 +1329,6 @@ mod tests {
             Some(&findings),
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1435,7 +1353,6 @@ mod tests {
             Some(&findings),
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1497,7 +1414,6 @@ mod tests {
             Some(&findings),
             None,
             &exclusions,
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             now,
         );
@@ -1539,7 +1455,6 @@ mod tests {
             Some(&findings),
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1577,7 +1492,6 @@ mod tests {
             Some(&findings),
             Some(&policy),
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1608,7 +1522,6 @@ mod tests {
             Some(&findings),
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );
@@ -1619,7 +1532,6 @@ mod tests {
             None,
             None,
             &[],
-            CompositeVerdictMode::Observed,
             Some(ts(1_000_000)),
             ts(2_000_000),
         );

@@ -55,8 +55,8 @@ use hort_domain::entities::artifact::{
     Artifact, CurationClearance, ProvenanceClearance, QuarantineStatus,
 };
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
-    ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold, SignerIdentityPattern,
 };
 use hort_domain::entities::scan_policy_fold::{
     apply_policy_batch, diff_policy_fields, exclusion_projection, fold_scan_policy,
@@ -91,6 +91,7 @@ use crate::metrics::{
     PolicyEvaluationResult, PolicyReEvaluationResult,
 };
 use crate::projectors::repo_security_score::RepoSecurityScoreProjector;
+use crate::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use crate::use_cases::release_clearance;
 use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::scan_kind_resolution::scan_kind_of;
@@ -149,13 +150,6 @@ pub struct CreatePolicyCommand {
     /// pipeline validates the wire value via
     /// `hort_config::scan_policy::validate_scan_policy`.
     pub enforcement: ScanEnforcement,
-    /// Whether a composed OCI image's scan verdict decides its
-    /// manifest's release (ADR 0064 D6). Default
-    /// [`CompositeVerdictMode::Observed`]; enforced by the scan
-    /// orchestrator's composite path. `Promoted` with an empty
-    /// `scan_backends` is rejected at gitops apply, since a waived scan
-    /// resolves no composition for the promotion to act on.
-    pub composite_verdict_mode: CompositeVerdictMode,
 }
 
 /// A field-level update directive for [`PolicyUseCase::update_policy`].
@@ -215,16 +209,6 @@ pub struct UpdatePolicyCommand {
     /// `FieldChange::Unchanged`, and a change in EITHER direction is
     /// gate-affecting (it enqueues an ADR 0041 re-evaluation pass).
     pub enforcement: FieldChange<ScanEnforcement>,
-    /// Operator-driven promotion (or demotion) of the composed-image
-    /// verdict's release authority. Both variants are meaningful values
-    /// distinct from `FieldChange::Unchanged`, and — unlike
-    /// [`enforcement`](Self::enforcement) — a change in **neither**
-    /// direction is gate-affecting: the re-evaluation pass re-derives
-    /// from stored findings, so demoting would un-reject a population a
-    /// promoted composite had correctly rejected with no fresh
-    /// assessment. Recovering the estate either way is the operator's
-    /// own curation re-evaluation (ADR 0064 D6).
-    pub composite_verdict_mode: FieldChange<CompositeVerdictMode>,
 }
 
 impl UpdatePolicyCommand {
@@ -248,7 +232,6 @@ impl UpdatePolicyCommand {
             rescan_interval_hours: FieldChange::Unchanged,
             negligible_action: FieldChange::Unchanged,
             enforcement: FieldChange::Unchanged,
-            composite_verdict_mode: FieldChange::Unchanged,
         }
     }
 }
@@ -425,6 +408,11 @@ pub struct PolicyUseCase {
     /// [`scan_kind_of`] so this pass and the scan run cannot answer
     /// differently about one row.
     handlers: HashMap<String, Arc<dyn FormatHandler>>,
+    /// The one place a re-entry's quarantine anchor is assembled. The
+    /// re-evaluation pass's re-quarantine arm takes a hold, and the
+    /// instant that hold begins at is the artifact's own age evidence
+    /// (ADR 0054), not the instant this pass happened to run.
+    anchor_resolver: Arc<QuarantineAnchorResolver>,
 }
 
 impl PolicyUseCase {
@@ -439,6 +427,7 @@ impl PolicyUseCase {
         curation_rules: Arc<dyn CurationRuleRepository>,
         jobs: Arc<dyn JobsRepository>,
         handlers: HashMap<String, Arc<dyn FormatHandler>>,
+        anchor_resolver: Arc<QuarantineAnchorResolver>,
     ) -> Self {
         Self {
             events,
@@ -450,6 +439,7 @@ impl PolicyUseCase {
             curation_rules,
             jobs,
             handlers,
+            anchor_resolver,
         }
     }
 
@@ -802,7 +792,6 @@ impl PolicyUseCase {
             rescan_interval_hours: cmd.rescan_interval_hours,
             negligible_action: cmd.negligible_action,
             enforcement: cmd.enforcement,
-            composite_verdict_mode: cmd.composite_verdict_mode,
             stream_version: 0,
             created_at: now,
             updated_at: now,
@@ -1760,13 +1749,16 @@ impl PolicyUseCase {
     /// evidence it violates).
     ///
     /// **"No stored findings" means there are none, not that this process
-    /// could not read them.** A `findings_blob` the CAS cannot hand back
-    /// leaves the artifact's recorded severity counts as the only evidence
-    /// about it, and those are evaluated
-    /// ([`evaluate_scan_summary`]) rather than replaced with an empty
-    /// list: an empty list is clean, clean is a no-op, and the artifact
-    /// would stay released against a threshold its own scan breached.
-    /// [`scan_history::FindingsEvidence`] is what keeps the two apart.
+    /// could not read them, and not that it read fewer than there are.**
+    /// A `findings_blob` the CAS cannot hand back — or one holding only
+    /// the most severe of a set too large to store whole — leaves the
+    /// artifact's recorded severity counts as the only evidence about
+    /// it, and those are evaluated ([`evaluate_scan_summary`]) rather
+    /// than replaced with an empty list: an empty list is clean, clean is
+    /// a no-op, and the artifact would stay released against a threshold
+    /// its own scan breached.
+    /// [`scan_history::FindingsEvidence`] is what keeps the three
+    /// apart.
     #[allow(clippy::too_many_arguments)]
     async fn re_evaluate_one_active(
         &self,
@@ -1903,6 +1895,26 @@ impl PolicyUseCase {
                     trigger = ?trigger,
                     "re-evaluation (tighten): the stored findings could not be read; \
                      deriving the verdict from the recorded severity counts instead",
+                );
+                evaluate_scan_summary(&summary, Some(policy))
+            }
+            // Findings exist and the blob holds only the most severe of
+            // them, because the complete set does not fit the 8 MiB blob
+            // cap. Epistemically this is the arm above: the CVE-level
+            // question cannot be answered, the recorded aggregate is of
+            // the complete set and a threshold walk is exactly what
+            // counts can feed, so the same definition decides — see
+            // there for why substituting the subset is not an option. A
+            // separate arm only because the cause an operator can act on
+            // is a different one.
+            scan_history::FindingsEvidence::Truncated { summary } => {
+                tracing::warn!(
+                    artifact_id = %artifact_id,
+                    policy_id = %policy_id,
+                    trigger = ?trigger,
+                    "re-evaluation (tighten): the stored findings_blob holds only the most \
+                     severe of this artifact's findings; deriving the verdict from the \
+                     recorded severity counts instead",
                 );
                 evaluate_scan_summary(&summary, Some(policy))
             }
@@ -2145,17 +2157,6 @@ impl PolicyUseCase {
             Some(policy),
             updated_exclusions,
             kind,
-            // **Pinned, not resolved** (ADR 0064 D6). This is the
-            // automatic pass: an exclusion added, a threshold raised, a
-            // policy archived. D6 reserves recovery of the
-            // already-rejected estate to the operator — "constituents
-            // already terminally rejected on filesystem findings are not
-            // un-rejected automatically" — and a resolved posture here
-            // would release exactly that population as a side effect of
-            // an unrelated loosening, with no fresh assessment behind it.
-            // The curator's explicit re-evaluation passes the resolved
-            // posture instead, which is the sanctioned recovery.
-            CompositeVerdictMode::Observed,
             now,
         )
         .await
@@ -2473,10 +2474,18 @@ impl PolicyUseCase {
         // because `re_evaluate` is on the entity, not the pure
         // helper. Boundary precision is per-second; the pass usually
         // completes inside that window.
+        // The anchor the re-quarantine arm would stamp — the artifact's
+        // own age evidence, assembled in the one place every hold path
+        // assembles it. Resolved before the call because the entity does
+        // no I/O; which arm consumes it is `re_evaluate`'s decision.
+        let derived = self
+            .anchor_resolver
+            .derive_for_re_entry(paired.artifact())
+            .await;
         let companion_event =
             match paired
                 .artifact_mut()
-                .re_evaluate(Utc::now(), provenance, curation)
+                .re_evaluate(Utc::now(), provenance, curation, derived)
             {
                 Ok(e) => e,
                 Err(e) => {
@@ -3099,9 +3108,6 @@ fn desired_projection(
     if let FieldChange::Set(v) = &cmd.enforcement {
         desired.enforcement = *v;
     }
-    if let FieldChange::Set(v) = &cmd.composite_verdict_mode {
-        desired.composite_verdict_mode = *v;
-    }
     desired
 }
 
@@ -3155,7 +3161,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
         }
     }
 
@@ -3180,7 +3185,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version,
             created_at: now,
             updated_at: now,
@@ -3788,6 +3792,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections)
     }
@@ -3822,6 +3827,7 @@ mod tests {
             curation_rules,
             jobs.clone(),
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, jobs)
     }
@@ -3874,6 +3880,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }
@@ -3922,6 +3929,7 @@ mod tests {
             curation_rules.clone(),
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (
             uc,
@@ -3969,6 +3977,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }
@@ -4067,6 +4076,7 @@ mod tests {
             curation_rules,
             jobs,
             handlers,
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }
@@ -4081,35 +4091,44 @@ mod tests {
         f
     }
 
+    /// A finding about the **payload's own bytes** — a leaked key, a
+    /// malware signature. It condemns its artifact however those bytes
+    /// are composed, including on a constituent, so it is what the
+    /// counter-cases below use: a filesystem claim on a constituent no
+    /// longer condemns at all, which would make a "the walk still
+    /// re-holds" assertion vacuous.
+    fn sample_bytes_finding(vuln: &str, sev: SeverityThreshold) -> Finding {
+        let mut f = sample_finding(vuln, sev);
+        f.statement = hort_domain::types::FindingStatement::Bytes;
+        f
+    }
+
     /// **The trapdoor, closed at the layer that fell through it.** A
-    /// constituent an operator's promoted policy released is not
-    /// re-rejected when that operator then *lowers* the threshold and the
-    /// tighten walk re-derives the verdict over its stored findings.
+    /// constituent is not re-rejected on its own isolated filesystem
+    /// findings when an operator *lowers* the threshold and the tighten
+    /// walk re-derives the verdict over its stored findings.
     ///
     /// Asserted through `run_policy_re_evaluation_pass` rather than over
     /// the pure evaluator, because the defect was never in the rule — it
     /// was that this pass could not see the statement. Everything the
     /// close depends on is exercised here: the finding round-trips through
-    /// the blob `seed_active_with_findings` writes, the pass resolves the
-    /// repository's format and asks the registry for the row's kind, and
-    /// `evaluate_scan_result` resolves the posture from the bumped policy
-    /// instead of pinning it.
+    /// the blob `seed_active_with_findings` writes, and the pass resolves
+    /// the repository's format and asks the registry for the row's kind.
     ///
     /// `ScanPolicyRetroactive → Rejected` is revisited by no rescan, so a
     /// re-hold here is terminal — which is why this is the test that has
     /// to be unmissable.
     #[tokio::test]
-    async fn run_pass_tighten_does_not_re_reject_a_promoted_constituent() {
+    async fn run_pass_tighten_does_not_re_reject_a_constituent_on_a_filesystem_claim() {
         let repo_id = Uuid::new_v4();
         let (uc, events, projections, artifacts, lifecycle, storage) =
             make_constituent_re_eval_harness(repo_id);
         let policy_id = Uuid::new_v4();
 
-        // The operator lowers the threshold to High under a promoted
-        // composite verdict — the mutation that used to spring the trap.
+        // The operator lowers the threshold to High — the mutation that
+        // used to spring the trap.
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::High;
-        p.composite_verdict_mode = CompositeVerdictMode::Promoted;
         projections.insert(p);
 
         artifacts.seed_rejected_for_policy(policy_id, vec![]);
@@ -4168,7 +4187,8 @@ mod tests {
     /// The tighten direction refuses the pair that would cross the cap,
     /// and skips that artifact rather than aborting the pass.
     ///
-    /// Same fixture as `run_pass_tighten_still_re_holds_an_unpromoted_constituent`
+    /// Same fixture as
+    /// `run_pass_tighten_still_re_holds_a_constituent_on_a_claim_about_its_bytes`
     /// — which commits exactly one re-hold — with the artifact's stream
     /// padded to one event short of the cap. The pair needs two, so the
     /// re-hold is refused; without the refusal the re-hold lands and the
@@ -4182,11 +4202,14 @@ mod tests {
 
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::High;
-        p.composite_verdict_mode = CompositeVerdictMode::Observed;
         projections.insert(p);
 
         artifacts.seed_rejected_for_policy(policy_id, vec![]);
-        let findings = vec![sample_filesystem_finding(
+        // A claim about the payload's own bytes, so the walk really does
+        // reach a re-hold and the cap refusal is what stops it. A
+        // filesystem claim on a constituent no longer condemns, which
+        // would make this assertion vacuous.
+        let findings = vec![sample_bytes_finding(
             "CVE-2024-LAYER",
             SeverityThreshold::Critical,
         )];
@@ -4218,12 +4241,14 @@ mod tests {
     }
 
     /// The counter-case that says the test above is not vacuous: the
-    /// identical pass, the identical stored findings, the identical
-    /// lowered threshold — and the **default** posture re-holds the row.
-    /// The tighten walk is doing real work; what changed is only that it
-    /// can now read what the finding is about.
+    /// identical pass, the identical lowered threshold — and a finding
+    /// about the payload's **own bytes** re-holds the row. The tighten
+    /// walk is doing real work; what changed is only that it can now read
+    /// what the finding is about, and that a constituent's claim about a
+    /// filesystem belonging to the composition above it is evidence
+    /// rather than the verdict.
     #[tokio::test]
-    async fn run_pass_tighten_still_re_holds_an_unpromoted_constituent() {
+    async fn run_pass_tighten_still_re_holds_a_constituent_on_a_claim_about_its_bytes() {
         let repo_id = Uuid::new_v4();
         let (uc, events, projections, artifacts, lifecycle, storage) =
             make_constituent_re_eval_harness(repo_id);
@@ -4231,11 +4256,10 @@ mod tests {
 
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::High;
-        p.composite_verdict_mode = CompositeVerdictMode::Observed;
         projections.insert(p);
 
         artifacts.seed_rejected_for_policy(policy_id, vec![]);
-        let findings = vec![sample_filesystem_finding(
+        let findings = vec![sample_bytes_finding(
             "CVE-2024-LAYER",
             SeverityThreshold::Critical,
         )];
@@ -4256,8 +4280,8 @@ mod tests {
         assert_eq!(
             transitions.len(),
             1,
-            "an unpromoted constituent gates on its own filesystem findings \
-             exactly as it did before ADR 0064 D2"
+            "a claim about the payload's own bytes gates its artifact exactly \
+             as it did before ADR 0064 D2, constituent or not"
         );
         assert_eq!(
             transitions[0].0.quarantine_status,
@@ -4308,6 +4332,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: Some(blob_hash),
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             correlation_id: Uuid::new_v4(),
@@ -4326,26 +4351,28 @@ mod tests {
         artifact_id
     }
 
-    /// **ADR 0064 D6's half of the asymmetry, at the layer that chooses
-    /// it.** A constituent already terminally rejected on its own
-    /// filesystem findings is *not* released by the automatic loosening
-    /// pass, even under a policy that has promoted the composite verdict.
+    /// **The two verdict functions agree at the layer that drives them.**
+    /// A constituent terminally rejected on its own isolated filesystem
+    /// findings *is* released by the loosening pass, because a fresh scan
+    /// of the identical findings would come back clean — the composition
+    /// is the unit of filesystem assessment and its verdict is the only
+    /// verdict (ADR 0064 D2).
     ///
-    /// This pins the call site, not the rule: the finding now persists and
-    /// the kind resolves, so the predicate *would* withhold authority here
-    /// — what holds the row is that this pass passes
-    /// `CompositeVerdictMode::Observed` rather than the resolved posture.
-    /// Swap that literal for `composite_verdict_mode_of(…)` and the whole
-    /// already-rejected estate is released by the next unrelated exclusion
-    /// add, with no fresh assessment behind it; nothing else in the suite
-    /// would notice.
+    /// This used to assert the opposite, and the inversion is the
+    /// behavioural change this layer carries. The loosening pass pinned
+    /// the posture that withheld the composite verdict's authority, so
+    /// that an operator's promotion could not un-reject an existing
+    /// estate as a side effect of an unrelated loosening. With the
+    /// posture retired there is nothing to pin, and keeping the old
+    /// answer would hold the row on a verdict no scan produces —
+    /// clearable only by a rescan, which for a `Rejected` row never runs.
     ///
-    /// Recovery of this row is the operator's, through the curation
-    /// re-evaluation, which passes the resolved posture — asserted in
-    /// `hort_domain::policy::re_evaluation`'s
-    /// `the_operators_curation_re_evaluation_can_recover_the_same_row`.
+    /// Note what this does **not** amount to: the pass only ever reaches
+    /// an artifact whose policy was just mutated, so it is not a sweep of
+    /// the already-rejected estate. Reassessing that population is its
+    /// own deliberate act.
     #[tokio::test]
-    async fn run_pass_loosen_does_not_release_a_rejected_constituent_under_promotion() {
+    async fn run_pass_loosen_releases_a_constituent_rejected_on_a_filesystem_claim() {
         let repo_id = Uuid::new_v4();
         let (uc, events, projections, artifacts, lifecycle, storage) =
             make_constituent_re_eval_harness(repo_id);
@@ -4353,7 +4380,6 @@ mod tests {
 
         let mut p = sample_projection(policy_id, 4);
         p.severity_threshold = SeverityThreshold::Low;
-        p.composite_verdict_mode = CompositeVerdictMode::Promoted;
         projections.insert(p);
 
         let findings = vec![sample_filesystem_finding(
@@ -4367,10 +4393,49 @@ mod tests {
         uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
             .await;
 
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "the layer's isolated package set is evidence, not the verdict, so \
+             the row no longer stands rejected on it: {transitions:?}",
+        );
+        assert_ne!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Rejected,
+            "and the committed status is not the one it was held at"
+        );
+    }
+
+    /// The counter-case, so the release above is the rule and not the
+    /// pass losing its grip: the identical loosening over a finding about
+    /// the payload's **own bytes** leaves the rejection standing.
+    #[tokio::test]
+    async fn run_pass_loosen_leaves_a_constituent_rejected_on_its_own_bytes() {
+        let repo_id = Uuid::new_v4();
+        let (uc, events, projections, artifacts, lifecycle, storage) =
+            make_constituent_re_eval_harness(repo_id);
+        let policy_id = Uuid::new_v4();
+
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+
+        let findings = vec![sample_bytes_finding(
+            "CVE-2024-LAYER",
+            SeverityThreshold::Critical,
+        )];
+        seed_rejected_with_findings(&artifacts, &events, &storage, repo_id, &findings);
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        artifacts.seed_active_for_policy(policy_id, vec![]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
         assert!(
             lifecycle.committed_transitions().is_empty(),
-            "promotion must not un-reject a terminal constituent by itself \
-             (ADR 0064 D6): {:?}",
+            "a leaked key is in those bytes however they are composed, so the \
+             rejection stands: {:?}",
             lifecycle.committed_transitions(),
         );
     }
@@ -4567,7 +4632,6 @@ mod tests {
         cmd.rescan_interval_hours = 7;
         cmd.negligible_action = NegligibleAction::Block;
         cmd.enforcement = ScanEnforcement::Record;
-        cmd.composite_verdict_mode = CompositeVerdictMode::Promoted;
         let expected = cmd.clone();
 
         let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
@@ -4599,10 +4663,6 @@ mod tests {
         );
         assert_eq!(projection.negligible_action, expected.negligible_action);
         assert_eq!(projection.enforcement, expected.enforcement);
-        assert_eq!(
-            projection.composite_verdict_mode,
-            expected.composite_verdict_mode
-        );
         assert!(!projection.archived);
 
         // The event records the row, encoded once.
@@ -4614,38 +4674,6 @@ mod tests {
             created.config_snapshot,
             policy_config_snapshot(&projection),
             "the event's snapshot must be the projection's own encoding"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_policy_with_a_promoted_composite_verdict_projects_promoted() {
-        let (uc, _events, projections) = make_use_case();
-        let mut cmd = sample_create_command("promoted-policy");
-        cmd.composite_verdict_mode = CompositeVerdictMode::Promoted;
-
-        let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
-
-        let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
-        assert_eq!(
-            projection.composite_verdict_mode,
-            CompositeVerdictMode::Promoted
-        );
-    }
-
-    #[tokio::test]
-    async fn create_policy_defaults_the_composite_verdict_to_observed() {
-        // The posture promotion is granted *from*. A created policy that
-        // says nothing about the composite verdict must not gate on it.
-        let (uc, _events, projections) = make_use_case();
-        let cmd = sample_create_command("default-policy");
-        assert_eq!(cmd.composite_verdict_mode, CompositeVerdictMode::Observed);
-
-        let policy_id = uc.create_policy(cmd, api_actor()).await.unwrap();
-
-        let projection = projections.find_by_id(policy_id).await.unwrap().unwrap();
-        assert_eq!(
-            projection.composite_verdict_mode,
-            CompositeVerdictMode::Observed
         );
     }
 
@@ -5789,6 +5817,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
 
         let err = uc
@@ -8430,6 +8459,7 @@ mod tests {
                     finding_count,
                     severity_summary: summary,
                     findings_blob,
+                    findings_blob_retained: None,
                     assessment: ScanAssessment::Analysed,
                 }),
                 correlation_id: Uuid::new_v4(),
@@ -8496,6 +8526,101 @@ mod tests {
             }
             other => panic!("expected ArtifactReEvaluated, got {other:?}"),
         }
+    }
+
+    /// **The fail-open the bounded blob had to be stopped from
+    /// opening.** The loosen direction's whole purpose is to release a
+    /// `Rejected` artifact whose findings an exclusion now clears — and
+    /// it matches exclusions by CVE id against the hydrated per-finding
+    /// list. Over a blob holding only the most severe of a set too large
+    /// to store, "every finding is excluded" is a statement about the
+    /// subset: the findings it dropped name CVEs the operator was never
+    /// asked about, and the artifact would be released on them.
+    ///
+    /// The pairing with
+    /// [`run_pass_loosen_releases_clean_artifact`] above is the whole
+    /// assertion: identical fixture and an exclusion covering every CVE
+    /// in the blob, differing only in whether the blob is the complete
+    /// set. Complete releases; bounded stays `Rejected` on the recorded
+    /// counts, which carry no CVE id for an exclusion to subtract.
+    #[tokio::test]
+    async fn run_pass_loosen_does_not_release_on_a_truncated_blob_every_exclusion_covers() {
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::Low;
+        projections.insert(p);
+        projections.insert_exclusion(ExclusionProjection {
+            exclusion_id: Uuid::new_v4(),
+            policy_id,
+            cve_id: "CVE-2024-3094".into(),
+            package_pattern: None,
+            scope: PolicyScope::Global,
+            reason: "the only CVE the bounded blob holds".into(),
+            added_by_actor_id: None,
+            expires_at: None,
+        });
+
+        // The same fixture `run_pass_loosen_releases_clean_artifact`
+        // releases on — one Critical, excluded — except that the scan
+        // records nine Criticals and the blob holds only this one.
+        let artifact_id = seed_rejected_with_scan(&artifacts, &events, &storage, repo_id, 1);
+        let bounded = ScanCompleted {
+            artifact_id,
+            scanner: "trivy".into(),
+            finding_count: 9,
+            severity_summary: SeveritySummary {
+                critical: 9,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: Some(VALID_SHA256.parse::<ContentHash>().unwrap()),
+            findings_blob_retained: Some(1),
+            assessment: ScanAssessment::Analysed,
+        };
+        bounded
+            .validate()
+            .expect("the fixture must be an event a producer could write");
+        events.seed_stream(
+            StreamId::artifact(artifact_id),
+            vec![
+                PersistedEvent {
+                    event_id: Uuid::new_v4(),
+                    stream_id: StreamId::artifact(artifact_id),
+                    stream_position: 0,
+                    global_position: 0,
+                    event: DomainEvent::ScanCompleted(bounded),
+                    correlation_id: Uuid::new_v4(),
+                    causation_id: None,
+                    actor: api_actor(),
+                    event_version: 1,
+                    stored_at: Utc::now(),
+                },
+                persisted_artifact_rejected(artifact_id, RejectionReason::Scanner, 1),
+            ],
+        );
+        artifacts.seed_rejected_for_policy(policy_id, vec![repo_id]);
+        artifacts.seed_active_for_policy(policy_id, vec![]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        assert_eq!(
+            lifecycle.committed_transitions().len(),
+            0,
+            "an exclusion covering every finding a bounded blob holds must not release \
+             the artifact",
+        );
+        assert_eq!(
+            artifacts
+                .get(artifact_id)
+                .expect("the artifact is still there")
+                .quarantine_status,
+            QuarantineStatus::Rejected,
+        );
     }
 
     /// Loosen direction driven by `enforcement` alone: a
@@ -8718,6 +8843,184 @@ mod tests {
             }
             other => panic!("expected ArtifactRejected, got {other:?}"),
         }
+    }
+
+    /// Seed an active artifact whose stored `ScanCompleted` records
+    /// `recorded_critical` Critical findings but whose `findings_blob`
+    /// holds only `retained` — the shape a re-evaluation pass meets
+    /// after a finding set too large for the 8 MiB blob cap was bounded
+    /// to its most severe (`ScanCompleted.findings_blob_retained`).
+    ///
+    /// The retained findings are seeded into CAS and are deliberately
+    /// **harmless**: `Low`, which no `High`-threshold policy blocks on.
+    /// So a path that decided over the blob would decide clean, and only
+    /// a path that decided over the recorded counts re-holds. That gap
+    /// is what the tests below measure.
+    fn seed_active_with_truncated_findings(
+        artifacts: &Arc<crate::use_cases::test_support::MockArtifactRepository>,
+        events: &Arc<MockEventStore>,
+        storage: &Arc<crate::use_cases::test_support::MockStoragePort>,
+        repo_id: Uuid,
+        status: QuarantineStatus,
+        recorded_critical: u32,
+        retained: u32,
+    ) -> Uuid {
+        let artifact = active_artifact_for_repo(repo_id, "xz-utils", status);
+        let artifact_id = artifact.id;
+        artifacts.insert(artifact);
+
+        let harmless: Vec<Finding> = (0..retained)
+            .map(|i| sample_finding(&format!("CVE-2024-RETAINED-{i}"), SeverityThreshold::Low))
+            .collect();
+        let bytes = serde_json::to_vec(&harmless).unwrap();
+        let blob_hash: ContentHash = hex::encode(Sha256::digest(&bytes)).parse().unwrap();
+        storage.insert_content(blob_hash.clone(), bytes);
+
+        let scan = ScanCompleted {
+            artifact_id,
+            scanner: "trivy".into(),
+            finding_count: recorded_critical,
+            severity_summary: SeveritySummary {
+                critical: recorded_critical,
+                high: 0,
+                medium: 0,
+                low: 0,
+                negligible: 0,
+            },
+            findings_blob: Some(blob_hash),
+            findings_blob_retained: Some(retained),
+            assessment: ScanAssessment::Analysed,
+        };
+        scan.validate()
+            .expect("the fixture must be an event a producer could write");
+        events.seed_stream(
+            StreamId::artifact(artifact_id),
+            vec![PersistedEvent {
+                event_id: Uuid::new_v4(),
+                stream_id: StreamId::artifact(artifact_id),
+                stream_position: 0,
+                global_position: 0,
+                event: DomainEvent::ScanCompleted(scan),
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: api_actor(),
+                event_version: 1,
+                stored_at: Utc::now(),
+            }],
+        );
+        artifact_id
+    }
+
+    /// **A truncated findings blob is not the complete finding set.**
+    /// The artifact's own `ScanCompleted` records nine Criticals; the
+    /// blob behind it holds one harmless `Low`, because the complete set
+    /// did not fit the cap. Deciding over the blob evaluates clean,
+    /// `reject_from_scan_policy_retroactive` turns clean into a no-op,
+    /// and the artifact stays `Released` against a threshold its own
+    /// scan breached. The recorded counts are of the complete set, and
+    /// the tighten walk judges them.
+    #[tokio::test]
+    async fn run_pass_tighten_re_holds_when_the_findings_blob_is_truncated() {
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        let artifact_id = seed_active_with_truncated_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            9,
+            1,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "nine recorded Criticals must not leave the artifact released because the \
+             one finding that fit the blob happens to be harmless"
+        );
+        let (committed_artifact, committed_events, _meta) = &transitions[0];
+        assert_eq!(committed_artifact.id, artifact_id);
+        assert_eq!(
+            committed_artifact.quarantine_status,
+            QuarantineStatus::Rejected
+        );
+        assert_eq!(
+            committed_artifact.rejection_reason,
+            Some(RejectionReason::ScanPolicyRetroactive)
+        );
+        match &committed_events.events[1].event {
+            DomainEvent::ArtifactRejected(r) => {
+                assert_eq!(r.rejected_by, RejectionReason::ScanPolicyRetroactive);
+            }
+            other => panic!("expected ArtifactRejected, got {other:?}"),
+        }
+    }
+
+    /// The exclusion set does not reach the truncated arm either, and
+    /// here it is the **releasing** direction that matters: an exclusion
+    /// naming every CVE the blob happens to hold would clear the subset
+    /// and release an artifact whose dropped findings name CVEs nobody
+    /// was asked about. Both retained CVEs are excluded; the artifact is
+    /// still re-held on the counts.
+    #[tokio::test]
+    async fn run_pass_tighten_truncated_blob_ignores_the_exclusion_set() {
+        let (uc, events, projections, artifacts, lifecycle, storage) = make_full_re_eval_harness();
+        let policy_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let mut p = sample_projection(policy_id, 4);
+        p.severity_threshold = SeverityThreshold::High;
+        projections.insert(p);
+        for i in 0..2 {
+            projections.insert_exclusion(ExclusionProjection {
+                exclusion_id: Uuid::new_v4(),
+                policy_id,
+                cve_id: format!("CVE-2024-RETAINED-{i}"),
+                package_pattern: None,
+                scope: PolicyScope::Global,
+                reason: "every CVE the bounded blob holds".into(),
+                added_by_actor_id: None,
+                expires_at: None,
+            });
+        }
+        artifacts.seed_rejected_for_policy(policy_id, vec![]);
+
+        seed_active_with_truncated_findings(
+            &artifacts,
+            &events,
+            &storage,
+            repo_id,
+            QuarantineStatus::Released,
+            9,
+            2,
+        );
+        artifacts.seed_active_for_policy(policy_id, vec![repo_id]);
+
+        uc.run_policy_re_evaluation_pass(policy_id, policy_updated_trigger(policy_id))
+            .await;
+
+        let transitions = lifecycle.committed_transitions();
+        assert_eq!(
+            transitions.len(),
+            1,
+            "excluding every CVE a bounded blob happens to hold says nothing about the \
+             findings it dropped"
+        );
+        assert_eq!(
+            transitions[0].0.quarantine_status,
+            QuarantineStatus::Rejected
+        );
     }
 
     /// The exclusion set does not reach the unreadable arm. Same fixture
@@ -8977,6 +9280,7 @@ mod tests {
                             negligible: 0,
                         },
                         findings_blob: Some(blob_hash.clone()),
+                        findings_blob_retained: None,
                         assessment: ScanAssessment::Analysed,
                     }),
                     correlation_id: Uuid::new_v4(),
@@ -9075,6 +9379,7 @@ mod tests {
                         finding_count: 1,
                         severity_summary: summary,
                         findings_blob: Some(blob_hash),
+                        findings_blob_retained: None,
                         assessment: ScanAssessment::Analysed,
                     }),
                     correlation_id: Uuid::new_v4(),
@@ -9580,87 +9885,6 @@ mod tests {
         );
     }
 
-    /// The `FieldChange::Set` branch emits exactly one
-    /// `PolicyField::CompositeVerdictMode` event carrying the lowercase
-    /// wire strings, mutates the upserted projection, and — unlike
-    /// `enforcement` — enqueues **no** re-evaluation pass in either
-    /// direction (ADR 0064 D6: that pass re-derives from stored
-    /// findings, so demoting that way would un-reject the population a
-    /// promoted composite had correctly rejected with nothing fresh
-    /// having looked at it).
-    #[tokio::test]
-    async fn update_policy_set_composite_verdict_mode_emits_one_event_and_enqueues_nothing() {
-        for (from, to) in [
-            (
-                CompositeVerdictMode::Observed,
-                CompositeVerdictMode::Promoted,
-            ),
-            (
-                CompositeVerdictMode::Promoted,
-                CompositeVerdictMode::Observed,
-            ),
-        ] {
-            let (uc, events, projections, jobs) = make_use_case_with_jobs();
-            let id = Uuid::new_v4();
-            let mut p = sample_projection(id, 3);
-            p.composite_verdict_mode = from;
-            projections.insert(p);
-
-            let mut cmd = UpdatePolicyCommand::new(id);
-            cmd.composite_verdict_mode = FieldChange::Set(to);
-            uc.update_policy(cmd, api_actor()).await.unwrap();
-
-            let batches = events.appended_batches();
-            assert_eq!(batches.len(), 1, "{from} -> {to}: single atomic batch");
-            assert_eq!(batches[0].events.len(), 1, "{from} -> {to}: one event");
-            match &batches[0].events[0].event {
-                DomainEvent::PolicyUpdated(u) => {
-                    assert_eq!(u.field, PolicyField::CompositeVerdictMode);
-                    assert_eq!(
-                        u.previous_value,
-                        serde_json::Value::String(from.to_string())
-                    );
-                    assert_eq!(u.new_value, serde_json::Value::String(to.to_string()));
-                }
-                other => panic!("expected PolicyUpdated, got {other:?}"),
-            }
-            assert_eq!(
-                projections.upserts().last().unwrap().composite_verdict_mode,
-                to,
-                "{from} -> {to}: the projection reflects the new posture"
-            );
-            assert!(
-                jobs.enqueue_calls()
-                    .iter()
-                    .all(|(kind, _, _)| kind != "policy-reevaluation"),
-                "{from} -> {to}: a composite-verdict change must enqueue no \
-                 re-evaluation pass",
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn update_policy_set_composite_verdict_mode_to_same_value_yields_zero_events() {
-        let (uc, events, projections) = make_use_case();
-        let id = Uuid::new_v4();
-        let p = sample_projection(id, 0);
-        assert_eq!(p.composite_verdict_mode, CompositeVerdictMode::Observed);
-        projections.insert(p);
-        let baseline_upserts = projections.upserts().len();
-
-        let mut cmd = UpdatePolicyCommand::new(id);
-        cmd.composite_verdict_mode = FieldChange::Set(CompositeVerdictMode::Observed);
-
-        uc.update_policy(cmd, api_actor()).await.unwrap();
-
-        assert!(events.appended_batches().is_empty(), "no event on no-op");
-        assert_eq!(
-            projections.upserts().len(),
-            baseline_upserts,
-            "no new upsert on no-op"
-        );
-    }
-
     /// A same-value (no-op) `update_policy` emits zero events AND enqueues
     /// no re-evaluation.
     #[tokio::test]
@@ -10073,6 +10297,7 @@ mod tests {
             curation_rules,
             jobs,
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         );
         (uc, events, projections, artifacts, lifecycle, storage)
     }

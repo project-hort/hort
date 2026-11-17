@@ -86,6 +86,19 @@ fn control_plane_routes() -> Router<Arc<AppContext>> {
         // curator can drive the day-to-day decision surface without
         // elevating to admin.
         .nest("/api/v1/admin/curation", admin::curation::curation_routes())
+        // Retention's held-set overview
+        // (`GET /api/v1/admin/retention/{overview,held}`) — the surface
+        // ADR 0039 D4 names when it declines to put a deadline on an
+        // unsigned hold, so an operator can see the held set and its
+        // age. Its own nest beside `curation_routes()` and under the
+        // same `CurateOrAdminPrincipal` gate: `Curate` is already the
+        // decision authority over the quarantined artifacts this view
+        // enumerates, so no new permission. Read-only — disposal is
+        // operator-confirmed and is not part of this surface.
+        .nest(
+            "/api/v1/admin/retention",
+            admin::retention::retention_routes(),
+        )
         // Finding-exclusion write surface
         // (`POST/DELETE /api/v1/admin/policies/:policy_id/exclusions[/:cve_id]`).
         // Same `CurateOrAdminPrincipal` gate as `/api/v1/admin/curation/*`

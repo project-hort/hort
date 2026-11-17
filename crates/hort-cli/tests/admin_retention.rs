@@ -381,6 +381,105 @@ async fn preview_states_an_unmeasured_size_with_its_reason_and_never_a_zero() {
     );
 }
 
+/// The whole point of the status, end to end: one reclaimable target the
+/// server could not size no longer costs the operator the figure. What
+/// reaches the page is a floor, labelled, with the count of targets
+/// missing from it — never a bare number that reads as the total.
+#[tokio::test]
+async fn preview_renders_a_partly_measured_size_as_a_floor_with_its_count() {
+    let mut server = Server::new_async().await;
+    mock_invoke(&mut server, "dry_run", DRY_RUN_JOB, 202).await;
+    mock_job(
+        &mut server,
+        DRY_RUN_JOB,
+        "completed",
+        Some(dry_run_summary(
+            51_535,
+            "complete",
+            &serde_json::json!({
+                "status": "at_least",
+                "bytes": 12_884_901_888_u64,
+                "unresolved_targets": 1
+            }),
+        )),
+    )
+    .await;
+
+    let mut out = Vec::new();
+    preview::run_with_output(
+        test_client(&server.url()),
+        PreviewArgs { sweep: opts() },
+        OutputFormat::Table,
+        &mut out,
+    )
+    .await
+    .expect("preview runs");
+    let text = String::from_utf8(out).expect("utf8");
+
+    let line = text
+        .lines()
+        .find(|l| l.contains("storage freed"))
+        .expect("the storage line exists");
+    assert!(
+        line.contains("at least 12.00 GiB"),
+        "the figure survives, as a bound: {line}"
+    );
+    assert!(
+        line.contains("1 reclaimable target"),
+        "and says what is missing from it: {line}"
+    );
+    assert!(
+        !line.contains("NOT MEASURED"),
+        "one unreadable target no longer suppresses the whole figure: {line}"
+    );
+}
+
+/// The machine surface carries the same distinction: a script reading
+/// `bytes` gets nothing rather than a total that is short, and the floor
+/// is there for one that asks for it by name.
+#[tokio::test]
+async fn preview_json_puts_a_floor_under_its_own_key() {
+    let mut server = Server::new_async().await;
+    mock_invoke(&mut server, "dry_run", DRY_RUN_JOB, 202).await;
+    mock_job(
+        &mut server,
+        DRY_RUN_JOB,
+        "completed",
+        Some(dry_run_summary(
+            51_535,
+            "complete",
+            &serde_json::json!({
+                "status": "at_least",
+                "bytes": 4_096,
+                "unresolved_targets": 12
+            }),
+        )),
+    )
+    .await;
+
+    let mut out = Vec::new();
+    preview::run_with_output(
+        test_client(&server.url()),
+        PreviewArgs { sweep: opts() },
+        OutputFormat::Json,
+        &mut out,
+    )
+    .await
+    .expect("preview runs");
+
+    let doc: serde_json::Value =
+        serde_json::from_slice(&out).expect("stdout is a single JSON document");
+    let freed = &doc["totals"]["freed_bytes"];
+    assert_eq!(freed["status"], "at_least");
+    assert_eq!(freed["measured"], false);
+    assert!(
+        freed["bytes"].is_null(),
+        "the key that means a total stays empty: {freed}"
+    );
+    assert_eq!(freed["bytes_at_least"], 4_096);
+    assert_eq!(freed["unresolved_targets"], 12);
+}
+
 #[tokio::test]
 async fn preview_json_carries_the_coverage_flag_and_the_omission_status() {
     let mut server = Server::new_async().await;

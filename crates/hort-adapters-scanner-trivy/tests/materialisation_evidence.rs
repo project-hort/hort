@@ -91,7 +91,9 @@ use std::sync::Arc;
 use hort_adapters_scanner_trivy::{TrivyAdapter, TrivyConfig};
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::scanner::{NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort};
+use hort_domain::ports::scanner::{
+    LayerRole, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort,
+};
 use hort_domain::ports::storage::{PutResult, StoragePort};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{ArtifactCoords, ArtifactKind, ByteRange, ContentHash, Finding};
@@ -192,6 +194,12 @@ async fn scan_fixture(
         },
         coords,
         kind,
+        // These fixtures prove an analyzer claims each format's
+        // materialisation. For the OCI layer that means the layer
+        // materialisation, so the role is the one a manifest declaring
+        // the blob among an image's layers produces — the fixture stands
+        // in for the registry's statement, which no adapter resolves.
+        layer_role: LayerRole::ImageLayer,
     };
     Some(adapter.scan(&target, None).await)
 }

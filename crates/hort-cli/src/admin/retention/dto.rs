@@ -30,6 +30,13 @@
 //! "nothing to free", which is a different and much more dangerous
 //! claim than "hort did not measure this".
 //!
+//! The server has a third thing to say, and it is neither of those: a
+//! sum over the reclaimable targets it *could* size, when some target's
+//! size it could not read. That is a floor, and a floor read as a total
+//! is the same class of mistake one step smaller — so the number is
+//! reachable only through [`ByteFigure::Floor`], which cannot be matched
+//! without also naming how many targets are missing from it.
+//!
 //! [`ProposalDigest`] carries the same posture on the same grounds. It
 //! is `Option`, and a digest missing either half counts as absent
 //! ([`ProposalDigest::is_usable`]): an identity this client cannot use
@@ -142,6 +149,21 @@ pub enum FreedBytes {
         #[serde(default)]
         bytes: u64,
     },
+    /// A floor, not a total: `bytes` is the sum over the reclaimable
+    /// targets whose size storage answered for, and
+    /// `unresolved_targets` counts the ones it did not. The real figure
+    /// is no smaller — for a target storage reports absent it is in fact
+    /// this exactly, since purging an already-absent blob frees nothing.
+    ///
+    /// The count is not decoration: without it this is a number the
+    /// output would render as a total, which is the one thing the byte
+    /// accounting never does.
+    AtLeast {
+        #[serde(default)]
+        bytes: u64,
+        #[serde(default)]
+        unresolved_targets: u64,
+    },
     /// Deliberately not measured, with the server's reason.
     Omitted {
         #[serde(default)]
@@ -160,24 +182,45 @@ impl Default for FreedBytes {
     }
 }
 
-impl FreedBytes {
-    /// The measured byte count, or `None` when hort did not measure one.
-    pub fn measured(&self) -> Option<u64> {
-        match self {
-            Self::Exact { bytes } => Some(*bytes),
-            Self::Omitted { .. } | Self::Unrecognised => None,
-        }
-    }
+/// What a reader of the byte accounting may truthfully say.
+///
+/// These are the *claims* `FreedBytes` supports rather than the fields
+/// it carries, and the distinction is the point: a floor's number is
+/// reachable only through the arm that names it a floor, so a renderer
+/// cannot carry it into a sentence that reads as a total. Adding a
+/// status to the wire therefore stops every reader at the compiler
+/// instead of letting one of them quietly keep printing a figure whose
+/// meaning has changed underneath it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteFigure<'a> {
+    /// Every reclaimable target resolved: the figure is the total.
+    Total(u64),
+    /// Some targets did not resolve: `bytes` is a lower bound and
+    /// `unresolved_targets` is how many are missing from it.
+    Floor { bytes: u64, unresolved_targets: u64 },
+    /// No figure at all, with the reason to print in its place.
+    Unmeasured { reason: &'a str },
+}
 
-    /// Why no figure is available, for the two non-measured cases.
-    pub fn omission_reason(&self) -> Option<&str> {
+impl FreedBytes {
+    /// The claim this figure supports. The only way to the number.
+    pub fn figure(&self) -> ByteFigure<'_> {
         match self {
-            Self::Exact { .. } => None,
-            Self::Omitted { reason } if !reason.is_empty() => Some(reason.as_str()),
-            Self::Omitted { .. } => Some("the server gave no reason"),
-            Self::Unrecognised => {
-                Some("the server reported a byte-accounting status this CLI does not recognise")
-            }
+            Self::Exact { bytes } => ByteFigure::Total(*bytes),
+            Self::AtLeast {
+                bytes,
+                unresolved_targets,
+            } => ByteFigure::Floor {
+                bytes: *bytes,
+                unresolved_targets: *unresolved_targets,
+            },
+            Self::Omitted { reason } if !reason.is_empty() => ByteFigure::Unmeasured { reason },
+            Self::Omitted { .. } => ByteFigure::Unmeasured {
+                reason: "the server gave no reason",
+            },
+            Self::Unrecognised => ByteFigure::Unmeasured {
+                reason: "the server reported a byte-accounting status this CLI does not recognise",
+            },
         }
     }
 }
@@ -366,7 +409,7 @@ mod tests {
         assert!(parsed.coverage_is_partial());
         let preview = parsed.preview.expect("dry run carries a preview");
         assert_eq!(preview.rows, 812);
-        assert_eq!(preview.freed_bytes.measured(), Some(12345));
+        assert_eq!(preview.freed_bytes.figure(), ByteFigure::Total(12345));
         assert_eq!(preview.groups[0].repository_key, "npm-proxy");
         assert_eq!(preview.sample[0].repository_key, "npm-proxy");
         assert_eq!(preview.sample_limit, Some(500));
@@ -392,11 +435,67 @@ mod tests {
             "reason": OMITTED_BYTES_REASON
         }))
         .expect("parses");
-        assert_eq!(omitted.measured(), None);
         assert_eq!(
-            omitted.omission_reason().expect("a reason"),
-            OMITTED_BYTES_REASON,
+            omitted.figure(),
+            ByteFigure::Unmeasured {
+                reason: OMITTED_BYTES_REASON
+            },
             "the server's reason is carried through verbatim, whatever it says",
+        );
+    }
+
+    /// The status this item exists for. It parses, it keeps both halves,
+    /// and the number it carries is reachable only as a floor — there is
+    /// no reading of this value that produces a total.
+    #[test]
+    fn a_partly_measured_figure_parses_as_a_floor_and_only_as_a_floor() {
+        let partial: FreedBytes = serde_json::from_value(serde_json::json!({
+            "status": "at_least",
+            "bytes": 4_096,
+            "unresolved_targets": 7
+        }))
+        .expect("parses");
+        assert_eq!(
+            partial,
+            FreedBytes::AtLeast {
+                bytes: 4_096,
+                unresolved_targets: 7
+            },
+            "`at_least` is a status this client knows, not an unrecognised one",
+        );
+        assert_eq!(
+            partial.figure(),
+            ByteFigure::Floor {
+                bytes: 4_096,
+                unresolved_targets: 7
+            },
+            "the count travels with the number, so no reader gets one without the other",
+        );
+        assert_eq!(
+            serde_json::to_value(&partial).expect("serialises"),
+            serde_json::json!({
+                "status": "at_least",
+                "bytes": 4_096,
+                "unresolved_targets": 7
+            }),
+            "and it round-trips through the shape the server sends",
+        );
+    }
+
+    /// `#[serde(default)]` on the count is the same tolerance every other
+    /// numeric field has, and it must not open a path to a total: a floor
+    /// that forgot to say how many targets it left out is still a floor.
+    #[test]
+    fn a_floor_without_its_count_is_still_a_floor() {
+        let countless: FreedBytes =
+            serde_json::from_value(serde_json::json!({ "status": "at_least", "bytes": 99 }))
+                .expect("parses");
+        assert_eq!(
+            countless.figure(),
+            ByteFigure::Floor {
+                bytes: 99,
+                unresolved_targets: 0
+            },
         );
     }
 
@@ -406,15 +505,23 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "status": "estimated", "bytes": 999 }))
                 .expect("unknown status still parses");
         assert_eq!(unknown, FreedBytes::Unrecognised);
-        assert_eq!(unknown.measured(), None, "an estimate is never reported");
-        assert!(unknown.omission_reason().is_some());
+        assert_eq!(
+            unknown.figure(),
+            ByteFigure::Unmeasured {
+                reason: "the server reported a byte-accounting status this CLI does not recognise"
+            },
+            "an unrecognised status reports no number and still says why",
+        );
     }
 
     #[test]
     fn a_missing_freed_bytes_object_is_not_zero_bytes() {
         let body: PreviewBody =
             serde_json::from_value(serde_json::json!({ "rows": 5 })).expect("parses");
-        assert_eq!(body.freed_bytes.measured(), None);
+        assert!(matches!(
+            body.freed_bytes.figure(),
+            ByteFigure::Unmeasured { .. }
+        ));
         assert_eq!(body.sample_limit, None);
     }
 
@@ -422,7 +529,12 @@ mod tests {
     fn an_omitted_reason_is_never_empty_in_the_rendered_path() {
         let bare: FreedBytes =
             serde_json::from_value(serde_json::json!({ "status": "omitted" })).expect("parses");
-        assert_eq!(bare.omission_reason(), Some("the server gave no reason"));
+        assert_eq!(
+            bare.figure(),
+            ByteFigure::Unmeasured {
+                reason: "the server gave no reason"
+            }
+        );
     }
 
     #[test]

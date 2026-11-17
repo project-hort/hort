@@ -388,9 +388,13 @@ deadline:
   have would put well-behaved clients in an unbounded retry loop (D5).
 - The exits from a hold are therefore: a signature (directly, or via the
   subject cascade for constituents), or an operator decision — an admin
-  release, a curator waiver, or deleting the artifact. Retention is not
-  one of them: `quarantined` and `rejected` are both GC-protected as
-  evidence.
+  release, a curator waiver, or deleting the artifact. **Retention is not
+  an exit**, and nothing it does makes a held artifact deliverable — but
+  it can *dispose of* one: a `RetentionPolicy` whose `spec.heldStates`
+  names `Quarantined` and whose predicate bounds every branch by time in
+  that state will expire and purge an artifact that has waited that long.
+  Without such a policy — the default — `quarantined` and `rejected` are
+  GC-protected as evidence, exactly as before.
 
 A **bad** signature is not held — a forged, wrong-key, or
 digest-mismatched signature is rejected **immediately**, even mid-window (a
@@ -429,10 +433,12 @@ on the provenance axis.
 > A constituent whose subject never arrives (a blob pushed without its
 > manifest) stays held indefinitely. That is deliberate: held bytes serve
 > nothing, and any "orphan timer" would just be a second observation
-> window with the same race. If you need such a row gone, delete it — do
-> not shorten the window expecting a rejection, and do not expect
-> retention to reclaim it (`quarantined` rows are GC-protected as
-> evidence).
+> window with the same race. If you need such a row gone, delete it, or
+> declare a `RetentionPolicy` whose `spec.heldStates` names
+> `Quarantined` and whose predicate bounds every branch by time in the
+> state — do not shorten the window expecting a rejection. With no such
+> policy, `quarantined` rows are GC-protected as evidence and retention
+> will not reclaim them.
 
 > **The "images waiting to be signed" signals.** The
 > `hort_provenance_verify_total{result="held_pending_signature"}` counter

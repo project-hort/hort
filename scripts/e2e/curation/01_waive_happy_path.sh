@@ -2,7 +2,7 @@
 # Scenario 1: Waive happy path.
 #
 # Ingest an artifact under quarantine-by-default; record a clean scan;
-# via `hort-cli curation waive <id> --justification "<text>"` release it
+# via `hort-cli curation waive artifact <id> --justification "<text>"` release it
 # before the window elapses; assert the artifact is downloadable AND
 # `ArtifactReleased` event carries `released_by_user_id = <curator>` +
 # `authority = CuratorWaiver`.
@@ -18,7 +18,7 @@
 #      user Curate. For this scenario we use the curator-only
 #      `developer-curator` Keycloak user when present, else fall back
 #      to the admin user with a noted attribution caveat).
-#   5. Call `hort-cli curation waive <aid> --justification "..."`.
+#   5. Call `hort-cli curation waive artifact <aid> --justification "..."`.
 #   6. Assert the `ArtifactReleased` event in `events` carries
 #      `authority = CuratorWaiver` + populated `released_by_user_id`.
 #   7. Assert the artifact is downloadable (GET against the artifact
@@ -95,7 +95,7 @@ log "  target artifact_id : $QUARANTINED_AID"
 
 JUSTIFICATION="E2E scenario 1: waive happy path, $(date -Is)"
 
-WAIVE_OUT="$(run_hort_cli "$ADMIN_TOKEN" -- curation waive "$QUARANTINED_AID" \
+WAIVE_OUT="$(run_hort_cli "$ADMIN_TOKEN" -- curation waive artifact "$QUARANTINED_AID" \
     --justification "$JUSTIFICATION" 2>&1)" || {
     assert_fail "curator waive succeeds" "hort-cli output: $WAIVE_OUT"
     print_summary

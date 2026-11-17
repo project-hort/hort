@@ -36,6 +36,62 @@
 # is intentionally **not** mirrored to a registry Exclusion — same
 # marker-naming convention as AUDIT-ONLY/DENY-ONLY.
 ignore = [
+    # AUDIT-ONLY: RUSTSEC-2026-0459
+    # REGISTRY-EXEMPT: RUSTSEC-2026-0459 — build-side acceptance only, with no
+    # registry Exclusion: an Exclusion waives the finding for EVERY registry
+    # consumer (the nuclear option). Nothing hort publishes carries this crate
+    # at all, so there is nothing for a registry-side waiver to protect.
+    #
+    # libsqlite3-sys 0.30.1 — C SQLite CVE-2026-119375 (RUSTSEC-2026-0459,
+    # 6.8 medium), advisory published 2026-10-30 and reaching the live RustSec
+    # database on 2026-11-09, between a green `security:cargo-audit` on
+    # `develop` at 08:59 and the next run. No code and no `Cargo.lock` change
+    # is involved on hort's side.
+    #
+    # It is a `Cargo.lock` entry and nothing more. `cargo tree -i
+    # libsqlite3-sys` prints "nothing to print" for EVERY edge kind — normal,
+    # dev and build — so the crate is in no dependency graph: it reaches no
+    # hort binary, no test binary, no container image and no published crate,
+    # and no input from a hort user can reach it. It is in the lockfile because
+    # a `Cargo.lock` is feature-independent and therefore records every
+    # optional driver of `sqlx 0.9` (mysql, postgres, sqlite) whatever feature
+    # set the workspace selects. That is also why `cargo deny check` reports
+    # `advisories ok` on the same tree — it walks the active build graph — and
+    # why this entry is AUDIT-ONLY: mirroring it into `deny.toml` would make
+    # cargo-deny emit `advisory-not-detected`, a hard failure.
+    #
+    # Not fixable here, on two independent counts, both measured rather than
+    # assumed:
+    #   * No upgrade path *today*. The advisory's fix is `>=0.39.0`, and
+    #     `sqlx-sqlite 0.9.0` requires `libsqlite3-sys >=0.30.1, <0.38.0`:
+    #     `cargo update -p libsqlite3-sys --precise 0.39.0` fails to resolve.
+    #     The widening is already merged upstream —
+    #     https://github.com/launchbadge/sqlx/pull/4502, merged 2026-11-08 —
+    #     and sqlx's own documented policy is to raise this range's maximum
+    #     "in patch (SemVer-compatible) releases". Only the release is
+    #     missing; `sqlx 0.9.0` is still the newest published version and
+    #     `cargo update -p sqlx` locks 0 packages.
+    #   * No removal path. `default-features = false` on the `sqlx` dependency
+    #     cannot drop the entry, because the lockfile records optional
+    #     dependencies regardless of feature activation.
+    #
+    # Two further bounds from the advisory's own text, both narrowing it
+    # further: the vulnerable code is the SQLite source the `bundled` feature
+    # compiles, and "a build that links a system SQLite instead of the bundled
+    # source is not affected by the copy in this crate" — hort compiles
+    # neither; and the attack is local and needs a victim to open a database
+    # file together with a sibling `-wal` file written by a less trusted party,
+    # which no hort code path does.
+    #
+    # Why the residual risk is accepted: the vulnerable code is C SQLite inside
+    # a crate that is compiled into nothing hort builds, ships or publishes, so
+    # the exposure is zero rather than small, and the bridge is short.
+    #
+    # Removal trigger, concrete: the next `sqlx` patch release carrying PR
+    # 4502. Then `cargo update -p sqlx` is a lockfile-only fix and **this entry
+    # is deleted** rather than carried forward. Nothing else needs to change.
+    "RUSTSEC-2026-0459",
+
     # AUDIT-ONLY: RUSTSEC-2026-0173
     # REGISTRY-EXEMPT: RUSTSEC-2026-0173 — not observed to block a CI
     # prefetch/build (issue #80's prod evidence names only the lru /

@@ -9,8 +9,9 @@
 //! the push order the distribution spec mandates. For a **pull-through**
 //! manifest the opposite is the ordinary case. Its constituent edges are
 //! registered by digest with **no existence check** — deliberately, since
-//! that edge is what gives a proxy descendant the zero-window quarantine
-//! carve-out on its own later ingest — so a cold proxy manifest nominates
+//! that edge is what makes a proxy descendant eligible for the zero-window
+//! quarantine carve-out on its own later ingest, once this manifest is
+//! itself released — so a cold proxy manifest nominates
 //! a complete, well-formed composition **not one constituent of which is
 //! here**. Its config blob included: the composition's own description is
 //! a constituent like any other, which is why it is acquired as its own
@@ -67,9 +68,10 @@
 //! deduplicates on content and the row is created as it always was.
 //! Minting the row here instead would mean committing an artifact, an
 //! `ArtifactIngested` event, a quarantine window and a scan job as a side
-//! effect of an assessment that carries no authority, which is a much
-//! larger claim than warming the cache. The layout writer reads CAS, not
-//! rows, so the row buys this path nothing.
+//! effect of assessing a *different* artifact — the manifest whose
+//! composition this layer belongs to — which is a much larger claim than
+//! warming the cache. The layout writer reads CAS, not rows, so the row
+//! buys this path nothing.
 
 use std::collections::HashSet;
 use std::fmt;

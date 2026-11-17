@@ -13,17 +13,25 @@
 //! [`DEFINITION_FILE`], with [`ComponentRelation::more_condemning`]
 //! beside it as the order two disagreeing relations reconcile to.
 //!
-//! The statement half takes **two** inputs, and that is why it is worth
-//! policing as hard as the relation half. A producer states only what it
-//! read (`Bytes` / `Filesystem` / `Unstated`); whose filesystem the claim
-//! is about is the row's `ArtifactKind`, and the predicate composes the
-//! two where it decides rather than anything storing them already joined
-//! (ADR 0040 — storing a composition is storing a conclusion). So the
-//! conjunction `kind.is_composition_constituent() &&
-//! composite_verdict.carries_release_authority()` is part of the single
-//! definition, pinned by [`the_scanned_corpus_is_real`]: a copy of it
-//! elsewhere, or its deletion here, is the same class of defect as a
-//! second copy of the match.
+//! The statement half takes a **second** input, and that is why it is
+//! worth policing as hard as the relation half. A producer states only
+//! what it read (`Bytes` / `Filesystem` / `Unstated`); whose filesystem
+//! the claim is about is the row's `ArtifactKind`, and the predicate
+//! composes the two where it decides rather than anything storing them
+//! already joined (ADR 0040 — storing a composition is storing a
+//! conclusion). So the role test
+//! `kind.is_composition_constituent()` is part of the single definition,
+//! pinned by [`the_scanned_corpus_is_real`]: a copy of it elsewhere, or
+//! its deletion here, is the same class of defect as a second copy of
+//! the match.
+//!
+//! It used to be a *conjunction* of that test with an operator-granted
+//! per-policy posture (`composite_verdict.carries_release_authority()`).
+//! The posture is retired — the composed image's verdict is the only
+//! verdict (ADR 0064 D2) — so the arm is the role test alone, and what
+//! this guard pins is that it is still **there**: deleting it would make
+//! D2's loosening unscoped, reaching every format the ADR leaves
+//! undecided.
 //!
 //! The rule is two short `match`es, and every place that needs it sits
 //! in a different file from the fields: the threshold walk in
@@ -110,8 +118,8 @@
 //! * [`the_scanned_corpus_is_real`] — the definition file still holds
 //!   exactly one decision-form read per policed field (the predicate's own
 //!   two `match`es) and still defines the predicate, both enums, the
-//!   order, its rank function, and the two halves of the statement
-//!   conjunction. A rename or a deletion of any of them turns this red,
+//!   order, its rank function, and the statement axis's role test. A
+//!   rename or a deletion of any of them turns this red,
 //!   which is the moment to re-read what the single definition is.
 //! * [`every_consumer_reaches_the_rule_rather_than_its_own_copy`] — the
 //!   census of production call sites, with per-file counts, matched
@@ -177,15 +185,19 @@ const RELATION_ENUM: &str = "ComponentRelation";
 /// The statement taxonomy (ADR 0064 D2).
 const STATEMENT_ENUM: &str = "FindingStatement";
 
-/// The two halves of the statement axis's conjunction. They are the
-/// *replacement* for the placement function this guard used to pin: the
-/// role half no longer lives in a function of its own, it lives inside
-/// the predicate's `Filesystem` arm — so what has to be pinned is that
-/// the arm still composes both, in the definition file and nowhere else.
-/// Deleting either half would leave the match compiling, the suite
-/// green, and ADR 0064 D2's loosening either unscoped (every format) or
-/// unconditional (no operator act required).
-const CONJUNCTION_HALVES: &[&str] = &["is_composition_constituent", "carries_release_authority"];
+/// The statement axis's role test. It is the *replacement* for the
+/// placement function this guard used to pin: the role half no longer
+/// lives in a function of its own, it lives inside the predicate's
+/// `Filesystem` arm — so what has to be pinned is that the arm still
+/// asks it, in the definition file and nowhere else. Deleting it would
+/// leave the match compiling, the suite green, and ADR 0064 D2's
+/// loosening unscoped — reaching every format the ADR leaves undecided.
+///
+/// A list of one, deliberately: it was a two-element conjunction while
+/// the loosening was also conditional on an operator-granted posture,
+/// and the shape stays so a future second input is added here rather
+/// than beside it.
+const CONJUNCTION_HALVES: &[&str] = &["is_composition_constituent"];
 
 /// The pipeline **above** the producers — the layers a finding travels
 /// through between the adapter that stated its `statement` and the

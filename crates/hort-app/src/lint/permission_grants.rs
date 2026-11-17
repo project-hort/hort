@@ -3,7 +3,7 @@
 //! | Rule | Trigger | Default action |
 //! |---|---|---|
 //! | `single-claim-grant` | `Claims` grant, `required.len() == 1`, claim ∉ `single_claim_allowlist` | **reject** (allowlist is the opt-out) |
-//! | `direct-user-grant-without-justification` | `User` grant not SA-owned (provenance = the v1 justification signal; see `lint_permission_grants` doc) | **reject** when `permission == Admin` OR (`repository_id IS NULL` AND `permission ∈ ADMIN_CLASS ∪ {Write, Delete}`); else **warn** |
+//! | `direct-user-grant-without-justification` | `User` grant that is not SA-owned, **or** is SA-owned but carries a permission no service account may hold (`SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS`) — provenance = the v1 justification signal; see `lint_permission_grants` doc | **reject** when `permission == Admin` OR (`repository_id IS NULL` AND `permission ∈ ADMIN_CLASS ∪ {Write, Delete}`); else **warn** |
 //! | `wildcard-repo-non-admin` | `Claims` grant, `repository_id IS NULL`, `permission != Admin` | **reject** |
 //! | `claim-name-collision` | `claim_mappings` row's claim collides with a reserved name | **reject** |
 //!
@@ -54,6 +54,8 @@ const ADMIN_CLASS_PERMISSIONS: &[Permission] = &[
     Permission::AdminTaskInvoke,
     Permission::Curate,
     Permission::Prefetch,
+    Permission::DestroyContent,
+    Permission::DestroyRecord,
 ];
 
 /// True when `p` confers admin-class authority (see
@@ -432,14 +434,16 @@ fn evaluate_wildcard_repo_non_admin(
 /// signal (see [`lint_permission_grants`] for the as-built
 /// reconciliation: every gitops grant carries a `managed_by_digest`,
 /// so it cannot be the discriminator). An SA-owned grant is exempt
-/// (justified by provenance → `Pass`) **for every permission except
-/// `Admin`** — an SA-owned `Admin` grant is denied the exemption and
-/// falls through to the `high_privilege` `Reject` (ADR 0038: no SA
-/// holds admin, on the grant axis too; `AdminTaskInvoke`/`Curate`/etc.
-/// SA grants stay exempt). An operator-hand-declared bare
+/// (justified by provenance → `Pass`) **for every permission a machine
+/// identity may hold** — an SA-owned grant of a permission in
+/// `SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS` (`Admin`, `DestroyRecord`)
+/// is denied the exemption and falls through to the `high_privilege`
+/// `Reject`; `AdminTaskInvoke`/`Curate`/`DestroyContent`/etc. SA grants
+/// stay exempt. An operator-hand-declared bare
 /// `User` grant rejects when high-privilege (`Admin` always, or a
 /// wildcard-repo grant of any [`ADMIN_CLASS_PERMISSIONS`] member —
-/// `AdminTaskInvoke`/`Curate`/`Prefetch` — or wildcard-repo
+/// `AdminTaskInvoke`/`Curate`/`Prefetch`/`DestroyContent`/`DestroyRecord`
+/// — or wildcard-repo
 /// write/delete) and warns otherwise (break-glass / low-priv direct
 /// grants remain non-blocking). A *repo-scoped* admin-class grant
 /// stays `Warn`: the reject is scoped to the wildcard case.
@@ -452,24 +456,35 @@ fn evaluate_direct_user_grant(
     let GrantSubject::User(uid) = &grant.subject else {
         return; // rule only applies to User subjects
     };
-    if sa_owned_user_ids.contains(uid) && grant.permission != Permission::Admin {
-        // Justified by provenance — but **strictly non-`Admin`**: this
-        // `User` grant was synthesised from a declared `ServiceAccount`,
-        // not a hand-written escalation, AND it is not an admin grant.
-        // The gate that makes an SA-owned grant safe is twofold: (1)
-        // `validate_permission_grant` hard-rejects a `serviceAccount`
-        // subject with `permission: admin` at apply (the earliest,
-        // clearest gate — see `hort-config`), and (2) this scoping, which
-        // declines the provenance exemption for `Admin` so an SA-owned
-        // Admin grant falls through to the `high_privilege` arm below and
-        // `Reject`s exactly like the hand-rolled `User`-subject form. This
-        // upholds ADR 0038 "no service account holds admin — no exception"
-        // on the *grant* axis. The exemption is **deliberately scoped to
-        // `permission != Permission::Admin`, NOT `!is_admin_class(..)`**:
-        // `AdminTaskInvoke` is a legitimate SA permission (the
-        // `cronjob-tasks` SA holds a global `admin_task_invoke` grant), as
-        // are `Curate`/`Read`/`Write`/`Delete` — all stay exempt. Only
-        // `Admin` itself is denied the exemption.
+    if sa_owned_user_ids.contains(uid) && grant.permission.service_account_refusal().is_none() {
+        // Justified by provenance — but **only for a permission a
+        // machine identity may hold**: this `User` grant was
+        // synthesised from a declared `ServiceAccount`, not a
+        // hand-written escalation, AND it is not one of the permissions
+        // no service account may carry. The gate that makes an SA-owned
+        // grant safe is twofold: (1) `validate_permission_grant`
+        // hard-rejects a `serviceAccount` subject carrying one of those
+        // permissions at apply (the earliest, clearest gate — see
+        // `hort-config`), and (2) this scoping, which declines the
+        // provenance exemption for them so such an SA-owned grant falls
+        // through to the `high_privilege` arm below and `Reject`s
+        // exactly like the hand-rolled `User`-subject form. That second
+        // half is what reaches the shape (1) cannot see: a hand-written
+        // `subject: { kind: user }` naming an SA's *backing user* is
+        // syntactically ordinary and never passes through the
+        // `serviceAccount` arm at all.
+        //
+        // Membership comes from the one declaration,
+        // `Permission::service_account_refusal`
+        // (`hort_domain::entities::rbac::SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS`),
+        // which `hort-config`'s parse gate and `issue-svc-token` read
+        // too. The exemption is deliberately scoped to that set and
+        // **NOT** to `!is_admin_class(..)`: `AdminTaskInvoke` is a
+        // legitimate SA permission (the `cronjob-tasks` SA holds a
+        // global `admin_task_invoke` grant), and so is
+        // `DestroyContent` (the same SA holds it for the retention
+        // tasks) — as are `Curate`/`Read`/`Write`/`Delete`. All stay
+        // exempt.
         emit_and_record(RULE_DIRECT_USER, RuleAction::Pass, grant, outcome);
         return;
     }
@@ -897,13 +912,15 @@ mod tests {
     #[test]
     fn direct_user_sa_owned_admin_is_rejected() {
         // ADR 0038 on the grant axis: the provenance exemption is
-        // scoped to non-`Admin` permissions. An SA-owned `User` grant
-        // at `Permission::Admin` is DENIED the exemption and falls
-        // through to the high-privilege `Reject` — exactly like the
-        // hand-rolled `User`-subject form. (The earliest gate is
-        // `hort_config::validate_permission_grant`, which rejects a
-        // `serviceAccount` subject + `permission: admin` at apply;
-        // this linter scoping is defense-in-depth.)
+        // scoped to the permissions a machine identity may hold. An
+        // SA-owned `User` grant at `Permission::Admin` is DENIED the
+        // exemption and falls through to the high-privilege `Reject` —
+        // exactly like the hand-rolled `User`-subject form. (The
+        // earliest gate is `hort_config::validate_permission_grant`,
+        // which rejects a `serviceAccount` subject + `permission: admin`
+        // at apply; this linter scoping is defense-in-depth — and it is
+        // what reaches the shape that gate cannot see, a hand-written
+        // `kind: user` subject naming the SA's own backing user.)
         let sa_uid = Uuid::new_v4();
         let g = user_grant_for(sa_uid, Permission::Admin, None);
         let mut sa_owned = HashSet::new();
@@ -922,7 +939,8 @@ mod tests {
     #[test]
     fn direct_user_sa_owned_admin_task_invoke_is_exempt() {
         // Over-rejection guard: the provenance exemption is scoped to
-        // `permission != Permission::Admin`, NOT `!is_admin_class(..)`.
+        // `SERVICE_ACCOUNT_FORBIDDEN_PERMISSIONS`, NOT
+        // `is_admin_class(..)`.
         // `AdminTaskInvoke` is a LEGITIMATE SA permission (the
         // `cronjob-tasks` SA holds a global `admin_task_invoke` grant),
         // so an SA-owned global AdminTaskInvoke `User` grant MUST stay
@@ -935,6 +953,50 @@ mod tests {
         assert!(
             !out.rejected(),
             "an SA-owned global AdminTaskInvoke grant is justified by provenance — must pass"
+        );
+        assert!(out.violations.is_empty());
+    }
+
+    /// The second of the three declaration/mint points that refuse
+    /// `destroy_record` to a machine identity (the other two are
+    /// `hort-config`'s apply-parse validator and `issue-svc-token`), and
+    /// the only one that reaches a **direct `User` subject** naming the
+    /// SA's backing user — the shape the apply-parse gate never sees,
+    /// because it never passes through the `serviceAccount` arm.
+    /// Asserted here on its own, not only end-to-end.
+    #[test]
+    fn direct_user_sa_owned_destroy_record_is_rejected() {
+        let sa_uid = Uuid::new_v4();
+        let g = user_grant_for(sa_uid, Permission::DestroyRecord, None);
+        let mut sa_owned = HashSet::new();
+        sa_owned.insert(sa_uid);
+        let out = lint_sa(&[g], &sa_owned, &LintConfig::default());
+        assert!(
+            out.rejected(),
+            "an SA-owned User grant at DestroyRecord is NOT exempt — nothing reconstructs a \
+             sealed audit stream, so no machine identity holds standing authority over one"
+        );
+        assert!(out
+            .violations
+            .iter()
+            .any(|v| v.rule == RULE_DIRECT_USER && v.action == RuleAction::Reject));
+    }
+
+    /// The other half of the destructive split stays exempt, and this
+    /// pin is what keeps the refusal above from being widened to both:
+    /// the shipped `cronjob-tasks` SA holds a global `destroy_content`
+    /// grant, so denying it the exemption would reject the production
+    /// gitops tree at apply.
+    #[test]
+    fn direct_user_sa_owned_destroy_content_is_exempt() {
+        let sa_uid = Uuid::new_v4();
+        let g = user_grant_for(sa_uid, Permission::DestroyContent, None);
+        let mut sa_owned = HashSet::new();
+        sa_owned.insert(sa_uid);
+        let out = lint_sa(&[g], &sa_owned, &LintConfig::default());
+        assert!(
+            !out.rejected(),
+            "an SA-owned global DestroyContent grant is justified by provenance — must pass"
         );
         assert!(out.violations.is_empty());
     }
@@ -1025,12 +1087,13 @@ mod tests {
 
     #[test]
     fn direct_user_sa_owned_admin_class_is_exempt() {
-        // Provenance exemption holds for admin-CLASS perms (other than
-        // `Admin` itself): an SA-owned wildcard admin-class `User` grant
-        // is justified by provenance → Pass (mirrors
-        // `direct_user_sa_owned_admin_task_invoke_is_exempt`; the `Admin`
-        // permission specifically is denied the exemption — see
-        // `direct_user_sa_owned_admin_is_rejected`).
+        // Provenance exemption holds for admin-CLASS perms a machine
+        // identity may hold: an SA-owned wildcard admin-class `User`
+        // grant is justified by provenance → Pass (mirrors
+        // `direct_user_sa_owned_admin_task_invoke_is_exempt`; `Admin`
+        // and `DestroyRecord` are denied the exemption — see
+        // `direct_user_sa_owned_admin_is_rejected` and
+        // `direct_user_sa_owned_destroy_record_is_rejected`).
         let sa_uid = Uuid::new_v4();
         let g = user_grant_for(sa_uid, Permission::AdminTaskInvoke, None);
         let mut sa_owned = HashSet::new();
@@ -1060,6 +1123,8 @@ mod tests {
             Permission::Curate,
             Permission::Prefetch,
             Permission::ReadMetrics,
+            Permission::DestroyContent,
+            Permission::DestroyRecord,
         ] {
             // Exhaustive, no-wildcard classification. Cross-check against the
             // production `is_admin_class` helper so the two cannot drift.
@@ -1068,6 +1133,12 @@ mod tests {
                 | Permission::AdminTaskInvoke
                 | Permission::Curate
                 | Permission::Prefetch => true,
+                // Task-tier destructive authority: a wildcard-repo direct
+                // `User` grant of either is a privilege-escalation shape,
+                // exactly like `AdminTaskInvoke`. The SA-provenance
+                // exemption above is scoped to `permission != Admin`, so a
+                // declared `serviceAccount`-subject grant still passes.
+                Permission::DestroyContent | Permission::DestroyRecord => true,
                 Permission::Read | Permission::Write | Permission::Delete => false,
                 // Read-only, non-admin by design (issue #113): a
                 // Prometheus scraper is deliberately not admin-class, and

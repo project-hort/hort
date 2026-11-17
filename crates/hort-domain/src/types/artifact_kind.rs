@@ -62,9 +62,18 @@ pub enum ArtifactKind {
     /// is projected at the same path prefix and stored with
     /// `application/octet-stream` regardless of the role the manifest
     /// that names it assigns it, so no handler can tell a layer from a
-    /// config without opening the bytes. The adapter therefore decides
-    /// by container: a tar (plain or gzip) is a layer and is extracted
-    /// as a root filesystem; anything else carries no package surface.
+    /// config without opening the bytes.
+    ///
+    /// The container is therefore one of two inputs to the
+    /// materialisation and not the whole of it. A tar (plain or gzip) can
+    /// be extracted as a root filesystem, but *whether it should be* is
+    /// the manifests' statement rather than the bytes' shape: an OCI
+    /// artifact's payload layer is a gzip tar too and is not a filesystem
+    /// anything runs, so a package finding read out of one is a statement
+    /// about nothing (ADR 0064 D6). The declared role travels beside this
+    /// kind on
+    /// [`ScanTarget::layer_role`](crate::ports::scanner::ScanTarget::layer_role);
+    /// anything that is not a tar carries no package surface either way.
     OciBlob,
     /// An OCI manifest or index — a JSON descriptor that names blobs by
     /// digest and carries no package content of its own.

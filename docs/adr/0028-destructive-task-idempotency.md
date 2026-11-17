@@ -47,16 +47,17 @@ idempotency key itself and the database enforces its uniqueness durably:
 - **Server-derived, always.** The invoke handler computes
   `cron:<kind>:<YYYY-MM-DD>` for `retention-purge` and
   `eventstore-archive`, and `cron:retention-evaluate:execute:<YYYY-MM-DD>`
-  for a retention execution
+  for an instance-wide retention execution (plus a `:<repository_id>`
+  segment for one confined to a repository — see the amendment below)
   (`crates/hort-http-admin-tasks/src/handlers/invoke.rs`, Step 4b), regardless
   of any operator-supplied `Idempotency-Key` header. There is no branch where
   a destructive invocation reaches `enqueue` with no key — the invariant
   "destructive ⇒ key present" is structural, not operator discipline.
 - **Per invocation, not per kind.** The gate is
-  `hort_domain::events::task_invocation_is_destructive(kind, params)` — the
-  same domain answer that decides whether the caller needs the
-  `DESTRUCTIVE_TASK_CLAIM` (`TaskUseCase::authorize_kind`), so the authority
-  an invocation needs and the single-flight claim it takes cannot come apart.
+  `hort_domain::events::task_invocation_destructive_authority(kind, params)` — the
+  same domain answer that decides which destructive `Permission` the caller
+  needs (`TaskUseCase::authorize_kind`), so the authority an invocation needs
+  and the single-flight claim it takes cannot come apart.
   The coarser `task_kind_is_destructive(kind)` remains correct for audit
   routing (`TaskUseCase::task_audit_stream`: a dry run's `TaskInvoked` still
   belongs on the never-deleted destructive-kind stream) and is deliberately
@@ -69,6 +70,21 @@ idempotency key itself and the database enforces its uniqueness durably:
   execute key even though no other mode now reaches that branch: it names the
   dimension the key separates on, so a second kind gaining a mode cannot
   silently collapse two invocations onto one key.
+- **Per *thing destroyed*, which is what the segments name.** *(Amended
+  2026-11-16.)* A `retention-evaluate` execution confined to one repository
+  appends the repository id as a further segment —
+  `cron:retention-evaluate:execute:<YYYY-MM-DD>:<repository_id>` — read
+  through `hort_domain::events::task_invocation_repository_scope`, the same
+  single reader the authority gate uses, so the key cannot separate on a
+  different repository from the one the invocation was authorized for. This is
+  the mode rule applied rather than a new one: two invocations that would
+  destroy different things must not collapse onto one key. Without the
+  segment the day's first scoped execution owns the day for every other
+  repository, and an operator who then asked for the **instance-wide** sweep
+  would be handed that scoped job's id and a `200` — the sweep they asked for
+  never ran, and nothing said so. An invocation that confines itself to
+  nothing appends no segment, so every key the shipped CronJob has ever
+  derived is byte-identical.
 - **Persisted and DB-enforced.** The key threads through
   `TaskUseCase::enqueue` (`crates/hort-app/src/use_cases/task_use_case.rs:259`)
   to `JobsRepository::enqueue_task`
@@ -138,10 +154,10 @@ block per ADR 0020.
   `Option<&IdempotencyKey>` decision; the compiler forces new enqueuers to
   consider idempotency.
 - Adding a kind to `DESTRUCTIVE_TASK_KINDS` automatically extends both the
-  server-side derivation (via `task_invocation_is_destructive`, which is built
+  server-side derivation (via `task_invocation_destructive_authority`, which is built
   on `task_kind_is_destructive`) and the closed-set guard test — no second list
   to update. A kind that needs a *mode* dimension extends
-  `task_invocation_is_destructive`, and the claim gate and the key follow
+  `task_invocation_destructive_authority`, and the claim gate and the key follow
   together because both read it.
 
 ## Alternatives considered
@@ -190,7 +206,7 @@ block per ADR 0020.
   (column, CHECKs, partial unique index);
   `crates/hort-domain/src/events/authorization_events.rs`
   (`DESTRUCTIVE_TASK_KINDS`, `task_kind_is_destructive`,
-  `task_invocation_is_destructive`, `retention_evaluate_mode`);
+  `task_invocation_destructive_authority`, `retention_evaluate_mode`);
   `crates/hort-domain/src/retention/mode.rs` (`RetentionEvaluationMode`).
 - Tests: `crates/hort-adapters-postgres/tests/idempotency_key.rs`;
   `crates/hort-http-admin-tasks/tests/destructive_kinds_carry_db_idempotency.rs`;

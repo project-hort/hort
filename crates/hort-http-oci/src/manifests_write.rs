@@ -33,11 +33,20 @@
 //!    media-type shape. A single-image manifest yields `config.digest` +
 //!    `layers[*].digest`; an image index / manifest list yields
 //!    `manifests[*].digest` (child **manifest** references). Resolve
-//!    each referenced blob / child through
-//!    [`ArtifactRepository::find_by_checksum`]; enforce
-//!    `artifact.repository_id == repo` (cross-repo isolation) and that
-//!    the resolved row's quarantine status is not terminal (a row the
-//!    blob read would refuse is not a satisfied reference).
+//!    each one repo-scoped (cross-repo isolation) and require that the
+//!    resolved row's quarantine status is not terminal (a row the blob
+//!    read would refuse is not a satisfied reference). A config / layer
+//!    reference resolves by checksum, because the `GET` that serves
+//!    those bytes does; an index child resolves by the **manifest
+//!    path**, because that is what the child's own `GET` resolves and an
+//!    index may not name a child this registry would not serve as a
+//!    manifest.
+//!
+//!    For an index, then the **transitive** question
+//!    ([`refuse_undeliverable_closure`]): the read path refuses a
+//!    document whose closure carries a terminal verdict anywhere, so
+//!    admission asks the same closure the same question, through the
+//!    same walk, over the body in hand.
 //!
 //!    **Then the door** ([`refuse_misdeclared_signature_layers`]): when
 //!    the manifest declares EVERY layer to be signature material hort
@@ -59,13 +68,16 @@
 //!    not hold.
 //! 6. Ingest the manifest bytes, carrying the claim set.
 //! 7. Any blob / child that does not resolve to a **deliverable**
-//!    same-repo row — absent, foreign-repo, or present but in a terminal
-//!    quarantine state — returns 400 `MANIFEST_BLOB_UNKNOWN` with a
-//!    `detail.blobs` array. Deliberately answered **after** the mint: the
-//!    manifest artifact stays committed so the client's
-//!    retry-after-pushing-blobs path is idempotent (a terminal reference
-//!    is the case no retry fixes); the group is NOT created, and the
-//!    manifest carries no membership claims.
+//!    same-repo row refuses the push, and **which** refusal follows from
+//!    why it did not resolve: absent or foreign-repo — bytes hort has
+//!    never ingested — is 400 `MANIFEST_BLOB_UNKNOWN` with its
+//!    `detail.blobs` array, while a row carrying a terminal verdict
+//!    answers the refusal the read routes give for that same row (403
+//!    `DENIED` naming the constituent digest, or 503 `UNAVAILABLE`).
+//!    Deliberately answered **after** the mint: the manifest artifact
+//!    stays committed so the client's retry-after-pushing-blobs path is
+//!    idempotent; the group is NOT created, and the manifest carries no
+//!    membership claims.
 //! 8. Attach the primary `manifest` member to the group, plus (single-
 //!    image only) config + layers, via
 //!    [`ArtifactGroupUseCase::add_member`]. Shared per-request
@@ -120,10 +132,12 @@ use uuid::Uuid;
 
 use hort_app::error::AppError;
 use hort_app::use_cases::ingest_use_case::{IngestOutcome, VerifiedIngestRequest};
-use hort_domain::entities::artifact::Artifact;
+use hort_app::use_cases::manifest_deliverability::ManifestDeliverability;
+use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::error::DomainError;
-use hort_domain::events::{Actor, ApiActor};
+use hort_domain::events::{Actor, ApiActor, RejectionReason};
+use hort_domain::oci::{AdmissionRefusal, ImageBudget};
 use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::types::{ArtifactCoords, ContentHash};
 use hort_formats::oci::OciFormatHandler;
@@ -132,7 +146,7 @@ use hort_http_core::authz::{DeleteRepoAccess, WriteRepoAccess};
 use hort_http_core::context::AppContext;
 use hort_http_core::limits::BoundedPath;
 
-use super::coords::{oci_group_coords, oci_manifest_coords};
+use super::coords::{oci_group_coords, oci_manifest_coords, oci_manifest_path};
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::name::validate_oci_name;
@@ -175,24 +189,96 @@ pub(crate) fn is_index_media_type(media_type: &str) -> bool {
 /// `MANIFEST_INVALID` (not `SIZE_INVALID` — size applies to blobs).
 const MANIFEST_BODY_MAX_BYTES: usize = 1024 * 1024;
 
-/// Upper bound on the number of distinct blob references (`config`
-/// digest plus `layers[*].digest`) a single manifest may carry.
+/// The bounds a manifest `PUT` and a pull-through mint are both held to:
+/// **the composite scan's own whole-image budget**, and nothing of this
+/// crate's own.
 ///
-/// The 1 MiB body cap above stops gross OOM, but a packed JSON body
-/// can fit ~10k pathologically dense `{"digest":"sha256:..."}` entries
-/// within 1 MiB — and every referenced blob triggers a
-/// `find_in_repo_by_hash` lookup against
-/// the artifact repository in [`resolve_referenced_blobs`]. A real-
-/// world OCI image carries tens of layers; 1024 is two orders of
-/// magnitude past observed maxima. Exceeding it lands as
-/// `MANIFEST_INVALID` per [`parse_manifest_blobs`]'s error envelope.
+/// hort must not accept an artifact it can never answer about. A manifest
+/// the composition can never assemble is accepted, scanned, and then
+/// refused deterministically before its config is even read — so its
+/// composite verdict is permanently absent, the release authority never
+/// arrives, and the resulting hold is deadline-less rather than "not yet".
+/// The only exit is a curator override. A refusal at the push is honest and
+/// immediately visible; a permanently stuck accepted image is not.
 ///
-/// The cap is enforced **at parse time** so the resolution loop is
-/// never entered for an over-cap manifest. Do NOT move this gate
-/// into `resolve_referenced_blobs` — that would defeat the purpose
-/// of the cap (the cost the cap protects against is N database
-/// lookups, one per referenced blob).
-pub(crate) const MAX_BLOB_REFERENCES: usize = 1024;
+/// So this is a **reference to one declaration**, not a number. The write
+/// path used to carry a `MAX_BLOB_REFERENCES = 1024` of its own, chosen
+/// against a different cost — N `find_in_repo_by_hash` lookups in
+/// [`resolve_referenced_blobs`] — and noting only that "a real-world OCI
+/// image carries tens of layers; 1024 is two orders of magnitude past
+/// observed maxima". It said nothing about assessability, and it admitted
+/// four times what the composition can compose. The lookup cost it was
+/// chosen for is bounded a fortiori by the tighter bound, so nothing it
+/// defended is given up.
+const ASSESSMENT_BUDGET: ImageBudget = ImageBudget::default_for_composite_scan();
+
+/// Render an admission refusal as the `detail.reason` of a 400
+/// `MANIFEST_INVALID`.
+///
+/// The count refusal's wording is **unchanged** — it was already
+/// OCI-conformant and already named the actual before the bound, and only the
+/// number it prints has moved. The byte refusal copies that shape
+/// deliberately: same code, same actual-then-bound phrasing, so an operator
+/// reading either learns how far past the wall they are and not merely that
+/// one exists.
+///
+/// The conformance refusal has no such pair and deliberately prints neither.
+/// It names a **constant reason plus hort's own slot** — `config`,
+/// `layers[N]`, which is what [`hort_domain::oci::ImageDescriptorSlot`]'s
+/// `Display` renders —
+/// and nothing the declarant supplied, the never-echo discipline
+/// [`check_child_against_descriptor`] records for the index-child counterpart
+/// of the same refusal. When the field is absent there is no value to
+/// withhold; a negative one *is* a value, and it stays in the server log. The
+/// slot is enough: the pusher holds the manifest, so a position in it is
+/// everything needed to find the descriptor and fix it.
+fn admission_refusal_reason(refusal: AdmissionRefusal) -> String {
+    match refusal {
+        AdmissionRefusal::TooManyBlobReferences { declared, max } => {
+            format!("manifest references {declared} blobs; max is {max}")
+        }
+        AdmissionRefusal::DeclaredBytes { declared, max } => {
+            format!("manifest declares {declared} bytes of content; max is {max}")
+        }
+        AdmissionRefusal::UnreadableDeclaredSize { slot } => {
+            format!(
+                "manifest descriptor {slot} declares no readable `size`, which the image \
+                 spec requires"
+            )
+        }
+    }
+}
+
+/// Refuse a manifest body whose declared composition the composite scan could
+/// never assess — **the admission gate**, on both paths that mint a manifest
+/// row.
+///
+/// The bound itself is
+/// [`hort_domain::oci::refuse_manifest_past_assessment_budget`]; this spends
+/// it against the one shipped budget. `Err` is the reason sentence, and the
+/// two callers put it in their own envelope rather than sharing one, because
+/// they are answering two different parties:
+///
+/// - The manifest `PUT` ([`parse_manifest_blobs`], which spends this before it
+///   collects anything) renders it as the `detail.reason` of a 400
+///   `MANIFEST_INVALID`. The client *sent* the manifest, so the numbers are
+///   its own and naming them is how it learns what to change. The conformance
+///   refusal has no numbers and names a slot instead — same code, same
+///   envelope, and nothing the declarant supplied.
+/// - The pull-through legs log it and answer a fixed message, because the
+///   numbers there came out of an **upstream** response body. That is the
+///   sanitisation discipline `DomainError::UpstreamMetadataInvalid` records:
+///   the wire layer renders a fixed message and the cause goes to the server
+///   log.
+///
+/// Spending it before the blob parse is what the retired `MAX_BLOB_REFERENCES`
+/// cap's "enforced at parse time" note was protecting: the per-reference
+/// lookup loop in [`resolve_referenced_blobs`] is never entered for a manifest
+/// hort is going to refuse.
+pub(crate) fn refuse_past_assessment_budget(body_bytes: &[u8]) -> Result<(), String> {
+    hort_domain::oci::refuse_manifest_past_assessment_budget(body_bytes, &ASSESSMENT_BUDGET)
+        .map_err(admission_refusal_reason)
+}
 
 /// `Retry-After` for a manifest write that lost to persistent storage
 /// contention, in seconds.
@@ -321,17 +407,19 @@ fn parse_and_validate_manifest_tail(
 /// MiB cap applies here; axum's `to_bytes` returns an `Err` if the body
 /// exceeds the limit — classified as `MANIFEST_INVALID` (not `SIZE_INVALID`,
 /// which is reserved for blob-upload limits).
-async fn read_manifest_body(request: Request<Body>) -> Result<(HeaderMap, Vec<u8>), Response> {
+async fn read_manifest_body(request: Request<Body>) -> Result<(HeaderMap, Vec<u8>), Box<Response>> {
     let headers = request.headers().clone();
     match to_bytes(request.into_body(), MANIFEST_BODY_MAX_BYTES).await {
         Ok(b) => Ok((headers, b.to_vec())),
-        Err(_) => Err(OciError::ManifestInvalid {
-            detail: Some(serde_json::json!({
-                "reason": "manifest body too large or unreadable",
-                "max_bytes": MANIFEST_BODY_MAX_BYTES,
-            })),
-        }
-        .into_response()),
+        Err(_) => Err(Box::new(
+            OciError::ManifestInvalid {
+                detail: Some(serde_json::json!({
+                    "reason": "manifest body too large or unreadable",
+                    "max_bytes": MANIFEST_BODY_MAX_BYTES,
+                })),
+            }
+            .into_response(),
+        )),
     }
 }
 
@@ -761,7 +849,7 @@ async fn run_manifest_ingest(
     claimed_edges: &[ContentReferenceClaim],
     hashes: &ManifestHashDecision,
     body_bytes: &[u8],
-) -> Result<IngestOutcome, Response> {
+) -> Result<IngestOutcome, Box<Response>> {
     // Build the ingest request + stream. The body is an in-memory `Vec<u8>`
     // by the time we're here (the 1 MiB cap keeps this cheap); wrap in a
     // `Cursor` to get an `AsyncRead`.
@@ -821,18 +909,20 @@ async fn run_manifest_ingest(
 
     match ingest_result {
         Ok(o) => Ok(o),
-        Err(AppError::Domain(DomainError::Conflict(_))) => Err(OciError::ManifestInvalid {
-            detail: Some(serde_json::json!({
-                "reason": "manifest ingest rejected declared digest",
-            })),
-        }
-        .into_response()),
+        Err(AppError::Domain(DomainError::Conflict(_))) => Err(Box::new(
+            OciError::ManifestInvalid {
+                detail: Some(serde_json::json!({
+                    "reason": "manifest ingest rejected declared digest",
+                })),
+            }
+            .into_response(),
+        )),
         Err(err) => {
             if let Some(busy) = manifest_write_contention(&err, "manifest_ingest") {
-                return Err(busy.into_response());
+                return Err(Box::new(busy.into_response()));
             }
             tracing::error!(error = %err, "OCI manifest ingest failed");
-            Err(OciError::Internal.into_response())
+            Err(Box::new(OciError::Internal.into_response()))
         }
     }
 }
@@ -874,8 +964,10 @@ fn parse_referenced_blobs(
     let result = if media_type_is_index {
         parse_index_children_for_admission(body_bytes)
     } else {
-        parse_manifest_blobs(parsed_manifest).map_err(|detail| OciError::ManifestInvalid {
-            detail: Some(detail),
+        parse_manifest_blobs(parsed_manifest, body_bytes).map_err(|detail| {
+            OciError::ManifestInvalid {
+                detail: Some(detail),
+            }
         })
     };
     result.map_err(|err| {
@@ -890,24 +982,150 @@ fn parse_referenced_blobs(
 /// The outcome of resolving a manifest's declared references against the
 /// repository, as it stands **before** the manifest is minted.
 ///
-/// Two outcomes, because the mint happens between them and the claim set
-/// depends on which one it is. [`Self::Complete`] means every declared
-/// reference resolved to an artifact in this repository, so the membership
-/// edges are safe to claim: no claim can name bytes the repository does not
-/// hold. [`Self::Missing`] carries the raw `sha256:<hex>` strings for the
-/// 400 `MANIFEST_BLOB_UNKNOWN` the caller answers **after** the mint — the
+/// Three outcomes, because the mint happens between them, the claim set
+/// depends on which one it is, and the two ways a reference fails to
+/// resolve are different facts that owe the publisher different answers.
+///
+/// [`Self::Complete`] means every declared reference resolved to a
+/// deliverable artifact in this repository, so the membership edges are
+/// safe to claim: no claim can name bytes the repository does not hold.
+///
+/// [`Self::Absent`] carries the raw `sha256:<hex>` strings for the 400
+/// `MANIFEST_BLOB_UNKNOWN` the caller answers **after** the mint — the
 /// manifest still commits (unchanged contract: the client's
 /// retry-after-pushing-the-blobs path is idempotent) and simply carries no
 /// membership claims, which is exactly what the post-ingest insert loop
 /// this replaced also left behind on that path.
+///
+/// [`Self::Terminal`] carries the one constituent whose verdict withholds
+/// this push, for the refusal that names it. It is a separate variant and
+/// not a second string in `Absent`'s list because the cause is the whole
+/// of what the publisher needs — see
+/// [`resolve_and_check_referenced_blobs`] for why the two answers differ.
 enum ResolvedReferences {
-    /// Boxed because an `Option<Artifact>` dwarfs a `Vec<String>` and
-    /// `clippy::large_enum_variant` is right to object: the
-    /// unknown-blob arm is the one every missing-blob PUT returns, and it
-    /// should not carry an artifact-sized hole. Same reflex as this
-    /// module's `Box<Response>` returns.
+    /// Boxed because an `Option<Artifact>` dwarfs the other two variants'
+    /// payloads and `clippy::large_enum_variant` is right to object: a
+    /// refused PUT should not carry an artifact-sized hole. Same reflex
+    /// as this module's `Box<Response>` returns.
     Complete(Box<ResolvedReferenceSet>),
-    Missing(Vec<String>),
+    Absent(Vec<String>),
+    Terminal(TerminalReference),
+}
+
+impl ResolvedReferences {
+    /// Whether every declared reference resolved to deliverable content.
+    ///
+    /// The two consumers — the membership claim set and the
+    /// signature-layer door — both need exactly this bit, and asking for
+    /// it here rather than with a `matches!` at each of them is what
+    /// keeps the question wildcard-free: a fourth outcome is a compile
+    /// error in this one match instead of silently taking the `false`
+    /// branch at two call sites that never mentioned it.
+    fn is_complete(&self) -> bool {
+        match self {
+            Self::Complete(_) => true,
+            Self::Absent(_) | Self::Terminal(_) => false,
+        }
+    }
+}
+
+/// The one terminal constituent a refused manifest PUT answers about:
+/// which bytes, and which verdict stands against them.
+struct TerminalReference {
+    /// The reference as the manifest declared it (`sha256:<hex>`), so the
+    /// refusal names the digest the publisher can match against its own
+    /// document.
+    digest: String,
+    verdict: TerminalVerdict,
+}
+
+/// Which terminal verdict a constituent carries — the two
+/// [`QuarantineStatus::is_terminal`](hort_domain::entities::artifact::QuarantineStatus::is_terminal)
+/// states, each with the data its own refusal envelope needs.
+enum TerminalVerdict {
+    /// `QuarantineStatus::Rejected`: a verdict was reached against those
+    /// bytes. `axis` is `RejectionReason::wire_kind()`, hydrated onto the
+    /// row by `ArtifactUseCase` during the resolution load, and `None` for
+    /// the illegal state ADR 0039 D6 names (a `Rejected` projection with
+    /// no `ArtifactRejected` behind it).
+    Rejected { axis: Option<&'static str> },
+    /// `QuarantineStatus::ScanIndeterminate`: no verdict was reached, and
+    /// the fail-closed posture withholds until one is (ADR 0007).
+    ScanIndeterminate,
+}
+
+impl TerminalVerdict {
+    /// Which of two terminal constituents a manifest naming both answers
+    /// about: the higher number wins.
+    ///
+    /// Same principle as terminal-over-absent one tier in. The refusal
+    /// names the constituent the publisher has least power over, because
+    /// naming a weaker one first walks them into a second refusal: an
+    /// indeterminate hold can clear on a rescan that reaches a verdict, so
+    /// a push blocked on it can succeed on a later attempt, while one
+    /// blocked on a rejection cannot succeed until someone replaces the
+    /// content or waives the verdict.
+    ///
+    /// Wildcard-free, so a third terminal state has to state its own
+    /// place in this order rather than inherit `ScanIndeterminate`'s.
+    fn refusal_precedence(&self) -> u8 {
+        match self {
+            Self::Rejected { .. } => 1,
+            Self::ScanIndeterminate => 0,
+        }
+    }
+}
+
+impl TerminalReference {
+    /// The refusal this constituent owes the publisher.
+    ///
+    /// Both arms reuse the envelope the **read** routes answer with for
+    /// the same fact — a `Rejected` artifact's `403 DENIED` and an
+    /// indeterminate one's `503 UNAVAILABLE` — so one fact has one answer
+    /// whichever route asks it, and a client meets no shape it does not
+    /// already know. No new error variant and no new OCI error code.
+    ///
+    /// **`Retry-After`: deliberately absent on the 503, and that is the
+    /// decision this site owns.** A `503` invites a harder retry than the
+    /// `400` this refusal used to be, so the header had to be chosen
+    /// rather than inherited. There is no real quantity to put in it: an
+    /// indeterminate hold has no self-resolving deadline — its exits are a
+    /// curator's waive and a rescan that reaches a verdict, never the
+    /// passage of time (ADR 0007, "a reached verdict supersedes an absent
+    /// one") — so any number would tell a well-behaved client to come back
+    /// forever on a schedule hort invented. `OciError::ScanIndeterminate`
+    /// carries no `retry_after_seconds` for exactly that reason and
+    /// `IntoResponse` emits no header for it; the status still says "not
+    /// yet", which is the half of the answer that *is* true, and the
+    /// envelope's code and message say the rest.
+    ///
+    /// **What the body discloses, and nothing more.** The `Rejected` arm
+    /// names the **constituent** blob digest as `subject`, plus the axis.
+    /// The subject is deliberately NOT the reference the client pushed:
+    /// that document is fine, and naming it would state the refusal is
+    /// about the wrong thing. No
+    /// policy, no `curator_id`, no `rule_id`, no findings and no CVE
+    /// identifiers; `OciError::ArtifactRejected`'s doc is the full list
+    /// and this constituent-shaped subject does not widen it. The axis is
+    /// omitted entirely when unknown rather than sent as a token, because
+    /// a token would dress an inconsistency up as a verdict.
+    ///
+    /// The indeterminate arm names nothing: its envelope is the unit one
+    /// the read route sends, and a hold's subject stays opaque there too.
+    /// Which constituent it was reaches the operator through the
+    /// resolution log line, and the publisher's next move does not depend
+    /// on knowing — it is "wait for the verdict, or ask the operator" for
+    /// every constituent in that state.
+    fn into_refusal(self) -> Response {
+        match self.verdict {
+            TerminalVerdict::Rejected { axis } => OciError::ArtifactRejected {
+                subject: self.digest,
+                axis,
+            }
+            .into_response(),
+            TerminalVerdict::ScanIndeterminate => OciError::ScanIndeterminate.into_response(),
+        }
+    }
 }
 
 /// The artifacts behind a [`ResolvedReferences::Complete`] resolution: the
@@ -920,96 +1138,278 @@ struct ResolvedReferenceSet {
     layer_artifacts: Vec<Artifact>,
 }
 
-/// Resolve each referenced blob / child manifest. Cross-repo isolation: a
-/// hash that exists in a foreign repo counts as missing — the blob must
-/// live in the same repo as the manifest (mount it across explicitly via
+/// Resolve each referenced blob / child manifest, and classify what the
+/// repository has to say about each one.
+///
+/// Cross-repo isolation: a hash that exists in a foreign repo counts as
+/// **absent** — the blob must live in the same repo as the manifest (mount
+/// it across explicitly via
 /// `POST /v2/.../blobs/uploads/?mount=...&from=...`). A hash whose
-/// same-repo row is in a terminal state counts as missing too — see
+/// same-repo row carries a terminal verdict is neither resolved nor
+/// absent: it is the [`ResolvedReferences::Terminal`] outcome — see
 /// [`resolve_referenced_blobs`]. For an index the children are resolved
-/// for **existence only** — a missing child is `MANIFEST_BLOB_UNKNOWN`,
-/// exactly like a missing layer (clients push the platform manifests
+/// for **existence only** — an absent child is `MANIFEST_BLOB_UNKNOWN`,
+/// exactly like an absent layer (clients push the platform manifests
 /// before the index). A single-image manifest has a resolved `config`; an
 /// index carries none — the config is required only on the single-image
 /// path.
 ///
 /// `Err` is reserved for the two failures that must abort before anything
 /// is minted: an infrastructure error from the lookup, and the defensive
-/// no-config assertion. A *missing* reference is not an error here — it is
-/// the [`ResolvedReferences::Missing`] outcome, answered after the mint so
-/// the committed-manifest contract is preserved.
+/// no-config assertion. An unresolved reference is not an error here — it
+/// is one of the two refusal outcomes, answered after the mint so the
+/// committed-manifest contract is preserved.
 ///
-/// This is a pure read — `find_in_repo_by_hash` and nothing else — which is
-/// what makes it runnable ahead of the mint. It used to take the minted
-/// manifest's id and used it only as a log field; the pre-mint diagnostics
-/// name the body's computed digest instead.
+/// For an **index** this additionally asks the transitive question, over
+/// the body in hand: see [`refuse_undeliverable_closure`]. The direct
+/// refusals above run first, so a document naming a directly-terminal or
+/// directly-absent constituent keeps the answer it already had and the
+/// closure walk only speaks about what sits deeper.
+///
+/// The catalog reads here are pure — no mint, no write — which is what
+/// makes the whole check runnable ahead of the mint. It used to take the
+/// minted manifest's id and used it only as a log field; the pre-mint
+/// diagnostics name the body's computed digest instead.
 async fn resolve_and_check_referenced_blobs(
     ctx: &AppContext,
     repo_id: Uuid,
     referenced: &[ReferencedBlob],
     media_type_is_index: bool,
     manifest_digest: &ContentHash,
-) -> Result<ResolvedReferences, Response> {
-    let (config_artifact, layer_artifacts, missing) =
-        resolve_referenced_blobs(ctx, repo_id, referenced)
-            .await
-            .inspect_err(|_| {
-                tracing::error!("infrastructure error during blob resolution");
-            })?;
+    body_bytes: &[u8],
+) -> Result<ResolvedReferences, Box<Response>> {
+    let resolution = resolve_referenced_blobs(ctx, repo_id, referenced)
+        .await
+        .inspect_err(|_| {
+            tracing::error!("infrastructure error during blob resolution");
+        })?;
 
-    if !missing.is_empty() {
-        // The manifest artifact stays committed, and what that buys the
-        // client depends on WHY the reference did not resolve — the two
-        // cases this list folds together:
-        //
-        // - **No row for the digest.** A retry after pushing the blob
-        //   reconciles cleanly; that is the case this path was built for
-        //   and the common one (a client pushing out of order, or an
-        //   index landing ahead of its platform children).
-        // - **A row in a terminal state** (`Rejected` /
-        //   `ScanIndeterminate`). No retry can help: the row already
-        //   exists, so re-pushing those bytes deduplicates onto it and
-        //   leaves the status untouched. Leaving the hold needs a
-        //   deliberate act on the blob — admin override, curator waiver,
-        //   a re-scan — or different content.
-        //
-        // Both answer the same envelope on purpose. It is not an opaque
-        // one — `detail.blobs` names every unresolvable digest, so the
-        // publisher knows exactly which references to act on; what it
-        // does not say is which of the two causes applied, and that
-        // costs them nothing because their next move is the same for
-        // both (upload or cross-mount the blob, at which point a
-        // terminal row surfaces on its own). The cause is in the log
-        // line in `resolve_referenced_blobs`, which names the digest and
-        // the status. Either way we do NOT create the group on this path, and
-        // the mint carries no membership claims — an edge must never name
-        // a blob the repository cannot deliver.
+    // One fact, one answer, whichever route asks it — so WHY a reference
+    // did not resolve decides what the publisher is told, and the two
+    // causes are not the same fact:
+    //
+    // - **A row in a terminal state.** Those bytes are *known*: hort
+    //   holds them and has decided about them. Re-pushing them
+    //   deduplicates onto the existing row and leaves its status
+    //   untouched, so no retry can change the answer — leaving the state
+    //   needs a deliberate act on that blob (a curator's waiver, an admin
+    //   override, a re-scan that reaches a verdict) or different content.
+    //   Calling that an unknown blob names a cause that does not apply
+    //   and sends the publisher to push bytes hort already has, which is
+    //   a loop with no exit in it. So this answers the refusal the READ
+    //   routes give for the same row — `403` for a rejected constituent,
+    //   `503` for a held one — and the publisher's next move is to take
+    //   it up with the operator or wait for the verdict.
+    // - **No row for the digest.** Nothing has been decided, because hort
+    //   has never seen those bytes; the push is simply out of order (a
+    //   client pushing a manifest before its layers, or an index before
+    //   its platform children). Here `MANIFEST_BLOB_UNKNOWN` is exactly
+    //   true, `detail.blobs` names what to send, and the retry does
+    //   reconcile — which is why this tier keeps both its answer and its
+    //   idempotent retry-after-push path.
+    //
+    // **A document naming both answers the terminal one.** The publisher
+    // can fix an absent reference by pushing it and cannot fix a terminal
+    // one, so naming the absent one first would walk them through a push
+    // into a second refusal.
+    //
+    // Either way the group is NOT created and the mint carries no
+    // membership claims — an edge must never name a blob the repository
+    // cannot deliver.
+    if let Some(terminal) = resolution.terminal {
+        // Bound rather than written inline in the field set below. A
+        // value expression inside the macro does not report as covered
+        // even when a test asserts the field it produced: measured, with
+        // `the_refusal_names_the_document_the_constituent_and_its_status_in_the_log`
+        // reading this very count out of the emitted line while the
+        // inline form showed as an uncovered line.
+        let also_absent = resolution.absent.len();
         tracing::info!(
             manifest_digest = %manifest_digest,
-            missing = ?missing,
-            "manifest referenced unresolvable blobs; group attachment and membership claims \
-             withheld (absent blobs reconcile on client retry; a terminal blob does not)"
+            constituent = %terminal.digest,
+            also_absent,
+            "manifest references a constituent carrying a terminal verdict; refusing the push \
+             with that constituent's own refusal (no retry changes this answer), and withholding \
+             group attachment and membership claims"
         );
-        return Ok(ResolvedReferences::Missing(missing));
+        return Ok(ResolvedReferences::Terminal(terminal));
     }
 
-    if !media_type_is_index && config_artifact.is_none() {
+    if !resolution.absent.is_empty() {
+        tracing::info!(
+            manifest_digest = %manifest_digest,
+            absent = ?resolution.absent,
+            "manifest referenced blobs this repository does not hold; group attachment and \
+             membership claims withheld (the client's push-then-retry path reconciles)"
+        );
+        return Ok(ResolvedReferences::Absent(resolution.absent));
+    }
+
+    if !media_type_is_index && resolution.config.is_none() {
         // Defensive: reachable only if `parse_manifest_blobs` accepted a
-        // single-image manifest with no config AND this resolution didn't
-        // mark it missing. The current parser rejects missing config, so
-        // this branch is an assertion.
+        // single-image manifest with no config AND this resolution found
+        // every reference deliverable. The current parser rejects missing
+        // config, so this branch is an assertion.
         tracing::error!(
             manifest_digest = %manifest_digest,
-            "resolve_referenced_blobs returned None config with empty missing list"
+            "resolve_referenced_blobs returned None config with every reference resolved"
         );
-        return Err(OciError::Internal.into_response());
+        return Err(Box::new(OciError::Internal.into_response()));
+    }
+
+    if media_type_is_index {
+        if let Some(terminal) =
+            refuse_undeliverable_closure(ctx, repo_id, manifest_digest, body_bytes).await?
+        {
+            return Ok(ResolvedReferences::Terminal(terminal));
+        }
     }
 
     Ok(ResolvedReferences::Complete(Box::new(
         ResolvedReferenceSet {
-            config_artifact,
-            layer_artifacts,
+            config_artifact: resolution.config,
+            layer_artifacts: resolution.layers,
         },
     )))
+}
+
+/// The transitive half of admission: **is everything this index binds, at
+/// every depth, still deliverable?**
+///
+/// Admission and delivery must answer the same question about the same
+/// closure. Checking only the direct children takes a cut the read path's
+/// own resolver rejects in writing — an index over a child whose *layers*
+/// are terminal would be admitted here, answer `201`, and then be refused
+/// at every read, which is a push reporting success for an image this
+/// registry can never serve (ADR 0062). So the question is asked of
+/// `ManifestDeliverabilityUseCase` — the **same** walk the read path
+/// takes, not a second traversal beside it. Two traversals that can
+/// disagree is the defect one level up, and this inherits every bound the
+/// read path has by inheriting its implementation: the depth cap
+/// (`MAX_CHILD_INGEST_DEPTH`, counted from this document exactly as the
+/// read path counts it from the stored one), the expansion budget, the
+/// per-read CAS ceiling, and the single catalog call over the whole
+/// closure.
+///
+/// Fed the **body in hand** rather than a CAS read, because the document
+/// is not stored yet: `resolve_pending` is that entry point, and it is
+/// what makes this runnable ahead of the mint.
+///
+/// # Only an index, and what that costs
+///
+/// A single-image manifest's constituents are blobs, and a blob binds
+/// nothing — its closure is empty, so the transitive question has no
+/// content beyond the direct one the resolution above already answered.
+/// Running the walk for it would buy a second catalog round trip per push
+/// and no additional refusal, so single-image pushes are byte-for-byte
+/// unchanged. An index pays one CAS read per child plus one catalog call;
+/// a real multi-arch index is a handful of children, and the alternative
+/// is a success response for a broken image.
+///
+/// # Only on an otherwise-complete resolution
+///
+/// A direct constituent that is terminal or absent has already decided
+/// the answer above, and that answer stays what it was: the direct
+/// terminal refusal names the constituent in its own envelope, and an
+/// absent one is `MANIFEST_BLOB_UNKNOWN` with the digests to send. The
+/// walk also cannot speak for a document whose children are not all
+/// resolvable — a child with no row has no bytes to read constituents
+/// from — and the publisher's next move reruns this check with the full
+/// closure. So the caller gates on the direct outcome and this runs only
+/// where there is a transitive question left to ask.
+///
+/// # What the refusal is
+///
+/// A [`TerminalReference`], the same shape a *direct* terminal
+/// constituent produces, so it rides the same envelope
+/// ([`TerminalReference::into_refusal`]) and the same refusal point. One
+/// fact has one answer whichever depth it was found at — and that answer
+/// is the read path's answer for the same constituent, which is the whole
+/// point. The digest it names is the constituent's own CAS hash, never
+/// the document the client pushed: that document is fine.
+///
+/// `Err` is the fail-closed answer for a closure that could not be
+/// resolved — unparseable bytes, a budget exceeded. Not knowing what a
+/// document binds is not the same as knowing it is safe (ADR 0007), and
+/// the read path refuses that case too.
+async fn refuse_undeliverable_closure(
+    ctx: &AppContext,
+    repo_id: Uuid,
+    manifest_digest: &ContentHash,
+    body_bytes: &[u8],
+) -> Result<Option<TerminalReference>, Box<Response>> {
+    let resolved = ctx
+        .manifest_deliverability_use_case
+        .resolve_pending(repo_id, manifest_digest, body_bytes.to_vec())
+        .await;
+    match resolved {
+        Ok(ManifestDeliverability::Deliverable) => Ok(None),
+        Ok(ManifestDeliverability::TerminalConstituent(constituent)) => {
+            // The decision itself is logged where it is made, naming the
+            // repository, the document and the constituent's verdict.
+            // This line adds the one fact that one cannot carry: the
+            // refusal is happening on a push rather than on a read, so an
+            // operator reading a refused `201` can tell the two apart.
+            tracing::info!(
+                manifest_digest = %manifest_digest,
+                constituent = %constituent.content_hash,
+                constituent_status = %constituent.status,
+                "image index binds a constituent carrying a terminal verdict below its direct \
+                 children; refusing the push with the refusal every read of this index would \
+                 give it"
+            );
+            Ok(Some(TerminalReference {
+                digest: format!("sha256:{}", constituent.content_hash.as_ref()),
+                verdict: match constituent.status {
+                    // The axis comes from the one definition the read
+                    // route's refusal of this same index uses
+                    // (`manifests::terminal_constituent_axis`), so the
+                    // disclosure is neither route-dependent nor
+                    // depth-dependent: a directly-terminal constituent
+                    // already names its axis here, and the read of a
+                    // stored index names it too.
+                    QuarantineStatus::Rejected => TerminalVerdict::Rejected {
+                        axis: crate::manifests::terminal_constituent_axis(
+                            ctx,
+                            repo_id,
+                            &constituent.content_hash,
+                            manifest_digest.as_ref(),
+                        )
+                        .await,
+                    },
+                    QuarantineStatus::ScanIndeterminate => TerminalVerdict::ScanIndeterminate,
+                    // Not reachable: `ConstituentStatusReader` can only
+                    // name a status `QuarantineStatus::is_terminal` holds
+                    // for, and the two arms above are that set, matched
+                    // without a wildcard so a sixth variant is a compile
+                    // error here. A port that broke its own contract is an
+                    // answer hort cannot map, so it fails closed rather
+                    // than admitting the push.
+                    QuarantineStatus::None
+                    | QuarantineStatus::Quarantined
+                    | QuarantineStatus::Released => {
+                        tracing::error!(
+                            manifest_digest = %manifest_digest,
+                            constituent = %constituent.content_hash,
+                            constituent_status = %constituent.status,
+                            "constituent-status reader named a non-terminal status as the \
+                             strongest terminal constituent; refusing the push"
+                        );
+                        return Err(Box::new(OciError::Internal.into_response()));
+                    }
+                },
+            }))
+        }
+        Err(e) => {
+            tracing::error!(
+                manifest_digest = %manifest_digest,
+                error = %e,
+                "image index admission: constituent deliverability could not be resolved, so \
+                 what the index binds is unknown; refusing the push"
+            );
+            Err(Box::new(OciError::Internal.into_response()))
+        }
+    }
 }
 
 /// Identifiers shared by the post-ingest writes left in the manifest-PUT
@@ -1054,7 +1454,7 @@ async fn attach_group_members(
     m: &ManifestPostIngest<'_>,
     config_artifact: &Option<Artifact>,
     layer_artifacts: &[Artifact],
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     if let Err(e) = ctx
         .artifact_group_use_case
         .add_member(
@@ -1072,7 +1472,7 @@ async fn attach_group_members(
         .await
     {
         if let Some(busy) = manifest_write_contention(&e, "group_attach_manifest") {
-            return Err(busy.into_response());
+            return Err(Box::new(busy.into_response()));
         }
         tracing::error!(
             manifest_artifact_id = %m.manifest_artifact.id,
@@ -1083,7 +1483,7 @@ async fn attach_group_members(
             "manifest group-attach failed; not idempotent-shaped (see commit_member_added \
              contract) — this is a genuine error"
         );
-        return Err(OciError::Internal.into_response());
+        return Err(Box::new(OciError::Internal.into_response()));
     }
 
     if let Some(config_artifact) = config_artifact {
@@ -1104,7 +1504,7 @@ async fn attach_group_members(
             .await
         {
             if let Some(busy) = manifest_write_contention(&e, "group_attach_config") {
-                return Err(busy.into_response());
+                return Err(Box::new(busy.into_response()));
             }
             tracing::error!(
                 manifest_artifact_id = %m.manifest_artifact.id,
@@ -1116,7 +1516,7 @@ async fn attach_group_members(
                 "config group-attach failed; not idempotent-shaped (see commit_member_added \
                  contract) — this is a genuine error"
             );
-            return Err(OciError::Internal.into_response());
+            return Err(Box::new(OciError::Internal.into_response()));
         }
     }
 
@@ -1138,7 +1538,7 @@ async fn attach_group_members(
             .await
         {
             if let Some(busy) = manifest_write_contention(&e, "group_attach_layer") {
-                return Err(busy.into_response());
+                return Err(Box::new(busy.into_response()));
             }
             tracing::error!(
                 manifest_artifact_id = %m.manifest_artifact.id,
@@ -1151,7 +1551,7 @@ async fn attach_group_members(
                 "layer group-attach failed; not idempotent-shaped (see commit_member_added \
                  contract) — this is a genuine error"
             );
-            return Err(OciError::Internal.into_response());
+            return Err(Box::new(OciError::Internal.into_response()));
         }
     }
 
@@ -1174,7 +1574,7 @@ async fn set_tag_ref(
     name: &str,
     reference: &str,
     actor: &ApiActor,
-) -> Result<(), Response> {
+) -> Result<(), Box<Response>> {
     if let Err(e) = ctx
         .ref_use_case
         .set(
@@ -1188,7 +1588,7 @@ async fn set_tag_ref(
         .await
     {
         if let Some(busy) = manifest_write_contention(&e, "ref_set") {
-            return Err(busy.into_response());
+            return Err(Box::new(busy.into_response()));
         }
         tracing::error!(
             manifest_artifact_id = %m.manifest_artifact.id,
@@ -1200,7 +1600,7 @@ async fn set_tag_ref(
             "ref set failed; not idempotent-shaped (see RefUseCase::set contract) — \
              this is a genuine error"
         );
-        return Err(OciError::Internal.into_response());
+        return Err(Box::new(OciError::Internal.into_response()));
     }
     Ok(())
 }
@@ -1269,7 +1669,9 @@ fn subject_content_reference_claim(
 /// ingest transition. The ordering worry that kept them outside it — that a
 /// claim made before the blob-existence gate could name a blob the
 /// repository does not hold, and so hand the blob's own later ingest a
-/// zero-window quarantine carve-out it did not earn — is answered by
+/// zero-window quarantine carve-out it did not earn once this manifest is
+/// released (ADR 0007's carve-out needs a `Released` referencing parent,
+/// which a clean scan of this manifest ordinarily produces) — is answered by
 /// *resolving first and claiming second*: the caller builds this set only
 /// from a [`ResolvedReferences::Complete`] resolution, and the
 /// unknown-blob 400 still answers after the mint, so the committed-manifest
@@ -1327,9 +1729,10 @@ pub(crate) fn membership_claims(
 /// `oci_layer` / `oci_index_member` row is a tree edge that
 /// `hort_app`'s referenced-tree-descendant predicate counts, so a row
 /// naming a blob the repository does not hold would let that blob's own
-/// later ingest see itself already referenced and take the zero-window
-/// quarantine carve-out — an observation window shortened on the strength
-/// of an edge written for content that did not exist. Resolving before the
+/// later ingest see itself already referenced and — once this manifest is
+/// released — take the zero-window quarantine carve-out: an observation
+/// window shortened on the strength of an edge written for content that
+/// did not exist. Resolving before the
 /// mint removes the possibility rather than mitigating it: on the
 /// unknown-blob path there is no membership claim to be wrong about.
 ///
@@ -1343,7 +1746,8 @@ pub(crate) fn membership_claims(
 /// descendant predicate: `is_referenced_tree_descendant` counts every
 /// kind outside `{primary_content, metadata_blob}`, `oci_subject`
 /// included. So a referrer for an absent subject does set the zero-window
-/// carve-out for that subject's own later ingest. That is the pre-existing
+/// carve-out for that subject's own later ingest, from the moment the
+/// referrer itself is released. That is the pre-existing
 /// shape of the Referrers flow and resolving the membership claims before
 /// the mint neither introduces nor repairs it; the two are gated
 /// differently because the push each one refuses is different, not
@@ -1355,7 +1759,7 @@ fn manifest_ingest_claims(
     media_type: &str,
 ) -> Vec<ContentReferenceClaim> {
     let mut claims: Vec<ContentReferenceClaim> = subject_claim.into_iter().collect();
-    if matches!(resolved, ResolvedReferences::Complete(_)) {
+    if resolved.is_complete() {
         claims.extend(membership_claims(referenced, media_type));
     }
     claims
@@ -1405,7 +1809,7 @@ async fn put_manifest_dispatch_inner(
     // audit-trail contract.
     let correlation_id = Uuid::new_v4();
 
-    let (headers, body_bytes) = read_manifest_body(request).await.map_err(Box::new)?;
+    let (headers, body_bytes) = read_manifest_body(request).await?;
     let media_type = validate_manifest_media_type(&headers)?;
     let parsed_manifest = parse_manifest_json(&body_bytes)?;
     let media_type_is_index = check_declared_media_type_matches_shape(&media_type, &body_bytes)?;
@@ -1445,20 +1849,21 @@ async fn put_manifest_dispatch_inner(
         &referenced,
         media_type_is_index,
         &hashes.computed_hash,
+        &body_bytes,
     )
-    .await
-    .map_err(Box::new)?;
+    .await?;
 
     // ONE decision, two consumers: it selects the ingest arm below and it
     // gates the door immediately after. See `run_manifest_ingest`.
     let is_pure_signature = is_pure_signature_manifest(&subject_digest_parsed, &body_bytes);
 
     // The door, before the mint. Gated on a COMPLETE resolution so the bytes
-    // it parses are bytes this repository holds: on the `Missing` path there
-    // is nothing of ours to read behind at least one declared layer, and that
-    // push keeps its established answer (the post-mint 400
-    // `MANIFEST_BLOB_UNKNOWN` below) rather than acquiring a second one.
-    if is_pure_signature && matches!(resolved, ResolvedReferences::Complete(_)) {
+    // it parses are bytes this repository holds and will serve: on either
+    // unresolved path there is nothing of ours to read behind at least one
+    // declared layer — absent, or present and refused — and that push keeps
+    // the answer its own cause earns below rather than acquiring a second
+    // one.
+    if is_pure_signature && resolved.is_complete() {
         refuse_misdeclared_signature_layers(ctx, &body_bytes, &hashes.computed_hash).await?;
     }
 
@@ -1477,30 +1882,40 @@ async fn put_manifest_dispatch_inner(
         &hashes,
         &body_bytes,
     )
-    .await
-    .map_err(Box::new)?;
+    .await?;
 
     let manifest_artifact = ingest_outcome.artifact;
     let manifest_event_id = ingest_outcome.ingested_event_id;
     let manifest_digest = hashes.computed_hash.clone();
 
-    // The unresolvable-reference answer lands HERE — after the mint — and
-    // that is the unchanged contract, not an oversight: a manifest
-    // referencing blobs the client has not pushed yet stays committed so the
-    // retry-after-pushing path is idempotent. For a reference that resolved
-    // to a TERMINAL row the mint is still committed but buys the client
-    // nothing — that blob's row already exists, so no re-push changes the
-    // answer (see `resolve_and_check_referenced_blobs` for both cases). What
-    // the reorder above changed is only that such a manifest now also
-    // carries no membership claims, which is what the post-ingest insert
-    // loop this replaced already left behind on this path (its gate returned
-    // before the first insert).
+    // The unresolved-reference answer lands HERE — after the mint — and the
+    // mint is the decided behaviour, not an inherited default: a principal
+    // holding Write may execute a PUT and rely on the artifact existing
+    // afterwards, so a refusal binds delivery and never ingest (ADR 0062).
+    // For a merely ABSENT constituent that guarantee is also what makes the
+    // retry-after-pushing path idempotent. For a TERMINAL one no re-push
+    // changes the answer, and the mint is not conditioned on that:
+    // deliverability is resolved from the manifest's own bytes on the next
+    // read rather than from anything recorded here, so if curation ever
+    // clears the constituent the manifest is already present to become
+    // deliverable, with nothing pushed a second time.
+    // Either way the manifest carries no membership claims, which is what
+    // the post-ingest insert loop this replaced already left behind on this
+    // path (its gate returned before the first insert).
+    //
+    // Which refusal, and why the two differ, is
+    // `resolve_and_check_referenced_blobs`; the envelope each one answers in
+    // is `TerminalReference::into_refusal`. Wildcard-free, so a fourth
+    // resolution outcome has to be answered rather than silently served.
     let (config_artifact, layer_artifacts) = match resolved {
         ResolvedReferences::Complete(set) => (set.config_artifact, set.layer_artifacts),
-        ResolvedReferences::Missing(blobs) => {
+        ResolvedReferences::Absent(blobs) => {
             return Err(Box::new(
                 OciError::ManifestBlobUnknown { blobs }.into_response(),
             ));
+        }
+        ResolvedReferences::Terminal(terminal) => {
+            return Err(Box::new(terminal.into_refusal()));
         }
     };
 
@@ -1514,14 +1929,10 @@ async fn put_manifest_dispatch_inner(
         actor_any: Actor::Api(actor.clone()),
         group_coords: oci_group_coords(&name, &manifest_digest),
     };
-    attach_group_members(ctx, &post_ingest, &config_artifact, &layer_artifacts)
-        .await
-        .map_err(Box::new)?;
+    attach_group_members(ctx, &post_ingest, &config_artifact, &layer_artifacts).await?;
 
     if !hashes.reference_is_digest {
-        set_tag_ref(ctx, &post_ingest, &name, &reference, &actor)
-            .await
-            .map_err(Box::new)?;
+        set_tag_ref(ctx, &post_ingest, &name, &reference, &actor).await?;
     }
 
     Ok(created_manifest_response(
@@ -1835,13 +2246,29 @@ pub(crate) enum BlobRole {
 /// `add_member` call sequence — the event stream records it as the
 /// audit trail; consumers of the group read unordered.
 ///
+/// `body_bytes` is the manifest blob itself, beside the parse of it,
+/// because the admission gate spent first is over two quantities and
+/// one of them — the manifest's own weight as a constituent — is a
+/// property of the bytes and not of any parse of them.
+///
 /// Error shape: returns an `Err(serde_json::Value)` carrying the
 /// `detail` object for a 400 `MANIFEST_INVALID` so the caller can
 /// surface it verbatim. This keeps all manifest-shape validation in
 /// one place and avoids leaking parser internals into the handler.
 pub(crate) fn parse_manifest_blobs(
     manifest: &serde_json::Value,
+    body_bytes: &[u8],
 ) -> Result<Vec<ReferencedBlob>, serde_json::Value> {
+    // The assessment budget, spent before anything is collected — so this
+    // parse cannot hand back a reference set larger than a composition hort
+    // would assemble, and the per-reference lookup loop in
+    // `resolve_referenced_blobs` is never entered for a manifest that is
+    // going to be refused. Inside this function rather than at its call
+    // sites because the bound on what it *returns* is its own guarantee to
+    // keep: both callers mint a manifest row on the strength of this list.
+    refuse_past_assessment_budget(body_bytes)
+        .map_err(|reason| serde_json::json!({ "reason": reason }))?;
+
     let mut out: Vec<ReferencedBlob> = Vec::new();
 
     // config.digest — REQUIRED by the single-image shape.
@@ -1882,20 +2309,6 @@ pub(crate) fn parse_manifest_blobs(
         }
     }
 
-    // Bound the referenced-blob count at parse time so the per-blob
-    // lookup loop in `resolve_referenced_blobs` is never entered for
-    // an over-cap manifest. Surfaces as `MANIFEST_INVALID` at the
-    // call site.
-    if out.len() > MAX_BLOB_REFERENCES {
-        return Err(serde_json::json!({
-            "reason": format!(
-                "manifest references {} blobs; max is {}",
-                out.len(),
-                MAX_BLOB_REFERENCES,
-            ),
-        }));
-    }
-
     Ok(out)
 }
 
@@ -1918,7 +2331,7 @@ pub(crate) fn parse_manifest_blobs(
 ///
 /// Each child becomes a [`ReferencedBlob`] with role
 /// [`BlobRole::ChildManifest`], so the shared [`resolve_referenced_blobs`]
-/// same-repo existence check treats a missing child exactly like a missing
+/// same-repo existence check treats an absent child exactly like an absent
 /// layer — a `MANIFEST_BLOB_UNKNOWN`. Clients push the platform child
 /// manifests before the index, so an unresolved child is the expected
 /// out-of-order case, not a hard error. The descriptor's declared `size`
@@ -2088,30 +2501,60 @@ fn parse_blob_digest(raw: &str) -> Result<ContentHash, serde_json::Value> {
     }
 }
 
-/// Resolve every referenced blob by SHA-256 against the artifact
-/// repository, enforcing cross-repo isolation. Returns
-/// `(config_opt, layers, missing_digests)` — `missing_digests` carries
-/// the raw `sha256:<hex>` strings so the response body can echo the
-/// client's form.
+/// Everything one pass of the reference-resolution loop learned: the
+/// artifacts it resolved, and both causes of a reference that did not
+/// resolve. Carrying the two causes separately is what lets the caller —
+/// and not this loop — decide which answer the document owes; see
+/// [`resolve_and_check_referenced_blobs`].
+struct ReferenceResolution {
+    /// The config blob, on the single-image path (an index has none).
+    config: Option<Artifact>,
+    /// The layer blobs, in manifest order.
+    layers: Vec<Artifact>,
+    /// The raw `sha256:<hex>` of every reference with no row in this
+    /// repository, in the client's own spelling so the response can echo
+    /// it back verbatim.
+    absent: Vec<String>,
+    /// The terminal constituent the refusal names, if any — one, chosen
+    /// by [`TerminalVerdict::refusal_precedence`], because the response
+    /// answers about one.
+    terminal: Option<TerminalReference>,
+}
+
+/// Resolve every reference against the artifact repository, enforcing
+/// cross-repo isolation (ADR 0008). Both lookups are repo-scoped at the
+/// port boundary, so a cross-repo row sharing the same SHA-256 is never
+/// a candidate.
 ///
-/// Resolve every referenced blob by SHA-256 against the artifact
-/// repository, enforcing cross-repo isolation (ADR 0008). The call
-/// uses `find_in_repo_by_hash` which scopes the SQL query to the
-/// target repo at the port boundary — the right row is the only
-/// candidate and there is no ordering hazard from cross-repo rows
-/// sharing the same SHA-256.
+/// **Which lookup depends on what the reference is**, and the loop body
+/// records why: a config / layer reference is about bytes and takes
+/// `find_in_repo_by_hash`; an index child is about a *document* and
+/// takes `find_in_repo_by_path` over the manifest path that document
+/// will be delivered under. A child with no manifest row is absent, not
+/// resolved — "some row shares these bytes" is not the question a later
+/// `GET …/manifests/sha256:<hex>` asks.
 ///
-/// **A row is not enough: the row's status decides too.** A reference
-/// resolving to an artifact in a terminal state
-/// ([`QuarantineStatus::is_terminal`](hort_domain::entities::artifact::QuarantineStatus::is_terminal)
-/// — `Rejected` / `ScanIndeterminate`) counts as **not present** and joins
-/// `missing`, because the blob GET refuses that very row (404
-/// `BLOB_UNKNOWN` for `Rejected`, 503 for `ScanIndeterminate` —
-/// `blobs.rs`, the exhaustive status match). Accepting the manifest over
-/// it is how a push reports success and the subsequent pull answers `not
-/// found` on a layer. The status arrives with the row
-/// `find_in_repo_by_hash` already returns, so this costs no extra port
-/// call and no extra I/O.
+/// **A row is not enough: the row's status decides too, and it decides
+/// which of two refusals the push gets.** A reference resolving to an
+/// artifact in a terminal state — the two states
+/// [`QuarantineStatus::is_terminal`](hort_domain::entities::artifact::QuarantineStatus::is_terminal)
+/// names, matched here wildcard-free so a sixth status cannot inherit
+/// either side — is not a satisfied reference, because the blob GET
+/// refuses that very row (`403 DENIED` naming the digest and the
+/// rejection axis for `Rejected`, `503 UNAVAILABLE` with no
+/// `Retry-After` for `ScanIndeterminate` — `blobs.rs`, the exhaustive
+/// status match). Accepting the manifest over it is how a push reports
+/// success and the subsequent pull answers `not found` on a layer.
+///
+/// Such a reference does **not** join the absent list: those bytes are
+/// known, so no re-push changes the answer, and it travels out as a
+/// [`TerminalReference`] carrying the verdict that refuses it. Neither
+/// refusal is a 404 and neither is an unknown-blob 400: a terminal
+/// verdict answers with its own envelope precisely so the refusal is
+/// distinguishable from "no such blob", which is the one fact that ends a
+/// caller's search (ADR 0055). The status — and, for a rejection, the
+/// axis — arrives with the row `find_in_repo_by_hash` already returns, so
+/// this costs no extra port call and no extra I/O.
 ///
 /// `Quarantined` still resolves as present — including a hold with no
 /// self-resolving deadline. Hort quarantines at ingest and the manifest
@@ -2119,94 +2562,156 @@ fn parse_blob_digest(raw: &str) -> Result<ContentHash, serde_json::Value> {
 /// essentially every push; and under `provenance_mode: required` the
 /// subject is held until its signature arrives, which ADR 0039 §10
 /// exists to let the signer read and sign. Hence the status-only
-/// predicate: see its rustdoc for why widening it to the hydrated
-/// `provenance_hold_indefinite` flag would break sign-after-push.
+/// predicate: widening it to the hydrated `provenance_hold_indefinite`
+/// flag would break sign-after-push.
 async fn resolve_referenced_blobs(
     ctx: &AppContext,
     repo: Uuid,
     refs: &[ReferencedBlob],
-) -> Result<(Option<Artifact>, Vec<Artifact>, Vec<String>), Response> {
+) -> Result<ReferenceResolution, Box<Response>> {
     let mut config: Option<Artifact> = None;
     let mut layers: Vec<Artifact> = Vec::new();
-    let mut missing: Vec<String> = Vec::new();
+    let mut absent: Vec<String> = Vec::new();
+    let mut terminal: Option<TerminalReference> = None;
 
     for r in refs {
-        let hit = match ctx
-            .artifact_use_case
-            .find_in_repo_by_hash(repo, &r.hash)
-            .await
-        {
+        // **A child manifest is resolved the way it will be delivered,
+        // and that is not the same lookup a blob takes.** A blob
+        // reference asks about bytes: the config / layer `GET` serves
+        // whatever row holds them, so "some live row in this repository
+        // for this hash" is exactly the question. An index child is a
+        // *document*, and the client's next request for it is
+        // `GET …/manifests/sha256:<hex>`, which resolves the manifest
+        // row and nothing else. Asking the hash-keyed question for it
+        // admitted an index over a row that is not a manifest at all:
+        // arbitrary bytes pushed through the blob route leave a live row
+        // under the same hash, the index committed, and the child `GET`
+        // then answered `MANIFEST_UNKNOWN` — an advertised child this
+        // registry will not serve (ADR 0062).
+        //
+        // The row's own layout is the fact in question and the only one
+        // consulted: the manifest prefix is what separates the two kinds
+        // of row, it is what every mint path writes (the hosted PUT and
+        // the eager child ingest alike), and `(repository_id, path)` is
+        // unique — so this resolves the one row a reader addressing that
+        // digest gets, while the hash-keyed lookup is a `LIMIT 1` with
+        // no `ORDER BY` over a set a repository may legitimately hold
+        // more than one member of. Nothing here reads the child's bytes;
+        // a parse would be a second, weaker definition of "is this a
+        // manifest" than the row delivery resolves.
+        //
+        // A child with no manifest row therefore joins `absent`, which
+        // is the answer that was already true and already correct for
+        // it: this repository does not hold that child manifest, the
+        // refusal names the digest to send, and the push-then-retry path
+        // reconciles once the child is pushed as a manifest.
+        let lookup = match r.role {
+            BlobRole::ChildManifest { .. } => {
+                ctx.artifact_use_case
+                    .find_in_repo_by_path(repo, &oci_manifest_path(&r.hash))
+                    .await
+            }
+            BlobRole::Config | BlobRole::Layer => {
+                ctx.artifact_use_case
+                    .find_in_repo_by_hash(repo, &r.hash)
+                    .await
+            }
+        };
+        let hit = match lookup {
             Ok(o) => o,
             Err(e) => {
-                tracing::error!(error = %e, "find_in_repo_by_hash failed");
-                return Err(OciError::Internal.into_response());
+                tracing::error!(error = %e, "referenced-constituent resolution failed");
+                return Err(Box::new(OciError::Internal.into_response()));
             }
         };
         match hit {
-            // A row in a terminal state is not a satisfied reference:
-            // the blob GET refuses this exact row, so admitting it here
-            // mints a manifest the registry cannot deliver. It joins the
-            // same `missing` list as an absent row — one code path, one
-            // `MANIFEST_BLOB_UNKNOWN` envelope, and the client is not
-            // told which of the two the reference was.
-            //
-            // Folding the two together is sound here on its own terms,
-            // and does not depend on how the blob GET answers. The caller
-            // on this path is a **publisher**, and
-            // `MANIFEST_BLOB_UNKNOWN`'s `detail.blobs` already names the
-            // offending digest — so nobody is left searching, which is
-            // the harm a collapsed answer would otherwise do. Their next
-            // action is the same for both causes: upload or cross-mount
-            // that blob, and if it is terminally blocked the upload is
-            // what surfaces that. The diagnosis of WHICH cause is this
-            // log line, which is why it carries the digest AND the
-            // status: without the status an operator has to compare
-            // event timestamps to learn why the push was refused.
-            Some(a) if a.quarantine_status.is_terminal() => {
-                tracing::warn!(
-                    digest = %r.digest_raw,
-                    status = %a.quarantine_status,
-                    role = ?r.role,
-                    "manifest references a terminally-blocked artifact; counted as missing \
-                     (the blob read would refuse this row)"
-                );
-                missing.push(r.digest_raw.clone());
-            }
             // The use case already enforces `repository_id == repo`
             // at the port boundary; no post-filter needed. Clients
             // cross-mount explicitly via
             // `POST …/blobs/uploads/?mount=<digest>&from=<src_repo>`
             // before pushing the manifest.
-            Some(a) => match r.role {
-                BlobRole::Config => {
-                    if config.is_some() {
-                        // Defensive — `parse_manifest_blobs` emits at
-                        // most one config; two configs would be a
-                        // parser regression.
-                        tracing::warn!(
-                            "multiple config blobs resolved; keeping first and ignoring extras"
-                        );
+            //
+            // Exhaustive on the status with no wildcard arm, so a sixth
+            // `QuarantineStatus` variant is a compile error here rather
+            // than a silent admission into the deliverable arm — which is
+            // the direction that mints a manifest the registry cannot
+            // deliver, and the one no test would notice.
+            Some(a) => match a.quarantine_status {
+                QuarantineStatus::Rejected | QuarantineStatus::ScanIndeterminate => {
+                    // A terminal row is not a satisfied reference, and
+                    // not an unknown blob either: the bytes are here and
+                    // decided about. Logged per reference because the
+                    // refusal names only one of them, so the record of
+                    // the others is this line — digest AND status,
+                    // because without the status an operator has to
+                    // compare event timestamps to learn why the push was
+                    // refused.
+                    tracing::warn!(
+                        digest = %r.digest_raw,
+                        status = %a.quarantine_status,
+                        role = ?r.role,
+                        "manifest references a terminally-blocked artifact; the push is refused \
+                         with the refusal the blob read would give this row"
+                    );
+                    let verdict = if a.quarantine_status == QuarantineStatus::Rejected {
+                        // The axis is a plain field here. `ArtifactUseCase`
+                        // derives it from the artifact's own
+                        // `ArtifactRejected` event during the load (the
+                        // `artifacts` projection has no such column), so
+                        // the format crate reads a field and never a
+                        // stream (ADR 0008) — and it tells the two causes
+                        // of an absent axis apart in its own log, which is
+                        // why there is no second line for that here.
+                        TerminalVerdict::Rejected {
+                            axis: a.rejection_reason.as_ref().map(RejectionReason::wire_kind),
+                        }
                     } else {
-                        config = Some(a);
+                        TerminalVerdict::ScanIndeterminate
+                    };
+                    let candidate = TerminalReference {
+                        digest: r.digest_raw.clone(),
+                        verdict,
+                    };
+                    if terminal.as_ref().is_none_or(|held| {
+                        candidate.verdict.refusal_precedence() > held.verdict.refusal_precedence()
+                    }) {
+                        terminal = Some(candidate);
                     }
                 }
-                BlobRole::Layer => layers.push(a),
-                // A child manifest of an image index is not attached as a
-                // group member (the index lands as a plain primary
-                // `manifest`; the index→child linkage is a
-                // content-reference edge, Item 3) — but it IS held against
-                // the descriptor that named it before being dropped.
-                BlobRole::ChildManifest {
-                    position,
-                    declared_size,
-                } => {
-                    check_child_against_descriptor(r, position, declared_size, &a)
-                        .map_err(|e| *e)?;
-                }
+                QuarantineStatus::None
+                | QuarantineStatus::Quarantined
+                | QuarantineStatus::Released => match r.role {
+                    BlobRole::Config => {
+                        if config.is_some() {
+                            // Defensive — `parse_manifest_blobs` emits at
+                            // most one config; two configs would be a
+                            // parser regression.
+                            tracing::warn!(
+                                "multiple config blobs resolved; keeping first and ignoring extras"
+                            );
+                        } else {
+                            config = Some(a);
+                        }
+                    }
+                    BlobRole::Layer => layers.push(a),
+                    // A child manifest of an image index is not attached as a
+                    // group member (the index lands as a plain primary
+                    // `manifest`; the index→child linkage is an
+                    // `oci_index_member` content-reference edge, not a group
+                    // role) — but it IS held against the descriptor that
+                    // named it before being dropped.
+                    BlobRole::ChildManifest {
+                        position,
+                        declared_size,
+                    } => {
+                        check_child_against_descriptor(r, position, declared_size, &a)
+                            .map_err(|e| *e)?;
+                    }
+                },
             },
             None => {
                 if matches!(r.role, BlobRole::ChildManifest { .. }) {
-                    // Mirror the layer-missing path: a child pushed
+                    // Mirror the absent-layer path: a child pushed
                     // out-of-order (index before its platform manifests)
                     // is the expected retry case, surfaced as
                     // `MANIFEST_BLOB_UNKNOWN` at the call site.
@@ -2215,12 +2720,17 @@ async fn resolve_referenced_blobs(
                         "image index references an unknown child manifest; deferring until client retry"
                     );
                 }
-                missing.push(r.digest_raw.clone());
+                absent.push(r.digest_raw.clone());
             }
         }
     }
 
-    Ok((config, layers, missing))
+    Ok(ReferenceResolution {
+        config,
+        layers,
+        absent,
+        terminal,
+    })
 }
 
 /// Hold a **present** index child against the descriptor that named it.
@@ -2236,11 +2746,11 @@ async fn resolve_referenced_blobs(
 /// trusted."
 ///
 /// Hort already has the digest half for free, and more strongly than the spec
-/// asks: a stored row's `sha256_checksum` IS the lookup key, and CAS reads are
-/// hash-verified on the way out (ADR 0003). What it did not have is the size
-/// half — so that is what this adds, and it is cheap: `size_bytes` arrives on
-/// the row `find_in_repo_by_hash` already returned, so the check costs no port
-/// call and no I/O.
+/// asks: the child is resolved at the manifest path its own digest names, and
+/// CAS reads are hash-verified on the way out (ADR 0003). What it did not have
+/// is the size half — so that is what this adds, and it is cheap: `size_bytes`
+/// arrives on the row the resolution already returned, so the check costs no
+/// port call and no I/O.
 ///
 /// # What is compared, and what is not
 ///
@@ -2270,21 +2780,23 @@ async fn resolve_referenced_blobs(
 /// the bytes collectable. Admission may refuse the document; a reader of
 /// already-stored bytes must not.
 ///
-/// **`mediaType`**: deliberately NOT compared. The apparent counterpart is
-/// `Artifact::content_type`, and it is not the descriptor's `mediaType` — it
-/// is the `Content-Type` header whoever wrote that row supplied: a pusher's
-/// manifest `PUT`, an upstream's response, or `application/octet-stream` when
-/// the same bytes entered through a blob upload. `artifacts` is unique on
-/// `(repository_id, path)` and not on the checksum, so one repository can hold
-/// several rows for one hash, and the repo-scoped checksum lookup behind
-/// `find_in_repo_by_hash` is a `LIMIT 1` with no `ORDER BY`. Comparing against
-/// it would make the admission verdict depend on which duplicate row the
-/// database happened to return. `size_bytes` has no such exposure: it is a
-/// property of the bytes, so every row for one hash agrees on it.
+/// **`mediaType`**: deliberately NOT compared — and the question it looks
+/// like it would answer is answered one step earlier instead. *Whether the
+/// child is a manifest at all* is settled by the resolution that produced
+/// `stored`: an index child is looked up at `manifests/sha256:<hex>`, the path
+/// every mint path writes a manifest row under and the one a later child `GET`
+/// resolves, so a row reaching here is a manifest row by construction. What a
+/// `mediaType` comparison would add on top is the *finer* distinction — index
+/// versus single image, OCI versus Docker schema — and its apparent
+/// counterpart cannot carry it: `Artifact::content_type` is not the
+/// descriptor's `mediaType` but the `Content-Type` header whoever wrote that
+/// row supplied, a pusher's manifest `PUT` or an upstream's response.
+/// `size_bytes` is in a different class — a property of the bytes, so it is
+/// the same number whichever row carries them.
 ///
-/// The one sound `mediaType` check would be against the child's **own stored
-/// bytes** (`is_image_index` over them) rather than against a header — the
-/// same "the body decides, never the declared media type" rule
+/// The one sound check of that finer distinction would be against the child's
+/// **own stored bytes** (`is_image_index` over them) rather than against a
+/// header — the same "the body decides, never the declared media type" rule
 /// [`pull_membership_claims`] records. It is not done here because it would
 /// put one CAS read per child on the manifest `PUT` path, and this resolution
 /// being a pure catalog read is what lets it run ahead of the mint at all.
@@ -2351,11 +2863,14 @@ fn check_child_against_descriptor(
 /// single-image manifest. `target =` each declared child/blob digest.
 ///
 /// **Register by digest, no existence check — and that is the mechanism,
-/// not an omission.** A proxy descendant's edge is what gives it the
-/// zero-window quarantine carve-out on its own later ingest (ADR 0007,
-/// `referenced_descendant.rs`): the target-check reads exactly these kinds,
-/// and before these edges were written at all, every proxy descendant's
-/// check missed and took the full observation window. The hosted PUT path
+/// not an omission.** A proxy descendant's edge is what makes it eligible
+/// for the zero-window quarantine carve-out on its own later ingest
+/// (ADR 0007, `referenced_descendant.rs`): the target-check reads exactly
+/// these kinds, and before these edges were written at all, every proxy
+/// descendant's check missed and took the full observation window. The
+/// edge is necessary and not sufficient — the carve-out also needs this
+/// manifest to be `Released`, so on a cold pull the whole closure is held
+/// for the window and the edge pays off on the next touch. The hosted PUT path
 /// gates its claims on in-repo resolution because ADR 0043 makes it
 /// reject an unknown-blob manifest in the same breath; a pull-through
 /// manifest's constituents legitimately are not here yet — the worker
@@ -2445,7 +2960,7 @@ pub(crate) fn pull_membership_claims(
                 return Vec::new();
             }
         };
-        match parse_manifest_blobs(&parsed) {
+        match parse_manifest_blobs(&parsed, body) {
             Ok(r) => r,
             Err(detail) => {
                 tracing::warn!(
@@ -2554,8 +3069,9 @@ mod tests {
     use hort_app::use_cases::test_support::{
         sample_artifact, sample_repository, GroupCommitInjection, MockArtifactGroupLifecyclePort,
         MockArtifactGroupRepository, MockArtifactLifecycle, MockArtifactRepository,
-        MockContentReferenceIndex, MockEventStore, MockPolicyProjectionRepository,
-        MockRefLifecyclePort, MockRefRegistryPort, MockRepositoryRepository, MockStoragePort,
+        MockConstituentStatusReader, MockContentReferenceIndex, MockEventStore,
+        MockPolicyProjectionRepository, MockRefLifecyclePort, MockRefRegistryPort,
+        MockRepositoryRepository, MockStoragePort,
     };
     use hort_domain::entities::artifact::QuarantineStatus;
     use hort_domain::entities::artifact_group::ArtifactGroup;
@@ -2595,6 +3111,9 @@ mod tests {
         lifecycle: Arc<MockArtifactLifecycle>,
         #[allow(dead_code)]
         events: Arc<MockEventStore>,
+        /// The catalog read behind the ADR 0062 closure question, for the
+        /// admission tests that drive its fail-closed arm.
+        constituent_status: Arc<MockConstituentStatusReader>,
     }
 
     fn harness() -> Harness {
@@ -2613,6 +3132,7 @@ mod tests {
             policy_projections: mocks.policy_projections,
             lifecycle: mocks.lifecycle,
             events: mocks.events,
+            constituent_status: mocks.constituent_status,
         }
     }
 
@@ -2703,9 +3223,90 @@ mod tests {
         size: i64,
     }
 
-    /// [`seed_blob`] for a child manifest, carrying the stored byte count out
-    /// alongside the hash so the index declaring it can be conformant.
+    /// A child manifest an index may legitimately name: a **manifest row**
+    /// at the manifest path, whose CAS bytes are a real single-image
+    /// manifest, over a config blob this repository holds.
+    ///
+    /// Every one of those halves is load-bearing, and the fixture used to
+    /// have none of them — it wrapped [`seed_blob`], so it seeded a *blob*
+    /// row with opaque bytes. Fifteen index tests in this module were green
+    /// over that shape, including the positive
+    /// `put_image_index_with_present_children_is_committed_as_manifest`,
+    /// which therefore asserted that an index over blob rows commits: the
+    /// exact push that makes this registry advertise a child it answers
+    /// `MANIFEST_UNKNOWN` for. A fixture that keeps passing after admission
+    /// starts asking the delivery question has not demonstrated the fix.
+    ///
+    /// - The **row at `manifests/sha256:<hex>`** is what admission resolves
+    ///   and what a later child `GET` resolves — the two sides of the one
+    ///   question.
+    /// - The **parseable manifest body** is what the closure walk reads to
+    ///   learn the child's own constituents. Opaque bytes are a legal state
+    ///   (the walk warns and judges the child alone), but a corpus made
+    ///   entirely of them never exercises the transitive step.
+    /// - The **seeded config** makes the child genuinely deliverable rather
+    ///   than deliverable-by-absence.
+    ///
+    /// `label` only has to be unique per child; the stored bytes are derived
+    /// from it.
     fn seed_index_child(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        label: &[u8],
+    ) -> SeededIndexChild {
+        seed_index_child_with_status(artifacts, storage, repo_id, label, QuarantineStatus::None)
+    }
+
+    /// [`seed_index_child`] with an explicit status on the **child's own
+    /// row** — for the admission cases that turn on the child's state
+    /// rather than on its existence.
+    fn seed_index_child_with_status(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        label: &[u8],
+        status: QuarantineStatus,
+    ) -> SeededIndexChild {
+        let config = seed_blob(artifacts, storage, repo_id, &[label, b"-config"].concat());
+        seed_child_manifest(
+            artifacts,
+            storage,
+            repo_id,
+            &build_manifest_json(&config, &[]),
+            status,
+        )
+    }
+
+    /// The one seeding site for a child manifest: a row at the **manifest**
+    /// path carrying `status`, and `body` in CAS under the same hash.
+    fn seed_child_manifest(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        body: &[u8],
+        status: QuarantineStatus,
+    ) -> SeededIndexChild {
+        let hex = hex::encode(Sha256::digest(body));
+        let hash: ContentHash = hex.parse().unwrap();
+        let mut a = sample_artifact(status);
+        a.repository_id = repo_id;
+        a.path = oci_manifest_path(&hash);
+        a.sha256_checksum = hash.clone();
+        a.size_bytes = body.len() as i64;
+        artifacts.insert(a);
+        storage.insert_content(hash.clone(), body.to_vec());
+        SeededIndexChild {
+            hash,
+            size: body.len() as i64,
+        }
+    }
+
+    /// A blob row for `content` at the **blob** path and nothing else — no
+    /// manifest row for those bytes. The shape an index child must not be
+    /// satisfied by: the push route that produces it is the blob upload, so
+    /// a client can leave one under any digest it likes.
+    fn seed_blob_only_child(
         artifacts: &MockArtifactRepository,
         storage: &MockStoragePort,
         repo_id: Uuid,
@@ -3821,8 +4422,9 @@ mod tests {
     /// `oci_index_member` are tree-edge kinds that the
     /// referenced-tree-descendant predicate counts, so a claim naming a
     /// blob the repository does not hold would hand that blob's own later
-    /// ingest the zero-window quarantine carve-out on the strength of an
-    /// edge written for content that did not exist. Resolving before the
+    /// ingest the zero-window quarantine carve-out — once this manifest is
+    /// released — on the strength of an edge written for content that did
+    /// not exist. Resolving before the
     /// mint removes the possibility instead of mitigating it: there is no
     /// membership claim on this path to be wrong about. The `oci_subject`
     /// claim is deliberately NOT gated this way — a referrer for a subject
@@ -4893,13 +5495,14 @@ mod tests {
 
     // -------------------- PUT — terminal reference --------------------
     //
-    // A referenced blob / child whose same-repo row exists but is in a
-    // terminal quarantine state (`Rejected` / `ScanIndeterminate`) is not
-    // a satisfied reference: the blob GET refuses that exact row (404
-    // `BLOB_UNKNOWN` / 503), so accepting the manifest is how a push
-    // reports success and the pull then answers `not found` on a layer.
-    // Such a reference joins the same `missing` list an absent row does —
-    // one envelope, same opacity, same post-mint answer.
+    // A referenced blob / child whose same-repo row exists but carries a
+    // terminal verdict (`Rejected` / `ScanIndeterminate`) is not a
+    // satisfied reference: the blob GET refuses that exact row, so
+    // accepting the manifest is how a push reports success and the pull
+    // then answers `not found` on a layer. It is not an *unknown* blob
+    // either — those bytes are here and decided about — so it answers the
+    // refusal the read route gives for the same row, and the absent tier
+    // keeps `MANIFEST_BLOB_UNKNOWN` to itself.
 
     /// Which reference of the pushed document carries the seeded status.
     #[derive(Clone, Copy, Debug)]
@@ -4911,26 +5514,58 @@ mod tests {
 
     /// Outcome of a push whose `role` reference resolves to a row in the
     /// seeded status: the response status + body, the number of group
-    /// commits, and whether the pushed document itself was committed.
+    /// commits, whether the pushed document itself was committed, and the
+    /// two digests the refusal has to be told apart by.
     struct PushOutcome {
         status: StatusCode,
         body: Vec<u8>,
         group_calls: usize,
         document_committed: bool,
+        /// The `sha256:<hex>` of the seeded constituent — what a
+        /// constituent-scoped refusal must name.
+        reference_digest: String,
+        /// The `sha256:<hex>` of the document the client pushed — what it
+        /// must NOT name.
+        document_digest: String,
+        /// `Retry-After` as the client received it, if at all.
+        retry_after: Option<String>,
+    }
+
+    impl PushOutcome {
+        /// The envelope's single error object.
+        fn envelope(&self) -> serde_json::Value {
+            let parsed: serde_json::Value = serde_json::from_slice(&self.body).unwrap();
+            parsed["errors"][0].clone()
+        }
     }
 
     /// Push a document one of whose references resolves to an existing
     /// same-repo row in `status`. Every other reference is seeded
     /// `QuarantineStatus::None` (plainly deliverable), so the only thing
     /// under test is the seeded row's state.
-    fn push_with_referenced_status(role: SeededRole, status: QuarantineStatus) -> PushOutcome {
+    ///
+    /// `axis` is read only when `status` is `Rejected`, and then it seeds
+    /// the row's **stream** with an `ArtifactRejected` carrying that
+    /// reason — `None` leaves the stream empty, which is the ADR 0039 D6
+    /// illegal state (a `Rejected` projection with no rejection on the
+    /// record). The fixture entity's `rejection_reason` is never set:
+    /// `MockArtifactRepository` clears it on read exactly as
+    /// `hort-adapters-postgres`'s one `row -> Artifact` mapper does, so
+    /// only `ArtifactUseCase`'s hydration can put it back — which is why
+    /// every push here goes through `with_provenance_hold_hydration`
+    /// rather than reading an axis a harness handed it.
+    fn push_with_referenced_status(
+        role: SeededRole,
+        status: QuarantineStatus,
+        axis: Option<RejectionReason>,
+    ) -> PushOutcome {
         run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
 
-            let (body, content_type) = match role {
+            let (body, content_type, reference) = match role {
                 SeededRole::Config => {
                     let config = seed_blob_with_status(
                         &h.artifacts,
@@ -4943,6 +5578,7 @@ mod tests {
                     (
                         build_manifest_json(&config, &[layer]),
                         "application/vnd.oci.image.manifest.v1+json",
+                        config,
                     )
                 }
                 SeededRole::Layer => {
@@ -4955,41 +5591,54 @@ mod tests {
                         status,
                     );
                     (
-                        build_manifest_json(&config, &[layer]),
+                        build_manifest_json(&config, std::slice::from_ref(&layer)),
                         "application/vnd.oci.image.manifest.v1+json",
+                        layer,
                     )
                 }
                 SeededRole::IndexChild => {
                     let present =
                         seed_index_child(&h.artifacts, &h.storage, repo_id, b"present-child");
-                    let seeded = SeededIndexChild {
-                        hash: seed_blob_with_status(
-                            &h.artifacts,
-                            &h.storage,
-                            repo_id,
-                            b"seeded-child",
-                            status,
-                        ),
-                        size: b"seeded-child".len() as i64,
-                    };
+                    // A terminal index child is a terminal **manifest**
+                    // row: that is the row a child `GET` resolves, so it
+                    // is the row admission asks about. A blob row under
+                    // the same digest is a different fixture entirely —
+                    // see `an_index_child_whose_only_row_is_a_blob_is_refused`.
+                    let seeded = seed_index_child_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        b"seeded-child",
+                        status,
+                    );
+                    let child = seeded.hash.clone();
                     (
                         build_index_json(
                             &[present, seeded],
                             "application/vnd.oci.image.index.v1+json",
                         ),
                         "application/vnd.oci.image.index.v1+json",
+                        child,
                     )
                 }
             };
+            if status == QuarantineStatus::Rejected {
+                seed_rejection_axis(&h, repo_id, &reference, axis).await;
+            }
             let document_hex = hex::encode(Sha256::digest(&body));
 
-            let router = router().with_state(h.ctx.clone());
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let router = router().with_state(ctx);
             let uri = "/v2/myrepo/library/nginx/manifests/v1";
             let resp = router
                 .oneshot(put_index_request(uri, body, content_type))
                 .await
                 .unwrap();
             let status_code = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("Retry-After")
+                .map(|v| v.to_str().unwrap().to_string());
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             let document_committed = h
                 .artifacts
@@ -5002,43 +5651,72 @@ mod tests {
                 body,
                 group_calls: h.group_lifecycle.commit_call_count(),
                 document_committed,
+                reference_digest: format!("sha256:{}", reference.as_ref()),
+                document_digest: format!("sha256:{document_hex}"),
+                retry_after,
             }
         })
     }
 
-    /// The whole refusal shape for a terminal reference: 400
-    /// `MANIFEST_BLOB_UNKNOWN`, exactly one digest echoed in
-    /// `detail.blobs`, no "why" anywhere in the envelope (the client is
-    /// never told the reference was terminal — the diagnosis is the
-    /// server-side log line), the document still committed, and no group.
-    fn assert_terminal_reference_refusal(out: &PushOutcome, case: &str) {
-        assert_eq!(
-            out.status,
-            StatusCode::BAD_REQUEST,
-            "{case}: a terminal reference must refuse the push: body = {}",
-            String::from_utf8_lossy(&out.body)
+    /// Put an `ArtifactRejected` on the seeded row's own stream, so the
+    /// axis the refusal reports is hydrated from the record rather than
+    /// stamped on the fixture. `None` leaves the stream empty on purpose.
+    async fn seed_rejection_axis(
+        h: &Harness,
+        repo_id: Uuid,
+        hash: &ContentHash,
+        axis: Option<RejectionReason>,
+    ) {
+        let artifact_id = h
+            .artifacts
+            .find_by_repo_and_checksum(repo_id, hash)
+            .await
+            .unwrap()
+            .expect("the seeded reference must have a row to carry a stream")
+            .id;
+        h.events.set_stream(
+            &hort_domain::events::StreamId::artifact(artifact_id),
+            axis.map(|reason| {
+                vec![
+                    hort_app::use_cases::test_support::persisted_artifact_rejected(
+                        artifact_id,
+                        reason,
+                        1,
+                    ),
+                ]
+            })
+            .unwrap_or_default(),
         );
-        let parsed: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
-        assert_eq!(
-            parsed["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN",
-            "{case}: must reuse the existing missing-reference envelope"
-        );
-        let blobs = parsed["errors"][0]["detail"]["blobs"].as_array().unwrap();
-        assert_eq!(
-            blobs.len(),
-            1,
-            "{case}: exactly the one unresolvable reference is echoed"
-        );
-        assert!(
-            blobs[0].as_str().unwrap().starts_with("sha256:"),
-            "{case}: blobs detail must echo the raw sha256:<hex> shape"
-        );
+    }
+
+    /// What every terminal-constituent refusal shares, whichever verdict
+    /// it carries: the document still committed (the mint behaviour this
+    /// change deliberately left alone), no group, and **nothing from
+    /// `ArtifactRejected`'s excluded list anywhere on the wire** — no
+    /// policy, no `curator_id`, no `rule_id`, no findings, no CVE
+    /// identifiers. The exclusion is asserted on both arms because a
+    /// hold's envelope has the same discipline to keep as a verdict's.
+    ///
+    /// The tokens below are those identifiers and deliberately not the
+    /// axis vocabulary: `scanner` and `curator` ARE legitimate axis
+    /// values, so banning the words would ban the one disclosure this
+    /// refusal is supposed to make. What bounds that disclosure instead
+    /// is the exact key-set assertion in
+    /// [`assert_rejected_constituent_refusal`].
+    fn assert_constituent_refusal_discloses_no_more(out: &PushOutcome, case: &str) {
         let wire = String::from_utf8_lossy(&out.body).to_lowercase();
-        for leak in ["reject", "indeterminate", "quarantin", "terminal"] {
+        for leak in [
+            "curator_id",
+            "rule_id",
+            "policy",
+            "finding",
+            "cve",
+            "severity",
+            "reason",
+        ] {
             assert!(
                 !wire.contains(leak),
-                "{case}: the envelope must not disclose WHY the reference failed \
-                 (found {leak:?} in {wire})"
+                "{case}: the envelope must not widen the disclosure (found {leak:?} in {wire})"
             );
         }
         assert!(
@@ -5047,56 +5725,451 @@ mod tests {
         );
         assert_eq!(
             out.group_calls, 0,
-            "{case}: no group attachment on the unresolvable-reference path"
+            "{case}: no group attachment on the unresolved-reference path"
         );
     }
 
-    #[test]
-    fn put_with_rejected_layer_returns_400_manifest_blob_unknown() {
-        let out = push_with_referenced_status(SeededRole::Layer, QuarantineStatus::Rejected);
-        assert_terminal_reference_refusal(&out, "rejected layer");
+    /// The whole refusal shape for a **rejected** constituent: `403
+    /// DENIED` through `ArtifactRejected`, naming the constituent digest
+    /// as `subject` and the expected axis, and naming nothing else.
+    fn assert_rejected_constituent_refusal(
+        out: &PushOutcome,
+        expected_axis: Option<&str>,
+        case: &str,
+    ) {
+        let rendered = String::from_utf8_lossy(&out.body);
+        assert_eq!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "{case}: a rejected constituent answers the read route's own 403: body = {rendered}"
+        );
+        let envelope = out.envelope();
+        assert_eq!(
+            envelope["code"], "DENIED",
+            "{case}: the read route's envelope for this fact"
+        );
+        assert_eq!(
+            envelope["message"], "artifact is rejected",
+            "{case}: one wording for one fact across every route"
+        );
+        // The subject is the CONSTITUENT, not the reference the client
+        // pushed. Both assertions are load-bearing: the first is the
+        // disclosure, the second is what makes it a statement about the
+        // blob rather than about the document.
+        assert_eq!(
+            envelope["detail"]["subject"], out.reference_digest,
+            "{case}: the subject must name the constituent blob digest"
+        );
+        assert_ne!(
+            envelope["detail"]["subject"], out.document_digest,
+            "{case}: the subject must NOT be the manifest the client pushed"
+        );
+        match expected_axis {
+            Some(axis) => assert_eq!(
+                envelope["detail"]["axis"], axis,
+                "{case}: the axis comes from the constituent's own ArtifactRejected"
+            ),
+            // No `unknown` token and no null — an absent axis emits no
+            // field at all, so a client cannot read "the server does not
+            // know why" as a reason of its own.
+            None => assert!(
+                envelope["detail"].get("axis").is_none(),
+                "{case}: an unrecoverable axis emits no axis field: {envelope}"
+            ),
+        }
+        // Axis plus subject and NOTHING else — asserted as the exact key
+        // set rather than as a list of absent names, so a field nobody
+        // thought to ban fails this too.
+        let mut keys: Vec<&str> = envelope["detail"]
+            .as_object()
+            .expect("the rejection detail is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let expected: &[&str] = if expected_axis.is_some() {
+            &["axis", "subject"]
+        } else {
+            &["subject"]
+        };
+        assert_eq!(keys, expected, "{case}: axis plus subject, and no more");
+        assert!(
+            out.retry_after.is_none(),
+            "{case}: a verdict is not a hold — nothing to come back for"
+        );
+        assert_constituent_refusal_discloses_no_more(out, case);
     }
 
-    #[test]
-    fn put_with_scan_indeterminate_layer_returns_400_manifest_blob_unknown() {
-        let out =
-            push_with_referenced_status(SeededRole::Layer, QuarantineStatus::ScanIndeterminate);
-        assert_terminal_reference_refusal(&out, "scan-indeterminate layer");
+    /// The whole refusal shape for an **indeterminate** constituent: the
+    /// `503 UNAVAILABLE` the read route sends, and — the decision this
+    /// change had to make deliberately — **no `Retry-After`**. A `503`
+    /// invites a harder retry than the `400` this used to be, and the
+    /// incident behind the change was already seventy pushes against that
+    /// `400`; the header is omitted because this hold has no
+    /// self-resolving deadline to put in it, so any number would be a
+    /// schedule hort invented. The status still says "not yet", which is
+    /// the true half.
+    fn assert_indeterminate_constituent_refusal(out: &PushOutcome, case: &str) {
+        let rendered = String::from_utf8_lossy(&out.body);
+        assert_eq!(
+            out.status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{case}: a held constituent answers the read route's own 503: body = {rendered}"
+        );
+        let envelope = out.envelope();
+        assert_eq!(
+            envelope["code"], "UNAVAILABLE",
+            "{case}: the read route's envelope for this fact"
+        );
+        assert_eq!(
+            envelope["message"], "artifact scan result is indeterminate",
+            "{case}: one wording for one fact across every route"
+        );
+        assert!(
+            envelope["detail"].is_null(),
+            "{case}: a hold's subject stays opaque, exactly as on the read route: {envelope}"
+        );
+        assert_eq!(
+            out.retry_after, None,
+            "{case}: this hold has no self-resolving deadline, so it advertises no schedule"
+        );
+        assert_constituent_refusal_discloses_no_more(out, case);
     }
 
-    /// The config blob is caught too, not only a layer — it is resolved
-    /// through the same loop and the pull reads it through the same blob
-    /// handler.
-    #[test]
-    fn put_with_rejected_config_returns_400_manifest_blob_unknown() {
-        let out = push_with_referenced_status(SeededRole::Config, QuarantineStatus::Rejected);
-        assert_terminal_reference_refusal(&out, "rejected config");
-    }
+    /// Every role a terminal constituent can hold — a layer, the config,
+    /// and an index child, which is resolved for existence only and so
+    /// could only ever be caught in the resolution loop.
+    const TERMINAL_ROLES: [SeededRole; 3] = [
+        SeededRole::Config,
+        SeededRole::Layer,
+        SeededRole::IndexChild,
+    ];
 
     #[test]
-    fn put_with_scan_indeterminate_config_returns_400_manifest_blob_unknown() {
-        let out =
-            push_with_referenced_status(SeededRole::Config, QuarantineStatus::ScanIndeterminate);
-        assert_terminal_reference_refusal(&out, "scan-indeterminate config");
+    fn put_with_rejected_constituent_returns_403_naming_that_constituent() {
+        for role in TERMINAL_ROLES {
+            let out = push_with_referenced_status(
+                role,
+                QuarantineStatus::Rejected,
+                Some(RejectionReason::Scanner),
+            );
+            assert_rejected_constituent_refusal(&out, Some("scanner"), &format!("{role:?}"));
+        }
     }
 
-    /// An index child is caught too. It is resolved for existence only
-    /// (never attached as a group member), which is exactly why the
-    /// status read has to happen in the resolution loop rather than in
-    /// the attachment step.
+    /// A rejection the record cannot explain (ADR 0039 D6's illegal
+    /// state) still refuses, still names the constituent, and reports no
+    /// axis rather than an invented one.
     #[test]
-    fn put_image_index_with_rejected_child_returns_400_manifest_blob_unknown() {
-        let out = push_with_referenced_status(SeededRole::IndexChild, QuarantineStatus::Rejected);
-        assert_terminal_reference_refusal(&out, "rejected index child");
+    fn put_with_rejected_constituent_lacking_an_axis_still_names_the_subject() {
+        let out = push_with_referenced_status(SeededRole::Layer, QuarantineStatus::Rejected, None);
+        assert_rejected_constituent_refusal(&out, None, "axis-less rejected layer");
     }
 
+    /// A non-scanner axis reaches the wire as its own token, so the
+    /// assertion above is about the hydration rather than about one
+    /// hard-coded string — and the variant chosen is one carrying a
+    /// payload, so the same case proves the payload stays behind: the
+    /// `curator_id` is in the event the axis was derived from and must
+    /// appear nowhere in the response.
     #[test]
-    fn put_image_index_with_scan_indeterminate_child_returns_400_manifest_blob_unknown() {
+    fn the_reported_axis_is_the_constituents_own_and_carries_none_of_its_payload() {
+        let curator_id = Uuid::new_v4();
         let out = push_with_referenced_status(
-            SeededRole::IndexChild,
-            QuarantineStatus::ScanIndeterminate,
+            SeededRole::Layer,
+            QuarantineStatus::Rejected,
+            Some(RejectionReason::Curator { curator_id }),
         );
-        assert_terminal_reference_refusal(&out, "scan-indeterminate index child");
+        assert_rejected_constituent_refusal(&out, Some("curator"), "curator-rejected layer");
+        assert!(
+            !String::from_utf8_lossy(&out.body).contains(&curator_id.to_string()),
+            "an actor is not a diagnosis of an artifact — the curator id must not ship"
+        );
+    }
+
+    #[test]
+    fn put_with_scan_indeterminate_constituent_returns_503_with_no_retry_after() {
+        for role in TERMINAL_ROLES {
+            let out = push_with_referenced_status(role, QuarantineStatus::ScanIndeterminate, None);
+            assert_indeterminate_constituent_refusal(&out, &format!("{role:?}"));
+        }
+    }
+
+    /// A document naming **both** an absent and a terminal constituent
+    /// answers the terminal one.
+    ///
+    /// The publisher can fix the absent reference by pushing it and
+    /// cannot fix the terminal one, so answering `MANIFEST_BLOB_UNKNOWN`
+    /// first would send them through a push into a second refusal — which
+    /// is the loop this whole change exists to end.
+    ///
+    /// Returns the response status and the envelope, plus the proof that
+    /// the absent reference really has no row: without that the test
+    /// could pass on a fixture where there was only ever one cause.
+    fn push_with_absent_and_terminal(status: QuarantineStatus) -> (StatusCode, bool) {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let terminal =
+                seed_blob_with_status(&h.artifacts, &h.storage, repo_id, b"terminal-layer", status);
+            if status == QuarantineStatus::Rejected {
+                seed_rejection_axis(&h, repo_id, &terminal, Some(RejectionReason::Scanner)).await;
+            }
+            // Never seeded in any state: the absent cause.
+            let absent: ContentHash = hex::encode(Sha256::digest(b"never-pushed-layer"))
+                .parse()
+                .unwrap();
+            // Absent FIRST in manifest order, so a loop that answered
+            // about whichever cause it met first would answer 400 here.
+            let body = build_manifest_json(&config, &[absent.clone(), terminal]);
+
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let router = router().with_state(ctx);
+            let resp = router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            let row_absent = h
+                .artifacts
+                .find_by_repo_and_checksum(repo_id, &absent)
+                .await
+                .unwrap()
+                .is_none();
+            (resp.status(), row_absent)
+        })
+    }
+
+    #[test]
+    fn a_document_naming_an_absent_and_a_rejected_constituent_answers_the_rejected_one() {
+        let (status, row_absent) = push_with_absent_and_terminal(QuarantineStatus::Rejected);
+        assert!(
+            row_absent,
+            "fixture integrity: the absent reference must have no catalog row, or this test \
+             has only one cause in it"
+        );
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the terminal cause is the one the publisher cannot fix, so it is the one named"
+        );
+    }
+
+    #[test]
+    fn a_document_naming_an_absent_and_a_held_constituent_answers_the_held_one() {
+        let (status, row_absent) =
+            push_with_absent_and_terminal(QuarantineStatus::ScanIndeterminate);
+        assert!(
+            row_absent,
+            "fixture integrity: the absent reference must have no catalog row, or this test \
+             has only one cause in it"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A document naming **two** terminal constituents answers the one
+    /// whose cause the publisher has least power over: an indeterminate
+    /// hold can clear on a rescan that reaches a verdict, so a push
+    /// blocked on it can succeed later, while one blocked on a rejection
+    /// cannot. The held layer is declared first, so a first-wins loop
+    /// would answer `503` here.
+    #[test]
+    fn a_document_naming_a_held_and_a_rejected_constituent_answers_the_rejected_one() {
+        let (status, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+            let held = seed_blob_with_status(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                b"held-layer",
+                QuarantineStatus::ScanIndeterminate,
+            );
+            let rejected = seed_blob_with_status(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                b"rejected-layer",
+                QuarantineStatus::Rejected,
+            );
+            seed_rejection_axis(&h, repo_id, &rejected, Some(RejectionReason::Scanner)).await;
+            let rejected_digest = format!("sha256:{}", rejected.as_ref());
+            let body = build_manifest_json(&config, &[held, rejected]);
+
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let router = router().with_state(ctx);
+            let resp = router
+                .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            (status, (body, rejected_digest))
+        });
+        let (body, rejected_digest) = body;
+        let rendered = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the rejection is the refusal no later attempt resolves: body = {rendered}"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            parsed["errors"][0]["detail"]["subject"], rejected_digest,
+            "and it is the rejected constituent that is named"
+        );
+    }
+
+    /// The client's `503` names no constituent at all, so the operator's
+    /// record is the only place the cause survives — and it has to carry
+    /// the whole of it: the document pushed, the constituent that
+    /// withheld it, that constituent's status, and how many other
+    /// references were merely absent (so a reader knows the refusal chose
+    /// between two causes rather than having only one).
+    ///
+    /// This is the half that was already right before the refusal was:
+    /// the diagnosis was in the log while the client was told the wrong
+    /// cause. It is pinned here so an edit cannot quietly trade one for
+    /// the other.
+    #[test]
+    fn the_refusal_names_the_document_the_constituent_and_its_status_in_the_log() {
+        let ((status, held_hex, document_hex), records) = capture_tracing(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-bytes");
+                let held = seed_blob_with_status(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    b"held-layer",
+                    QuarantineStatus::ScanIndeterminate,
+                );
+                let absent: ContentHash = hex::encode(Sha256::digest(b"never-pushed-layer"))
+                    .parse()
+                    .unwrap();
+                let held_hex = held.as_ref().to_string();
+                let body = build_manifest_json(&config, &[absent, held]);
+                let document_hex = hex::encode(Sha256::digest(&body));
+
+                let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+                let router = router().with_state(ctx);
+                let resp = router
+                    .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                    .await
+                    .unwrap();
+                (resp.status(), held_hex, document_hex)
+            })
+        });
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "premise: the push is refused for the held constituent"
+        );
+        // The per-reference line: which blob, and in which state. Without
+        // the status an operator has to compare event timestamps to learn
+        // why the push was refused.
+        let warns = events_at(
+            &records,
+            tracing::Level::WARN,
+            "hort_http_oci::manifests_write",
+        );
+        assert!(
+            warns.iter().any(|e| {
+                e.fields.contains(&format!("sha256:{held_hex}"))
+                    && e.fields.contains("scan_indeterminate")
+                    && e.fields.contains("terminally-blocked")
+            }),
+            "expected a WARN naming the held constituent and its status; captured: {warns:?}"
+        );
+        // The decision line: which document, which constituent decided
+        // it, and that a second, absent cause was passed over.
+        let infos = events_at(
+            &records,
+            tracing::Level::INFO,
+            "hort_http_oci::manifests_write",
+        );
+        assert!(
+            infos.iter().any(|e| {
+                e.fields.contains(&document_hex)
+                    && e.fields.contains(&format!("sha256:{held_hex}"))
+                    && e.fields.contains("also_absent=1")
+            }),
+            "expected an INFO naming the document, the deciding constituent and the \
+             passed-over absent count; captured: {infos:?}"
+        );
+    }
+
+    /// The resolution loop keeps the FIRST config and ignores a second,
+    /// rather than overwriting or failing.
+    ///
+    /// `parse_manifest_blobs` emits at most one config, so the handler
+    /// cannot put this loop in that state — which is exactly why the
+    /// branch is tested against the loop directly. It is a defensive arm
+    /// guarding a parser regression, and the behaviour it guards (keep
+    /// the first, warn, carry on) is the whole of what a reader needs to
+    /// know it does.
+    #[test]
+    fn two_config_references_keep_the_first_and_warn() {
+        let (kept, warned) = capture_tracing(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let first = seed_blob(&h.artifacts, &h.storage, repo_id, b"first-config");
+                let second = seed_blob(&h.artifacts, &h.storage, repo_id, b"second-config");
+                let refs = [&first, &second].map(|hash| ReferencedBlob {
+                    digest_raw: format!("sha256:{}", hash.as_ref()),
+                    hash: hash.clone(),
+                    role: BlobRole::Config,
+                });
+                let resolution = resolve_referenced_blobs(&h.ctx, repo_id, &refs)
+                    .await
+                    .expect("both configs resolve; this is not an infrastructure failure");
+                (
+                    resolution
+                        .config
+                        .expect("a config resolved")
+                        .sha256_checksum
+                        .as_ref()
+                        .to_string(),
+                    first.as_ref().to_string(),
+                )
+            })
+        });
+        let (kept_hex, first_hex) = kept;
+        assert_eq!(
+            kept_hex, first_hex,
+            "the first config wins; the extra is dropped, not swapped in"
+        );
+        let warns = events_at(
+            &warned,
+            tracing::Level::WARN,
+            "hort_http_oci::manifests_write",
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|e| e.fields.contains("multiple config blobs resolved")),
+            "a parser regression must leave a record, not pass silently: {warns:?}"
+        );
     }
 
     /// `Quarantined` is NOT terminal and must keep resolving as present.
@@ -5106,7 +6179,7 @@ mod tests {
     #[test]
     fn put_with_quarantined_layer_still_succeeds() {
         for role in [SeededRole::Layer, SeededRole::Config] {
-            let out = push_with_referenced_status(role, QuarantineStatus::Quarantined);
+            let out = push_with_referenced_status(role, QuarantineStatus::Quarantined, None);
             assert_eq!(
                 out.status,
                 StatusCode::CREATED,
@@ -6925,8 +7998,8 @@ mod tests {
 
     #[test]
     fn the_descriptor_check_is_not_gated_on_every_other_child_resolving() {
-        // ORDER, which is what this issue is about. A missing reference is NOT
-        // an error on this path — it is the `Missing` outcome, answered with
+        // ORDER, which is what this issue is about. An absent reference is NOT
+        // an error on this path — it is the `Absent` outcome, answered with
         // `MANIFEST_BLOB_UNKNOWN` AFTER the mint, because the client's
         // retry-after-pushing-the-blob has to be idempotent. A descriptor that
         // disagrees with a child the repository DOES hold is a different thing:
@@ -7104,6 +8177,654 @@ mod tests {
                     "descriptor": "manifests[1]",
                 }),
                 "{declared}"
+            );
+        }
+    }
+
+    // -- admission asks the question delivery answers ---------------------
+    //
+    // Two halves of one property: a successful push must not name a
+    // document this registry will refuse. The first half is about the
+    // DIRECT child — a digest whose only row is a blob row is not a child
+    // manifest, whatever the bytes are. The second is about everything
+    // BELOW it — a deliverable child over a terminal layer is a document
+    // the read path refuses, so the push that mints the index over it is
+    // a success response for an image that can never be pulled.
+
+    /// Build a `PushOutcome`-shaped result for one index body: the
+    /// status, the wire body, and whether the index was minted.
+    struct IndexPush {
+        status: StatusCode,
+        body: Vec<u8>,
+        retry_after: Option<String>,
+    }
+
+    impl IndexPush {
+        fn envelope(&self) -> serde_json::Value {
+            let parsed: serde_json::Value = serde_json::from_slice(&self.body).unwrap();
+            parsed["errors"][0].clone()
+        }
+
+        /// The wire body as text, for an assertion message.
+        ///
+        /// Hoisted into a `let` at every call site rather than written
+        /// inside the `assert!` it reports on: an argument to a panic
+        /// message is only evaluated when the assertion fails, so in a
+        /// green run both this body and the call read as uncovered.
+        fn rendered(&self) -> String {
+            String::from_utf8_lossy(&self.body).to_string()
+        }
+    }
+
+    /// PUT `body` as an image index into a fresh `myrepo`, after `seed`
+    /// has populated the harness. The closure hands back the body so each
+    /// case can seed whatever shape it is about and build its index over
+    /// the digests it seeded.
+    fn push_index_with<S>(seed: S) -> IndexPush
+    where
+        S: for<'a> FnOnce(
+            &'a Harness,
+            Uuid,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<u8>> + 'a>>,
+    {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let body = seed(&h, repo_id).await;
+            // The hydrating context, so a `Rejected` constituent's axis is
+            // recovered from its own stream rather than read off a field a
+            // harness stamped.
+            let ctx = hort_http_core::test_support::with_provenance_hold_hydration(&h.ctx);
+            let resp = router()
+                .with_state(ctx)
+                .oneshot(put_index_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    body,
+                    "application/vnd.oci.image.index.v1+json",
+                ))
+                .await
+                .unwrap();
+            let status = resp.status();
+            let retry_after = resp
+                .headers()
+                .get("Retry-After")
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+            IndexPush {
+                status,
+                body,
+                retry_after,
+            }
+        })
+    }
+
+    /// **The push this closes.** Arbitrary bytes go up the OCI **blob**
+    /// route, leaving a live `blobs/sha256:<hex>` row and no manifest row.
+    /// An index then names that digest with its true size.
+    ///
+    /// Before, admission resolved the child by checksum, found the blob
+    /// row, was satisfied, and the index committed with a `201`. The
+    /// child `GET` then answered `MANIFEST_UNKNOWN` — hort advertised a
+    /// child it will not serve (ADR 0062), and the push reported success
+    /// for a broken image.
+    ///
+    /// The answer is `MANIFEST_BLOB_UNKNOWN` naming that digest, which is
+    /// the one that was already true for it: this repository does not
+    /// hold that child manifest, the response says which bytes to send,
+    /// and pushing the child as a manifest makes the retry succeed — the
+    /// converse below.
+    #[test]
+    fn an_index_child_whose_only_row_is_a_blob_is_refused() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let blob_only =
+                    seed_blob_only_child(&h.artifacts, &h.storage, repo_id, b"arbitrary-bytes");
+                assert!(
+                    h.artifacts
+                        .find_by_path(repo_id, &oci_manifest_path(&blob_only.hash))
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "the premise: those bytes have a blob row and no manifest row"
+                );
+                build_index_json(
+                    std::slice::from_ref(&blob_only),
+                    "application/vnd.oci.image.index.v1+json",
+                )
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::BAD_REQUEST,
+            "a blob row does not satisfy a child-manifest reference: {rendered}"
+        );
+        assert_eq!(envelope_code(&out.body), "MANIFEST_BLOB_UNKNOWN");
+        let named = out.envelope()["detail"]["blobs"]
+            .as_array()
+            .expect("the unknown-blob envelope names what to send")
+            .len();
+        assert_eq!(named, 1, "the one unsatisfied child: {rendered}");
+    }
+
+    /// The converse, and the test that keeps the one above from passing
+    /// for the wrong reason: the same digest, now carrying a **manifest**
+    /// row, is admitted. Without this, refusing every index child would
+    /// satisfy the refusal test.
+    #[test]
+    fn the_same_child_is_admitted_once_a_manifest_row_exists_for_it() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"real-child");
+                // The same bytes ALSO have a blob row, which is legal —
+                // `(repository_id, path)` is what is unique, not the
+                // checksum. The admission verdict must not depend on
+                // which of the two a checksum lookup happened to return.
+                let mut blob_twin = sample_artifact(QuarantineStatus::None);
+                blob_twin.repository_id = repo_id;
+                blob_twin.path = format!("blobs/sha256:{}", child.hash.as_ref());
+                blob_twin.sha256_checksum = child.hash.clone();
+                blob_twin.size_bytes = child.size;
+                h.artifacts.insert(blob_twin);
+                build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                )
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::CREATED,
+            "a child with a manifest row is admitted, blob twin or not: {rendered}"
+        );
+    }
+
+    /// Seed a child manifest whose own row is `Released` and whose single
+    /// **layer** carries `status`, and return the index naming it plus
+    /// that layer's digest.
+    ///
+    /// Exactly the shape Group B is about: publish and release a child
+    /// manifest over a layer, a later rescan concludes against the layer
+    /// while the child's own row stays `Released`, then an index names
+    /// the child. Admission used to read the child's row, see
+    /// `Released`, and accept.
+    async fn seed_released_child_over_layer(
+        h: &Harness,
+        repo_id: Uuid,
+        status: QuarantineStatus,
+        axis: Option<RejectionReason>,
+    ) -> (Vec<u8>, ContentHash) {
+        let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"child-config");
+        let layer =
+            seed_blob_with_status(&h.artifacts, &h.storage, repo_id, b"child-layer", status);
+        if status == QuarantineStatus::Rejected {
+            seed_rejection_axis(h, repo_id, &layer, axis).await;
+        }
+        let child = seed_child_manifest(
+            &h.artifacts,
+            &h.storage,
+            repo_id,
+            &build_manifest_json(&config, std::slice::from_ref(&layer)),
+            QuarantineStatus::Released,
+        );
+        (
+            build_index_json(
+                std::slice::from_ref(&child),
+                "application/vnd.oci.image.index.v1+json",
+            ),
+            layer,
+        )
+    }
+
+    /// **Group B, the rejected arm.** The child is `Released` and
+    /// resolves; its own layer is `Rejected`. The push is refused with
+    /// the refusal every read of this index would give it — `403 DENIED`
+    /// naming the **layer**, with its axis.
+    ///
+    /// The subject is the constituent and not the index: that document is
+    /// fine, and naming it would state the refusal is about the wrong
+    /// thing. The axis comes from `manifests::terminal_constituent_axis`,
+    /// the one definition the read route's refusal of this same index
+    /// uses, so the disclosure is neither route- nor depth-dependent.
+    #[test]
+    fn an_index_child_released_over_a_rejected_layer_is_refused() {
+        let layer_cell: Arc<std::sync::Mutex<Option<ContentHash>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let sink = layer_cell.clone();
+        let out = push_index_with(move |h, repo_id| {
+            Box::pin(async move {
+                let (body, layer) = seed_released_child_over_layer(
+                    h,
+                    repo_id,
+                    QuarantineStatus::Rejected,
+                    Some(RejectionReason::Scanner),
+                )
+                .await;
+                *sink.lock().unwrap() = Some(layer);
+                body
+            })
+        });
+        let layer = layer_cell.lock().unwrap().clone().expect("layer seeded");
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "one hop is an arbitrary cut — the push is refused for the grandchild layer: \
+             {rendered}"
+        );
+        let envelope = out.envelope();
+        assert_eq!(envelope["code"], "DENIED");
+        assert_eq!(
+            envelope["detail"]["subject"],
+            format!("sha256:{}", layer.as_ref()),
+            "the refusal names the terminal constituent, not the pushed index"
+        );
+        assert_eq!(
+            envelope["detail"]["axis"], "scanner",
+            "the axis is recovered the same way the read route recovers it"
+        );
+    }
+
+    /// **Group B, the indeterminate arm.** Same shape, `ScanIndeterminate`
+    /// on the layer: `503 UNAVAILABLE` and **no** `Retry-After` — that
+    /// hold has no self-resolving deadline, so any number would invite a
+    /// client back forever on a schedule hort invented.
+    #[test]
+    fn an_index_child_released_over_an_indeterminate_layer_is_refused_without_a_deadline() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                seed_released_child_over_layer(
+                    h,
+                    repo_id,
+                    QuarantineStatus::ScanIndeterminate,
+                    None,
+                )
+                .await
+                .0
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(out.status, StatusCode::SERVICE_UNAVAILABLE, "{rendered}");
+        assert_eq!(out.envelope()["code"], "UNAVAILABLE");
+        assert_eq!(
+            out.retry_after, None,
+            "an indeterminate hold advertises no deadline"
+        );
+    }
+
+    /// **A hold below the child is not a refusal.** A `Quarantined` layer
+    /// means "not yet": the client's own blob fetch answers it with the
+    /// deadline, and propagating it here would refuse essentially every
+    /// push — hort quarantines at ingest and the index PUT follows
+    /// seconds later. The arm that would break every multi-arch push if
+    /// the walk treated a hold as terminal.
+    #[test]
+    fn an_index_child_over_a_quarantined_layer_still_commits() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                seed_released_child_over_layer(h, repo_id, QuarantineStatus::Quarantined, None)
+                    .await
+                    .0
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::CREATED,
+            "a hold is `not yet`, not `never`: {rendered}"
+        );
+    }
+
+    /// **Acceptance: the deliverable push is unchanged.** Two children,
+    /// each a real manifest over a `Released` config and layer, every row
+    /// present and non-terminal at every depth. The index commits `201`.
+    #[test]
+    fn an_index_over_genuinely_deliverable_children_still_commits() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let mut children = Vec::new();
+                for label in [b"amd64".as_slice(), b"arm64".as_slice()] {
+                    let config = seed_blob_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        label,
+                        QuarantineStatus::Released,
+                    );
+                    let layer = seed_blob_with_status(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        &[label, b"-layer"].concat(),
+                        QuarantineStatus::Released,
+                    );
+                    children.push(seed_child_manifest(
+                        &h.artifacts,
+                        &h.storage,
+                        repo_id,
+                        &build_manifest_json(&config, std::slice::from_ref(&layer)),
+                        QuarantineStatus::Released,
+                    ));
+                }
+                build_index_json(&children, "application/vnd.oci.image.index.v1+json")
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::CREATED,
+            "a genuinely deliverable multi-arch push is untouched: {rendered}"
+        );
+    }
+
+    /// **The walk is transitive past one level, not just one hop below
+    /// the index.** A nested index: the pushed document names a child
+    /// index, which names a manifest, whose layer is rejected. Two hops
+    /// of expansion, which a one-level-deeper check would still miss.
+    ///
+    /// The bound on how deep this goes is not restated here: admission
+    /// inherits `MAX_CHILD_INGEST_DEPTH` and the expansion budget by
+    /// running the read path's own walk, and those bounds are pinned
+    /// where they are implemented
+    /// (`hort_app::use_cases::manifest_deliverability`).
+    #[test]
+    fn the_closure_walk_reaches_a_layer_two_levels_below_the_pushed_index() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"deep-config");
+                let layer = seed_blob_with_status(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    b"deep-layer",
+                    QuarantineStatus::Rejected,
+                );
+                seed_rejection_axis(h, repo_id, &layer, Some(RejectionReason::Scanner)).await;
+                let grandchild = seed_child_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &build_manifest_json(&config, std::slice::from_ref(&layer)),
+                    QuarantineStatus::Released,
+                );
+                let child = seed_child_manifest(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    &build_index_json(
+                        std::slice::from_ref(&grandchild),
+                        "application/vnd.oci.image.index.v1+json",
+                    ),
+                    QuarantineStatus::Released,
+                );
+                build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                )
+            })
+        });
+        let rendered = out.rendered();
+        assert_eq!(
+            out.status,
+            StatusCode::FORBIDDEN,
+            "a terminal layer two levels down still refuses the push: {rendered}"
+        );
+        assert_eq!(out.envelope()["code"], "DENIED");
+    }
+
+    /// **The cost claim.** A single-image manifest push opens **no** CAS
+    /// object for a closure walk: its constituents are blobs, a blob
+    /// binds nothing, so the transitive question has no content beyond
+    /// the direct one the reference resolution already answered. Running
+    /// the walk for it would buy a second catalog round trip per push
+    /// and no additional refusal.
+    ///
+    /// Asserted against the index push, which does read: a regression
+    /// that ran the walk unconditionally fails the first assertion, and
+    /// one that never ran it fails the second.
+    #[test]
+    fn only_an_index_push_pays_for_a_closure_walk() {
+        let (single_image_reads, index_reads) = run(async {
+            let single = {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config");
+                let layer = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer");
+                let body = build_manifest_json(&config, std::slice::from_ref(&layer));
+                let resp = router()
+                    .with_state(h.ctx.clone())
+                    .oneshot(put_request("/v2/myrepo/library/nginx/manifests/v1", body))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+                h.storage.get_call_count()
+            };
+            let index = {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child");
+                let body = build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                );
+                let resp = router()
+                    .with_state(h.ctx.clone())
+                    .oneshot(put_index_request(
+                        "/v2/myrepo/library/nginx/manifests/v1",
+                        body,
+                        "application/vnd.oci.image.index.v1+json",
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+                h.storage.get_call_count()
+            };
+            (single, index)
+        });
+        assert_eq!(
+            single_image_reads, 0,
+            "a single-image push must not open a CAS object for a closure it cannot have"
+        );
+        assert!(
+            index_reads > 0,
+            "an index push does walk its closure, which is what it pays for"
+        );
+    }
+
+    /// **The catalog read behind the closure question fails.** Not knowing
+    /// what a document binds is not knowing it is safe (ADR 0007), so the
+    /// push is refused rather than admitted — and the failure is an
+    /// `error!`, because nothing about the index was decided.
+    #[test]
+    fn an_index_push_is_refused_when_the_closure_question_cannot_be_answered() {
+        let (status, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child");
+                h.constituent_status
+                    .fail_next(DomainError::Invariant("catalog unreachable".into()));
+                let body = build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                );
+                router()
+                    .with_state(h.ctx.clone())
+                    .oneshot(put_index_request(
+                        "/v2/myrepo/library/nginx/manifests/v1",
+                        body,
+                        "application/vnd.oci.image.index.v1+json",
+                    ))
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        });
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a closure hort cannot enumerate fails the push closed"
+        );
+        assert!(
+            events.iter().any(|e| e
+                .fields
+                .contains("constituent deliverability could not be resolved")),
+            "and the operator is told what could not be resolved: {events:?}"
+        );
+    }
+
+    /// **The port breaks its own contract.** `ConstituentStatusReader`
+    /// may only name a status `QuarantineStatus::is_terminal` holds for;
+    /// an answer outside that set is one admission cannot map onto a
+    /// refusal, so it fails closed rather than admitting the push.
+    ///
+    /// Driven with a local double because the harness reader cannot
+    /// produce the answer — it filters through `is_terminal` itself,
+    /// which is the property that makes it a faithful stand-in. The
+    /// double is the only way to reach the arm, and the arm is what keeps
+    /// a disagreement between two definitions of "terminal" from serving
+    /// a push.
+    #[test]
+    fn an_index_push_is_refused_when_the_status_reader_names_a_non_terminal_constituent() {
+        struct NamesANonTerminalStatus;
+        impl hort_domain::ports::constituent_status::ConstituentStatusReader for NamesANonTerminalStatus {
+            fn strongest_terminal_constituent<'a>(
+                &'a self,
+                _repository_id: Uuid,
+                constituents: &'a [ContentHash],
+            ) -> hort_domain::ports::BoxFuture<
+                'a,
+                hort_domain::error::DomainResult<
+                    Option<hort_domain::ports::constituent_status::TerminalConstituent>,
+                >,
+            > {
+                let first = constituents.first().cloned();
+                Box::pin(async move {
+                    Ok(first.map(|content_hash| {
+                        hort_domain::ports::constituent_status::TerminalConstituent {
+                            content_hash,
+                            // Not terminal — the contract violation.
+                            status: QuarantineStatus::Released,
+                        }
+                    }))
+                })
+            }
+        }
+
+        let (status, events) = capture_tracing(|| {
+            run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child");
+                let body = build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                );
+                let ctx = hort_http_core::test_support::with_manifest_deliverability_use_case(
+                    &h.ctx,
+                    Arc::new(
+                        hort_app::use_cases::manifest_deliverability::ManifestDeliverabilityUseCase::new(
+                            h.storage.clone(),
+                            Arc::new(NamesANonTerminalStatus),
+                        ),
+                    ),
+                );
+                router()
+                    .with_state(ctx)
+                    .oneshot(put_index_request(
+                        "/v2/myrepo/library/nginx/manifests/v1",
+                        body,
+                        "application/vnd.oci.image.index.v1+json",
+                    ))
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        });
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an unmappable answer is not an admission"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| e.fields.contains("named a non-terminal status")),
+            "and the disagreement is reported: {events:?}"
+        );
+    }
+
+    /// **The reference resolution's own lookup fails.** A failed catalog
+    /// read must not read as "no such row", which would answer
+    /// `MANIFEST_BLOB_UNKNOWN` and send the publisher to push bytes this
+    /// repository may already hold. Asserted on **both** lookups, because
+    /// a child and a blob now take different ones: a child resolves by
+    /// the manifest path, a config/layer by checksum.
+    #[test]
+    fn a_failed_reference_lookup_refuses_the_push_rather_than_reading_as_absent() {
+        for (label, is_index) in [("index child", true), ("manifest layer", false)] {
+            let (status, events) = capture_tracing(|| {
+                run(async {
+                    let h = harness();
+                    let repo = oci_repo("myrepo");
+                    let repo_id = repo.id;
+                    h.repositories.insert(repo);
+                    let body = if is_index {
+                        let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"child");
+                        h.artifacts
+                            .fail_next_find_by_path(DomainError::Invariant("catalog down".into()));
+                        build_index_json(
+                            std::slice::from_ref(&child),
+                            "application/vnd.oci.image.index.v1+json",
+                        )
+                    } else {
+                        let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config");
+                        let layer = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer");
+                        h.artifacts
+                            .fail_next_find_by_repo_and_checksum(DomainError::Invariant(
+                                "catalog down".into(),
+                            ));
+                        build_manifest_json(&config, std::slice::from_ref(&layer))
+                    };
+                    let media = if is_index {
+                        "application/vnd.oci.image.index.v1+json"
+                    } else {
+                        "application/vnd.oci.image.manifest.v1+json"
+                    };
+                    router()
+                        .with_state(h.ctx.clone())
+                        .oneshot(put_index_request(
+                            "/v2/myrepo/library/nginx/manifests/v1",
+                            body,
+                            media,
+                        ))
+                        .await
+                        .unwrap()
+                        .status()
+                })
+            });
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{label}: a failed lookup is not an absent reference"
+            );
+            assert!(
+                events.iter().any(|e| e
+                    .fields
+                    .contains("referenced-constituent resolution failed")),
+                "{label}: the failure is reported: {events:?}"
             );
         }
     }
@@ -7742,20 +9463,30 @@ mod tests {
         assert_eq!(location, "/v2/myrepo/library/nginx/manifests/v1");
     }
 
-    // -------------------- parse_manifest_blobs blob-count cap --------------------
+    // ----------- the admission gate: what assessment can reach -----------
     //
-    // The 1 MiB body cap stops gross OOM but a manifest body can pack
-    // ~10k pathologically dense entries within 1 MiB — each entry
-    // triggers a `find_in_repo_by_hash` lookup in
-    // `resolve_referenced_blobs`. Cap the blob-reference count at 1024
-    // at parse time, before the lookup loop is entered.
+    // hort must not accept an artifact it can never answer about. A
+    // manifest the composite scan cannot assemble is accepted, scanned, and
+    // then refused deterministically before its config is read — so its
+    // composite verdict is permanently absent, the release authority never
+    // arrives, and the resulting hold is deadline-less. So the accepted set
+    // is derived from the assessable set: the one declaration is
+    // `ImageBudget::default_for_composite_scan()`, and the write path reads
+    // it through `max_manifest_blob_references()` rather than declaring a
+    // number of its own (it used to declare `MAX_BLOB_REFERENCES = 1024`,
+    // four times what the composition can compose).
+    //
+    // The gate is also spent before anything is collected, which is what
+    // the retired cap's "at parse time" note protected: the per-reference
+    // `find_in_repo_by_hash` loop in `resolve_referenced_blobs` is never
+    // entered for a manifest hort is going to refuse.
 
     /// Build a manifest JSON with `n` distinct synthetic layer digests
-    /// plus one config digest. Total referenced blobs = n + 1.
-    /// Digests are unique-by-construction (the index is encoded into
-    /// the hex), so the cap counts distinct entries, not deduplicated
-    /// hashes.
-    fn build_manifest_with_n_layers(n: usize) -> serde_json::Value {
+    /// plus one config digest, each declaring `layer_size` bytes. Total
+    /// referenced blobs = n + 1. Digests are unique-by-construction (the
+    /// index is encoded into the hex), so the count bound counts distinct
+    /// entries, not deduplicated hashes.
+    fn build_manifest_with_n_sized_layers(n: usize, layer_size: u64) -> serde_json::Value {
         // Use a stable config hash and unique-per-index layer hashes.
         // 64 hex chars per digest; index encoded as 16-hex prefix.
         let config_digest = format!("sha256:{}", "c".repeat(64));
@@ -7765,7 +9496,7 @@ mod tests {
                 serde_json::json!({
                     "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
                     "digest": format!("sha256:{hex}"),
-                    "size": 0,
+                    "size": layer_size,
                 })
             })
             .collect();
@@ -7781,68 +9512,438 @@ mod tests {
         })
     }
 
-    #[test]
-    fn parse_manifest_blobs_accepts_1023_layers_plus_config() {
-        // 1023 layers + 1 config = 1024 referenced blobs, exactly at
-        // the cap. Must succeed.
-        let manifest = build_manifest_with_n_layers(1023);
-        let result = parse_manifest_blobs(&manifest);
-        assert!(
-            result.is_ok(),
-            "1024 referenced blobs (1023 layers + 1 config) must be accepted; got {result:?}"
-        );
-        let blobs = result.unwrap();
-        assert_eq!(blobs.len(), 1024, "must include config + 1023 layers");
+    /// The same, declaring nothing for any layer's weight.
+    fn build_manifest_with_n_layers(n: usize) -> serde_json::Value {
+        build_manifest_with_n_sized_layers(n, 0)
     }
 
-    #[test]
-    fn parse_manifest_blobs_accepts_1024_layers_when_total_is_1025_fails() {
-        // Sanity: 1024 layers + 1 config = 1025 referenced blobs,
-        // exactly one over the cap. Must fail.
-        let manifest = build_manifest_with_n_layers(1024);
-        let result = parse_manifest_blobs(&manifest);
-        assert!(
-            result.is_err(),
-            "1025 referenced blobs (1024 layers + 1 config) must be rejected; got {result:?}"
-        );
-        let detail = result.unwrap_err();
-        let reason = detail
+    /// Parse a manifest value the way the handler does — the serialised
+    /// body beside the parse of it, because the manifest's own weight as a
+    /// constituent is a property of the bytes.
+    fn parse_value(manifest: &serde_json::Value) -> Result<Vec<ReferencedBlob>, serde_json::Value> {
+        let body = serde_json::to_vec(manifest).expect("fixture serialises");
+        parse_manifest_blobs(manifest, &body)
+    }
+
+    /// The reason sentence out of a refusal's `detail`.
+    fn refusal_reason(detail: &serde_json::Value) -> String {
+        detail
             .get("reason")
             .and_then(|v| v.as_str())
-            .expect("error detail must carry `reason`");
-        assert!(
-            reason.contains("1025") && reason.contains("1024"),
-            "reason must surface both the count and the cap; got {reason:?}"
+            .expect("error detail must carry `reason`")
+            .to_string()
+    }
+
+    /// **The boundary itself, from the composition's side.** The budget
+    /// counts *constituents* — manifest + config + layers — so the largest
+    /// composable image declares `max_blobs - 2` layers, and the largest
+    /// admissible manifest declares `max_blobs - 1` blob references. Both
+    /// bounds are inclusive, and this is the case the slice must not get
+    /// wrong in the other direction: refusing an image the composition
+    /// would have assembled.
+    #[test]
+    fn a_manifest_exactly_at_the_assessment_bound_is_admitted() {
+        let budget = ImageBudget::default_for_composite_scan();
+        let references = budget.max_manifest_blob_references();
+        let blobs = parse_value(&build_manifest_with_n_layers(references - 1))
+            .expect("a composition that exactly fits the budget must be admitted");
+        assert_eq!(
+            blobs.len(),
+            references,
+            "config + {} layers is exactly the bound",
+            references - 1
         );
+        // And the same count is what the composition will spend: the
+        // manifest is the constituent the manifest's own descriptors do not
+        // name.
+        assert_eq!(blobs.len() + 1, budget.max_blobs);
+    }
+
+    /// One layer past the bound — a **255-layer** image under the shipped
+    /// budget — is refused, naming the actual and then the bound.
+    ///
+    /// 255 layers is a valid image that the registry used to accept and the
+    /// composition then refused: 2 + 255 constituents against a ceiling of
+    /// 256. It is the exact case the maintainer's 2026-11-09 decision
+    /// (refuse at admission) was taken over.
+    #[test]
+    fn a_manifest_one_reference_past_the_bound_is_refused_naming_actual_then_bound() {
+        let budget = ImageBudget::default_for_composite_scan();
+        let references = budget.max_manifest_blob_references();
+        let detail = parse_value(&build_manifest_with_n_layers(references))
+            .expect_err("one reference past the bound must be refused");
+        let reason = refusal_reason(&detail);
+        assert_eq!(
+            reason,
+            format!(
+                "manifest references {} blobs; max is {references}",
+                references + 1
+            ),
+            "the refusal names the actual, then the bound"
+        );
+        // The shipped numbers, spelled out so a silent drift in either is a
+        // failing test rather than a quietly looser registry.
+        assert_eq!(references, 255);
+        assert_eq!(reason, "manifest references 256 blobs; max is 255");
     }
 
     #[test]
     fn parse_manifest_blobs_rejects_2048_layers() {
-        // Far over the cap — proves the check fires regardless of how
-        // far over the manifest is.
+        // Far over the bound — proves the check fires regardless of how
+        // far over the manifest is, and that the actual is the real count
+        // rather than a clamp.
         let manifest = build_manifest_with_n_layers(2048);
-        let result = parse_manifest_blobs(&manifest);
-        assert!(result.is_err(), "2049 referenced blobs must be rejected");
-        let detail = result.unwrap_err();
-        let reason = detail
-            .get("reason")
-            .and_then(|v| v.as_str())
-            .expect("error detail must carry `reason`");
+        let detail = parse_value(&manifest).expect_err("2049 referenced blobs must be rejected");
+        let reason = refusal_reason(&detail);
         assert!(
-            reason.contains("2049") && reason.contains("1024"),
-            "reason must report actual count 2049 and cap 1024; got {reason:?}"
+            reason.contains("2049") && reason.contains("255"),
+            "reason must report actual count 2049 and bound 255; got {reason:?}"
         );
     }
 
     #[test]
     fn parse_manifest_blobs_small_manifest_unchanged() {
         // Existing happy path — small single-layer manifest stays
-        // green. Regression guard: the cap must not interfere with
+        // green. Regression guard: the gate must not interfere with
         // legitimate manifests.
         let manifest = build_manifest_with_n_layers(1);
-        let blobs =
-            parse_manifest_blobs(&manifest).expect("a single-layer manifest must parse cleanly");
+        let blobs = parse_value(&manifest).expect("a single-layer manifest must parse cleanly");
         assert_eq!(blobs.len(), 2, "config + 1 layer = 2 referenced blobs");
+    }
+
+    /// **The byte bound, which admission had none of.** Checked from the
+    /// manifest's declared `layers[].size` sum plus the manifest's own
+    /// body — so nothing is fetched to reach it, which is the whole point:
+    /// an 8 GiB image used to be accepted, its blobs pulled, and the
+    /// composition then refused on bytes.
+    ///
+    /// The refusal copies the count refusal's shape exactly: same code,
+    /// actual then bound.
+    #[test]
+    fn a_manifest_declaring_more_bytes_than_the_budget_is_refused_naming_actual_then_bound() {
+        let budget = ImageBudget::default_for_composite_scan();
+        // Two layers, each half the whole-image byte budget: the pair alone
+        // is exactly the budget, and the manifest body itself puts the sum
+        // over it.
+        let manifest = build_manifest_with_n_sized_layers(2, budget.max_bytes / 2);
+        let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+        let detail = parse_manifest_blobs(&manifest, &body)
+            .expect_err("a composition the budget cannot hold must be refused");
+        let reason = refusal_reason(&detail);
+        assert_eq!(
+            reason,
+            format!(
+                "manifest declares {} bytes of content; max is {}",
+                budget.max_bytes + body.len() as u64,
+                budget.max_bytes
+            ),
+            "the byte refusal names the actual, then the bound: {reason}"
+        );
+        assert!(reason.contains("8589934592"), "the shipped 8 GiB: {reason}");
+    }
+
+    /// The byte bound is **inclusive**, matching the layout writer's (an
+    /// image whose total is exactly the budget assembles). The manifest
+    /// body is a constituent too — the writer copies it first and charges
+    /// it — so the sum that must fit is `body + config + layers`.
+    #[test]
+    fn a_manifest_declaring_exactly_the_byte_budget_is_admitted() {
+        let budget = ImageBudget::default_for_composite_scan();
+        // The layer's declared size has to be `max_bytes` minus the body it
+        // is written *into*, and writing it changes that body's length — so
+        // solve the small self-reference by iterating to a fixed point. It
+        // converges in two steps (the digit count of the size field is what
+        // moves), and the bound is there so a non-converging change fails
+        // loudly instead of hanging.
+        let mut layer_size = budget.max_bytes;
+        let (manifest, body) = (0..8)
+            .find_map(|_| {
+                let manifest = build_manifest_with_n_sized_layers(1, layer_size);
+                let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+                let want = budget.max_bytes - body.len() as u64;
+                if want == layer_size {
+                    return Some((manifest, body));
+                }
+                layer_size = want;
+                None
+            })
+            .expect("the declared-size fixed point must converge");
+
+        parse_manifest_blobs(&manifest, &body)
+            .expect("a composition that exactly fits the byte budget must be admitted");
+
+        // And one byte more is refused — so the assertion above is pinning
+        // the boundary rather than a bound nothing reaches. Same body
+        // length, since the size field's digit count has not moved.
+        let over = build_manifest_with_n_sized_layers(1, layer_size + 1);
+        let over_body = serde_json::to_vec(&over).expect("fixture serialises");
+        assert_eq!(over_body.len(), body.len(), "same body, one byte declared");
+        parse_manifest_blobs(&over, &over_body)
+            .expect_err("one byte past the budget must be refused");
+    }
+
+    /// **The wire, both bounds, through the real handler.** The unit tests
+    /// above pin the gate; this pins what a pushing client is told and that
+    /// nothing is left behind — no artifact row, so no permanently-absent
+    /// verdict to hold and nothing for a curator to waive.
+    ///
+    /// `MANIFEST_INVALID` with the actual before the bound in
+    /// `detail.reason`: the client sent the manifest, so the numbers are its
+    /// own and naming them is how it learns what to change. The count arm's
+    /// wording is unchanged from the cap this gate replaced — only the number
+    /// it prints moved.
+    #[test]
+    fn put_past_either_assessment_bound_is_refused_and_mints_nothing() {
+        let budget = ImageBudget::default_for_composite_scan();
+        let references = budget.max_manifest_blob_references();
+        let over_count = build_manifest_with_n_layers(references);
+        let over_bytes = build_manifest_with_n_sized_layers(2, budget.max_bytes / 2);
+
+        for (label, manifest, expected) in [
+            (
+                "one blob reference past the bound",
+                over_count,
+                format!(
+                    "manifest references {} blobs; max is {references}",
+                    references + 1
+                ),
+            ),
+            (
+                "more declared bytes than the whole-image budget",
+                over_bytes.clone(),
+                {
+                    let body = serde_json::to_vec(&over_bytes).expect("serialises");
+                    format!(
+                        "manifest declares {} bytes of content; max is {}",
+                        budget.max_bytes + body.len() as u64,
+                        budget.max_bytes
+                    )
+                },
+            ),
+        ] {
+            let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+            let (status, envelope, minted) = run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+
+                let router = router().with_state(h.ctx.clone());
+                let uri = "/v2/myrepo/library/nginx/manifests/v1";
+                let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+                let status = resp.status();
+                let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("an OCI error envelope is JSON");
+                let minted = h
+                    .artifacts
+                    .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                    .await
+                    .unwrap();
+                (status, envelope, minted.is_some())
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(
+                envelope["errors"][0]["code"], "MANIFEST_INVALID",
+                "{label}: {envelope}"
+            );
+            assert_eq!(
+                envelope["errors"][0]["detail"]["reason"],
+                serde_json::Value::String(expected),
+                "{label}: the refusal names the actual, then the bound: {envelope}"
+            );
+            assert!(
+                !minted,
+                "{label}: the gate is spent before the mint, so there is no row to hold"
+            );
+        }
+    }
+
+    /// **A size hort cannot read is refused at the push, by slot.** `size` is
+    /// REQUIRED on every `config` / `layers[]` descriptor by the OCI image
+    /// spec, so this is malformed input and not a composition that is too
+    /// large — the posture `check_child_against_descriptor` already takes one
+    /// descriptor type over, for an index child.
+    ///
+    /// Charging an absent `size` as zero let a manifest declaring one layer of
+    /// unstated weight clear the byte bound whatever it really weighed, be
+    /// minted, and then be refused by the assessment — accepted, then
+    /// permanently unassessable, which is the state admission exists to
+    /// prevent.
+    ///
+    /// Two things are asserted beyond the status code: the `detail.reason`
+    /// names **hort's own slot** and the declarant's value does not reach the
+    /// envelope anywhere — a *negative* size is a value, unlike an absent one,
+    /// so the sentinel below is the case that can leak.
+    #[test]
+    fn put_with_an_unreadable_declared_size_is_refused_by_slot_and_mints_nothing() {
+        // Distinctive enough that a substring search over the whole envelope
+        // is a real test: no bound, count or body length can coincide with it.
+        const SENTINEL: i64 = -4242424242;
+
+        for (label, manifest, expected_slot) in [
+            (
+                "a layer declaring no `size` at all",
+                serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "config": {
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "c".repeat(64)),
+                        "size": 0,
+                    },
+                    "layers": [
+                        {
+                            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                            "digest": format!("sha256:{}", "1".repeat(64)),
+                            "size": 64,
+                        },
+                        {
+                            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                            "digest": format!("sha256:{}", "2".repeat(64)),
+                        },
+                    ],
+                }),
+                "layers[1]",
+            ),
+            (
+                "a config declaring a negative `size`",
+                serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "config": {
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{}", "c".repeat(64)),
+                        "size": SENTINEL,
+                    },
+                    "layers": [{
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                        "digest": format!("sha256:{}", "1".repeat(64)),
+                        "size": 64,
+                    }],
+                }),
+                "config",
+            ),
+        ] {
+            let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+            let (status, envelope, minted) = run(async {
+                let h = harness();
+                let repo = oci_repo("myrepo");
+                let repo_id = repo.id;
+                h.repositories.insert(repo);
+
+                let router = router().with_state(h.ctx.clone());
+                let uri = "/v2/myrepo/library/nginx/manifests/v1";
+                let resp = router.oneshot(put_request(uri, body)).await.unwrap();
+                let status = resp.status();
+                let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let envelope: serde_json::Value =
+                    serde_json::from_slice(&bytes).expect("an OCI error envelope is JSON");
+                let minted = h
+                    .artifacts
+                    .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                    .await
+                    .unwrap();
+                (status, envelope, minted.is_some())
+            });
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{label}");
+            assert_eq!(
+                envelope["errors"][0]["code"], "MANIFEST_INVALID",
+                "{label}: {envelope}"
+            );
+            assert_eq!(
+                envelope["errors"][0]["detail"]["reason"],
+                serde_json::Value::String(format!(
+                    "manifest descriptor {expected_slot} declares no readable `size`, which \
+                     the image spec requires"
+                )),
+                "{label}: the refusal names hort's own slot: {envelope}"
+            );
+            let serialized = envelope.to_string();
+            assert!(
+                !serialized.contains("4242424242"),
+                "{label}: a declared size must not reach the envelope: {serialized}"
+            );
+            assert!(
+                !minted,
+                "{label}: the gate is spent before the mint, so there is no row to hold"
+            );
+        }
+    }
+
+    /// **The counter-assertion on the wire: a conformant manifest is still
+    /// admitted, `size: 0` included.** Zero is readable, conformant and
+    /// legitimate — the empty config blob weighs two bytes — so refusing it
+    /// would be an off-by-one into the valid range, and the fixture every
+    /// bound test in this module builds on declares exactly that for its
+    /// config.
+    #[test]
+    fn put_admits_a_conformant_manifest_whose_descriptors_declare_zero() {
+        let manifest = build_manifest_with_n_sized_layers(2, 0);
+        let body = serde_json::to_vec(&manifest).expect("fixture serialises");
+        parse_manifest_blobs(&manifest, &body)
+            .expect("every descriptor declares a readable `size`, and zero is one");
+    }
+
+    /// **One declaration, both readers.** Not two numbers that agree: the
+    /// budget is *moved* and admission follows it, on both bounds, through
+    /// `refuse_manifest_past_assessment_budget` — the same function the
+    /// shipped gate spends.
+    ///
+    /// A pair of constants that merely matched is how the accepted set and
+    /// the assessable set came apart in the first place, so what is asserted
+    /// here is the derivation and not a value.
+    #[test]
+    fn moving_the_assessment_budget_moves_admission() {
+        use hort_domain::oci::{refuse_manifest_past_assessment_budget, AdmissionRefusal};
+
+        // A budget that admits four blob references (five constituents).
+        let tight = ImageBudget {
+            max_blobs: 5,
+            ..ImageBudget::default_for_composite_scan()
+        };
+        assert_eq!(tight.max_manifest_blob_references(), 4);
+        let at_bound = serde_json::to_vec(&build_manifest_with_n_layers(3)).expect("serialises");
+        refuse_manifest_past_assessment_budget(&at_bound, &tight)
+            .expect("config + 3 layers is exactly four references");
+        let over = serde_json::to_vec(&build_manifest_with_n_layers(4)).expect("serialises");
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(&over, &tight),
+            Err(AdmissionRefusal::TooManyBlobReferences {
+                declared: 5,
+                max: 4
+            }),
+            "the bound moved with the budget, and so did the number the refusal prints"
+        );
+        // The same manifest is admitted under the shipped budget, so what
+        // moved is the budget and not the manifest.
+        refuse_manifest_past_assessment_budget(&over, &ImageBudget::default_for_composite_scan())
+            .expect("five references are far inside the shipped bound");
+
+        // And the byte bound moves the same way.
+        let small = serde_json::to_vec(&build_manifest_with_n_sized_layers(1, 64)).expect("ser");
+        let bytes_budget = ImageBudget {
+            max_bytes: small.len() as u64 + 64,
+            ..ImageBudget::default_for_composite_scan()
+        };
+        refuse_manifest_past_assessment_budget(&small, &bytes_budget)
+            .expect("the body plus its one declared layer is exactly the byte budget");
+        assert_eq!(
+            refuse_manifest_past_assessment_budget(
+                &small,
+                &ImageBudget {
+                    max_bytes: small.len() as u64 + 63,
+                    ..ImageBudget::default_for_composite_scan()
+                }
+            ),
+            Err(AdmissionRefusal::DeclaredBytes {
+                declared: small.len() as u64 + 64,
+                max: small.len() as u64 + 63
+            }),
+            "one byte less of budget refuses the same manifest"
+        );
     }
 
     /// `config.digest` is fully attacker-controlled manifest-JSON
@@ -7851,10 +9952,15 @@ mod tests {
     #[test]
     fn parse_manifest_blobs_malformed_config_digest_does_not_echo_raw_value() {
         let manifest = serde_json::json!({
-            "config": {"digest": "xsentinel-not-a-digest-at-all"},
+            // Conformant `size`, so the admission gate the parse spends first
+            // passes this descriptor through to the digest grammar that is
+            // what this test is about. Dropping it moves the refusal to the
+            // missing-`size` arm and the never-echo property below goes
+            // untested.
+            "config": {"digest": "xsentinel-not-a-digest-at-all", "size": 0},
             "layers": [],
         });
-        let detail = parse_manifest_blobs(&manifest).unwrap_err();
+        let detail = parse_value(&manifest).unwrap_err();
         assert_eq!(detail["reason"], "malformed digest in manifest");
         assert!(
             detail.get("digest").is_none(),
@@ -7873,10 +9979,14 @@ mod tests {
     #[test]
     fn parse_manifest_blobs_unsupported_config_digest_algo_does_not_echo_algorithm() {
         let manifest = serde_json::json!({
-            "config": {"digest": format!("xsentinelalgo:{}", "a".repeat(64))},
+            // Conformant `size`, for the reason the malformed-digest test
+            // above records: without it the admission gate refuses on the
+            // descriptor's `size` and the algorithm never reaches the arm
+            // under test.
+            "config": {"digest": format!("xsentinelalgo:{}", "a".repeat(64)), "size": 0},
             "layers": [],
         });
-        let detail = parse_manifest_blobs(&manifest).unwrap_err();
+        let detail = parse_value(&manifest).unwrap_err();
         assert_eq!(detail["reason"], "unsupported digest algorithm in manifest");
         assert!(
             detail.get("digest").is_none(),

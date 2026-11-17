@@ -23,7 +23,11 @@
 //! **An unmeasured size is stated, never implied.** When the server did
 //! not measure the reclaimable bytes it says so and why. That renders as
 //! the words "not measured" plus the reason — never `0`, never a blank,
-//! never a dash, each of which reads as "there is nothing to free".
+//! never a dash, each of which reads as "there is nothing to free". A
+//! figure the server could measure only in part is a **floor**, and is
+//! labelled one everywhere it appears, with the count of targets missing
+//! from it: a lower bound printed as a total is the same misreading in a
+//! smaller font, and it is the one this output would make silently.
 //!
 //! **Truncation is a header, not a footnote.** A `partial` sweep stopped
 //! before the end of the artifact table, so every total below it
@@ -35,7 +39,7 @@ use std::collections::BTreeMap;
 use crate::output::format_table_rows;
 
 use super::dto::{
-    compare_proposals, coverage_is_partial, FreedBytes, PreviewBody, PreviewGroup,
+    compare_proposals, coverage_is_partial, ByteFigure, FreedBytes, PreviewBody, PreviewGroup,
     ProposalComparison, ProposalDigest, RetentionRunSummary,
 };
 
@@ -86,25 +90,57 @@ fn byte_noun(n: u64) -> &'static str {
     }
 }
 
-/// One line's worth of byte accounting, measured or explicitly not.
-fn bytes_phrase(freed: &FreedBytes) -> String {
-    match freed.measured() {
-        Some(bytes) => measured_bytes(bytes),
-        None => format!(
-            "NOT MEASURED — {}",
-            freed
-                .omission_reason()
-                .unwrap_or("the server gave no reason")
-        ),
+/// The same agreement for the unresolved-target count that rides with a
+/// floor, and for the same reason.
+fn target_noun(n: u64) -> &'static str {
+    if n == 1 {
+        "target"
+    } else {
+        "targets"
     }
 }
 
-/// A short form for the delta table, where the reason is carried in its
-/// own row rather than inline.
+/// One line's worth of byte accounting: a total, a floor, or an explicit
+/// statement that there is no figure.
+///
+/// The floor says what is missing from it rather than only that
+/// something is. "At least X" alone invites the reading that X is
+/// nearly the answer, which one unreadable target out of thousands and
+/// a thousand out of thousands would both support.
+fn bytes_phrase(freed: &FreedBytes) -> String {
+    match freed.figure() {
+        ByteFigure::Total(bytes) => measured_bytes(bytes),
+        ByteFigure::Floor {
+            bytes,
+            unresolved_targets,
+        } => format!(
+            "at least {} — a floor: storage did not answer for {} reclaimable {}, \
+             whose bytes are not counted here",
+            measured_bytes(bytes),
+            count(unresolved_targets),
+            target_noun(unresolved_targets),
+        ),
+        ByteFigure::Unmeasured { reason } => format!("NOT MEASURED — {reason}"),
+    }
+}
+
+/// A short form for the delta table, where the explanation is carried in
+/// its own row rather than inline. The floor keeps its label and its
+/// count even here: a cell is read beside the other column's cell, which
+/// is exactly where a bound reads as a total.
 fn bytes_cell(freed: &FreedBytes) -> String {
-    match freed.measured() {
-        Some(bytes) => format!("{} {}", count(bytes), byte_noun(bytes)),
-        None => "not measured".to_string(),
+    match freed.figure() {
+        ByteFigure::Total(bytes) => format!("{} {}", count(bytes), byte_noun(bytes)),
+        ByteFigure::Floor {
+            bytes,
+            unresolved_targets,
+        } => format!(
+            "at least {} {} ({} unresolved)",
+            count(bytes),
+            byte_noun(bytes),
+            count(unresolved_targets),
+        ),
+        ByteFigure::Unmeasured { .. } => "not measured".to_string(),
     }
 }
 
@@ -561,15 +597,21 @@ pub fn render_delta(delta: &PreviewDelta, baseline_job: &str, fresh_job: &str) -
         &rows,
     )));
 
-    if delta.fresh_bytes.measured().is_none() {
-        out.push_str(&format!(
-            "\n  The fresh preview did not measure a size: {}.\n\
+    match delta.fresh_bytes.figure() {
+        ByteFigure::Total(_) => {}
+        ByteFigure::Floor {
+            unresolved_targets, ..
+        } => out.push_str(&format!(
+            "\n  The fresh preview measured a floor, not a total: storage did not answer\n\
+             \x20 for {} reclaimable {}, so the figure above is the least that would be\n\
+             \x20 freed and the change column has no difference to state.\n",
+            count(unresolved_targets),
+            target_noun(unresolved_targets),
+        )),
+        ByteFigure::Unmeasured { reason } => out.push_str(&format!(
+            "\n  The fresh preview did not measure a size: {reason}.\n\
              \x20 No estimate is substituted.\n",
-            delta
-                .fresh_bytes
-                .omission_reason()
-                .unwrap_or("the server gave no reason")
-        ));
+        )),
     }
 
     let moved: Vec<&GroupDelta> = delta.groups.iter().filter(|g| g.changed()).collect();
@@ -726,17 +768,30 @@ fn group_identity_cell(identity: Option<ProposalComparison>) -> String {
 
 /// Describe how the byte accounting moved.
 ///
-/// A signed figure only when both sides were actually measured: a
-/// difference computed against a run that measured nothing would be an
-/// invented number, which is the one thing this output never produces.
+/// A signed figure only when both sides are totals. A difference
+/// computed against a run that measured nothing would be an invented
+/// number, which is the one thing this output never produces — and a
+/// difference taken against a floor is invented in the same way: what
+/// moved is the bound, and a bound that fell may sit under a figure that
+/// rose. Two floors are no better, since each leaves a different set of
+/// targets out.
 fn byte_change(before: &FreedBytes, after: &FreedBytes) -> String {
-    match (before.measured(), after.measured()) {
-        (Some(b), Some(a)) if b == a => "unchanged".to_string(),
-        (Some(b), Some(a)) => format!("{} {}", signed(b, a), byte_noun(a.abs_diff(b))),
-        (Some(_), None) => "no longer measured".to_string(),
-        (None, Some(_)) => "now measured".to_string(),
-        (None, None) if before == after => "unchanged".to_string(),
-        (None, None) => "still not measured".to_string(),
+    match (before.figure(), after.figure()) {
+        (ByteFigure::Total(b), ByteFigure::Total(a)) if b == a => "unchanged".to_string(),
+        (ByteFigure::Total(b), ByteFigure::Total(a)) => {
+            format!("{} {}", signed(b, a), byte_noun(a.abs_diff(b)))
+        }
+        (ByteFigure::Floor { .. }, _) | (_, ByteFigure::Floor { .. }) => {
+            "not comparable (a floor)".to_string()
+        }
+        (ByteFigure::Total(_), ByteFigure::Unmeasured { .. }) => "no longer measured".to_string(),
+        (ByteFigure::Unmeasured { .. }, ByteFigure::Total(_)) => "now measured".to_string(),
+        (ByteFigure::Unmeasured { .. }, ByteFigure::Unmeasured { .. }) if before == after => {
+            "unchanged".to_string()
+        }
+        (ByteFigure::Unmeasured { .. }, ByteFigure::Unmeasured { .. }) => {
+            "still not measured".to_string()
+        }
     }
 }
 
@@ -933,6 +988,94 @@ mod tests {
         );
     }
 
+    /// The figure survives a target hort could not size, and says what it
+    /// is: a floor with the count of targets missing from it. The whole
+    /// point of the status is that an operator reads a number here at all
+    /// — but never one that reads as the total.
+    #[test]
+    fn a_partly_measured_size_renders_as_a_floor_with_its_count() {
+        let rendered = bytes_phrase(&FreedBytes::AtLeast {
+            bytes: 4_096,
+            unresolved_targets: 3,
+        });
+        assert!(
+            rendered.starts_with("at least "),
+            "the bound is the first thing read: {rendered}"
+        );
+        assert!(rendered.contains("4,096 bytes"), "{rendered}");
+        assert!(
+            rendered.contains("3 reclaimable targets"),
+            "the count says how far short the figure may be: {rendered}"
+        );
+        assert!(
+            !rendered.contains("NOT MEASURED"),
+            "a floor is measured — of part: {rendered}"
+        );
+    }
+
+    /// Singular, because an output whose job is to be trusted cannot
+    /// read as a typo at the figure that triggered this whole change:
+    /// one unresolved target out of thousands.
+    #[test]
+    fn a_floor_missing_one_target_says_target_not_targets() {
+        let rendered = bytes_phrase(&FreedBytes::AtLeast {
+            bytes: 1,
+            unresolved_targets: 1,
+        });
+        assert!(rendered.contains("1 reclaimable target,"), "{rendered}");
+        assert!(rendered.contains("at least 1 byte"), "{rendered}");
+    }
+
+    /// The delta table is read column beside column, which is exactly
+    /// where an unlabelled bound reads as a total.
+    #[test]
+    fn a_floor_keeps_its_label_and_count_in_the_delta_table_cell() {
+        let cell = bytes_cell(&FreedBytes::AtLeast {
+            bytes: 12_345,
+            unresolved_targets: 2,
+        });
+        assert_eq!(cell, "at least 12,345 bytes (2 unresolved)");
+        assert_eq!(
+            bytes_cell(&FreedBytes::Exact { bytes: 12_345 }),
+            "12,345 bytes",
+            "and a total is still stated without hedging",
+        );
+    }
+
+    /// A difference taken against a bound is as invented as one taken
+    /// against nothing: the bound moved, which does not say which way
+    /// the bytes did. It holds in both directions and for two floors,
+    /// because each floor leaves a different set of targets out.
+    #[test]
+    fn a_floor_on_either_side_is_not_a_byte_difference() {
+        let total = FreedBytes::Exact { bytes: 100 };
+        let floor = FreedBytes::AtLeast {
+            bytes: 90,
+            unresolved_targets: 1,
+        };
+        let other_floor = FreedBytes::AtLeast {
+            bytes: 90,
+            unresolved_targets: 4,
+        };
+        for (before, after) in [
+            (&total, &floor),
+            (&floor, &total),
+            (&floor, &other_floor),
+            (&floor, &floor),
+        ] {
+            let change = byte_change(before, after);
+            assert_eq!(
+                change, "not comparable (a floor)",
+                "{before:?} -> {after:?} produced {change:?}"
+            );
+        }
+        assert_eq!(
+            byte_change(&total, &FreedBytes::Exact { bytes: 90 }),
+            "-10 bytes",
+            "two totals still state their difference",
+        );
+    }
+
     #[test]
     fn partial_coverage_is_in_the_header_above_every_figure() {
         let s = summary(812, 634, FreedBytes::Exact { bytes: 12_345 }, "partial");
@@ -983,6 +1126,28 @@ mod tests {
         assert!(line.contains("refcount simulation"), "{line}");
         assert!(!line.contains(" 0"), "a zero must not appear: {line}");
         assert!(!line.contains(" - "), "a dash must not appear: {line}");
+    }
+
+    /// The preview line is where an operator reads the figure, so the
+    /// label has to be there and not only in the DTO.
+    #[test]
+    fn a_floor_is_labelled_on_the_preview_line_itself() {
+        let s = summary(
+            10,
+            10,
+            FreedBytes::AtLeast {
+                bytes: 4_096,
+                unresolved_targets: 1,
+            },
+            "complete",
+        );
+        let out = render_preview("RETENTION PREVIEW", &facts(), &s, 20);
+        let line = out
+            .lines()
+            .find(|l| l.contains("storage freed"))
+            .expect("the storage line exists");
+        assert!(line.contains("at least"), "{line}");
+        assert!(line.contains("1 reclaimable target"), "{line}");
     }
 
     #[test]
@@ -1042,6 +1207,37 @@ mod tests {
         assert_eq!(age(7_200), "2h");
         assert_eq!(age(600), "10m");
         assert_eq!(age(-1), "(future)");
+    }
+
+    /// The caution under the table carries what the cell has no room
+    /// for, and says why the change column is blank — a reader who sees
+    /// "not comparable" and no explanation reads it as a defect.
+    #[test]
+    fn a_floor_in_the_fresh_preview_is_explained_below_the_table() {
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let after = summary(
+            10,
+            8,
+            FreedBytes::AtLeast {
+                bytes: 90,
+                unresolved_targets: 2,
+            },
+            "complete",
+        );
+        let rendered = render_delta(&diff(&before, &after), "job-a", "job-b");
+        assert!(
+            rendered.contains("measured a floor, not a total"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("2 reclaimable targets"), "{rendered}");
+        assert!(
+            rendered.contains("not comparable (a floor)"),
+            "the change column says so too: {rendered}"
+        );
+        assert!(
+            !rendered.contains("No estimate is substituted"),
+            "that sentence belongs to a run with no figure at all: {rendered}"
+        );
     }
 
     #[test]

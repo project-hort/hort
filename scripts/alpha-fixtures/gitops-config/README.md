@@ -116,8 +116,8 @@ hort-cli admin retention preview            # dry run: appends nothing, deletes 
 ```
 
 Executing is the separate, destructive step (`hort-cli admin retention
-apply`), and it needs the `task:destructive` claim on a fresh IdP-backed
-admin session.
+apply`), and it needs the `destroy_content` permission — a grant bound to
+the invoking identity, not something `admin` implies.
 
 ## Storage paths
 
@@ -141,9 +141,9 @@ relative to the storage backend root.
   retention CronJobs ship `enabled: false` and this tree does not change
   that. The evaluate/purge pair is run by a person through `hort-cli admin
   retention preview` / `apply`; `preview` (the dry run) needs only
-  `Permission::AdminTaskInvoke`, while executing additionally needs the
-  `task:destructive` claim, which a claimless bootstrap svc-token cannot
-  carry.
+  `Permission::AdminTaskInvoke`, while executing additionally needs
+  `Permission::DestroyContent`, which the bootstrap svc-token does not hold
+  and `admin` does not imply.
 - **`KeepLastN` / `UnusedFor` retention** — neither predicate is declared.
   `KeepLastN` ranks siblings and decides nothing over groups of size one,
   and this tree's own walk publishes exactly one version of each hosted

@@ -81,13 +81,13 @@ use hort_app::rbac::RbacEvaluator;
 use hort_app::task_dispatcher::TaskDispatcher;
 use hort_app::task_handlers::eventstore_checkpoint::BackfillBaselineConfig;
 use hort_app::task_handlers::{
-    AdvisoryWatchTickHandler, CheckpointEmissionHook, CheckpointEmitterHookAdapter,
-    CronRescanTickHandler, EventStoreArchiveHandler, EventstoreCheckpointHandler,
-    JobsRowRetentionSweepHandler, NoopTaskHandler, OciIndexChildIngestHandler,
-    OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler, PrefetchIngestHandler,
-    PrefetchRowRetentionSweepHandler, PrefetchTickHandler, ProvenanceVerifyHandler,
-    QuarantineReleaseSweepHandler, ReplaySeenPruneHandler, RetentionEvaluateHandler,
-    RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
+    AdvisoryWatchTickHandler, ApiTokenRetentionSweepHandler, CheckpointEmissionHook,
+    CheckpointEmitterHookAdapter, CronRescanTickHandler, EventStoreArchiveHandler,
+    EventstoreCheckpointHandler, JobsRowRetentionSweepHandler, NoopTaskHandler,
+    OciIndexChildIngestHandler, OciMembershipEdgeBackfillHandler, PrefetchDependenciesHandler,
+    PrefetchIngestHandler, PrefetchRowRetentionSweepHandler, PrefetchTickHandler,
+    ProvenanceVerifyHandler, QuarantineReleaseSweepHandler, ReplaySeenPruneHandler,
+    RetentionEvaluateHandler, RetentionPurgeHandler, ScanRowRetentionSweepHandler, ScanTaskHandler,
     ScannerRegistryPruneHandler, SeedImportHandler, ServiceAccountRotationHandler,
     StagingSweepHandler, WheelMetadataBackfillHandler,
 };
@@ -103,6 +103,7 @@ use hort_app::use_cases::artifact_group_use_case::ArtifactGroupUseCase;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
 use hort_app::use_cases::prefetch_use_case::PrefetchUseCase;
 use hort_app::use_cases::provenance_orchestration::ProvenanceOrchestrationUseCase;
+use hort_app::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use hort_app::use_cases::quarantine_use_case::QuarantineUseCase;
 use hort_app::use_cases::scan_orchestration::{ScanOrchestrationConfig, ScanOrchestrationUseCase};
 use hort_app::use_cases::seed_import_use_case::SeedImportUseCase;
@@ -506,6 +507,17 @@ pub async fn build_app_context(
     //    transaction), so the use case no longer holds a separate
     //    `ScanFindingsRepository` handle.
     // -----------------------------------------------------------------
+    // The one quarantine-anchor assembly every hold path shares (ADR
+    // 0054). Built here because the first consumer is immediately below;
+    // the mapping repo it reads for the `trust_upstream_publish_time`
+    // opt-in is the same adapter the prefetch handlers take further down.
+    let anchor_resolver = Arc::new(QuarantineAnchorResolver::new(
+        artifacts.clone(),
+        content_references.clone(),
+        policy_projections.clone(),
+        Arc::new(PgRepositoryUpstreamMappingRepo::new(pool.clone())),
+    ));
+
     let quarantine = Arc::new(QuarantineUseCase::new(
         artifacts.clone(),
         event_publisher.clone(),
@@ -518,6 +530,7 @@ pub async fn build_app_context(
         // final `provenance-verify` for Required + Pending + expired
         // candidates via the shared `jobs` adapter.
         jobs.clone(),
+        anchor_resolver.clone(),
     ));
 
     // -----------------------------------------------------------------
@@ -619,6 +632,11 @@ pub async fn build_app_context(
         // The composite path's constituent acquisition (ADR 0064 D1).
         upstream_proxy_for_composite_scan,
         caching_resolver.clone(),
+        // The membership projection the layer-role resolver reads a
+        // blob's nominating manifests out of (ADR 0064 D6), so a blob no
+        // manifest composes an image from is not presented to a scanner
+        // as a root filesystem. Read-only on this path.
+        content_references.clone(),
         scanners_map,
         // Clone so the SeedImportUseCase below can consume the same
         // handler set. The `Arc<dyn FormatHandler>` values are cheap
@@ -983,6 +1001,32 @@ pub async fn build_app_context(
     // other sweep in this file.
     dispatcher.register(Arc::new(JobsRowRetentionSweepHandler::new(jobs.clone())), 1);
 
+    // Credential-store retention sweep — the first in this family whose
+    // DELETE lands outside `public.jobs`. Deletes an `api_tokens` row
+    // whose own `expires_at` or `revoked_at` is more than 90 days in the
+    // past; a row with both marks NULL is a durable identity and matches
+    // neither disjunct. Registered unconditionally: the table grows on
+    // every deployment from day one (one row per issued credential, plus
+    // one per federated workload exchange) and had no horizon at all
+    // before this handler.
+    //
+    // Its own `ApiTokenRepository` rather than the one
+    // `register_service_account_rotation` builds: that one is scoped to
+    // the rotation handler's conditional registration (it returns early
+    // without `HORT_ROTATION_NAMESPACES` / `HORT_PUBLIC_REGISTRY_HOST`),
+    // and this sweep must run whether or not rotation is configured.
+    //
+    // Concurrency = 1 — single-active per worker replica, same as every
+    // other sweep in this file. Two concurrent runs would be harmless
+    // (the second `DELETE` finds the first one's rows already gone) but
+    // there is nothing to gain from one.
+    dispatcher.register(
+        Arc::new(ApiTokenRetentionSweepHandler::new(Arc::new(
+            PgApiTokenRepository::new(pool.clone()),
+        ))),
+        1,
+    );
+
     // -----------------------------------------------------------------
     // 12.e.tris Register the WheelMetadataBackfillHandler (kind
     //          `wheel-metadata-backfill`).
@@ -1247,6 +1291,11 @@ pub async fn build_app_context(
             // stored findings reads the row's role the way the scan run
             // read it (ADR 0064 D2).
             handlers.clone(),
+            // The same anchor assembly the quarantine use case above
+            // takes: the pass's re-quarantine arm returns an artifact to
+            // the hold, and one artifact gets one anchor whichever path
+            // puts it there.
+            anchor_resolver.clone(),
         ));
         dispatcher.register(
             Arc::new(hort_app::task_handlers::PolicyReEvaluationHandler::new(

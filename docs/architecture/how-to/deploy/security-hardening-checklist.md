@@ -533,17 +533,30 @@ distinct mechanism) is unchanged.
   surface).
 - **Relaxation:** none.
 
-### OCI manifest blob-reference cap
+### OCI manifest admission bounds
 
-- **Control:** `parse_manifest_blobs` rejects manifests referencing
-  more than 1024 distinct blob digests. The 1 MiB body cap admits
-  ~10k pathologically dense entries; this stops the lookup-loop
-  amplification.
-- **Chart default:** unconditional (constant `MAX_BLOB_REFERENCES`).
+- **Control:** `parse_manifest_blobs` rejects a manifest declaring more
+  than **255** blob references (`config` + `layers[]`), or more than
+  **8 GiB** of content between its own body, its config and its layers.
+  Both are the composite scan's own whole-image budget
+  (`ImageBudget::default_for_composite_scan`), read through
+  `ImageBudget::max_manifest_blob_references`, and not a number this
+  path declares: an image hort cannot assess would be accepted and then
+  held with no verdict for ever. The byte sum is read from the
+  manifest's declared `layers[].size`, so nothing is fetched to reach
+  the refusal. The bound also covers the lookup-loop amplification the
+  earlier, looser cap was chosen for — the 1 MiB body cap admits ~10k
+  pathologically dense entries, each of which would cost a repository
+  lookup.
+- **Chart default:** unconditional in the binary; no values key.
 - **Operator action required:** no.
-- **Verify post-install:** pushing a synthetic 1025-blob manifest via
+- **Verify post-install:** pushing a synthetic 256-reference manifest via
   `PUT /v2/<repo>/manifests/v1` returns 400 with error code
-  `MANIFEST_INVALID`.
+  `MANIFEST_INVALID` and a `detail.reason` naming the actual count and
+  the bound. A pull-through of such an image from an upstream returns 400
+  `UNSUPPORTED` and mints nothing — **an upstream image above either
+  bound cannot be mirrored**, which is the accepted cost of not
+  accepting what cannot be assessed.
 - **Relaxation:** none.
 
 ### mTLS / custom CA / cert pinning per upstream

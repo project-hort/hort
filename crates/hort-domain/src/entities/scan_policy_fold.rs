@@ -31,7 +31,9 @@
 //! So it refuses a stream that does not open with [`PolicyCreated`], a
 //! stream mixing policy ids, an event type that does not belong on a
 //! policy stream, a `config_snapshot` missing a field's key, and any value
-//! that does not decode. A refusal means the caller writes nothing.
+//! that does not decode. A refusal means the caller writes nothing. The
+//! retired field above is the one thing it neither decodes nor refuses —
+//! a value nothing consults is not evidence a replay can be wrong about.
 
 use chrono::{DateTime, Utc};
 use std::str::FromStr;
@@ -46,8 +48,8 @@ use crate::events::{
 };
 
 use super::scan_policy::{
-    CompositeVerdictMode, ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement,
-    ScanPolicyProjection, SeverityThreshold, SignerIdentityPattern,
+    ExclusionProjection, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
+    SeverityThreshold, SignerIdentityPattern,
 };
 
 // ---------------------------------------------------------------------------
@@ -77,7 +79,14 @@ const fn next_policy_field(field: &PolicyField) -> Option<PolicyField> {
         PolicyField::ScanBackends => Some(PolicyField::RescanIntervalHours),
         PolicyField::RescanIntervalHours => Some(PolicyField::NegligibleAction),
         PolicyField::NegligibleAction => Some(PolicyField::Enforcement),
-        PolicyField::Enforcement => Some(PolicyField::CompositeVerdictMode),
+        PolicyField::Enforcement => None,
+        // Retired, and so deliberately off the chain rather than
+        // terminating it (see `set_policy_field`): the walk is what
+        // `policy_config_snapshot` writes, what `replay_policy_created`
+        // *requires*, and what `diff_policy_fields` emits — so a field no
+        // projection carries must not be visited by any of the three. A
+        // historical stream's events are still folded; they are just not
+        // produced any more.
         PolicyField::CompositeVerdictMode => None,
     }
 }
@@ -85,7 +94,7 @@ const fn next_policy_field(field: &PolicyField) -> Option<PolicyField> {
 /// The number of fields [`policy_fields`] visits. Asserted against the
 /// walk in this module's tests, so a successor arm that short-circuits the
 /// chain (`NewField => None` beside an existing terminal) is caught.
-pub const POLICY_FIELD_COUNT: usize = 15;
+pub const POLICY_FIELD_COUNT: usize = 14;
 
 /// Walk every [`PolicyField`] in the canonical diff order.
 pub fn policy_fields() -> impl Iterator<Item = PolicyField> {
@@ -113,6 +122,11 @@ const fn snapshot_key(field: &PolicyField) -> &'static str {
         PolicyField::RescanIntervalHours => "rescan_interval_hours",
         PolicyField::NegligibleAction => "negligible_action",
         PolicyField::Enforcement => "enforcement",
+        // The key historical `PolicyCreated` snapshots carry for the
+        // retired field. Unreachable from the two walks that consume this
+        // function, because the field is off `policy_fields()`; kept so the
+        // closed match still names every variant and so a reader of an old
+        // event can find the spelling here.
         PolicyField::CompositeVerdictMode => "composite_verdict_mode",
     }
 }
@@ -132,7 +146,7 @@ const fn snapshot_key(field: &PolicyField) -> &'static str {
 #[must_use]
 pub fn policy_field_value(policy: &ScanPolicyProjection, field: &PolicyField) -> Value {
     // The lowercase-wire enums (`ProvenanceMode`, `NegligibleAction`,
-    // `ScanEnforcement`, `CompositeVerdictMode`) go out through `Display`,
+    // `ScanEnforcement`) go out through `Display`,
     // not serde: their `Serialize` derive writes the PascalCase variant
     // name, and the wire form every other surface (YAML, SQL) uses is the
     // lowercase one. `SeverityThreshold` is the deliberate odd one out —
@@ -163,9 +177,11 @@ pub fn policy_field_value(policy: &ScanPolicyProjection, field: &PolicyField) ->
         PolicyField::RescanIntervalHours => Value::from(policy.rescan_interval_hours),
         PolicyField::NegligibleAction => Value::String(policy.negligible_action.to_string()),
         PolicyField::Enforcement => Value::String(policy.enforcement.to_string()),
-        PolicyField::CompositeVerdictMode => {
-            Value::String(policy.composite_verdict_mode.to_string())
-        }
+        // Retired: no projection field left to encode, and the walk that
+        // would ask never asks (the field is off `policy_fields()`). `Null`
+        // is the honest answer and the exact inverse of
+        // `set_policy_field`'s discard, so the pair stays a pair.
+        PolicyField::CompositeVerdictMode => Value::Null,
     }
 }
 
@@ -231,9 +247,22 @@ pub fn set_policy_field(
         PolicyField::Enforcement => {
             policy.enforcement = decode_wire::<ScanEnforcement>(field, value)?;
         }
-        PolicyField::CompositeVerdictMode => {
-            policy.composite_verdict_mode = decode_wire::<CompositeVerdictMode>(field, value)?;
-        }
+        // Retired, and **tolerated rather than decoded**: the composed
+        // image's verdict now decides a manifest's release
+        // unconditionally, so there is no posture left for a value to
+        // name and no projection field to assign. The variant stays
+        // because the event store is append-only (ADR 0002) — a
+        // `PolicyUpdated` carrying this field sits in every installation's
+        // policy streams for the life of the installation, and a fold that
+        // refused it would refuse to replay those streams at all. Nothing
+        // is lost by discarding the value: a replay that honoured it would
+        // be setting a field no decision reads.
+        //
+        // Deliberately not validated either. Refusing an out-of-taxonomy
+        // value here would turn a stored byte nothing consults into a
+        // permanent replay failure, which is the opposite of what
+        // tolerating the field is for.
+        PolicyField::CompositeVerdictMode => {}
     }
     Ok(())
 }
@@ -348,7 +377,6 @@ fn replay_policy_created(
         rescan_interval_hours: 0,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at,
         updated_at: created_at,
@@ -668,7 +696,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Warn,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: ts(1_000),
             updated_at: ts(1_000),
@@ -741,9 +768,11 @@ mod tests {
             PolicyField::RescanIntervalHours => policy.rescan_interval_hours = 0,
             PolicyField::NegligibleAction => policy.negligible_action = NegligibleAction::Block,
             PolicyField::Enforcement => policy.enforcement = ScanEnforcement::Record,
-            PolicyField::CompositeVerdictMode => {
-                policy.composite_verdict_mode = CompositeVerdictMode::Promoted;
-            }
+            // Retired: there is no projection field to move. The arm
+            // stays because the match is closed (a new variant must be
+            // given a mutation), and nothing reaches it because the field
+            // is off `policy_fields()`.
+            PolicyField::CompositeVerdictMode => {}
         }
     }
 
@@ -767,7 +796,12 @@ mod tests {
         // changed field in it, and the gitops applier's own diff is
         // asserted against the same sequence.
         assert_eq!(fields.first(), Some(&PolicyField::Name));
-        assert_eq!(fields.last(), Some(&PolicyField::CompositeVerdictMode));
+        assert_eq!(fields.last(), Some(&PolicyField::Enforcement));
+        assert!(
+            !fields.contains(&PolicyField::CompositeVerdictMode),
+            "the retired field is off the canonical order, so no snapshot is \
+             written with it and no diff emits it: {fields:?}"
+        );
     }
 
     #[test]
@@ -870,7 +904,12 @@ mod tests {
         assert_eq!(snapshot["provenance_mode"], "verify_if_present");
         assert_eq!(snapshot["negligible_action"], "warn");
         assert_eq!(snapshot["enforcement"], "reject");
-        assert_eq!(snapshot["composite_verdict_mode"], "observed");
+        // The retired field is not written. A new `PolicyCreated` that
+        // carried the key would be asserting a posture no decision reads.
+        assert!(
+            snapshot.get("composite_verdict_mode").is_none(),
+            "a new snapshot must not carry the retired field: {snapshot}"
+        );
         assert_eq!(snapshot["quarantine_duration_secs"], 86_400);
         assert_eq!(snapshot["rescan_interval_hours"], 24);
         assert_eq!(snapshot["require_approval"], true);
@@ -903,7 +942,7 @@ mod tests {
         snapshot
             .as_object_mut()
             .expect("object")
-            .remove("composite_verdict_mode");
+            .remove("enforcement");
         let created = PolicyCreated {
             policy_id: policy.policy_id,
             name: policy.name.clone(),
@@ -914,7 +953,7 @@ mod tests {
             .expect_err("an incomplete snapshot must refuse");
         match err {
             DomainError::Validation(msg) => assert!(
-                msg.contains("composite_verdict_mode"),
+                msg.contains("enforcement"),
                 "the refusal must name the missing key: {msg}"
             ),
             other => panic!("expected Validation, got {other:?}"),
@@ -1009,6 +1048,75 @@ mod tests {
         )
         .expect_err("i32 range is the column's range");
         assert!(matches!(err, DomainError::Validation(_)), "got {err:?}");
+    }
+
+    // -- the retired historical field ---------------------------------------
+
+    /// **A policy stream written months ago still folds.** The composed
+    /// image's verdict decides a manifest's release unconditionally, so
+    /// `composite_verdict_mode` is gone from the projection, from the
+    /// canonical field order and from every decision — but the event
+    /// store is append-only (ADR 0002), so every installation's policy
+    /// streams carry `PolicyUpdated` events naming it for the life of the
+    /// installation, and a `PolicyCreated` snapshot carrying its key.
+    ///
+    /// "The field is retired" and "a replay of an old stream still
+    /// works" are different claims and only the second one protects a
+    /// running installation — a fold that refused either shape would make
+    /// `PolicyUseCase`'s projection repair permanently impossible for
+    /// every policy created before this release, which is every policy.
+    ///
+    /// Both historical shapes are in the corpus, and both postures are
+    /// among the values, because tolerating the field must not depend on
+    /// which one a stream happens to carry.
+    #[test]
+    fn a_stream_carrying_the_retired_composite_verdict_mode_still_folds() {
+        for historical in ["observed", "promoted", "whatever-a-future-value-was"] {
+            let policy = sample_policy(Uuid::from_u128(40));
+
+            // A `PolicyCreated` as the create path wrote it before the
+            // retirement: the snapshot carries the extra key.
+            let mut snapshot = policy_config_snapshot(&policy);
+            snapshot.as_object_mut().expect("object").insert(
+                "composite_verdict_mode".to_owned(),
+                Value::String("observed".to_owned()),
+            );
+            let created = DomainEvent::PolicyCreated(PolicyCreated {
+                policy_id: policy.policy_id,
+                name: policy.name.clone(),
+                scope: policy.scope.clone(),
+                config_snapshot: snapshot,
+            });
+
+            let promotion = DomainEvent::PolicyUpdated(PolicyUpdated {
+                policy_id: policy.policy_id,
+                field: PolicyField::CompositeVerdictMode,
+                previous_value: Value::String("observed".to_owned()),
+                new_value: Value::String(historical.to_owned()),
+            });
+
+            let stream = vec![
+                persisted(policy.policy_id, 0, created, 5_000),
+                persisted(policy.policy_id, 1, promotion, 6_000),
+            ];
+
+            let replay = fold_scan_policy(&stream)
+                .unwrap_or_else(|e| panic!("a stream carrying `{historical}` must fold: {e}"));
+
+            // It yields a policy, and the retired event moved no decision:
+            // every field is the created one, and only the stream position
+            // and `updated_at` advanced — which they must, because the
+            // event took a position and the next append's
+            // `ExpectedVersion::Exact` is read off it.
+            let mut expected = policy.clone();
+            expected.created_at = ts(5_000);
+            expected.updated_at = ts(6_000);
+            expected.stream_version = 1;
+            assert_eq!(
+                replay.policy, expected,
+                "folding `{historical}` must change no policy field"
+            );
+        }
     }
 
     // -- the stream fold -----------------------------------------------------

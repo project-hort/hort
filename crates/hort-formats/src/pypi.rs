@@ -1,10 +1,12 @@
+use std::borrow::Cow;
 use std::io::{Cursor, Read, Seek};
 
 use bytes::Bytes;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::format_handler::{
-    require_https_metadata_url, DependencySpec, FormatHandler, MetadataUrlSubject, VersionDiscovery,
+    require_https_metadata_url, DependencySpec, FormatHandler, MetadataUrlSubject, PayloadSbom,
+    PayloadSbomExtraction, SbomResolution, VersionDiscovery,
 };
 use hort_domain::types::checksum::{HashAlgorithm, UpstreamPublishedChecksum};
 use hort_domain::types::{
@@ -12,7 +14,7 @@ use hort_domain::types::{
 };
 
 use crate::range_resolvers::resolve_pep440_range_max;
-use crate::sbom_helpers::build_subject_component;
+use crate::sbom_helpers::{build_subject_component, subject_only};
 
 /// Internal cap on the wheel `<dist-info>/METADATA` body extracted by
 /// [`PyPiFormatHandler::extract_wheel_metadata_bytes`]. 1 MiB. A
@@ -32,7 +34,13 @@ const PYPI_VERSION_JSON_MAX_BYTES: u64 = 128 * 1024;
 
 /// Compressed-input cap for the whole stored PyPI distribution artifact
 /// (a wheel zip or an sdist gzip) fed to
-/// [`PyPiFormatHandler::extract_dependency_specs`]. The cascade caller reads
+/// [`PyPiFormatHandler::extract_dependency_specs`] and to
+/// [`PyPiFormatHandler::extract_sbom_from_payload`] — the **archive**
+/// bound, which is a different bound from the 1 MiB cap on the METADATA
+/// member extracted out of the archive and is not satisfied by it: the
+/// scan path is handed a `PayloadAccess::ReadStream` straight off CAS,
+/// so without a cap on the way in the member cap would be applied after
+/// an unbounded read. The cascade caller reads
 /// the artifact from CAS under a 32 MiB **compressed** bound
 /// (`prefetch_dependencies::read_artifact_bytes`) before handing it here, so
 /// this cap is set to that same 32 MiB to admit every artifact the cascade
@@ -741,8 +749,27 @@ impl FormatHandler for PyPiFormatHandler {
     /// dependencies are `Requires-Dist` declarations resolved by the
     /// installer against the index, so the BOM's components are names the
     /// artifact does not carry.
+    ///
+    /// This is what decides a dependency finding's authority over the
+    /// artifact: a component the BOM names and the payload does not
+    /// carry is `ComponentRelation::NotContained`, which
+    /// `Finding::may_condemn_artifact` denies release authority — a
+    /// vulnerability in `urllib3` is not a vulnerability in the wheel
+    /// that merely asks for it. Unchanged by the payload-derived BOM
+    /// below: reading the declaration out of the artifact's own bytes
+    /// makes the declaration trustworthy, not the dependency present.
     fn payload_contains_components(&self) -> bool {
         false
+    }
+
+    /// `Some(self)` — PyPI implements [`PayloadSbom`]. A wheel carries
+    /// its own `<dist-info>/METADATA` and an sdist its `PKG-INFO`, so
+    /// the artifact's dependency declaration is **in the artifact** and
+    /// a proxied distribution — whose stored `format_metadata` is only
+    /// `{"source": "pypi_upstream_pull", "upstream_url": …}` — no longer
+    /// scans as though it declared nothing. See the impl block below.
+    fn payload_sbom(&self) -> Option<&dyn PayloadSbom> {
+        Some(self)
     }
 
     /// Parse a download path like `simple/{project}/{filename}` into coordinates.
@@ -958,29 +985,9 @@ impl FormatHandler for PyPiFormatHandler {
             }));
         };
 
-        let mut components = Vec::new();
-        for req_str in reqs {
-            let Some((name, version)) = parse_pep_508_requirement(req_str) else {
-                continue;
-            };
-            let normalised_name = self.normalize_name(&name);
-            let purl = match version.as_deref() {
-                Some(v) => format!("pkg:pypi/{normalised_name}@{v}"),
-                None => format!("pkg:pypi/{normalised_name}"),
-            };
-            components.push(SbomComponent {
-                purl,
-                name: normalised_name,
-                version,
-                ecosystem: Ecosystem::PyPI,
-                licenses: licenses.clone(),
-                direct_dependency: true,
-            });
-        }
-
         Ok(Some(Sbom {
             subject: Some(subject),
-            components,
+            components: pypi_components_from_requirements(&reqs, &licenses),
         }))
     }
 
@@ -1059,6 +1066,710 @@ impl FormatHandler for PyPiFormatHandler {
                 extract_wheel_metadata_from_zip(Cursor::new(v))
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PayloadSbom — the dependency declaration is in the artifact
+// ---------------------------------------------------------------------------
+
+/// PyPI's [`PayloadSbom`] participation: the BOM's components come from
+/// the distribution's **own** dependency declaration — `Requires-Dist`
+/// in a wheel's `<dist-info>/METADATA` or an sdist's `PKG-INFO`.
+///
+/// # Why the payload and not the stored metadata
+///
+/// Both upstream ingest sites store `format_metadata` as exactly
+/// `{"source": "pypi_upstream_pull", "upstream_url": …}`, so a proxied
+/// distribution's declaration never reached the scan subject at all: the
+/// metadata-only path found no `requires_dist` and produced a
+/// subject-only BOM, and on a policy whose backend adjudicates the BOM
+/// every proxied distribution was assessed as though it declared no
+/// dependencies. The bytes were in CAS and digest-verified the whole
+/// time; only the SBOM path did not read them. Reading upstream's own
+/// JSON instead would bind the BOM to upstream's word about bytes hort
+/// can read itself, which ADR 0006's reasoning rejects.
+///
+/// # PyPI is never `Resolved`
+///
+/// `Requires-Dist` is a set of PEP 508 **specifiers** over **direct**
+/// edges: `requests (==2.31.0)` names a version, `click (>=8.0)` names a
+/// range, and neither is the output of a closure walk — this reader
+/// never resolves one, and strips environment markers on the way. So
+/// every successful extraction here is [`SbomResolution::Declared`],
+/// pinned requirements included;
+/// [`SbomResolution::Resolved`] would claim a resolve that did not
+/// happen, and overstating is the direction ADR 0007 makes dangerous.
+///
+/// # Every failure is soft about the BOM and closed about the verdict
+///
+/// No arm returns `Err`: a hostile or corrupt archive must not be able
+/// to abort a scan. But a subject-only BOM is not a *clean* scan — the
+/// three arms that could not read the declaration all report
+/// [`SbomResolution::UnusableLockfile`], which the scan orchestrator
+/// spends as a gating absence rather than as a thinner BOM, so a backend
+/// whose entire input is the component list abstains instead of
+/// returning an empty finding set over an artifact nothing examined.
+/// Fail-soft about the BOM is not fail-soft about release authority.
+impl PayloadSbom for PyPiFormatHandler {
+    fn extract_sbom_from_payload(
+        &self,
+        coords: &ArtifactCoords,
+        format_metadata: &serde_json::Value,
+        payload: PayloadAccess<'_>,
+    ) -> DomainResult<PayloadSbomExtraction> {
+        let licenses = extract_pypi_license_list(format_metadata);
+        let subject_purl_name = self.normalize_name(&coords.name);
+        let subject = build_subject_component(
+            coords,
+            Ecosystem::PyPI,
+            "pkg:pypi/",
+            &subject_purl_name,
+            licenses.clone(),
+        );
+
+        match read_pypi_declaration(payload) {
+            PypiDeclaration::Stated(reqs) => {
+                let refs: Vec<&str> = reqs.iter().map(String::as_str).collect();
+                Ok(declared_or_empty(subject, &refs, &licenses))
+            }
+            // Read, and it says its own value is not the answer. The
+            // distinction from an empty declaration is the whole of PEP
+            // 643: the same absent field means "none" in one document
+            // and "ask the built distribution" in another.
+            PypiDeclaration::NotCanonical(why) => {
+                tracing::warn!(
+                    package = %coords.name,
+                    reason = %why,
+                    "pypi SBOM: the distribution's dependency declaration is not canonical — \
+                     holding it as an unread declaration rather than as an empty one",
+                );
+                Ok(subject_only(subject, SbomResolution::UnusableLockfile))
+            }
+            PypiDeclaration::Unread(why) => {
+                // **`format_metadata` stays a consulted input, not a
+                // discarded one.** The direct-upload publish handler
+                // stores twine's multipart harvest under `pkg_info`, so
+                // for a hosted distribution hort holds its own record of
+                // the publisher's declaration, taken at the door. The
+                // artifact's bytes outrank it wherever both exist (they
+                // are verified; the harvest is an assertion about them)
+                // and have already won in the arms above — this arm is
+                // reached only when there are no bytes to prefer.
+                //
+                // An absent or empty record is not a rescue: it says no
+                // more than the unreadable archive did, so the gating
+                // absence stands. Only a declaration actually on record
+                // substitutes for one that could not be read.
+                match pypi_requires_dist(format_metadata) {
+                    Some(reqs) if !reqs.is_empty() => {
+                        tracing::debug!(
+                            package = %coords.name,
+                            reason = %why,
+                            "pypi SBOM: no declaration in the payload; using the stored \
+                             publish-time harvest",
+                        );
+                        Ok(declared_or_empty(subject, &reqs, &licenses))
+                    }
+                    _ => {
+                        tracing::warn!(
+                            package = %coords.name,
+                            reason = %why,
+                            "pypi SBOM: the distribution's dependency declaration could not be \
+                             read and none is on record",
+                        );
+                        Ok(subject_only(subject, SbomResolution::UnusableLockfile))
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Turn a read declaration into an extraction, keeping the three
+/// outcomes a component list can have apart.
+///
+/// - No requirement lines at all → [`SbomResolution::NoLockfile`]: the
+///   declaration was read and states there are none, which is as
+///   truthful as an absent document and just as non-gating.
+/// - Lines that parsed → [`SbomResolution::Declared`].
+/// - Lines that **all** failed to parse → the declaration was read and
+///   could not be used, which is [`SbomResolution::UnusableLockfile`]
+///   and gates. Reporting `Declared` with an empty list here would say
+///   "this distribution declares nothing" about one that declares
+///   several things in a syntax this reader does not admit.
+fn declared_or_empty(
+    subject: SbomComponent,
+    reqs: &[&str],
+    licenses: &[String],
+) -> PayloadSbomExtraction {
+    if reqs.is_empty() {
+        return subject_only(subject, SbomResolution::NoLockfile);
+    }
+    let components = pypi_components_from_requirements(reqs, licenses);
+    if components.is_empty() {
+        return subject_only(subject, SbomResolution::UnusableLockfile);
+    }
+    PayloadSbomExtraction {
+        sbom: Some(Sbom {
+            subject: Some(subject),
+            components,
+        }),
+        resolution: SbomResolution::Declared,
+        // PyPI walks no closure, so there is no traversed-but-unemitted
+        // population to count. A requirement line this reader cannot
+        // parse is not one either: it is a declaration that could not be
+        // used, which the caller above reports as such.
+        skipped_non_registry: 0,
+    }
+}
+
+/// Build the BOM component list from a set of PEP 508 requirement
+/// strings.
+///
+/// One definition, consumed by both the artifact's own `Requires-Dist`
+/// and a stored `pkg_info.requires_dist` harvest of those same lines, so
+/// the two cannot produce different lists for the same declaration.
+///
+/// Environment markers are dropped and the requirement kept — including
+/// an `extra ==`-gated one. That is deliberately **not**
+/// [`parse_wheel_metadata_into_specs`]'s rule, which filters
+/// extras-gated lines out: there the output seeds the transitive
+/// prefetch cascade, where a dev/test extras closure is a 10–100×
+/// fan-out of packages nothing downstream installs. Here the output is a
+/// BOM, where naming a component an installer *may* activate costs one
+/// advisory lookup and no download — and
+/// [`PyPiFormatHandler::payload_contains_components`] already denies
+/// every such finding authority over the artifact.
+fn pypi_components_from_requirements(reqs: &[&str], licenses: &[String]) -> Vec<SbomComponent> {
+    let mut components = Vec::new();
+    for req_str in reqs {
+        let Some((name, version)) = parse_pep_508_requirement(req_str) else {
+            continue;
+        };
+        let normalised_name = pep_503_normalize(&name);
+        let purl = match version.as_deref() {
+            Some(v) => format!("pkg:pypi/{normalised_name}@{v}"),
+            None => format!("pkg:pypi/{normalised_name}"),
+        };
+        components.push(SbomComponent {
+            purl,
+            name: normalised_name,
+            version,
+            ecosystem: Ecosystem::PyPI,
+            licenses: licenses.to_vec(),
+            direct_dependency: true,
+        });
+    }
+    components
+}
+
+/// What a PyPI distribution's own dependency declaration turned out to
+/// say, once its metadata document has been located and classified.
+///
+/// The three arms exist because "the field is absent" is not one fact.
+/// In a built wheel it means the distribution requires nothing; in an
+/// sdist that marks the field `Dynamic`, or whose metadata predates the
+/// version that made such a marking possible, it means the answer is
+/// elsewhere. Collapsing the two would let an artifact whose
+/// dependencies were never established record a clean scan under a
+/// policy whose backend adjudicates the component list (ADR 0007).
+#[derive(Debug, PartialEq, Eq)]
+enum PypiDeclaration {
+    /// The document states the distribution's requirements. Every
+    /// `Requires-Dist` value in declaration order; **empty is a
+    /// statement**, not an absence — this distribution declares none.
+    Stated(Vec<String>),
+    /// The document was read and does not state them: it marks
+    /// `Requires-Dist` dynamic (PEP 643), it is an sdist whose metadata
+    /// version makes silence about the field meaningless, or its RFC
+    /// 5322 header block folds an authority-bearing field into
+    /// something that cannot be read as that field's value.
+    NotCanonical(String),
+    /// No metadata document could be read out of the payload: the bytes
+    /// are not one of the two containers, the archive is unreadable, the
+    /// container carries no metadata member, or the member is not UTF-8.
+    Unread(String),
+}
+
+/// Which of the two PyPI distribution containers a payload is.
+///
+/// The distinction is not cosmetic: it decides whether an absent
+/// `Requires-Dist` is a statement about the distribution or an absence
+/// of one (see [`PypiDeclaration`]). Resolved by
+/// [`classify_pypi_container`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PypiContainer {
+    /// A PEP 427 wheel — a zip carrying `*.dist-info/METADATA`.
+    Wheel,
+    /// A source distribution — a gzip tar carrying `<root>/PKG-INFO`.
+    Sdist,
+}
+
+/// Locate and classify the dependency declaration in a stored PyPI
+/// distribution.
+///
+/// Every failure is a [`PypiDeclaration::Unread`] carrying
+/// operator-readable text — never an `Err`, and never silence.
+fn read_pypi_declaration(payload: PayloadAccess<'_>) -> PypiDeclaration {
+    let (container, bytes) = match locate_pypi_metadata_document(payload) {
+        Ok(found) => found,
+        Err(why) => return PypiDeclaration::Unread(why),
+    };
+
+    // PEP 566 §3 — the metadata document is UTF-8.
+    match std::str::from_utf8(&bytes) {
+        Ok(text) => classify_requires_dist(text, container),
+        Err(e) => PypiDeclaration::Unread(format!("pypi metadata body is not valid UTF-8: {e}")),
+    }
+}
+
+/// Pull the metadata document — a wheel's `<dist-info>/METADATA` or an
+/// sdist's `PKG-INFO` — out of whichever shape the payload arrives in,
+/// reading no more of the distribution than the shape forces.
+///
+/// # The archive cap
+///
+/// Every arm that has to hold the archive holds at most
+/// [`PYPI_DIST_MAX_BYTES`] of it. That bound is this function's, and it
+/// is **not** the 1 MiB cap on the METADATA member: the member cap
+/// bounds what comes *out* of the archive and would otherwise be applied
+/// after an unbounded read of the archive itself. The scan orchestrator
+/// hands over a [`PayloadAccess::ReadStream`] wrapping a CAS read, so
+/// without a cap here there is nothing between a stored artifact and
+/// this process's memory.
+///
+/// # Why the seekable arm is not just "the stream arm with a cap"
+///
+/// A ZIP is indexed by the central directory at its tail, so a
+/// forward-only reader leaves no way to reach a member other than to
+/// buffer the whole archive — which is what the cap exists to bound.
+/// [`PayloadAccess::ReadSeek`] exists precisely to remove that buffer,
+/// and its contract says a handler handed it must not read the payload
+/// whole, so the wheel arm walks the member table in place and reads one
+/// member. A gzip sdist is a different matter: it is decoded
+/// front-to-back and seeking buys nothing, so that arm reads under the
+/// cap exactly as the stream arm does.
+fn locate_pypi_metadata_document(
+    payload: PayloadAccess<'_>,
+) -> Result<(PypiContainer, Vec<u8>), String> {
+    match payload {
+        // Already in the caller's memory — the cap is a bound on the
+        // parse work rather than on an allocation here, and refusing
+        // over it keeps one answer for one artifact whichever variant
+        // carried it.
+        PayloadAccess::Bytes(b) => {
+            if b.len() > PYPI_DIST_MAX_BYTES {
+                return Err(over_archive_cap(b.len()));
+            }
+            locate_in_archive_buffer(b)
+        }
+        PayloadAccess::ReadStream(mut r) => {
+            let buf = read_archive_under_cap(&mut *r)?;
+            locate_in_archive_buffer(&buf)
+        }
+        PayloadAccess::ReadSeek(mut r) => match sniff_pypi_container(&mut r)? {
+            PypiContainer::Wheel => match locate_wheel_metadata_in_zip(r) {
+                Ok(scan) => Ok((PypiContainer::Wheel, wheel_metadata_or_reason(scan)?)),
+                Err(e) => Err(format!("wheel is not a readable zip: {e}")),
+            },
+            PypiContainer::Sdist => {
+                let buf = read_archive_under_cap(&mut r)?;
+                locate_in_archive_buffer(&buf)
+            }
+        },
+    }
+}
+
+/// Sniff which container a seekable payload is and rewind, so the walk
+/// that follows starts where it would have without the look.
+fn sniff_pypi_container(reader: &mut (impl Read + Seek + ?Sized)) -> Result<PypiContainer, String> {
+    let mut magic = [0u8; 4];
+    let mut read = 0usize;
+    while read < magic.len() {
+        match reader.read(&mut magic[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) => return Err(format!("pypi distribution could not be read: {e}")),
+        }
+    }
+    reader
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| format!("pypi distribution could not be rewound after sniffing: {e}"))?;
+    classify_pypi_container(&magic[..read])
+}
+
+/// Which container a distribution's leading bytes say it is.
+///
+/// Sniffed from the magic rather than from a filename, mirroring
+/// [`PyPiFormatHandler::extract_dependency_specs`] — the payload arrives
+/// as bytes with no name attached.
+fn classify_pypi_container(magic: &[u8]) -> Result<PypiContainer, String> {
+    match magic {
+        // Wheel = zip. Magic `PK\x03\x04` (local file header).
+        [0x50, 0x4B, 0x03, 0x04, ..] => Ok(PypiContainer::Wheel),
+        // sdist = gzip. Magic `\x1f\x8b`.
+        [0x1F, 0x8B, ..] => Ok(PypiContainer::Sdist),
+        _ => Err(
+            "unrecognised pypi distribution container: expected a wheel zip \
+                  (PK\\x03\\x04) or an sdist gzip (\\x1f\\x8b)"
+                .to_string(),
+        ),
+    }
+}
+
+/// Read a distribution into memory under [`PYPI_DIST_MAX_BYTES`].
+///
+/// `read_to_capped_vec` takes `max + 1` bytes through `Take` and refuses
+/// on the overrun, so an over-cap distribution is rejected having
+/// allocated one byte past the cap — never the whole stream.
+fn read_archive_under_cap(reader: &mut dyn Read) -> Result<Vec<u8>, String> {
+    crate::stream_helpers::read_to_capped_vec(reader, PYPI_DIST_MAX_BYTES, |len, max| {
+        format!("pypi distribution artifact is {len} bytes; pypi distribution max is {max}")
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// The over-cap refusal for a payload whose length is known up front,
+/// worded identically to the streamed one.
+fn over_archive_cap(len: usize) -> String {
+    format!(
+        "pypi distribution artifact is {len} bytes; pypi distribution max is \
+         {PYPI_DIST_MAX_BYTES}"
+    )
+}
+
+/// Locate the metadata document in an in-memory distribution.
+fn locate_in_archive_buffer(buf: &[u8]) -> Result<(PypiContainer, Vec<u8>), String> {
+    match classify_pypi_container(buf)? {
+        PypiContainer::Wheel => match locate_wheel_metadata_in_zip(Cursor::new(buf)) {
+            Ok(scan) => Ok((PypiContainer::Wheel, wheel_metadata_or_reason(scan)?)),
+            Err(e) => Err(format!("wheel is not a readable zip: {e}")),
+        },
+        PypiContainer::Sdist => match locate_sdist_pkg_info(buf) {
+            Ok(Some(bytes)) => Ok((PypiContainer::Sdist, bytes)),
+            Ok(None) => Err("sdist carries no PKG-INFO entry at its root".to_string()),
+            Err(e) => Err(format!("sdist is not a readable gzip-tar: {e}")),
+        },
+    }
+}
+
+/// The wheel walk's `None` turned into a reason, with the skipped-name
+/// count beside it.
+///
+/// The count is stated even when it is zero: it rules out the one other
+/// way this verdict is reached, so an operator can tell a wheel that
+/// genuinely has no METADATA member from one whose member was passed
+/// over unread.
+fn wheel_metadata_or_reason(scan: WheelMetadataScan) -> Result<Vec<u8>, String> {
+    scan.metadata.ok_or_else(|| {
+        format!(
+            "wheel carries no *.dist-info/METADATA entry; {} entries were skipped for an \
+             undecodable name",
+            scan.undecodable_names
+        )
+    })
+}
+
+/// Read the sdist's root `PKG-INFO` out of a gzip tar.
+///
+/// Routed through
+/// [`archive_bounds::read_tar_gz_entry`](crate::archive_bounds::read_tar_gz_entry)
+/// — the sanctioned gzip-tar reader, which bounds cumulative
+/// decompressed output, entry count and the compression ratio, and
+/// rejects a nested archive. Its output cap is **cumulative** across the
+/// sequential scan, so a `PKG-INFO` ordered late in a large sdist is
+/// unreachable and reads as absent; the sdist format places it directly
+/// under the single root directory and every real build tool writes it
+/// early.
+fn locate_sdist_pkg_info(buf: &[u8]) -> DomainResult<Option<Vec<u8>>> {
+    crate::archive_bounds::read_tar_gz_entry(
+        Cursor::new(buf),
+        buf.len() as u64,
+        crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
+        is_sdist_pkg_info_path,
+    )
+}
+
+/// Whether a tar entry name is the sdist's **own** `PKG-INFO`.
+///
+/// The sdist format puts it directly inside the single top-level
+/// directory (`<name>-<version>/PKG-INFO`); a bare root `PKG-INFO` is
+/// accepted too. Anything deeper is rejected deliberately: a packaged
+/// project may ship another distribution's metadata as test data or a
+/// vendored tree, and reading that as this artifact's declaration would
+/// put another package's dependencies in this artifact's BOM. A leading
+/// `./` is tolerated — tar writers emit both forms for the same path.
+fn is_sdist_pkg_info_path(name: &str) -> bool {
+    let name = name.strip_prefix("./").unwrap_or(name);
+    match name.strip_suffix("PKG-INFO") {
+        Some("") => true,
+        Some(prefix) => prefix
+            .strip_suffix('/')
+            .is_some_and(|root| !root.is_empty() && !root.contains('/')),
+        None => false,
+    }
+}
+
+/// Classify a PyPI metadata document's `Requires-Dist` declaration.
+///
+/// Reads three fields, and the latter two are what the earlier
+/// metadata-only path never looked at:
+///
+/// - `Requires-Dist` — the requirement lines themselves.
+/// - `Dynamic` — PEP 643's marker. `Dynamic: Requires-Dist` says the
+///   field's value in **this** document is not canonical for what gets
+///   built, so its absence is unknown rather than empty.
+/// - `Metadata-Version` — which decides whether silence about the field
+///   carries a guarantee at all.
+///
+/// Header field names are matched case-insensitively (RFC 5322 §3.6.8).
+/// That is not tidiness: a case-sensitive match that missed a `dynamic:`
+/// spelling would read a non-canonical declaration as a canonical one,
+/// and the fail-open direction is the one that matters here.
+///
+/// For the same reason the document is **unfolded** before it is read
+/// (see [`unfold_rfc5322_block`]): a value folded onto a continuation
+/// line is part of its header's value, so `Dynamic:` followed by
+/// ` Requires-Dist` declares the field dynamic just as a single-line
+/// `Dynamic: Requires-Dist` does. Reading per physical line dropped the
+/// continuation and read that document as declaring nothing dynamic —
+/// a static empty declaration over a distribution that explicitly
+/// withheld its requirement list.
+///
+/// A reassembly this reader cannot make sense of is reported
+/// [`PypiDeclaration::NotCanonical`] — an **unreadable** declaration,
+/// never an empty one. The empty arm grants release authority under a
+/// policy whose backend adjudicates the component list (ADR 0007), so
+/// it is reserved for a document that says there are no requirements.
+fn classify_requires_dist(text: &str, container: PypiContainer) -> PypiDeclaration {
+    let mut requires: Vec<String> = Vec::new();
+    let mut requires_dist_is_dynamic = false;
+    let mut metadata_version: Option<(u32, u32)> = None;
+
+    // Classified per *field*, not per physical line: a folded value is
+    // part of its header's value, so the continuation has to be joined
+    // back on before any of this is read. `unfold_rfc5322_block` stops
+    // at the blank line, so the long description below it stays out.
+    let headers = match unfold_rfc5322_block(text) {
+        Ok(headers) => headers,
+        Err(why) => return PypiDeclaration::NotCanonical(why),
+    };
+
+    for header in &headers {
+        let Some((name, value)) = rfc5322_header(&header.line) else {
+            continue;
+        };
+        match name.as_str() {
+            "requires-dist" => {
+                // A field folded onto a continuation that carries
+                // nothing is a requirement this reader cannot recover,
+                // not one the distribution declined to state — and the
+                // difference is release authority, so say unreadable.
+                if header.folded && value.is_empty() {
+                    return PypiDeclaration::NotCanonical(
+                        "the distribution's `Requires-Dist` field is folded onto a continuation \
+                         line that carries no value, so the requirement it states cannot be read"
+                            .to_string(),
+                    );
+                }
+                if !value.is_empty() {
+                    requires.push(value.to_string());
+                }
+            }
+            "dynamic" => {
+                // Only a reassembled value is held to this: what the
+                // document states on one line is read as it stands, and
+                // what this reader joined back together must come out
+                // legible. A fold that splits the field name yields
+                // text no field is called, and reading that as "not
+                // dynamic" would withhold the declaration exactly as
+                // dropping the continuation did.
+                if header.folded && !is_core_metadata_field_name(value) {
+                    return PypiDeclaration::NotCanonical(
+                        "the distribution's `Dynamic` field is folded across lines into text \
+                         that is not a single Core Metadata field name (PEP 643), so whether it \
+                         marks `Requires-Dist` dynamic cannot be read"
+                            .to_string(),
+                    );
+                }
+                if value.eq_ignore_ascii_case("Requires-Dist") {
+                    requires_dist_is_dynamic = true;
+                }
+            }
+            "metadata-version" => metadata_version = parse_metadata_version(value),
+            _ => {}
+        }
+    }
+
+    if requires_dist_is_dynamic {
+        return PypiDeclaration::NotCanonical(
+            "the distribution declares `Dynamic: Requires-Dist` (PEP 643), so this document's \
+             requirement list is not canonical for the built distribution"
+                .to_string(),
+        );
+    }
+
+    if !requires.is_empty() {
+        // Lines are present. Their completeness relative to a future
+        // build is exactly what `Dynamic` is for, and it is not set, so
+        // what is written is what is declared — at any metadata version.
+        return PypiDeclaration::Stated(requires);
+    }
+
+    // Nothing declared, and whether that is a statement depends on which
+    // document this is.
+    match container {
+        // A wheel is the **built** distribution: its METADATA describes
+        // what was built, which is why PEP 643 permits `Dynamic` only in
+        // a source distribution and why `pip` resolves a wheel's
+        // dependencies from exactly this field. There is no later
+        // document for the answer to move to, so an absent
+        // `Requires-Dist` is the wheel declaring no runtime
+        // requirements — at every metadata version, 2.2 included.
+        PypiContainer::Wheel => PypiDeclaration::Stated(Vec::new()),
+        // An sdist's PKG-INFO is a **pre-build** document whose fields
+        // may be recomputed when a wheel is built from it, and before
+        // metadata 2.2 it had no way to say which ones were settled.
+        // PEP 643 exists to close precisely that gap, so silence below
+        // 2.2 proves nothing — all the more so because an sdist's
+        // dependencies commonly live in `setup.py` / `pyproject.toml`,
+        // which no reader here executes. From 2.2 on, a field absent
+        // from `Dynamic` is declared static and its absence IS the
+        // statement.
+        PypiContainer::Sdist => match metadata_version {
+            Some(version) if version >= (2, 2) => PypiDeclaration::Stated(Vec::new()),
+            Some((major, minor)) => PypiDeclaration::NotCanonical(format!(
+                "the sdist's PKG-INFO is metadata {major}.{minor}, which predates PEP 643's \
+                 `Dynamic` field (metadata 2.2) — an absent `Requires-Dist` carries no \
+                 guarantee that the built distribution declares none"
+            )),
+            None => PypiDeclaration::NotCanonical(
+                "the sdist's PKG-INFO states no readable `Metadata-Version`, so an absent \
+                 `Requires-Dist` carries no guarantee (PEP 643 made that guarantee available \
+                 from metadata 2.2)"
+                    .to_string(),
+            ),
+        },
+    }
+}
+
+/// One field of an RFC 5322 header block, with any folded continuation
+/// lines joined back onto it.
+struct UnfoldedHeader<'a> {
+    /// The field's whole logical line — its first physical line with
+    /// every continuation appended and the line breaks removed. Borrowed
+    /// when the field occupied one line, which is the overwhelming
+    /// majority of them.
+    line: Cow<'a, str>,
+    /// Whether the value arrived across more than one physical line, so
+    /// `line` is a reassembly this reader performed rather than text the
+    /// document states as it stands. The two authority-bearing fields
+    /// insist their reassembly is legible; see
+    /// [`classify_requires_dist`].
+    folded: bool,
+}
+
+/// Unfold a Core Metadata document's RFC 5322 header block into one
+/// entry per field.
+///
+/// A Core Metadata document (PEP 566) **is** an RFC 5322 header block,
+/// and RFC 5322 §2.2.3 lets a long value be *folded*: a line beginning
+/// with SP or HTAB continues the preceding line's value, and unfolding
+/// is removing the line break in front of it. So a folded value is part
+/// of its header's value, and a reader that classifies per *physical*
+/// line drops the continuation — which for `Dynamic` and
+/// `Requires-Dist` turns a declaration the document makes into one it
+/// appears to withhold.
+///
+/// **The blank line still ends the block.** What follows it is the long
+/// description, where indented prose is ordinary, so unfolding stops at
+/// the break: an indented description line must never become a
+/// continuation of the last header.
+///
+/// `Err` is the one block that cannot be unfolded at all: one whose
+/// first line is already a continuation, leaving text with no field to
+/// belong to. No conforming document has that shape — PEP 566 §3 puts
+/// `Metadata-Version` first — and guessing which field such text
+/// continues is precisely the guess that decides whether a dependency
+/// declaration was withheld, so the document is reported unreadable
+/// instead.
+fn unfold_rfc5322_block(text: &str) -> Result<Vec<UnfoldedHeader<'_>>, String> {
+    let mut headers: Vec<UnfoldedHeader<'_>> = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            let Some(last) = headers.last_mut() else {
+                let why = "the metadata document's RFC 5322 header block opens with a folded \
+                           continuation line, so that text belongs to no field and the \
+                           declaration cannot be read";
+                return Err(why.to_string());
+            };
+            // RFC 5322 §2.2.3: unfolding removes the line break and
+            // keeps the whitespace that marked the line a continuation.
+            last.line.to_mut().push_str(line);
+            last.folded = true;
+            continue;
+        }
+        headers.push(UnfoldedHeader {
+            line: Cow::Borrowed(line),
+            folded: false,
+        });
+    }
+    Ok(headers)
+}
+
+/// Whether a value is a single Core Metadata field name — the only
+/// thing PEP 643's `Dynamic` admits as its value.
+///
+/// A field name is a token of letters, digits and hyphens, so it cannot
+/// span a fold's whitespace: `Dynamic:` + ` Requires` + ` -Dist`
+/// reassembles into something no field is called, and which conforming
+/// readers reject rather than resolve.
+fn is_core_metadata_field_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// Split an RFC 5322 header line into a lowercased field name and its
+/// trimmed value.
+///
+/// Returns `None` for anything that is not a header line: a folded
+/// continuation (which begins with whitespace, so the name would carry
+/// it) and a line with no colon.
+///
+/// **Joining a continuation is not this function's job** — the block is
+/// unfolded by [`unfold_rfc5322_block`] before anything reaches here.
+/// Answering `Some` for a continuation line would make a wrapped value
+/// look like a field of its own, so `  Dynamic: Requires-Dist` inside a
+/// wrapped `Description` would read as a PEP 643 marker.
+fn rfc5322_header(line: &str) -> Option<(String, &str)> {
+    let (name, value) = line.split_once(':')?;
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    Some((name.to_ascii_lowercase(), value.trim()))
+}
+
+/// Parse a `Metadata-Version` value into `(major, minor)` for ordered
+/// comparison against PEP 643's 2.2 threshold.
+///
+/// A value with no `.` is read as `(major, 0)`, so a future `3` compares
+/// above 2.2 rather than reading as unparseable. Anything genuinely
+/// unparseable is `None`, which the caller treats as the pre-2.2 case —
+/// the fail-closed direction, since the whole question is whether a
+/// guarantee is in force.
+fn parse_metadata_version(raw: &str) -> Option<(u32, u32)> {
+    let raw = raw.trim();
+    match raw.split_once('.') {
+        Some((major, minor)) => {
+            // `2.2.1` is not a metadata version, but reading its leading
+            // `2.2` is strictly better than discarding it.
+            let minor = minor.split('.').next().unwrap_or(minor);
+            Some((major.trim().parse().ok()?, minor.trim().parse().ok()?))
+        }
+        None => Some((raw.parse().ok()?, 0)),
     }
 }
 
@@ -1213,6 +1924,32 @@ impl VersionDiscovery for PyPiFormatHandler {
         ]
     }
 
+    /// The two containers
+    /// [`extract_dependency_specs`](VersionDiscovery::extract_dependency_specs)
+    /// recognises: the `.whl` zip, whose `*.dist-info/METADATA` carries
+    /// `Requires-Dist`, and the `.tar.gz` sdist.
+    ///
+    /// The long-tail sdist containers PyPI still hosts — `.zip`,
+    /// `.tar.bz2`, `.tar.xz`, `.egg` — answer `false`, for the same
+    /// reason [`PyPiFormatHandler::scan_kind`] classifies them
+    /// `Other`: the extractor sniffs the container from its leading
+    /// bytes and reads a zip as a wheel or a gzip as an sdist, so a
+    /// `.zip`/`.egg` reaches the wheel arm and fails on the absent
+    /// `*.dist-info/METADATA` while a `.tar.bz2`/`.tar.xz` is neither
+    /// container at all. Claiming a container the extractor cannot read
+    /// turns a clean refusal into a failing job, which is the whole
+    /// hazard this predicate exists to close.
+    ///
+    /// The sdist arm answers `true` even though it is a documented
+    /// best-effort skip (PKG-INFO rarely carries `Requires-Dist`): a
+    /// gzip sdist IS input the extractor reads and reports `Ok` on, and
+    /// "read it and found nothing declared" is a different fact from
+    /// "there was nothing to read". Only the second belongs here.
+    fn path_carries_dependency_specs(&self, path: &str) -> bool {
+        let lower = path.to_ascii_lowercase();
+        lower.ends_with(".whl") || lower.ends_with(".tar.gz")
+    }
+
     /// Extract the *declared runtime* dependency specs from the **stored
     /// PyPI distribution artifact stream**.
     ///
@@ -1261,6 +1998,9 @@ impl VersionDiscovery for PyPiFormatHandler {
     /// - Wheel zip is malformed / unreadable → `Validation`.
     /// - `*.dist-info/METADATA` absent from a wheel zip → `Validation`.
     /// - METADATA present but not valid UTF-8 → `Validation` (non-retry).
+    /// - METADATA whose RFC 5322 header block opens with a folded
+    ///   continuation line, so the text belongs to no field → `Validation`
+    ///   (an unparseable manifest, not a wheel declaring nothing).
     /// - A well-formed wheel with zero declared runtime deps → `Ok(vec![])`.
     /// - sdist gzip → `Ok(vec![])` (best-effort skip).
     ///
@@ -1284,7 +2024,7 @@ impl VersionDiscovery for PyPiFormatHandler {
         match buf.as_slice() {
             // Wheel = zip. Magic `PK\x03\x04` (local file header).
             [0x50, 0x4B, 0x03, 0x04, ..] => {
-                let scan = locate_wheel_metadata_in_zip(&buf)?;
+                let scan = locate_wheel_metadata_in_zip(Cursor::new(&buf))?;
                 // The skipped-name count is stated unconditionally, including
                 // when it is zero: "0 skipped" is what rules out the one other
                 // explanation for this verdict, so an operator reading the
@@ -1373,8 +2113,13 @@ impl VersionDiscovery for PyPiFormatHandler {
     }
 }
 
-/// Locate the first `*.dist-info/METADATA` member in a wheel ZIP byte buffer
-/// and return its bytes, bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`].
+/// Locate the first `*.dist-info/METADATA` member in a wheel ZIP and
+/// return its bytes, bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`].
+///
+/// Generic over `Read + Seek` rather than taking a buffer, because a
+/// ZIP's member table is its tail-indexed central directory: handed a
+/// seekable payload this walk reads that directory and the one member it
+/// wants, so the archive itself never has to be in memory.
 ///
 /// Routes through [`archive_bounds::iter_zip_entries`](crate::archive_bounds::iter_zip_entries)
 /// — the single sanctioned home for ZIP extraction: entry count is bounded by
@@ -1402,11 +2147,11 @@ impl VersionDiscovery for PyPiFormatHandler {
 /// - `Err(DomainError::Validation)` — the buffer is not a readable ZIP, or an
 ///   `archive_bounds` guard tripped (entry-count / compression-ratio), or the
 ///   matched entry exceeds [`PYPI_WHEEL_METADATA_MAX_BYTES`].
-fn locate_wheel_metadata_in_zip(buf: &[u8]) -> DomainResult<WheelMetadataScan> {
+fn locate_wheel_metadata_in_zip<R: Read + Seek>(reader: R) -> DomainResult<WheelMetadataScan> {
     let mut found: Option<Vec<u8>> = None;
     let mut read_err: Option<String> = None;
     let stats = crate::archive_bounds::iter_zip_entries(
-        Cursor::new(buf),
+        reader,
         crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
         |name, reader| {
             // First match wins (the wheel spec mandates exactly one
@@ -1473,15 +2218,25 @@ struct WheelMetadataScan {
 /// `pip install pkg` never activates. Plain markers without an `extra ==`
 /// clause (`; python_version >= '3.8'`) ARE kept.
 ///
-/// Each surviving line is parsed via [`parse_requires_dist_into_spec`] — name +
+/// Each surviving field is parsed via [`parse_requires_dist_into_spec`] — name +
 /// parenthesised-or-inline version specifier. The specifier (e.g. `(>=1.0,<2)`)
-/// becomes the `range` field verbatim (no specifier → empty `range`). Lines
+/// becomes the `range` field verbatim (no specifier → empty `range`). Fields
 /// that don't parse as `Requires-Dist:` (other headers, the description body
-/// after the first blank line, malformed continuations) are silently skipped.
+/// after the first blank line) are silently skipped.
 ///
-/// Input must be valid UTF-8 (PEP 566 §3) — otherwise `Validation`. Bounded by
-/// [`PYPI_WHEEL_METADATA_MAX_BYTES`] (1 MiB) as a parser-input sanity cap on
-/// this identical content (the same canonical cap
+/// **Fields, not physical lines.** METADATA is an RFC 5322 header block, so a
+/// requirement may be folded across lines; the block is unfolded by
+/// [`unfold_rfc5322_block`] first and the extras-marker filter and the spec
+/// parser both see the whole value. Reading per physical line truncated a
+/// folded requirement to its first line and dropped the rest with no error,
+/// so the dependency simply was not in the cascade and advisory matching
+/// never asked about it.
+///
+/// Input must be valid UTF-8 (PEP 566 §3) — otherwise `Validation`. A header
+/// block that cannot be unfolded at all (its first line is a continuation) is
+/// an unparseable manifest, which the port contract puts on `Validation` too.
+/// Bounded by [`PYPI_WHEEL_METADATA_MAX_BYTES`] (1 MiB) as a parser-input
+/// sanity cap on this identical content (the same canonical cap
 /// [`extract_wheel_metadata_bytes`](PyPiFormatHandler::extract_wheel_metadata_bytes)
 /// uses), decoupled from `metadata_expected_max_bytes`.
 fn parse_wheel_metadata_into_specs(metadata: &[u8]) -> DomainResult<Vec<DependencySpec>> {
@@ -1496,14 +2251,13 @@ fn parse_wheel_metadata_into_specs(metadata: &[u8]) -> DomainResult<Vec<Dependen
     })?;
 
     let mut out = Vec::new();
-    for line in text.lines() {
-        // RFC 5322 headers end at the first blank line — everything after is
-        // the description body, which the wheel METADATA spec calls out
-        // explicitly.
-        if line.is_empty() {
-            break;
-        }
-        let Some(value) = line.strip_prefix("Requires-Dist:") else {
+    // Walked per *field*, not per physical line: a `Requires-Dist` value
+    // folded onto a continuation is still that field's value, and reading
+    // only the first line drops the rest of the requirement silently.
+    // `unfold_rfc5322_block` stops at the blank line, so the description
+    // body below it — indented prose included — stays out.
+    for header in unfold_rfc5322_block(text).map_err(DomainError::Validation)? {
+        let Some(value) = header.line.strip_prefix("Requires-Dist:") else {
             continue;
         };
         let value = value.trim();
@@ -1640,10 +2394,11 @@ fn parse_requires_dist_into_spec(line: &str) -> Option<(String, String)> {
 /// - `name==1.0` / `name>=1.0` (the legacy comma-less form)
 /// - `name ; python_version >= '3.8'` (environment marker dropped)
 ///
-/// Only the `==` exact-pin operator promotes to a concrete version; any
-/// other operator (including the parenthesised forms) leaves the version
-/// as `None`. We deliberately do NOT ship a full PEP 508 grammar parser —
-/// the intent is to parse what's needed, not re-derive the full grammar.
+/// A version is recovered only from a specifier that pins exactly one —
+/// see [`pep_440_single_exact_version`]; every other operator, and every
+/// multi-clause set, leaves the version as `None`. We deliberately do
+/// NOT ship a full PEP 508 grammar parser — the intent is to parse
+/// what's needed, not re-derive the full grammar.
 fn parse_pep_508_requirement(line: &str) -> Option<(String, Option<String>)> {
     // 1. Drop the environment marker (everything after the first `;`).
     let head = line.split(';').next()?;
@@ -1697,44 +2452,83 @@ fn parse_pep_508_requirement(line: &str) -> Option<(String, Option<String>)> {
         return None;
     }
 
-    // 4. From the spec, recover an exact-pin version. PEP 508 allows
-    //    comma-separated constraints (`==1.0,!=1.0.1`) — pick the first
-    //    `==` clause.
-    let version = spec_part.and_then(|spec| {
-        for clause in spec.split(',') {
-            let clause = clause.trim();
-            if let Some(rest) = clause.strip_prefix("==") {
-                let v = rest.trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-        None
-    });
+    // 4. From the spec, recover a version only when the specifier pins
+    //    exactly one. See [`pep_440_single_exact_version`] for why the
+    //    first `==` clause is not that test.
+    let version = spec_part.as_deref().and_then(pep_440_single_exact_version);
 
     Some((name_part, version))
 }
 
-/// The `Requires-Dist` strings in a stored PyPI metadata document, from
-/// whichever of its three shapes this artifact has.
+/// Recover the one version a PEP 440 specifier set pins, or `None` when
+/// it does not pin exactly one.
 ///
-/// The shapes are not variants of one document; they are **different
-/// documents**, one per ingest path, and a reader that knows only some of
-/// them silently reports an artifact's dependencies as absent:
+/// A version in a PURL is an assertion that the component **is** at that
+/// version, so it may be written only from a specifier that admits
+/// exactly one. Promoting the first `==` clause instead — which is what
+/// this reader used to do — labelled three shapes exact that are not:
 ///
-/// - `info.requires_dist` — the per-version PyPI JSON API body, which is
-///   what a pull-through fetch parses.
-/// - `requires_dist` at the top level — the same body sliced to a single
-///   version.
-/// - `pkg_info.requires_dist` — a **direct upload**. `twine` sends the
-///   distribution's `METADATA` fields as multipart form fields and the
-///   publish handler stores the harvest under `pkg_info`, so a hosted
-///   repository's declared dependencies live only here. This was the
-///   one shape missing, and the consequence was not a thinner BOM: on a
-///   policy whose backend adjudicates the BOM, every hosted PyPI
-///   distribution was assessed as though it declared no dependencies at
-///   all.
+/// - `==1.*` is PEP 440 **prefix matching**: it names a release series,
+///   and a PURL at `1` would be matched against advisories for a
+///   version nothing resolves to.
+/// - `==1.0,!=1.0` is unsatisfiable, and more generally a multi-clause
+///   set carries a constraint the PURL cannot show. A reader of
+///   `pkg:pypi/x@1.0` cannot see the clause that was dropped, so the
+///   honest answer is to name the package and not the version.
+/// - `===1.0` is **arbitrary equality** — a legacy string comparison
+///   over a version PEP 440's grammar does not admit. Stripping `==`
+///   from it yields `=1.0`, which was emitted into a PURL as though it
+///   were a version.
+///
+/// Declining is the conservative direction on both axes: a versionless
+/// PURL still names the package for advisory matching, and matching a
+/// package broadly costs findings that
+/// [`PyPiFormatHandler::payload_contains_components`] already denies
+/// authority over the artifact — while a *wrong* version silently
+/// matches the wrong advisories.
+fn pep_440_single_exact_version(spec: &str) -> Option<String> {
+    let mut clauses = spec.split(',').map(str::trim).filter(|c| !c.is_empty());
+    let only = clauses.next()?;
+    if clauses.next().is_some() {
+        return None;
+    }
+    if only.starts_with("===") {
+        return None;
+    }
+    let version = only.strip_prefix("==")?.trim();
+    if version.is_empty() || version.contains('*') {
+        return None;
+    }
+    Some(version.to_string())
+}
+
+/// The `Requires-Dist` strings recorded in a stored PyPI metadata
+/// document — `pkg_info.requires_dist`, and that shape alone.
+///
+/// `twine` sends a **direct upload**'s `METADATA` fields as multipart
+/// form fields and the publish handler stores that harvest under
+/// `pkg_info`, so this is hort's own record of what a hosted
+/// distribution's publisher declared, taken at the door.
+///
+/// # Why this reader accepts one shape and not three
+///
+/// It used to accept two more — `info.requires_dist` (the upstream
+/// per-version PyPI JSON API body) and a top-level `requires_dist` (that
+/// body sliced to one version). Neither has a producer anywhere in the
+/// workspace: both pull-through ingest sites store `format_metadata` as
+/// exactly `{"source": "pypi_upstream_pull", "upstream_url": …}`.
+///
+/// They are not kept as a tolerance, because the document they describe
+/// is one hort must not read for this purpose. It is upstream's
+/// assertion about bytes hort holds and can parse itself, and the
+/// artifact's own `<dist-info>/METADATA` / `PKG-INFO` is now read
+/// directly (see the [`PayloadSbom`] impl) — so a reader for the
+/// upstream shape could only ever substitute a third party's word for a
+/// verified document, which is the direction ADR 0006's reasoning
+/// refuses. Leaving the branches in place would also leave the
+/// invitation: an accepted shape with no producer reads as a supported
+/// ingest path, and the next contributor's cheapest way to "fix" a
+/// proxied BOM is to start storing it.
 ///
 /// A repeated multipart field arrives as a JSON array and a
 /// single-occurrence one as a bare string, so both are accepted — a
@@ -1743,14 +2537,8 @@ fn parse_pep_508_requirement(line: &str) -> Option<(String, Option<String>)> {
 /// failing the document: the array is publisher-supplied.
 fn pypi_requires_dist(metadata: &serde_json::Value) -> Option<Vec<&str>> {
     let raw = metadata
-        .get("info")
-        .and_then(|info| info.get("requires_dist"))
-        .or_else(|| metadata.get("requires_dist"))
-        .or_else(|| {
-            metadata
-                .get("pkg_info")
-                .and_then(|pkg_info| pkg_info.get("requires_dist"))
-        })?;
+        .get("pkg_info")
+        .and_then(|pkg_info| pkg_info.get("requires_dist"))?;
     match raw {
         serde_json::Value::Array(items) => Some(items.iter().filter_map(|v| v.as_str()).collect()),
         serde_json::Value::String(one) => Some(vec![one.as_str()]),
@@ -3307,13 +4095,18 @@ mod tests {
     }
 
     #[test]
-    fn extract_sbom_pypi_happy_path_with_info_wrapper() {
-        // PyPI's per-release JSON has the `info.requires_dist` shape.
+    fn extract_sbom_pypi_happy_path_from_the_upload_harvest() {
+        // `pkg_info.requires_dist` is the one recorded shape: twine's
+        // multipart harvest, stored by the direct-upload publish
+        // handler. The license still comes off `info`, which is a
+        // different key path and unaffected.
         let metadata = serde_json::json!({
             "info": {
                 "name": "myapp",
                 "version": "1.0.0",
                 "license": "MIT",
+            },
+            "pkg_info": {
                 "requires_dist": [
                     "requests (==2.31.0)",
                     "click >=8.0",
@@ -3350,15 +4143,16 @@ mod tests {
         assert_eq!(click.purl, "pkg:pypi/click");
     }
 
+    /// The upstream per-version JSON shapes (`info.requires_dist` and a
+    /// top-level `requires_dist`) are **not** read: no ingest path
+    /// produces them, and the document they describe is upstream's
+    /// assertion about bytes hort reads itself through `PayloadSbom`.
+    /// A document carrying only those keys declares nothing here.
     #[test]
-    fn extract_sbom_pypi_happy_path_without_info_wrapper() {
-        // Some shapes carry `requires_dist` at the top level (single-version slice).
+    fn extract_sbom_pypi_ignores_the_unproduced_upstream_json_shapes() {
         let metadata = serde_json::json!({
-            "name": "myapp",
-            "license": "Apache-2.0",
-            "requires_dist": [
-                "urllib3 (==1.26.0)",
-            ],
+            "info": { "requires_dist": ["requests (==2.31.0)"] },
+            "requires_dist": ["urllib3 (==1.26.0)"],
         });
         let coords = sbom_coords("myapp", "1.0.0");
         let payload = PayloadAccess::Bytes(b"");
@@ -3367,17 +4161,19 @@ mod tests {
             .extract_sbom(&coords, &metadata, payload)
             .expect("Some")
             .expect("Some");
-        // No info wrapper → license currently unavailable; OK.
-        assert_eq!(sbom.components.len(), 1);
-        assert_eq!(sbom.components[0].name, "urllib3");
-        assert_eq!(sbom.components[0].purl, "pkg:pypi/urllib3@1.26.0");
+        assert!(
+            sbom.components.is_empty(),
+            "an unproduced upstream shape must not be a dependency source: {:?}",
+            sbom.components
+        );
+        assert!(sbom.subject.is_some(), "the subject is still built");
     }
 
     #[test]
     fn extract_sbom_pypi_environment_marker_is_stripped() {
         // PEP 508 env markers are dropped from the canonical name+version.
         let metadata = serde_json::json!({
-            "info": {
+            "pkg_info": {
                 "requires_dist": [
                     "importlib-metadata (==4.0.0); python_version >= '3.8'",
                 ],
@@ -3402,7 +4198,7 @@ mod tests {
     fn extract_sbom_pypi_extras_are_stripped() {
         // PEP 508 extras (`name [extras] (==1.0)`) are dropped from name.
         let metadata = serde_json::json!({
-            "info": {
+            "pkg_info": {
                 "requires_dist": [
                     "requests[security] (==2.31.0)",
                 ],
@@ -3424,7 +4220,7 @@ mod tests {
     fn extract_sbom_pypi_normalises_pep503_name_in_purl() {
         // PEP 503 §4: `Foo_Bar.baz` normalises to `foo-bar-baz`.
         let metadata = serde_json::json!({
-            "info": {
+            "pkg_info": {
                 "requires_dist": [
                     "Foo_Bar.baz (==1.0)",
                 ],
@@ -3522,11 +4318,14 @@ mod tests {
         );
     }
 
-    /// The proxied shapes keep precedence, so an artifact that carries
-    /// both documents is read from the registry body rather than from a
-    /// client-supplied harvest.
+    /// There is no longer a precedence question in this reader: the
+    /// upstream `info` shape is not a dependency source, so a document
+    /// carrying both keys is read from the recorded harvest alone.
+    /// Precedence between the *harvest* and the *artifact's own bytes*
+    /// is decided one layer up, in the `PayloadSbom` impl, where the
+    /// bytes win.
     #[test]
-    fn extract_sbom_pypi_prefers_the_registry_body_over_the_upload_harvest() {
+    fn extract_sbom_pypi_reads_the_harvest_even_beside_an_upstream_shape() {
         let metadata = serde_json::json!({
             "info": { "requires_dist": ["requests (==2.31.0)"] },
             "pkg_info": { "requires_dist": ["attrs (==1.0)"] },
@@ -3542,7 +4341,7 @@ mod tests {
                 .iter()
                 .map(|c| c.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["requests"]
+            vec!["attrs"]
         );
     }
 
@@ -3627,8 +4426,8 @@ mod tests {
                     "Development Status :: 4 - Beta",
                     "License :: OSI Approved :: BSD License",
                 ],
-                "requires_dist": ["foo (==1.0)"],
             },
+            "pkg_info": { "requires_dist": ["foo (==1.0)"] },
         });
         let coords = sbom_coords("myapp", "1.0.0");
         let payload = PayloadAccess::Bytes(b"");
@@ -3645,6 +4444,1296 @@ mod tests {
             "license classifier not surfaced: {:?}",
             sbom.components[0].licenses
         );
+    }
+
+    // -- PayloadSbom: the declaration is in the artifact ---------------------
+
+    use crate::test_support::build_tar_gz_bytes;
+
+    /// The `format_metadata` **both** upstream ingest sites store — a
+    /// source marker and a URL, and no dependency information at all.
+    /// Every test that passes this is a test about the artifact's own
+    /// bytes, because there is nothing else to read.
+    fn proxied_metadata() -> serde_json::Value {
+        serde_json::json!({
+            "source": "pypi_upstream_pull",
+            "upstream_url": "https://pypi.org/simple/myapp/",
+        })
+    }
+
+    fn wheel_with_metadata(body: &str) -> Vec<u8> {
+        build_wheel_zip(&[
+            ("myapp-1.0.0.dist-info/METADATA", body.as_bytes()),
+            ("myapp/__init__.py", b"" as &[u8]),
+        ])
+    }
+
+    fn sdist_with_pkg_info(body: &str) -> Vec<u8> {
+        build_tar_gz_bytes(&[
+            ("myapp-1.0.0/PKG-INFO", body.as_bytes()),
+            ("myapp-1.0.0/setup.py", b"# nothing" as &[u8]),
+        ])
+    }
+
+    /// Run the payload path over in-memory bytes.
+    fn extract_payload(payload: &[u8], metadata: &serde_json::Value) -> PayloadSbomExtraction {
+        PyPiFormatHandler
+            .extract_sbom_from_payload(
+                &sbom_coords("myapp", "1.0.0"),
+                metadata,
+                PayloadAccess::Bytes(payload),
+            )
+            .expect("the payload path never returns Err")
+    }
+
+    fn purls(extraction: &PayloadSbomExtraction) -> Vec<&str> {
+        extraction
+            .sbom
+            .as_ref()
+            .expect("a BOM")
+            .components
+            .iter()
+            .map(|c| c.purl.as_str())
+            .collect()
+    }
+
+    /// **The reported defect, as a test.** A proxied wheel's stored
+    /// `format_metadata` is exactly the source marker — so under the
+    /// metadata-only path its dependency declaration never reached the
+    /// scan subject, and every proxied distribution was assessed as
+    /// though it declared nothing. The declaration was inside the
+    /// artifact the whole time.
+    #[test]
+    fn a_proxied_wheel_yields_a_component_list_from_its_own_bytes() {
+        // The premise: the stored document really does carry nothing.
+        assert!(
+            pypi_requires_dist(&proxied_metadata()).is_none(),
+            "the proxied metadata shape must carry no declaration"
+        );
+
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.1\nName: myapp\nVersion: 1.0.0\n\
+             Requires-Dist: requests (==2.31.0)\nRequires-Dist: click (>=8.0)\n\
+             \nA long description that mentions Requires-Dist: ignored (==9.9)\n",
+        );
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(
+            purls(&extraction),
+            vec!["pkg:pypi/requests@2.31.0", "pkg:pypi/click"],
+            "the body after the first blank line is not a header block"
+        );
+    }
+
+    /// The sdist shape: `PKG-INFO` under the single root directory.
+    #[test]
+    fn an_sdist_yields_a_component_list_from_its_pkg_info() {
+        let sdist = sdist_with_pkg_info(
+            "Metadata-Version: 2.2\nName: myapp\nVersion: 1.0.0\n\
+             Requires-Dist: urllib3 (==1.26.0)\n",
+        );
+        let extraction = extract_payload(&sdist, &proxied_metadata());
+
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/urllib3@1.26.0"]);
+    }
+
+    /// **A fully pinned wheel is still not a resolve.** `Resolved`
+    /// promises a resolved-dependency document AND a successful closure
+    /// walk; this reader takes the direct `Requires-Dist` lines and
+    /// never walks a closure, so the exactness of the versions does not
+    /// earn the stronger value. Asserted because the opposite — all-`==`
+    /// ⇒ `Resolved` — was this change's own earlier rule.
+    #[test]
+    fn a_fully_pinned_wheel_reports_declared_and_never_resolved() {
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.3\nName: myapp\nVersion: 1.0.0\n\
+             Requires-Dist: requests (==2.31.0)\nRequires-Dist: urllib3 (==2.0.7)\n",
+        );
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(
+            extraction.resolution,
+            SbomResolution::Declared,
+            "every component is exactly pinned, and it is still a declaration"
+        );
+        assert_ne!(extraction.resolution, SbomResolution::Resolved);
+        assert_eq!(
+            purls(&extraction),
+            vec!["pkg:pypi/requests@2.31.0", "pkg:pypi/urllib3@2.0.7"]
+        );
+    }
+
+    /// A PEP 440 **prefix match** names a release series, not a version.
+    #[test]
+    fn a_prefix_match_specifier_does_not_reach_a_versioned_purl() {
+        let wheel = wheel_with_metadata("Metadata-Version: 2.3\nRequires-Dist: requests (==1.*)\n");
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/requests"]);
+        let component = &extraction.sbom.as_ref().unwrap().components[0];
+        assert!(
+            component.version.is_none(),
+            "`==1.*` admits every release in the 1 series: {:?}",
+            component.version
+        );
+    }
+
+    /// A multi-clause specifier set carries a constraint the PURL cannot
+    /// show, and this one is unsatisfiable outright. Promoting its first
+    /// `==` clause is what the reader used to do.
+    #[test]
+    fn a_multi_clause_specifier_does_not_reach_a_versioned_purl() {
+        let wheel =
+            wheel_with_metadata("Metadata-Version: 2.3\nRequires-Dist: requests (==1.0,!=1.0)\n");
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/requests"]);
+    }
+
+    /// PEP 440 **arbitrary equality**. Stripping `==` off it used to
+    /// emit `=1.0` into a PURL — not a version at all.
+    #[test]
+    fn an_arbitrary_equality_specifier_does_not_reach_a_versioned_purl() {
+        let wheel =
+            wheel_with_metadata("Metadata-Version: 2.3\nRequires-Dist: requests (===1.0)\n");
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/requests"]);
+    }
+
+    /// An sdist whose metadata is 2.2+ and does not mark the field
+    /// dynamic has **declared** that it needs nothing. Subject-only, and
+    /// `NoLockfile` rather than a gating absence: there is nothing for a
+    /// hold to wait on. Not an `Err`.
+    #[test]
+    fn a_static_empty_declaration_is_subject_only_and_no_lockfile() {
+        let sdist = sdist_with_pkg_info("Metadata-Version: 2.2\nName: myapp\nVersion: 1.0.0\n");
+        let extraction = extract_payload(&sdist, &proxied_metadata());
+
+        assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
+        let sbom = extraction.sbom.expect("subject-only, not absent");
+        assert!(sbom.components.is_empty());
+        assert_eq!(
+            sbom.subject.expect("subject").purl,
+            "pkg:pypi/myapp@1.0.0",
+            "the artifact itself is still worth an advisory query"
+        );
+    }
+
+    /// A **wheel** is the built distribution: its METADATA is what `pip`
+    /// resolves from, and PEP 643's `Dynamic` is not permitted in one
+    /// precisely because there is no later document for the answer to
+    /// move to. So an absent `Requires-Dist` is a statement at every
+    /// metadata version — including the pre-2.2 versions that make an
+    /// *sdist*'s silence meaningless.
+    #[test]
+    fn a_pre_2_2_wheel_with_no_requirements_has_still_declared_none() {
+        let wheel = wheel_with_metadata("Metadata-Version: 2.1\nName: myapp\nVersion: 1.0.0\n");
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
+        assert!(extraction.sbom.expect("subject-only").components.is_empty());
+    }
+
+    /// `Dynamic: Requires-Dist` (PEP 643) says this document's value is
+    /// not canonical for what gets built — so its absence is **unknown**,
+    /// and unknown is a gating absence, not an empty dependency set.
+    #[test]
+    fn a_dynamic_requires_dist_is_unknown_and_gates() {
+        let sdist = sdist_with_pkg_info(
+            "Metadata-Version: 2.2\nName: myapp\nVersion: 1.0.0\n\
+             Dynamic: Requires-Dist\n",
+        );
+        let extraction = extract_payload(&sdist, &proxied_metadata());
+
+        assert_eq!(
+            extraction.resolution,
+            SbomResolution::UnusableLockfile,
+            "a declaration the artifact marks non-canonical is unread, not empty"
+        );
+    }
+
+    /// Header field names are case-insensitive (RFC 5322 §3.6.8), and
+    /// here a case-sensitive match would be **fail-open**: a `dynamic:`
+    /// spelling missed reads a non-canonical declaration as a canonical
+    /// one and releases on it.
+    #[test]
+    fn a_lowercased_dynamic_header_is_still_read() {
+        let sdist =
+            sdist_with_pkg_info("metadata-version: 2.2\nname: myapp\ndynamic: requires-dist\n");
+        assert_eq!(
+            extract_payload(&sdist, &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// Below metadata 2.2 an sdist had no way to say whether a field was
+    /// settled — which is the gap PEP 643 was written to close — and an
+    /// sdist's dependencies commonly live in `setup.py` / `pyproject.toml`
+    /// that no reader here executes. Silence there proves nothing.
+    #[test]
+    fn a_pre_2_2_sdist_with_no_requirements_is_unknown_and_gates() {
+        let sdist = sdist_with_pkg_info("Metadata-Version: 2.1\nName: myapp\nVersion: 1.0.0\n");
+        assert_eq!(
+            extract_payload(&sdist, &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// No readable `Metadata-Version` at all takes the same gating
+    /// answer, because the question is whether a guarantee is in force.
+    #[test]
+    fn an_sdist_with_no_metadata_version_is_unknown_and_gates() {
+        let sdist = sdist_with_pkg_info("Name: myapp\nVersion: 1.0.0\n");
+        assert_eq!(
+            extract_payload(&sdist, &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A pre-2.2 sdist that *does* declare requirements has declared
+    /// them: `Dynamic` is what would have said otherwise and it is
+    /// absent. The pre-2.2 rule is about **absence** proving nothing.
+    #[test]
+    fn a_pre_2_2_sdist_that_declares_requirements_is_read() {
+        let sdist = sdist_with_pkg_info(
+            "Metadata-Version: 2.1\nName: myapp\nRequires-Dist: urllib3 (==1.26.0)\n",
+        );
+        let extraction = extract_payload(&sdist, &proxied_metadata());
+
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/urllib3@1.26.0"]);
+    }
+
+    /// A corrupt wheel ZIP degrades to a subject-only BOM carrying
+    /// `UnusableLockfile` — the gating arm — and does **not** return
+    /// `Err`: a publisher-controlled byte sequence must not abort a scan.
+    #[test]
+    fn a_corrupt_wheel_zip_is_subject_only_and_unusable_not_err() {
+        // The zip magic, and then nothing a zip reader can use.
+        let mut corrupt = b"PK\x03\x04".to_vec();
+        corrupt.extend_from_slice(&[0xFF; 64]);
+
+        let extraction = extract_payload(&corrupt, &proxied_metadata());
+        assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
+        let sbom = extraction.sbom.expect("subject-only, never absent");
+        assert!(sbom.components.is_empty());
+        assert!(sbom.subject.is_some());
+    }
+
+    /// Bytes that are neither container are reported honestly, and
+    /// gate — hort expected a distribution and did not get one.
+    #[test]
+    fn a_payload_that_is_not_a_distribution_gates() {
+        assert_eq!(
+            extract_payload(
+                b"Metadata-Version: 2.3\nRequires-Dist: x\n",
+                &proxied_metadata()
+            )
+            .resolution,
+            SbomResolution::UnusableLockfile,
+            "a bare METADATA body is not a distribution container"
+        );
+    }
+
+    /// A wheel that verified but carries no `*.dist-info/METADATA`
+    /// member has no declaration to read.
+    #[test]
+    fn a_wheel_with_no_metadata_member_gates() {
+        let wheel = build_wheel_zip(&[("myapp/__init__.py", b"" as &[u8])]);
+        assert_eq!(
+            extract_payload(&wheel, &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A declaration whose every line is unparseable was read and cannot
+    /// be used — which is the gating arm, not an empty declaration. The
+    /// opposite would report "this distribution declares nothing" about
+    /// one that declares something in a syntax this reader cannot admit.
+    #[test]
+    fn a_declaration_no_line_of_which_parses_gates() {
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.3\nRequires-Dist: ; python_version >= '3.8'\n",
+        );
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
+        assert!(extraction.sbom.expect("subject-only").components.is_empty());
+    }
+
+    /// The metadata document must be UTF-8 (PEP 566 §3); bytes that are
+    /// not are an unread declaration rather than a silent empty one.
+    #[test]
+    fn a_metadata_member_that_is_not_utf8_gates() {
+        let wheel = build_wheel_zip(&[("myapp-1.0.0.dist-info/METADATA", &[0xFF, 0xFE, 0xFD][..])]);
+        assert_eq!(
+            extract_payload(&wheel, &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// **The hosted path loses nothing.** A direct upload's declaration
+    /// is recorded under `pkg_info` by the publish handler, and where
+    /// the payload yields no declaration that record is still read — so
+    /// moving PyPI onto the payload does not take the hosted BOM away.
+    #[test]
+    fn the_recorded_upload_harvest_still_yields_the_same_list() {
+        let harvest = serde_json::json!({
+            "pkg_info": {
+                "requires_dist": ["requests (==2.31.0)", "click (>=8.0)"],
+            },
+        });
+        // A payload with no declaration in it at all.
+        let extraction = extract_payload(b"not a distribution", &harvest);
+
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(
+            purls(&extraction),
+            vec!["pkg:pypi/requests@2.31.0", "pkg:pypi/click"],
+            "the same list the metadata-only path produced"
+        );
+        // And identical to what `extract_sbom` makes of the same record,
+        // because both go through one component builder.
+        let metadata_path = PyPiFormatHandler
+            .extract_sbom(
+                &sbom_coords("myapp", "1.0.0"),
+                &harvest,
+                PayloadAccess::Bytes(b""),
+            )
+            .expect("Ok")
+            .expect("Some");
+        assert_eq!(
+            metadata_path
+                .components
+                .iter()
+                .map(|c| c.purl.as_str())
+                .collect::<Vec<_>>(),
+            purls(&extraction)
+        );
+    }
+
+    /// **Where both exist, the bytes win** (ADR 0006's reasoning: the
+    /// bytes are verified, the harvest is an assertion about them).
+    #[test]
+    fn the_artifacts_own_bytes_outrank_the_recorded_harvest() {
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.3\nName: myapp\nRequires-Dist: urllib3 (==2.0.7)\n",
+        );
+        let harvest = serde_json::json!({
+            "pkg_info": { "requires_dist": ["attrs (==1.0)"] },
+        });
+        let extraction = extract_payload(&wheel, &harvest);
+
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/urllib3@2.0.7"]);
+    }
+
+    /// An empty or absent record is not a rescue: it says no more than
+    /// the unreadable archive did, so the gating absence stands.
+    #[test]
+    fn an_empty_recorded_harvest_does_not_rescue_an_unread_declaration() {
+        let harvest = serde_json::json!({ "pkg_info": { "requires_dist": [] } });
+        assert_eq!(
+            extract_payload(b"not a distribution", &harvest).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A bytes payload over the archive cap is refused rather than
+    /// parsed. Paired with the streamed test below, which is the one
+    /// that shows the read is bounded.
+    #[test]
+    fn a_bytes_payload_over_the_archive_cap_is_refused() {
+        let oversized = vec![0x50u8; PYPI_DIST_MAX_BYTES + 1];
+        assert_eq!(
+            extract_payload(&oversized, &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A reader that can serve far more than the cap and counts what it
+    /// was actually asked for.
+    struct CountingZeros {
+        remaining: usize,
+        served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for CountingZeros {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.remaining);
+            buf[..n].fill(0);
+            self.remaining -= n;
+            self.served
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    /// **A streamed distribution above the archive cap is refused
+    /// without an unbounded read.** This is the acceptance the 1 MiB
+    /// METADATA-member cap does not satisfy: the member cap bounds what
+    /// comes out of the archive, and on the `ReadStream` the scan
+    /// orchestrator supplies it would be applied *after* reading the
+    /// whole stream. The served count is the evidence — an unbounded
+    /// read would have taken every byte on offer.
+    #[test]
+    fn a_streamed_distribution_over_the_cap_is_refused_without_an_unbounded_read() {
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let on_offer = PYPI_DIST_MAX_BYTES * 4;
+        let reader = CountingZeros {
+            remaining: on_offer,
+            served: std::sync::Arc::clone(&served),
+        };
+
+        let extraction = PyPiFormatHandler
+            .extract_sbom_from_payload(
+                &sbom_coords("myapp", "1.0.0"),
+                &proxied_metadata(),
+                PayloadAccess::ReadStream(Box::new(reader)),
+            )
+            .expect("over-cap is a soft degradation, never an Err");
+
+        assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
+        let taken = served.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            taken <= PYPI_DIST_MAX_BYTES + 1,
+            "the read must stop one byte past the cap, took {taken} of {on_offer}"
+        );
+    }
+
+    /// The streaming variant the scan orchestrator actually hands over
+    /// (ADR 0026) reaches the same declaration as the buffered one.
+    #[test]
+    fn the_streaming_payload_variant_reads_the_same_declaration() {
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.3\nName: myapp\nRequires-Dist: requests (==2.31.0)\n",
+        );
+        let extraction = PyPiFormatHandler
+            .extract_sbom_from_payload(
+                &sbom_coords("myapp", "1.0.0"),
+                &proxied_metadata(),
+                PayloadAccess::ReadStream(Box::new(Cursor::new(wheel.clone()))),
+            )
+            .expect("Ok");
+
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/requests@2.31.0"]);
+    }
+
+    /// The seekable variant exists so a wheel's tail-indexed member
+    /// table can be walked without holding the archive, and its contract
+    /// says a handler handed it must not read the payload whole. The
+    /// served count is what shows this one does not: a wheel padded well
+    /// past its own metadata is read for the central directory and the
+    /// one member, not end to end.
+    #[test]
+    fn the_seekable_payload_variant_does_not_read_the_wheel_whole() {
+        let mut files: Vec<(String, Vec<u8>)> = vec![(
+            "myapp-1.0.0.dist-info/METADATA".to_string(),
+            b"Metadata-Version: 2.3\nName: myapp\nRequires-Dist: requests (==2.31.0)\n".to_vec(),
+        )];
+        // Padding the deflate stream cannot shrink, so the archive on
+        // the wire really is large — a patterned filler compresses to
+        // nothing and the fixture would not test what it claims.
+        let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
+        for i in 0..8 {
+            let body: Vec<u8> = (0..256 * 1024)
+                .map(|_| {
+                    lcg = lcg
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    (lcg >> 33) as u8
+                })
+                .collect();
+            files.push((format!("myapp/data{i}.bin"), body));
+        }
+        let borrowed: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
+        let wheel = build_wheel_zip(&borrowed);
+        let wheel_len = wheel.len();
+        assert!(
+            wheel_len > 1024 * 1024,
+            "the fixture must be large: {wheel_len}"
+        );
+
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let extraction = PyPiFormatHandler
+            .extract_sbom_from_payload(
+                &sbom_coords("myapp", "1.0.0"),
+                &proxied_metadata(),
+                PayloadAccess::ReadSeek(Box::new(CountingSeekable {
+                    inner: Cursor::new(wheel.clone()),
+                    served: std::sync::Arc::clone(&served),
+                })),
+            )
+            .expect("Ok");
+
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/requests@2.31.0"]);
+        let taken = served.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            taken < wheel_len,
+            "a seekable wheel must not be read whole: took {taken} of {wheel_len}"
+        );
+    }
+
+    /// A seekable reader that counts the bytes it serves.
+    struct CountingSeekable {
+        inner: Cursor<Vec<u8>>,
+        served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Read for CountingSeekable {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.served
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+            Ok(n)
+        }
+    }
+
+    impl Seek for CountingSeekable {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// A seekable reader whose read or whose rewind fails — the two ways
+    /// the container sniff's own I/O arms are reachable. With
+    /// `fail_read` clear it serves a wheel's magic and then refuses to
+    /// rewind, which is the arm that matters most: a payload the sniff
+    /// cannot put back is one the walk after it would read from the
+    /// wrong offset.
+    struct FailingSeekable {
+        fail_read: bool,
+    }
+
+    impl Read for FailingSeekable {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.fail_read {
+                return Err(std::io::Error::other("seekable payload read failed"));
+            }
+            let magic = b"PK\x03\x04";
+            let n = buf.len().min(magic.len());
+            buf[..n].copy_from_slice(&magic[..n]);
+            Ok(n)
+        }
+    }
+
+    impl Seek for FailingSeekable {
+        fn seek(&mut self, _pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            Err(std::io::Error::other("seekable payload rewind failed"))
+        }
+    }
+
+    /// The seekable arm's refusals are the buffered arm's, reached by a
+    /// different route: a reader that errors, one too short to sniff, and
+    /// a zip the walk cannot open all degrade softly and gate.
+    #[test]
+    fn the_seekable_arm_refuses_the_same_shapes_the_buffered_arm_does() {
+        fn seekable(
+            payload: Box<dyn hort_domain::types::sbom::SeekableRead + Send>,
+        ) -> SbomResolution {
+            PyPiFormatHandler
+                .extract_sbom_from_payload(
+                    &sbom_coords("myapp", "1.0.0"),
+                    &proxied_metadata(),
+                    PayloadAccess::ReadSeek(payload),
+                )
+                .expect("a soft degradation, never an Err")
+                .resolution
+        }
+
+        // A read error while sniffing the container.
+        assert_eq!(
+            seekable(Box::new(FailingSeekable { fail_read: true })),
+            SbomResolution::UnusableLockfile
+        );
+        // A payload the sniff cannot rewind: the walk after it would
+        // start at the wrong offset, so the refusal is the answer.
+        assert_eq!(
+            seekable(Box::new(FailingSeekable { fail_read: false })),
+            SbomResolution::UnusableLockfile
+        );
+        // Fewer bytes than a magic number — the short-read arm.
+        assert_eq!(
+            seekable(Box::new(Cursor::new(b"PK".to_vec()))),
+            SbomResolution::UnusableLockfile
+        );
+        // Zip magic the walk cannot open.
+        let mut corrupt = b"PK\x03\x04".to_vec();
+        corrupt.extend_from_slice(&[0xFF; 64]);
+        assert_eq!(
+            seekable(Box::new(Cursor::new(corrupt))),
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// Seeking buys nothing on a gzip, which is decoded front-to-back, so
+    /// the seekable arm reads an sdist under the archive cap exactly as
+    /// the stream arm does — and reaches the same declaration.
+    #[test]
+    fn a_seekable_sdist_is_read_under_the_cap_and_reaches_its_declaration() {
+        let sdist = sdist_with_pkg_info(
+            "Metadata-Version: 2.2\nName: myapp\nRequires-Dist: urllib3 (==1.26.0)\n",
+        );
+        let extraction = PyPiFormatHandler
+            .extract_sbom_from_payload(
+                &sbom_coords("myapp", "1.0.0"),
+                &proxied_metadata(),
+                PayloadAccess::ReadSeek(Box::new(Cursor::new(sdist))),
+            )
+            .expect("Ok");
+
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/urllib3@1.26.0"]);
+    }
+
+    /// An sdist whose archive carries no `PKG-INFO` at all has no
+    /// declaration to read, so it gates rather than reading as an empty
+    /// declaration — and it reaches that answer by **completing** the
+    /// walk, not by tripping a bound.
+    ///
+    /// The filler is why: `read_tar_gz_entry`'s output cap is derived
+    /// from the compressed size, and on a near-empty archive tar's zero
+    /// padding compresses far better than the ratio limit allows, so the
+    /// cap lands below the padded size and the scan aborts. A fixture
+    /// that small would assert the same verdict for the wrong reason.
+    #[test]
+    fn an_sdist_with_no_pkg_info_member_gates() {
+        let mut lcg: u64 = 0x9E37_79B9_7F4A_7C15;
+        let filler: Vec<u8> = (0..64 * 1024)
+            .map(|_| {
+                lcg = lcg
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (lcg >> 33) as u8
+            })
+            .collect();
+        let sdist = build_tar_gz_bytes(&[
+            ("myapp-1.0.0/setup.py", b"# nothing" as &[u8]),
+            ("myapp-1.0.0/data.bin", filler.as_slice()),
+        ]);
+
+        // The premise: the walk completes and simply finds no PKG-INFO.
+        assert!(
+            matches!(locate_sdist_pkg_info(&sdist), Ok(None)),
+            "the fixture must reach the no-such-member answer, not a bounds trip"
+        );
+        assert_eq!(
+            extract_payload(&sdist, &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A continuation line belongs to the field it continues, never to a
+    /// field of its own — so a `Description` that wraps onto a line
+    /// reading `Dynamic: Requires-Dist` is a wrapped description, not a
+    /// PEP 643 marker. The declaration around it is still read.
+    #[test]
+    fn a_continuation_line_belongs_to_the_field_it_continues() {
+        let wheel = wheel_with_metadata(concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Description: a summary that wraps\n",
+            "  Dynamic: Requires-Dist\n",
+            "Requires-Dist: urllib3 (==1.26.0)\n",
+        ));
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(
+            extraction.resolution,
+            SbomResolution::Declared,
+            "a wrapped line is not a `Dynamic` field"
+        );
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/urllib3@1.26.0"]);
+    }
+
+    // ----- RFC 5322 folding ------------------------------------------------
+    //
+    // Core Metadata is an RFC 5322 header block, so a value may be folded
+    // onto a continuation line. Both readers below used to classify per
+    // *physical* line, which dropped the continuation: a folded `Dynamic`
+    // read as "nothing is dynamic" (a static empty declaration over a
+    // distribution that withheld its requirement list) and a folded
+    // `Requires-Dist` lost the rest of the requirement with no error.
+
+    /// **The fail-open, as the disposition that carries it.** A metadata
+    /// 2.2 sdist whose `Dynamic:` value is folded onto a continuation
+    /// line marks `Requires-Dist` dynamic — `email.parser` with
+    /// `compat32`, the parser the Core Metadata specification names,
+    /// unfolds it to `Requires-Dist`. Read per physical line it was a
+    /// static empty declaration, which becomes `NoLockfile` and a
+    /// subject-only BOM an SBOM-only policy's backend answers
+    /// `Analysed([])` over: a clean scan recorded over a distribution
+    /// that explicitly said its requirement list is not canonical.
+    ///
+    /// The resolution — not the handler's `Option<Sbom>` — is what the
+    /// scan orchestrator spends, so the resolution is what is asserted
+    /// here. `UnusableLockfile` holds the artifact with no verdict;
+    /// `NoLockfile` completes the run as not-applicable and releases on
+    /// it. That the two dispose differently is pinned where the
+    /// disposition is made, in `hort-app`'s `scan_orchestration_tests`
+    /// (`a_subject_only_bom_from_an_unread_declaration_does_not_authorize_release`
+    /// against `a_declared_empty_declaration_still_completes`); what is
+    /// pinned here is which of the two this document lands on.
+    #[test]
+    fn a_folded_dynamic_marker_is_read_and_the_declaration_gates() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Version: 1.0.0\n",
+            "Dynamic:\n",
+            " Requires-Dist\n",
+        );
+        assert!(
+            matches!(
+                classify_requires_dist(body, PypiContainer::Sdist),
+                PypiDeclaration::NotCanonical(_)
+            ),
+            "a folded `Dynamic` value is still a `Dynamic` declaration"
+        );
+
+        let extraction = extract_payload(&sdist_with_pkg_info(body), &proxied_metadata());
+        assert_eq!(
+            extraction.resolution,
+            SbomResolution::UnusableLockfile,
+            "a withheld declaration is unread, not empty — `NoLockfile` is the non-gating arm \
+             and would have released this artifact"
+        );
+        assert!(
+            extraction
+                .sbom
+                .expect("the subject-only shape")
+                .components
+                .is_empty(),
+            "nothing was declared readable, so no component may be claimed"
+        );
+    }
+
+    /// RFC 5322 §2.2.3 admits SP **or** HTAB as the fold's leading
+    /// whitespace, and a producer that indents with a tab is making the
+    /// same declaration.
+    #[test]
+    fn a_tab_folded_dynamic_marker_is_read_the_same_way() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Dynamic:\n",
+            "\tRequires-Dist\n",
+        );
+        assert!(matches!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::NotCanonical(_)
+        ));
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A folded `Requires-Dist` is read whole by the declaration
+    /// reader, so the BOM carries the requirement the document states
+    /// rather than the truncated head of it.
+    #[test]
+    fn a_folded_requires_dist_value_is_read_whole_by_the_declaration_reader() {
+        let body = concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Requires-Dist: requests\n",
+            " (==2.31.0)\n",
+        );
+        assert_eq!(
+            classify_requires_dist(body, PypiContainer::Wheel),
+            PypiDeclaration::Stated(vec!["requests (==2.31.0)".to_string()])
+        );
+        assert_eq!(
+            purls(&extract_payload(
+                &wheel_with_metadata(body),
+                &proxied_metadata()
+            )),
+            vec!["pkg:pypi/requests@2.31.0"],
+            "read per physical line this was `requests` with no version"
+        );
+    }
+
+    /// And read whole by the cascade reader, which is the half that lost
+    /// a dependency in silence: nothing was withheld and nothing errored,
+    /// the requirement simply was not in the list advisory matching sees.
+    ///
+    /// The extras marker on the continuation is the point of the second
+    /// case: `is_extras_gated_requirement` runs on the **unfolded**
+    /// value, so a line whose `; extra == 'test'` arrived on a
+    /// continuation is filtered exactly as an inline one is. Per physical
+    /// line the marker was invisible and the dev-only dependency entered
+    /// the prefetch cascade as a runtime one.
+    #[test]
+    fn a_folded_requires_dist_value_is_read_whole_by_the_cascade_reader() {
+        let specs = parse_wheel_metadata_into_specs(
+            concat!(
+                "Metadata-Version: 2.3\n",
+                "Name: myapp\n",
+                "Requires-Dist: requests\n",
+                " (==2.31.0)\n",
+            )
+            .as_bytes(),
+        )
+        .expect("specs");
+        assert_eq!(
+            specs
+                .iter()
+                .map(|s| (s.name.as_str(), s.range.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("requests", "==2.31.0")]
+        );
+
+        let gated = parse_wheel_metadata_into_specs(
+            concat!(
+                "Metadata-Version: 2.3\n",
+                "Name: myapp\n",
+                "Requires-Dist: pytest (==7.0.0)\n",
+                " ; extra == 'test'\n",
+            )
+            .as_bytes(),
+        )
+        .expect("specs");
+        assert!(
+            gated.is_empty(),
+            "the extras filter reads the unfolded value: {gated:?}"
+        );
+    }
+
+    /// The two readers diverge on an extras-gated requirement **on
+    /// purpose**, and that divergence has to survive unfolding in both
+    /// directions. The cascade reader drops one (above); the declaration
+    /// reader keeps it, because in the BOM it is one advisory lookup over
+    /// a component whose artifact `payload_contains_components() == false`
+    /// already denies authority over, while in the cascade it is a
+    /// dev/test download fan-out that inflates the closure 10-100x.
+    ///
+    /// Unfolding hands both readers the same whole value, so this is the
+    /// half that goes wrong by making the extras filter the *unfolder's*
+    /// business rather than each reader's: a filter applied during
+    /// reassembly would silently take the requirement out of the BOM too,
+    /// and nothing else in this file would notice.
+    #[test]
+    fn a_folded_extras_gated_requirement_is_still_kept_in_the_bom() {
+        let body = concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Requires-Dist: requests (==2.31.0)\n",
+            "Requires-Dist: pytest (==7.0.0)\n",
+            " ; extra == 'test'\n",
+        );
+        assert_eq!(
+            purls(&extract_payload(
+                &wheel_with_metadata(body),
+                &proxied_metadata()
+            )),
+            vec!["pkg:pypi/requests@2.31.0", "pkg:pypi/pytest@7.0.0"],
+            "the BOM keeps an extras-gated requirement whether or not it was folded"
+        );
+        let specs = parse_wheel_metadata_into_specs(body.as_bytes()).expect("specs");
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["requests"],
+            "and the cascade still drops it, read whole"
+        );
+    }
+
+    /// Two or more continuation lines are one value. RFC 5322 unfolding
+    /// removes every line break that precedes whitespace, not just the
+    /// first.
+    #[test]
+    fn a_multi_line_continuation_is_read_whole_by_both_readers() {
+        let body = concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Requires-Dist: requests\n",
+            " (>=2.25,\n",
+            " <3)\n",
+        );
+        assert_eq!(
+            classify_requires_dist(body, PypiContainer::Wheel),
+            PypiDeclaration::Stated(vec!["requests (>=2.25, <3)".to_string()])
+        );
+        let specs = parse_wheel_metadata_into_specs(body.as_bytes()).expect("specs");
+        assert_eq!(
+            specs
+                .iter()
+                .map(|s| (s.name.as_str(), s.range.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("requests", ">=2.25, <3")]
+        );
+    }
+
+    /// **The regression unfolding could introduce.** The header block
+    /// ends at the first blank line and the long description follows,
+    /// where indented prose is entirely ordinary. Neither half of the
+    /// description may reach the declaration: an indented line must not
+    /// become a continuation of the last header, and an un-indented one
+    /// must not become a header. Both would replace a fail-open with a
+    /// corrupted component list assembled out of publisher-controlled
+    /// prose, which is the worse of the two failures: the first holds an
+    /// artifact that should have been held, the second puts components
+    /// in a BOM that the distribution never declared.
+    ///
+    /// The fixture carries both shapes — a description opening with a
+    /// line that reads exactly like a PEP 643 marker, then indented
+    /// continuation prose under it — so the test is red for a blank line
+    /// that is skipped *and* for one that is merely not special-cased.
+    #[test]
+    fn an_indented_description_line_is_not_a_continuation_of_the_last_header() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Requires-Dist: urllib3 (==1.26.0)\n",
+            "\n",
+            "Dynamic: Requires-Dist\n",
+            "  continued prose under it\n",
+            "  Requires-Dist: evil (==9.9)\n",
+            "    indented example code\n",
+        );
+        assert_eq!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::Stated(vec!["urllib3 (==1.26.0)".to_string()]),
+            "the description is not part of the header block"
+        );
+        let specs = parse_wheel_metadata_into_specs(body.as_bytes()).expect("specs");
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["urllib3"]
+        );
+    }
+
+    /// A fold that splits the field name reassembles into text no field
+    /// is called, and `packaging` rejects such a document outright. This
+    /// reader cannot tell whether it meant `Requires-Dist`, so it
+    /// reports the declaration **unreadable** — reaching for the empty
+    /// arm here would reproduce the fail-open through a different door.
+    #[test]
+    fn a_dynamic_folded_into_a_name_no_field_has_is_unreadable_not_empty() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Dynamic:\n",
+            " Requires\n",
+            " -Dist\n",
+        );
+        assert!(
+            matches!(
+                classify_requires_dist(body, PypiContainer::Sdist),
+                PypiDeclaration::NotCanonical(_)
+            ),
+            "an illegible reassembly of `Dynamic` is not a statement that nothing is dynamic"
+        );
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// `Dynamic` naming some *other* field is a legible declaration that
+    /// says nothing about `Requires-Dist`, folded or not — so the
+    /// refusal above must not fire on it. Without this the fail-closed
+    /// arm would hold every sdist that marks an unrelated field dynamic.
+    #[test]
+    fn a_folded_dynamic_naming_another_field_does_not_gate() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Dynamic:\n",
+            " Provides-Extra\n",
+            "Requires-Dist: urllib3 (==1.26.0)\n",
+        );
+        assert_eq!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::Stated(vec!["urllib3 (==1.26.0)".to_string()])
+        );
+    }
+
+    /// A `Requires-Dist` whose continuation carries nothing is a
+    /// requirement this reader cannot recover, not one the distribution
+    /// declined to state. The empty arm is for a document that says
+    /// there are none.
+    #[test]
+    fn a_requires_dist_folded_onto_an_empty_continuation_is_unreadable_not_empty() {
+        let body = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Requires-Dist:\n",
+            "  \n",
+        );
+        assert!(matches!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::NotCanonical(_)
+        ));
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// A header block whose **first** line is a continuation leaves text
+    /// belonging to no field, and guessing which field it continues is
+    /// the guess that decides whether a declaration was withheld. No
+    /// conforming document has that shape (PEP 566 §3 puts
+    /// `Metadata-Version` first), so both readers refuse it: the
+    /// declaration reader as unreadable, the cascade reader as the
+    /// unparseable manifest its port contract puts on `Validation`.
+    #[test]
+    fn a_header_block_opening_with_a_continuation_is_refused_by_both_readers() {
+        let body = concat!(
+            " Requires-Dist\n",
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+        );
+        assert!(matches!(
+            classify_requires_dist(body, PypiContainer::Sdist),
+            PypiDeclaration::NotCanonical(_)
+        ));
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile
+        );
+        assert!(matches!(
+            parse_wheel_metadata_into_specs(body.as_bytes()),
+            Err(DomainError::Validation(_))
+        ));
+    }
+
+    /// The unfolder's own contract, stated where it is cheap to read:
+    /// one entry per field, continuations joined on with their
+    /// whitespace and the line break removed (RFC 5322 §2.2.3), the
+    /// block ended by the first blank line, and a leading continuation
+    /// refused.
+    #[test]
+    fn unfold_rfc5322_block_joins_continuations_and_stops_at_the_blank_line() {
+        let headers = unfold_rfc5322_block(concat!(
+            "Name: myapp\n",
+            "Requires-Dist: requests\n",
+            " (==2.31.0)\n",
+            "\tand more\n",
+            "\n",
+            " an indented description line\n",
+        ))
+        .expect("a readable block");
+
+        let lines: Vec<(&str, bool)> = headers
+            .iter()
+            .map(|h| (h.line.as_ref(), h.folded))
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                ("Name: myapp", false),
+                ("Requires-Dist: requests (==2.31.0)\tand more", true),
+            ],
+            "the description below the blank line is not part of the block"
+        );
+
+        assert!(unfold_rfc5322_block(" continues nothing\nName: myapp\n").is_err());
+        assert!(unfold_rfc5322_block("").expect("an empty block").is_empty());
+    }
+
+    /// PEP 643's `Dynamic` admits exactly one Core Metadata field name,
+    /// which is a token of letters, digits and hyphens — so it cannot
+    /// span a fold's whitespace, and cannot be empty.
+    #[test]
+    fn a_core_metadata_field_name_is_a_single_token() {
+        assert!(is_core_metadata_field_name("Requires-Dist"));
+        assert!(is_core_metadata_field_name("requires-dist"));
+        assert!(!is_core_metadata_field_name(""));
+        assert!(!is_core_metadata_field_name("Requires -Dist"));
+        assert!(!is_core_metadata_field_name(
+            "Requires-Dist, Provides-Extra"
+        ));
+    }
+
+    /// An `extra ==`-gated requirement stays **in the BOM**, which is
+    /// deliberately not what the prefetch cascade does with one. There
+    /// the output is a download fan-out a dev/test closure inflates
+    /// 10–100×; here it is one advisory lookup over a component
+    /// `payload_contains_components() == false` already denies authority
+    /// over the artifact.
+    #[test]
+    fn an_extras_gated_requirement_is_kept_in_the_bom() {
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.3\nName: myapp\n\
+             Requires-Dist: requests (==2.31.0)\n\
+             Requires-Dist: pytest (==7.0.0); extra == 'test'\n",
+        );
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+        assert_eq!(
+            purls(&extraction),
+            vec!["pkg:pypi/requests@2.31.0", "pkg:pypi/pytest@7.0.0"]
+        );
+
+        // The cascade's reader over the same bytes drops it.
+        let specs = parse_wheel_metadata_into_specs(
+            b"Metadata-Version: 2.3\nName: myapp\n\
+              Requires-Dist: requests (==2.31.0)\n\
+              Requires-Dist: pytest (==7.0.0); extra == 'test'\n",
+        )
+        .expect("specs");
+        assert_eq!(
+            specs.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["requests"],
+            "the two readers differ on extras on purpose"
+        );
+    }
+
+    /// Only the sdist's **own** root `PKG-INFO` is its declaration. A
+    /// packaged project may ship another distribution's metadata as test
+    /// data or a vendored tree, and reading that would put another
+    /// package's dependencies in this artifact's BOM.
+    #[test]
+    fn only_the_sdists_root_pkg_info_is_its_declaration() {
+        assert!(is_sdist_pkg_info_path("myapp-1.0.0/PKG-INFO"));
+        assert!(is_sdist_pkg_info_path("./myapp-1.0.0/PKG-INFO"));
+        assert!(is_sdist_pkg_info_path("PKG-INFO"));
+        assert!(!is_sdist_pkg_info_path("myapp-1.0.0/tests/data/PKG-INFO"));
+        assert!(!is_sdist_pkg_info_path("myapp-1.0.0/vendor/other/PKG-INFO"));
+        assert!(!is_sdist_pkg_info_path("myapp-1.0.0/NOT-PKG-INFO"));
+        assert!(!is_sdist_pkg_info_path("PKG-INFO.txt"));
+
+        // And end to end: a nested copy is not read as the declaration.
+        let sdist = build_tar_gz_bytes(&[
+            (
+                "myapp-1.0.0/tests/data/PKG-INFO",
+                b"Metadata-Version: 2.3\nRequires-Dist: smuggled (==9.9)\n" as &[u8],
+            ),
+            (
+                "myapp-1.0.0/PKG-INFO",
+                b"Metadata-Version: 2.3\nName: myapp\nRequires-Dist: urllib3 (==1.26.0)\n"
+                    as &[u8],
+            ),
+        ]);
+        assert_eq!(
+            purls(&extract_payload(&sdist, &proxied_metadata())),
+            vec!["pkg:pypi/urllib3@1.26.0"]
+        );
+    }
+
+    /// `Metadata-Version` is compared numerically, not lexically: 2.10
+    /// is above the 2.2 threshold, and a bare major is read rather than
+    /// discarded.
+    #[test]
+    fn metadata_version_is_compared_numerically() {
+        assert_eq!(parse_metadata_version("2.2"), Some((2, 2)));
+        assert_eq!(parse_metadata_version("2.10"), Some((2, 10)));
+        assert_eq!(parse_metadata_version(" 2.1 "), Some((2, 1)));
+        assert_eq!(parse_metadata_version("3"), Some((3, 0)));
+        assert_eq!(parse_metadata_version("2.2.1"), Some((2, 2)));
+        assert_eq!(parse_metadata_version("unversioned"), None);
+        assert!(Some((2, 10)) > Some((2, 2)));
+
+        // 2.10 is above the threshold, so an absent field is a statement.
+        let sdist = sdist_with_pkg_info("Metadata-Version: 2.10\nName: myapp\n");
+        assert_eq!(
+            extract_payload(&sdist, &proxied_metadata()).resolution,
+            SbomResolution::NoLockfile
+        );
+    }
+
+    /// A folded continuation line is not a header, so a `Dynamic` value
+    /// wrapped onto a continuation of some other field cannot be read as
+    /// a field of its own.
+    #[test]
+    fn a_folded_continuation_line_is_not_a_header() {
+        assert!(rfc5322_header("Requires-Dist: requests").is_some());
+        assert!(rfc5322_header("  continued: value").is_none());
+        assert!(rfc5322_header("no colon here").is_none());
+        assert!(rfc5322_header(": empty name").is_none());
+    }
+
+    /// The declaration reader keeps the three outcomes apart as values,
+    /// which is what lets the impl above spend each one differently.
+    #[test]
+    fn the_declaration_reader_reports_which_of_the_three_happened() {
+        assert_eq!(
+            classify_requires_dist(
+                "Metadata-Version: 2.3\nRequires-Dist: x\n",
+                PypiContainer::Wheel
+            ),
+            PypiDeclaration::Stated(vec!["x".to_string()])
+        );
+        assert_eq!(
+            classify_requires_dist("Metadata-Version: 2.3\n", PypiContainer::Wheel),
+            PypiDeclaration::Stated(Vec::new())
+        );
+        assert!(matches!(
+            classify_requires_dist("Metadata-Version: 2.1\n", PypiContainer::Sdist),
+            PypiDeclaration::NotCanonical(_)
+        ));
+        assert!(matches!(
+            classify_requires_dist("", PypiContainer::Sdist),
+            PypiDeclaration::NotCanonical(_)
+        ));
+    }
+
+    /// The subject carries the artifact's own coordinate and its
+    /// licenses, so an advisory against the distribution itself is found
+    /// even when it declares no dependency.
+    #[test]
+    fn the_subject_carries_the_coordinate_and_licenses() {
+        let metadata = serde_json::json!({ "info": { "license": "MIT" } });
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.3\nName: myapp\nRequires-Dist: requests (==2.31.0)\n",
+        );
+        let sbom = extract_payload(&wheel, &metadata).sbom.expect("a BOM");
+
+        let subject = sbom.subject.expect("subject");
+        assert_eq!(subject.purl, "pkg:pypi/myapp@1.0.0");
+        assert_eq!(subject.licenses, vec!["MIT".to_string()]);
+        assert_eq!(sbom.components[0].licenses, vec!["MIT".to_string()]);
+    }
+
+    /// PEP 503 normalisation reaches the payload path too, so a
+    /// declaration naming `Foo_Bar.baz` and an index naming `foo-bar-baz`
+    /// produce the same PURL.
+    #[test]
+    fn the_payload_path_normalises_component_names() {
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.3\nName: myapp\nRequires-Dist: Foo_Bar.baz (==1.0)\n",
+        );
+        assert_eq!(
+            purls(&extract_payload(&wheel, &proxied_metadata())),
+            vec!["pkg:pypi/foo-bar-baz@1.0"]
+        );
+    }
+
+    /// No arm of the payload path returns `Err`: SBOM enrichment must
+    /// not be abortable by a publisher-controlled byte sequence. The
+    /// posture it *does* take is the resolution, asserted per shape
+    /// above.
+    #[test]
+    fn no_payload_shape_returns_err() {
+        let shapes: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            b"PK\x03\x04garbage".to_vec(),
+            b"\x1f\x8bnot really gzip".to_vec(),
+            b"plain text".to_vec(),
+            wheel_with_metadata("Metadata-Version: 2.3\n"),
+            sdist_with_pkg_info("Metadata-Version: 2.1\n"),
+        ];
+        for shape in shapes {
+            let out = PyPiFormatHandler.extract_sbom_from_payload(
+                &sbom_coords("myapp", "1.0.0"),
+                &proxied_metadata(),
+                PayloadAccess::Bytes(&shape),
+            );
+            assert!(out.is_ok(), "payload shape returned Err: {out:?}");
+            assert!(
+                out.unwrap().sbom.is_some(),
+                "every arm keeps the subject so the artifact itself is still queried"
+            );
+        }
     }
 
     // -- upstream_metadata_path + upstream_metadata_accept -------------------
@@ -3673,6 +5762,44 @@ mod tests {
             handler.upstream_metadata_path("zope.interface"),
             Some("/simple/zope-interface/".to_string()),
         );
+    }
+
+    /// The two containers the extractor recognises, and the long tail
+    /// it does not.
+    ///
+    /// `.zip` and `.egg` are refused even though they ARE sdists: the
+    /// extractor sniffs the leading bytes, reads any zip as a wheel and
+    /// then fails on the absent `*.dist-info/METADATA`, so admitting
+    /// them would enqueue exactly the job that cannot succeed.
+    /// `.tar.bz2` and `.tar.xz` are neither of its containers at all.
+    /// The same split, for the same reason,
+    /// [`PyPiFormatHandler::scan_kind`] makes between `PyWheel` /
+    /// `PySdist` and `Other`.
+    #[test]
+    fn path_carries_dependency_specs_admits_the_wheel_and_the_gzip_sdist() {
+        let handler = handler();
+
+        for admitted in [
+            "simple/requests/requests-2.31.0-py3-none-any.whl",
+            "simple/requests/requests-2.31.0.tar.gz",
+            "simple/requests/REQUESTS-2.31.0-PY3-NONE-ANY.WHL",
+        ] {
+            assert!(
+                handler.path_carries_dependency_specs(admitted),
+                "{admitted}"
+            );
+        }
+
+        for refused in [
+            "simple/requests/requests-2.31.0.zip",
+            "simple/requests/requests-2.31.0.egg",
+            "simple/requests/requests-2.31.0.tar.bz2",
+            "simple/requests/requests-2.31.0.tar.xz",
+            "simple/requests/",
+            "simple/requests/requests-2.31.0-py3-none-any.whl.metadata",
+        ] {
+            assert!(!handler.path_carries_dependency_specs(refused), "{refused}");
+        }
     }
 
     #[test]
@@ -4213,10 +6340,16 @@ Version: 1.0.0\n\
     #[test]
     fn parse_wheel_metadata_at_cap_boundary_is_accepted() {
         // A body sized exactly at the wheel-METADATA cap parses (gate is
-        // `>`, not `>=`). An all-space body has no blank line and no
-        // `Requires-Dist:` header, so it yields zero deps.
+        // `>`, not `>=`). The padding follows a real header line so the
+        // block is a readable RFC 5322 one — a body that opens with
+        // whitespace is a continuation belonging to no field and is
+        // refused on its own terms, which is not what this asserts. It
+        // carries no blank line and no `Requires-Dist:` header, so it
+        // yields zero deps.
         let max = PYPI_WHEEL_METADATA_MAX_BYTES as usize;
-        let body = vec![b' '; max];
+        let mut body = b"Metadata-Version: 2.1\n".to_vec();
+        body.resize(max, b'X');
+        assert_eq!(body.len(), max);
         let out = parse_wheel_metadata_into_specs(&body).expect("at-cap body must parse");
         assert!(out.is_empty());
     }

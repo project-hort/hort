@@ -258,6 +258,67 @@ async fn seed_artifact_rejected_event(
     .expect("seed ArtifactRejected event");
 }
 
+/// Read back the digest [`seed_artifact`] stored for `artifact_id`.
+///
+/// Read rather than recomputed from the seeder's own formula: the tag
+/// join and the projected column both key on the value that is actually
+/// in the row, so a test that re-derived it could agree with a seeder
+/// that had drifted from the schema.
+async fn stored_digest(pool: &PgPool, artifact_id: Uuid) -> String {
+    sqlx::query_scalar::<_, String>("SELECT checksum_sha256 FROM artifacts WHERE id = $1")
+        .bind(artifact_id)
+        .fetch_one(pool)
+        .await
+        .expect("stored_digest")
+}
+
+/// Seed a hash-kind `mutable_refs` row pointing at `target_hash` — the
+/// pointer shape an OCI tag takes once it resolves to bytes.
+async fn seed_hash_ref(
+    pool: &PgPool,
+    repo: Uuid,
+    namespace: &str,
+    ref_name: &str,
+    target_hash: &str,
+) {
+    sqlx::query(
+        r#"INSERT INTO public.mutable_refs
+               (repository_id, namespace, ref_name, target_kind, target_hash)
+           VALUES ($1, $2, $3, 'hash', $4)"#,
+    )
+    .bind(repo)
+    .bind(namespace)
+    .bind(ref_name)
+    .bind(target_hash)
+    .execute(pool)
+    .await
+    .expect("seed_hash_ref");
+}
+
+/// Seed a version-kind `mutable_refs` row — a pointer at a *version*
+/// rather than at bytes (`target_hash` is NULL, which the table's
+/// `chk_target_exactly_one` requires for this kind).
+async fn seed_version_ref(
+    pool: &PgPool,
+    repo: Uuid,
+    namespace: &str,
+    ref_name: &str,
+    target_version: &str,
+) {
+    sqlx::query(
+        r#"INSERT INTO public.mutable_refs
+               (repository_id, namespace, ref_name, target_kind, target_version)
+           VALUES ($1, $2, $3, 'version', $4)"#,
+    )
+    .bind(repo)
+    .bind(namespace)
+    .bind(ref_name)
+    .bind(target_version)
+    .execute(pool)
+    .await
+    .expect("seed_version_ref");
+}
+
 /// Truncate a `DateTime<Utc>` to microsecond precision so Rust's
 /// nanosecond clock and Postgres' `timestamptz` microsecond column
 /// agree on the exact value the deadline-arithmetic assertion expects.
@@ -1586,4 +1647,424 @@ async fn list_queue_artifact_id_and_a_mismatched_repository_id_return_empty() {
 
     cleanup_repo(&pool, repo_id).await;
     cleanup_repo(&pool, other_repo).await;
+}
+
+// ---------------------------------------------------------------------------
+// The bytes the row decides about — the digest, and the tags pointing at it.
+//
+// Half of this landed with the `path` column, which for OCI *is* the
+// digest because `version` is NULL by construction there. For every other
+// format the path carries no digest at all, and a digest parsed back out of
+// a path is not an addressing key in any case: a waiver addressed by digest
+// resolves against `artifacts.checksum_sha256`, so that is the column the
+// queue has to show.
+//
+// Tags come along for the human, and only for the human. A ref is a
+// mutable pointer — it can be moved to other bytes the moment after a
+// curator reviewed these — so the decision binds to the digest and the tag
+// is what the operator recognises the artifact by.
+// ---------------------------------------------------------------------------
+
+/// The digest is projected for a `version`-bearing row and for an OCI row
+/// whose `version` is NULL — the two shapes the queue carries, and the
+/// second is the one whose `path` already held a digest, which is exactly
+/// why it must be shown as a column rather than parsed back out.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_projects_the_digest_for_a_versioned_and_an_oci_row() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let npm_repo = seed_repo(&pool, "npm").await;
+    let oci_repo = seed_repo(&pool, "oci").await;
+    let now = truncate_us(Utc::now());
+
+    let versioned = seed_artifact(
+        &pool,
+        npm_repo,
+        "evil-pkg",
+        "1.0.0",
+        Some("quarantined"),
+        now,
+        Some(now),
+    )
+    .await;
+    let manifest = seed_artifact(
+        &pool,
+        oci_repo,
+        "library/nginx",
+        "",
+        Some("quarantined"),
+        now,
+        Some(now),
+    )
+    .await;
+    sqlx::query("UPDATE artifacts SET version = NULL, path = $1 WHERE id = $2")
+        .bind(format!("manifests/sha256:{}", "b".repeat(64)))
+        .bind(manifest)
+        .execute(&pool)
+        .await
+        .expect("set OCI coords");
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    for (artifact_id, repo_id, expect_version) in
+        [(versioned, npm_repo, true), (manifest, oci_repo, false)]
+    {
+        let rows = adapter
+            .list_queue(CurationQueueFilter {
+                artifact_id: Some(artifact_id),
+                ..CurationQueueFilter::default()
+            })
+            .await
+            .expect("list_queue");
+        assert_eq!(rows.len(), 1, "one row per artifact");
+        let entry = &rows[0];
+        assert_eq!(entry.repository_id, repo_id);
+        assert_eq!(entry.version.is_some(), expect_version);
+        assert_eq!(
+            entry.checksum_sha256,
+            stored_digest(&pool, artifact_id).await,
+            "the row names the bytes it is about"
+        );
+        assert_eq!(
+            entry.checksum_sha256.len(),
+            64,
+            "the whole digest, not an abbreviation: this is the key a \
+             decision is addressed by"
+        );
+    }
+
+    cleanup_repo(&pool, npm_repo).await;
+    cleanup_repo(&pool, oci_repo).await;
+}
+
+/// Tags render when `mutable_refs` points at the artifact's bytes.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_renders_the_tags_pointing_at_the_bytes() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "oci").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "library/nginx",
+        "1.27",
+        Some("quarantined"),
+        now,
+        Some(now),
+    )
+    .await;
+    let digest = stored_digest(&pool, artifact).await;
+    // Seeded out of order, so the assertion is about the query's ordering
+    // and not about the insertion sequence.
+    seed_hash_ref(&pool, repo_id, "library/nginx", "latest", &digest).await;
+    seed_hash_ref(&pool, repo_id, "library/nginx", "1.27", &digest).await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            artifact_id: Some(artifact),
+            ..CurationQueueFilter::default()
+        })
+        .await
+        .expect("list_queue");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].tags,
+        vec!["1.27".to_string(), "latest".to_string()],
+        "every ref pointing at these bytes, in a stable order"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+/// **The lateral does not widen the row set.** An artifact with three
+/// tags appears exactly once and an artifact with none still appears —
+/// which is the whole reason the aggregate is inside the subquery.
+///
+/// Asserted on the row *count*, not on the tag contents: a plain
+/// `LEFT JOIN mutable_refs` returns the right names on every row it
+/// returns, and the only thing wrong with it is that it returns three of
+/// them.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_lateral_does_not_widen_the_row_set() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "oci").await;
+    let now = truncate_us(Utc::now());
+    let tagged = seed_artifact(
+        &pool,
+        repo_id,
+        "library/nginx",
+        "1.27",
+        Some("quarantined"),
+        now,
+        Some(now),
+    )
+    .await;
+    let untagged = seed_artifact(
+        &pool,
+        repo_id,
+        "library/alpine",
+        "3.20",
+        Some("quarantined"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+    let digest = stored_digest(&pool, tagged).await;
+    for ref_name in ["latest", "1.27", "stable"] {
+        seed_hash_ref(&pool, repo_id, "library/nginx", ref_name, &digest).await;
+    }
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            ..CurationQueueFilter::default()
+        })
+        .await
+        .expect("list_queue");
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "two artifacts, two rows — three refs at one artifact's bytes must \
+         not become three rows: got {:#?}",
+        rows.iter()
+            .map(|r| (r.artifact_id, r.tags.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.artifact_id == tagged).count(),
+        1,
+        "the three-tag artifact appears once"
+    );
+    assert_eq!(
+        rows.iter().filter(|r| r.artifact_id == untagged).count(),
+        1,
+        "the no-tags artifact still appears — `ON true` over an aggregate \
+         keeps its row"
+    );
+    let tagged_row = rows
+        .iter()
+        .find(|r| r.artifact_id == tagged)
+        .expect("tagged");
+    assert_eq!(
+        tagged_row.tags,
+        vec![
+            "1.27".to_string(),
+            "latest".to_string(),
+            "stable".to_string()
+        ],
+        "all three refs arrive in the one row"
+    );
+    let untagged_row = rows
+        .iter()
+        .find(|r| r.artifact_id == untagged)
+        .expect("untagged");
+    assert!(
+        untagged_row.tags.is_empty(),
+        "nothing points at these bytes, and that is an empty list rather \
+         than an absent row"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+/// The `limit` keeps counting artifacts, not refs.
+///
+/// The widening above is visible as a row count only when the page is big
+/// enough to hold the duplicates; at the boundary it is worse — the page
+/// silently holds less curator work than it says, and the row the curator
+/// acts on is indistinguishable from its copies.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_limit_counts_artifacts_not_refs() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "oci").await;
+    let now = truncate_us(Utc::now());
+    let newer = seed_artifact(
+        &pool,
+        repo_id,
+        "library/nginx",
+        "1.27",
+        Some("quarantined"),
+        now,
+        Some(now),
+    )
+    .await;
+    let older = seed_artifact(
+        &pool,
+        repo_id,
+        "library/alpine",
+        "3.20",
+        Some("quarantined"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+    let digest = stored_digest(&pool, newer).await;
+    for ref_name in ["latest", "1.27", "stable"] {
+        seed_hash_ref(&pool, repo_id, "library/nginx", ref_name, &digest).await;
+    }
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            limit: 2,
+            ..CurationQueueFilter::default()
+        })
+        .await
+        .expect("list_queue");
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "`limit = 2` means two artifacts; under a widening join the \
+         three-tag artifact alone would fill the page and the second \
+         artifact would be invisible"
+    );
+    assert!(rows.iter().any(|r| r.artifact_id == newer));
+    assert!(
+        rows.iter().any(|r| r.artifact_id == older),
+        "the second artifact is still on the page"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+}
+
+/// A ref is scoped to its own repository and to the bytes it names.
+///
+/// Three near-misses, one test, because each of them would render a tag
+/// the curator could not act on: the same digest pointed at from another
+/// repository, a hash-kind ref at *other* bytes, and a version-kind ref
+/// (whose `target_hash` is NULL by the table's own CHECK) in the right
+/// repository.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_tags_exclude_refs_that_do_not_name_these_bytes() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "oci").await;
+    let other_repo = seed_repo(&pool, "oci").await;
+    let now = truncate_us(Utc::now());
+    let artifact = seed_artifact(
+        &pool,
+        repo_id,
+        "library/nginx",
+        "1.27",
+        Some("quarantined"),
+        now,
+        Some(now),
+    )
+    .await;
+    let digest = stored_digest(&pool, artifact).await;
+
+    seed_hash_ref(&pool, repo_id, "library/nginx", "mine", &digest).await;
+    // Same bytes, different repository: a tag in someone else's namespace
+    // is not this row's annotation.
+    seed_hash_ref(&pool, other_repo, "library/nginx", "elsewhere", &digest).await;
+    // Right repository, other bytes.
+    let other_bytes = "c".repeat(64);
+    seed_hash_ref(&pool, repo_id, "library/nginx", "other-bytes", &other_bytes).await;
+    // Right repository, points at a version rather than at bytes.
+    seed_version_ref(&pool, repo_id, "library/nginx", "by-version", "1.27").await;
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            artifact_id: Some(artifact),
+            ..CurationQueueFilter::default()
+        })
+        .await
+        .expect("list_queue");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].tags,
+        vec!["mine".to_string()],
+        "only the refs naming THESE bytes in THIS repository"
+    );
+
+    cleanup_repo(&pool, repo_id).await;
+    cleanup_repo(&pool, other_repo).await;
+}
+
+/// A soft-deleted artifact stays out of the listing however many refs
+/// point at it.
+///
+/// The tags join is the place a second, unfiltered read of `artifacts`
+/// would be easiest to introduce. It does not read the table at all — the
+/// digest it matches on is projected from the driving row — and this is
+/// the behavioural half of that claim, beside the `live_reads_exclude_
+/// deleted` guard which judges the SQL.
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn list_queue_omits_a_soft_deleted_artifact_that_carries_tags() {
+    let Some(pool) = maybe_pool().await else {
+        return;
+    };
+    let repo_id = seed_repo(&pool, "oci").await;
+    let now = truncate_us(Utc::now());
+    let deleted = seed_artifact(
+        &pool,
+        repo_id,
+        "library/nginx",
+        "1.27",
+        Some("rejected"),
+        now,
+        Some(now),
+    )
+    .await;
+    let live = seed_artifact(
+        &pool,
+        repo_id,
+        "library/alpine",
+        "3.20",
+        Some("quarantined"),
+        now - Duration::hours(1),
+        Some(now - Duration::hours(1)),
+    )
+    .await;
+    let deleted_digest = stored_digest(&pool, deleted).await;
+    let live_digest = stored_digest(&pool, live).await;
+    seed_hash_ref(&pool, repo_id, "library/nginx", "latest", &deleted_digest).await;
+    seed_hash_ref(&pool, repo_id, "library/alpine", "latest", &live_digest).await;
+    sqlx::query("UPDATE artifacts SET deleted_at = now() WHERE id = $1")
+        .bind(deleted)
+        .execute(&pool)
+        .await
+        .expect("soft delete");
+
+    let adapter = PgCurationQueueRepository::new(pool.clone());
+    let rows = adapter
+        .list_queue(CurationQueueFilter {
+            repository_id: Some(repo_id),
+            ..CurationQueueFilter::default()
+        })
+        .await
+        .expect("list_queue");
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "the deleted artifact is not curator work, and a ref pointing at \
+         its bytes does not make it any: got {:#?}",
+        rows.iter().map(|r| r.artifact_id).collect::<Vec<_>>()
+    );
+    assert_eq!(rows[0].artifact_id, live);
+    assert_eq!(rows[0].tags, vec!["latest".to_string()]);
+
+    cleanup_repo(&pool, repo_id).await;
 }

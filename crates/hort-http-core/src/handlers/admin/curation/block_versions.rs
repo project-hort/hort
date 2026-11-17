@@ -81,6 +81,11 @@ pub struct BlockVersionsRequestDto {
 /// - `not_found_versions` — strings in the request the resolver could
 ///   not match to an artifact_id; this surface does NOT auto-block
 ///   future ingests of these (deliberately out of scope)
+/// - `not_found_digests` — the same partition for a
+///   [`BlockTarget::DigestList`] call, echoed back as the caller wrote
+///   them. Both lists are always present and the unused one is empty:
+///   which addressing mode a call used is the request's property, not
+///   something a client should have to infer from an absent key
 /// - `failed` — per-(artifact, error) pairs that hit a continue-on-error
 ///   path (event-store conflict, repository error, etc.); see
 ///   [`FailedBlockEntryDto`] for the per-entry shape
@@ -90,6 +95,7 @@ pub(crate) struct BlockOutcomeDto {
     pub blocked_artifact_ids: Vec<Uuid>,
     pub already_rejected_ids: Vec<Uuid>,
     pub not_found_versions: Vec<String>,
+    pub not_found_digests: Vec<String>,
     pub failed: Vec<FailedBlockEntryDto>,
 }
 
@@ -114,7 +120,11 @@ pub(crate) struct FailedBlockEntryDto {
 }
 
 impl FailedBlockEntryDto {
-    fn from_app_error(artifact_id: Uuid, err: &AppError) -> Self {
+    /// Reachable from the sibling waive handlers: a per-entry apply
+    /// failure is the same wire shape whichever bulk verb produced it,
+    /// and a second copy of this `AppError` match would be a second
+    /// place for an un-sanitised variant to appear.
+    pub(crate) fn from_app_error(artifact_id: Uuid, err: &AppError) -> Self {
         let (error_kind, message) = match err {
             AppError::Domain(DomainError::NotFound { entity, id }) => {
                 ("not_found", format!("{entity} {id} not found"))
@@ -206,6 +216,7 @@ impl BlockOutcomeDto {
             blocked_artifact_ids: o.blocked_artifact_ids,
             already_rejected_ids: o.already_rejected_ids,
             not_found_versions: o.not_found_versions,
+            not_found_digests: o.not_found_digests,
             failed: o
                 .failed
                 .iter()

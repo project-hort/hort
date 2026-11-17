@@ -825,14 +825,43 @@ impl DomainEvent {
         Self::envelope_exceeds_cap(&super::stored_payload_envelope(self)).is_none()
     }
 
+    /// The serialised size of this event's stored payload envelope —
+    /// the exact number [`Self::validate_serialized`] compares against
+    /// [`MAX_EVENT_JSON_BYTES`].
+    ///
+    /// A producer that fills a payload *to* a budget needs the size
+    /// rather than the yes/no of [`Self::fits_storage_cap`]: it is
+    /// bisecting on how much of a variable-length collection it can
+    /// keep, and the answer has to be measured against the bytes the
+    /// store will hold. The one caller is
+    /// [`ArtifactBecameVulnerable::retaining_most_severe`](super::ArtifactBecameVulnerable::retaining_most_severe),
+    /// which fills below the cap by a deliberate reserve and so cannot
+    /// ask the cap's own question.
+    ///
+    /// Crate-internal: it is not a storage *rule*, only the measurement
+    /// the rules are stated in, and a caller outside this crate wanting
+    /// to know whether an event is storable wants
+    /// [`Self::fits_storage_cap`].
+    pub(crate) fn stored_envelope_len(&self) -> usize {
+        Self::envelope_len(&super::stored_payload_envelope(self))
+    }
+
     /// The cap comparison itself, stated once: `Some(size)` when
     /// `stored_envelope` serialises past [`MAX_EVENT_JSON_BYTES`] (the
     /// size the refusal message reports), `None` when it fits. Shared
     /// by the refusal and the question above so the two can never
     /// answer differently.
     fn envelope_exceeds_cap(stored_envelope: &serde_json::Value) -> Option<usize> {
-        let size = stored_envelope.to_string().len();
+        let size = Self::envelope_len(stored_envelope);
         (size > MAX_EVENT_JSON_BYTES).then_some(size)
+    }
+
+    /// The size measurement itself, stated once: the length of
+    /// `stored_envelope`'s serialised text. The cap's refusal and the
+    /// budget-filling producer above both go through it, so the number
+    /// one of them enforces is the number the other fills to.
+    fn envelope_len(stored_envelope: &serde_json::Value) -> usize {
+        stored_envelope.to_string().len()
     }
 }
 
@@ -899,7 +928,7 @@ pub(crate) mod tests {
         SubscriptionUpdated, TargetKindWire,
     };
     use super::*;
-    use crate::entities::api_token::TokenKind;
+    use crate::entities::api_token::{IssuedVia, TokenKind};
     use crate::entities::artifact::QuarantineStatus;
     use crate::entities::mutable_ref::RefTarget;
     use crate::entities::rbac::Permission;
@@ -993,6 +1022,7 @@ pub(crate) mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                findings_blob_retained: None,
                 assessment: ScanAssessment::Analysed,
             }),
             DomainEvent::ArtifactBecameVulnerable(ArtifactBecameVulnerable {
@@ -1014,6 +1044,7 @@ pub(crate) mod tests {
                     advisory_published_at: None,
                 }],
                 previously_clean_at: Utc::now(),
+                truncated_from_total: None,
             }),
             DomainEvent::ArtifactReleased(ArtifactReleased {
                 artifact_id: Uuid::nil(),
@@ -1099,6 +1130,7 @@ pub(crate) mod tests {
                 reason: "policy".into(),
             }),
             DomainEvent::ArtifactExpired(ArtifactExpired {
+                held_state_authority: None,
                 artifact_id: Uuid::nil(),
                 policy_id: Uuid::nil(),
                 policy_name: "90-day-age".into(),
@@ -1292,6 +1324,7 @@ pub(crate) mod tests {
                 source_issuer: None,
                 source_jti: None,
                 source_sub: None,
+                issued_via: IssuedVia::HttpMint,
             }),
             DomainEvent::ApiTokenRevoked(ApiTokenRevoked {
                 token_id: Uuid::nil(),
@@ -1433,6 +1466,7 @@ pub(crate) mod tests {
             // discriminations (wrapper shape). Created carries the
             // predicate + scope that re-validate in `validate()`.
             DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
+                held_states: Default::default(),
                 id: Uuid::nil(),
                 name: "retain-proxied-30d".into(),
                 predicate: PolicyPredicate::AgeExceeds(2_592_000),
@@ -1440,6 +1474,7 @@ pub(crate) mod tests {
                 created_at: Utc::now(),
             }),
             DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id: Uuid::nil(),
                 predicate: PolicyPredicate::AgeExceeds(5_184_000),
                 scope: RetentionScope::AllRepos,
@@ -1467,6 +1502,7 @@ pub(crate) mod tests {
     #[test]
     fn retention_policy_changed_event_type_discriminates_inner_variant() {
         let created = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "p".into(),
             predicate: PolicyPredicate::AgeExceeds(60),
@@ -1476,6 +1512,7 @@ pub(crate) mod tests {
         assert_eq!(created.event_type(), "RetentionPolicyCreated");
 
         let updated = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Updated {
+            held_states: Default::default(),
             id: Uuid::nil(),
             predicate: PolicyPredicate::AgeExceeds(60),
             scope: RetentionScope::AllRepos,
@@ -1507,6 +1544,7 @@ pub(crate) mod tests {
     #[test]
     fn retention_policy_changed_validate_delegates_to_inner() {
         let ok = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "ok".into(),
             predicate: PolicyPredicate::AgeExceeds(60),
@@ -1516,6 +1554,7 @@ pub(crate) mod tests {
         assert!(ok.validate().is_ok());
 
         let bad = DomainEvent::RetentionPolicyChanged(RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "bad".into(),
             // A zero-second TTL is a footgun and is rejected by

@@ -958,7 +958,7 @@ mod tests {
     use metrics_util::{CompositeKey, MetricKind};
     use uuid::Uuid;
 
-    use hort_domain::entities::api_token::{ApiToken, TokenCap, TokenKind};
+    use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenCap, TokenKind};
     use hort_domain::entities::rbac::Permission;
     use hort_domain::entities::user::{AuthProvider, User};
     use hort_domain::error::DomainResult;
@@ -1279,6 +1279,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: t0(),
+            issued_via: IssuedVia::HttpMint,
         }
     }
 

@@ -729,6 +729,8 @@ mod tests {
 
     use super::*;
 
+    use crate::events::EVENT_TASK_KINDS;
+
     /// Every literal `jobs.trigger_source` may hold, read off the one
     /// definition rather than re-typed.
     ///
@@ -743,35 +745,33 @@ mod tests {
         TriggerSource::ALL.iter().map(|v| v.as_str()).collect()
     }
 
-    /// Every literal in the `jobs.kind` CHECK as migration 027 leaves it.
-    const CHECK_KINDS: &[&str] = &[
-        "scan",
-        "cron-rescan-tick",
-        "advisory-watch-tick",
-        "retention-evaluate",
-        "retention-purge",
-        "eventstore-archive",
-        "staging-sweep",
-        "noop",
-        "service-account-rotation",
-        "eventstore-checkpoint",
-        "replay-seen-prune",
-        "quarantine-release-sweep",
-        "seed-import",
-        "prefetch-tick",
-        "prefetch",
-        "prefetch-dependencies",
-        "prefetch-row-retention-sweep",
-        "wheel-metadata-backfill",
-        "provenance-verify",
-        "scanner-registry-prune",
-        "verify-event-chain",
-        "policy-reevaluation",
-        "oci-membership-edge-backfill",
-        "scan-row-retention-sweep",
-        "oci-index-child-ingest",
-        "jobs-row-retention-sweep",
-    ];
+    /// Every literal the `jobs.kind` CHECK may hold, read off the one
+    /// definition rather than re-typed.
+    ///
+    /// It used to be a hand-typed copy, on the same argument
+    /// [`check_trigger_sources`] above once carried — that the CHECK is
+    /// SQL and the test owed the reader its own statement of the column's
+    /// contents. That argument is spent here for the same reason: the SQL
+    /// CHECK is held against [`EVENT_TASK_KINDS`] by
+    /// `task_kind_check_lockstep_guard`, so the constant *is* the
+    /// column's contents, while nothing held the copy against either — a
+    /// kind added to the column could leave this module's exhaustive
+    /// loops running over a set the column no longer had, which is the
+    /// one way an "exhaustive over the CHECK" assertion goes quietly
+    /// vacuous.
+    ///
+    /// What this does **not** do is make a new kind declare itself below.
+    /// [`TaskTier::classify`] answers from the *trigger source*, so an
+    /// unrecognised kind classifies rather than failing — that is ADR
+    /// 0066's design (the tier is a property of who waits, and the
+    /// trigger source is what expresses it), not a gap. The loops here
+    /// therefore guarantee that every pair the column admits gets a
+    /// legal, class-consistent ordinal; they do not guarantee that a new
+    /// kind appears in [`PRODUCER_CENSUS`], whose own reconciliation is
+    /// its count assertion.
+    fn check_kinds() -> &'static [&'static str] {
+        EVENT_TASK_KINDS
+    }
 
     /// Tier order as a number, so two tiers can be compared.
     ///
@@ -790,8 +790,8 @@ mod tests {
     /// previous scheme wrote, the ordinal the table answers now)`.
     ///
     /// Each row names a producer and the constant or bare literal it used
-    /// before the ordinal was decided in one place — twelve named
-    /// constants plus twelve bare literals, all twenty-four of them. Both
+    /// before the ordinal was decided in one place — thirteen named
+    /// constants plus twelve bare literals, all twenty-five of them. Both
     /// numbers are written down here, so the change that re-ranks a path
     /// again has to edit a row rather than move a number quietly.
     ///
@@ -814,9 +814,11 @@ mod tests {
             10,
             INTERACTIVE_BAND + LOW_VOLUME_OFFSET,
         ),
-        // CRON_PRIORITY = 10, the six `hort-server enqueue-*` subcommands.
-        // Five of them are Bulk; the sixth enqueues the release sweep,
-        // which D3 keeps client-waited whatever triggers it.
+        // CRON_PRIORITY = 10, the seven `hort-server enqueue-*`
+        // subcommands. Six of them are Bulk; the seventh enqueues the
+        // release sweep, which D3 keeps client-waited whatever triggers
+        // it.
+        ("api-token-retention-sweep", "cron", 10, BULK_BAND),
         ("jobs-row-retention-sweep", "cron", 10, BULK_BAND),
         ("prefetch-row-retention-sweep", "cron", 10, BULK_BAND),
         ("prefetch-tick", "cron", 10, BULK_BAND),
@@ -897,10 +899,11 @@ mod tests {
         }
         assert_eq!(
             PRODUCER_CENSUS.len(),
-            24,
-            "the census is the twelve named constants plus the twelve bare literals the \
-             producers wrote before the ordinal was decided in one place; a producer added \
-             or removed changes this number deliberately"
+            25,
+            "the census is the named constants plus the twelve bare literals the producers \
+             wrote before the ordinal was decided in one place — thirteen of the former \
+             since `enqueue-api-token-retention-sweep` joined the `CRON_PRIORITY` group; a \
+             producer added or removed changes this number deliberately"
         );
     }
 
@@ -924,7 +927,7 @@ mod tests {
     ///   fetches that dependency whether or not the walk ever ran.
     #[test]
     fn an_admin_task_invoke_lands_at_the_normal_band_floor() {
-        for kind in CHECK_KINDS {
+        for kind in check_kinds() {
             if *kind == KIND_SCAN
                 || *kind == KIND_QUARANTINE_RELEASE_SWEEP
                 || *kind == KIND_PREFETCH_DEPENDENCIES
@@ -1021,7 +1024,7 @@ mod tests {
     #[test]
     fn the_ordinal_order_agrees_with_the_tier_order() {
         let mut pairs: Vec<(&str, &str, TaskTier, i16)> = Vec::new();
-        for kind in CHECK_KINDS {
+        for kind in check_kinds() {
             for source in check_trigger_sources() {
                 let tier = TaskTier::classify(kind, source)
                     .unwrap_or_else(|| panic!("({kind}, {source}) does not classify"));
@@ -1130,7 +1133,7 @@ mod tests {
     #[test]
     fn every_ordinal_the_table_answers_fits_the_columns_check() {
         let mut answers: Vec<i16> = Vec::new();
-        for kind in CHECK_KINDS {
+        for kind in check_kinds() {
             for source in check_trigger_sources() {
                 let p = queue_priority(kind, source);
                 assert!(
@@ -1282,7 +1285,7 @@ mod tests {
     #[test]
     fn every_check_trigger_source_classifies() {
         for source in check_trigger_sources() {
-            for kind in CHECK_KINDS {
+            for kind in check_kinds() {
                 assert!(
                     TaskTier::classify(kind, source).is_some(),
                     "({kind}, {source}) does not classify"
@@ -1484,7 +1487,7 @@ mod tests {
             "the probe has to be a source the parse rejects, or this census is vacuous"
         );
 
-        let carved: BTreeSet<(&str, &str)> = CHECK_KINDS
+        let carved: BTreeSet<(&str, &str)> = check_kinds()
             .iter()
             .filter_map(|kind| {
                 TaskTier::classify(kind, unparseable).map(|tier| (*kind, tier.as_str()))
@@ -1534,7 +1537,7 @@ mod tests {
         assert_eq!(SCHEMA_DEFAULT_PRIORITY, TaskTier::Bulk.band());
         assert!(SCHEMA_DEFAULT_PRIORITY < TaskTier::Normal.band());
         assert!(SCHEMA_DEFAULT_PRIORITY < TaskTier::Interactive.band());
-        for kind in CHECK_KINDS {
+        for kind in check_kinds() {
             for source in check_trigger_sources() {
                 assert!(
                     queue_priority(kind, source) >= SCHEMA_DEFAULT_PRIORITY,

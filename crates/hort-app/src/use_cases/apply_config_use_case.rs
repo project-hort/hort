@@ -144,8 +144,8 @@ use hort_domain::entities::scan_policy::SeverityThreshold;
 // the shared `hort_app::provenance` module (single source for apply + the
 // offline validator), not duplicated here.
 use crate::provenance::{
-    composite_verdict_mode_from_spec, negligible_action_from_spec, provenance_identities_from_spec,
-    provenance_mode_from_spec, scan_enforcement_from_spec,
+    negligible_action_from_spec, provenance_identities_from_spec, provenance_mode_from_spec,
+    scan_enforcement_from_spec,
 };
 use hort_domain::entities::service_account::{
     backing_username, FallbackRotation, FederatedIdentity, SecretFormat, ServiceAccount,
@@ -776,8 +776,18 @@ const PRE_WRITE_REJECT_ROWS: &[(LinterRule, &str, RowAbort)] = &[
         RowAbort::EveryFinding,
     ),
     (
-        LinterRule::CompositeVerdictPromotedRequiresScanBackends,
-        "gitops apply: compositeVerdictMode × scanBackends:[] linter rejected ScanPolicy envelope(s) (a waived scan resolves no composed image, so the promoted verdict is never produced)",
+        LinterRule::ScanPolicyCompositeVerdictModeRetired,
+        "gitops apply: compositeVerdictMode linter rejected ScanPolicy envelope(s) (the field is retired — the composed image's verdict decides its manifest's release unconditionally, so neither value selects anything)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::RepositoryQuotaBytesRetired,
+        "gitops apply: quotaBytes linter rejected ArtifactRepository envelope(s) (the field is retired and was never enforced — nothing compared it to a usage figure)",
+        RowAbort::EveryFinding,
+    ),
+    (
+        LinterRule::OciRepositoryRequiresScanBackends,
+        "gitops apply: scanBackends linter rejected ScanPolicy envelope(s) (an empty scanBackends waives the composed-image assessment that is an OCI artifact's only verdict, and the waiver is itself the release authority)",
         RowAbort::EveryFinding,
     ),
 ];
@@ -1917,12 +1927,6 @@ fn create_command_from_spec(
         // hort-config validated the wire value (parses to reject/record)
         // before this site.
         enforcement: scan_enforcement_from_spec(&env.spec.enforcement),
-        // `composite_verdict_mode` flows from YAML to the create
-        // command. hort-config validated the wire value (parses to
-        // observed/promoted) before this site, and the `promoted` ×
-        // empty-`scanBackends` combination is rejected by the linter row
-        // ahead of the first write.
-        composite_verdict_mode: composite_verdict_mode_from_spec(&env.spec.composite_verdict_mode),
     }
 }
 
@@ -1973,11 +1977,6 @@ fn update_command_from_diff(
         // Flow enforcement through. Same argument: per-field same-value
         // skip in `update_policy`.
         enforcement: FieldChange::Set(scan_enforcement_from_spec(&env.spec.enforcement)),
-        // Flow composite_verdict_mode through. Same argument: per-field
-        // same-value skip in `update_policy`.
-        composite_verdict_mode: FieldChange::Set(composite_verdict_mode_from_spec(
-            &env.spec.composite_verdict_mode,
-        )),
     }
 }
 
@@ -2126,9 +2125,7 @@ mod tests {
     // Test-only — the provenance mappers live in `crate::provenance`;
     // these types are referenced only by the fixtures.
     use hort_config::scan_policy::SignerIdentitySpec;
-    use hort_domain::entities::scan_policy::{
-        CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-    };
+    use hort_domain::entities::scan_policy::{NegligibleAction, ProvenanceMode, ScanEnforcement};
 
     use crate::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
     use crate::use_cases::test_support::{MockCall, MockRepositoryRepository};
@@ -2952,6 +2949,9 @@ mod tests {
             download_audit_enabled: false,
             index_mode: IndexMode::default(),
             prefetch_policy: hort_domain::entities::repository::PrefetchPolicy::default(),
+            // `None` for the same reason as `path` above: row 17 rejects
+            // every declaration, so a shared builder that carried a
+            // value would fail every apply test in the module.
             quota_bytes: None,
             replication_priority: "immediate".into(),
             promotion: None,
@@ -3157,7 +3157,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -3272,6 +3272,7 @@ mod tests {
             Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
             Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         ));
         // OidcIssuer / ServiceAccount gitops surface mocks.
         let oidc_issuers =
@@ -3378,6 +3379,7 @@ mod tests {
             Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
             Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
             HashMap::new(),
+            crate::use_cases::test_support::anchor_resolver_without_evidence(),
         ));
         let oidc_issuers =
             Arc::new(crate::use_cases::test_support::MockOidcIssuerRepository::new());
@@ -6563,6 +6565,7 @@ mod tests {
                 Arc::new(crate::use_cases::test_support::MockCurationRuleRepository::new()),
                 Arc::new(crate::use_cases::test_support::MockJobsRepository::default()),
                 HashMap::new(),
+                crate::use_cases::test_support::anchor_resolver_without_evidence(),
             )),
             h.artifacts.clone(),
             h.lifecycle.clone(),
@@ -6632,7 +6635,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -6667,7 +6670,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 3,
             created_at: now,
             updated_at: now,
@@ -7333,6 +7335,7 @@ mod tests {
             spec: hort_config::retention_policy::RetentionPolicySpec {
                 predicate,
                 scope: serde_json::json!("AllRepos"),
+                held_states: Default::default(),
             },
         }
     }
@@ -8109,21 +8112,52 @@ mod tests {
                 expect_rule: LinterRule::SaRotationTargetConflict,
                 effective_backend: None,
             },
-            // Row 15 — a ScanPolicy promoting the composed-image verdict
-            // while waiving scanning outright. Global scope and no
-            // repositories, so row 7c has nothing to pair the (empty)
-            // backend list against and row 15 is the first error.
+            // Row 15 — a ScanPolicy declaring the retired
+            // `compositeVerdictMode`. The shared builder sets nothing
+            // else that rejects, so row 15 is the first error.
             Case {
                 desired: DesiredState {
                     scan_policies: vec![{
-                        let mut env = scan_policy_env("p-waived-but-promoted");
-                        env.spec.composite_verdict_mode = "promoted".into();
-                        env.spec.scan_backends = vec![];
+                        let mut env = scan_policy_env("p-declares-the-mode");
+                        env.spec.composite_verdict_mode = Some("promoted".into());
                         env
                     }],
                     ..Default::default()
                 },
-                expect_rule: LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+                expect_rule: LinterRule::ScanPolicyCompositeVerdictModeRetired,
+                effective_backend: None,
+            },
+            // Row 17 — a repository declaring the retired `quotaBytes`.
+            // The shared builder sets nothing else that rejects, so row
+            // 17 is the first (and only) error.
+            Case {
+                desired: DesiredState {
+                    repositories: vec![{
+                        let mut r = repo_env("npm-quota", "hosted");
+                        r.spec.quota_bytes = Some(1_073_741_824);
+                        r
+                    }],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::RepositoryQuotaBytesRetired,
+                effective_backend: None,
+            },
+            // Row 18 — an OCI repository governed by a scan waiver. The
+            // shared policy builder leaves `verify_if_present` with no
+            // identities, which is row 7's *warning* and not an error, and
+            // row 7c returns early on the empty list it would otherwise
+            // judge — so row 18 is the first (and only) error.
+            Case {
+                desired: DesiredState {
+                    repositories: vec![repo_env_with_format("oci-waived", "proxy", "oci")],
+                    scan_policies: vec![scan_policy_with_repo_scope_and_backends(
+                        "p-oci-waived",
+                        "oci-waived",
+                        vec![],
+                    )],
+                    ..Default::default()
+                },
+                expect_rule: LinterRule::OciRepositoryRequiresScanBackends,
                 effective_backend: None,
             },
         ];
@@ -8409,7 +8443,9 @@ mod tests {
                 | LinterRule::VirtualMemberFormatNotEnforced
                 | LinterRule::ScanPolicyMaxArtifactAgeNotImplemented
                 | LinterRule::SaRotationTargetConflict
-                | LinterRule::CompositeVerdictPromotedRequiresScanBackends => Consumption::Table,
+                | LinterRule::ScanPolicyCompositeVerdictModeRetired
+                | LinterRule::RepositoryQuotaBytesRetired
+                | LinterRule::OciRepositoryRequiresScanBackends => Consumption::Table,
                 // Row 2 — its own abort immediately before row 4, so the
                 // cross-kind FK keeps its distinct log line and its
                 // `"; "`-joined envelope.
@@ -8443,8 +8479,10 @@ mod tests {
             LinterRule::VirtualMemberFormatNotEnforced,
             LinterRule::ScanPolicyMaxArtifactAgeNotImplemented,
             LinterRule::SaRotationTargetConflict,
-            LinterRule::CompositeVerdictPromotedRequiresScanBackends,
+            LinterRule::ScanPolicyCompositeVerdictModeRetired,
             LinterRule::RepositoryStoragePathDeprecated,
+            LinterRule::RepositoryQuotaBytesRetired,
+            LinterRule::OciRepositoryRequiresScanBackends,
         ];
 
         let in_table: HashSet<LinterRule> =
@@ -8488,7 +8526,7 @@ mod tests {
             .count();
         assert_eq!(
             (table, dedicated, advisory),
-            (14, 1, 2),
+            (16, 1, 2),
             "the LinterRule bucket counts changed — a silent reclassification \
              (or a variant missing from ALL_RULES) is exactly what this guard \
              exists to catch"
@@ -9047,7 +9085,14 @@ mod tests {
                             ..Default::default()
                         },
                         rebuild: rebuild_scan_policy,
-                        leaves: 9,
+                        // Eight, not nine: `compositeVerdictMode` is a
+                        // retired `Option<String>` whose `None` the seed
+                        // carries, so there is no string leaf for the
+                        // mutation walk to reach. Row 15 refuses every
+                        // `Some` in the pre-write pass, which is the
+                        // answer to the question this test asks about
+                        // every field it does see.
+                        leaves: 8,
                     }
                 }
                 Kind::RetentionPolicy => {
@@ -9310,9 +9355,9 @@ mod tests {
         // through by both gates proves nothing about either.
         assert_eq!(
             (checked, unrepresentable),
-            (76, 8),
+            (74, 8),
             "the mutation corpus changed size (checked {checked}, \
-             unrepresentable {unrepresentable}; 42 string leaves x 2 \
+             unrepresentable {unrepresentable}; 41 string leaves x 2 \
              replacements, less the typed leaves that stop deserialising). \
              Expected when a spec field is added or removed — re-read the \
              per-kind leaf counts above with it"
@@ -9626,6 +9671,91 @@ mod tests {
         );
     }
 
+    /// Row-17 metric — two repositories declaring the retired
+    /// `quotaBytes` tick `repository_quota_bytes_retired` twice (once per
+    /// offending repository, not once per row), and the abort names both.
+    /// The label is asserted verbatim against the catalog key, because a
+    /// label that drifts is a silently-renamed series.
+    #[test]
+    fn apply_row17_metric_ticks_once_per_offending_repository() {
+        use crate::metrics::capture_metrics;
+
+        let mut captured_err: Option<AppError> = None;
+        let snap = capture_metrics(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let h = build_harness();
+                let mut r1 = repo_env("npm-quota-a", "hosted");
+                r1.spec.quota_bytes = Some(1_073_741_824);
+                let mut r2 = repo_env("npm-quota-b", "hosted");
+                r2.spec.quota_bytes = Some(1);
+                let desired = DesiredState {
+                    repositories: vec![r1, r2],
+                    ..Default::default()
+                };
+                captured_err = Some(
+                    h.uc.apply(desired, env_oidc())
+                        .await
+                        .expect_err("a declared quotaBytes must reject the apply"),
+                );
+            });
+        });
+        match captured_err.expect("apply must have errored") {
+            AppError::Domain(DomainError::Validation(msg)) => {
+                assert!(
+                    msg.contains("npm-quota-a") && msg.contains("npm-quota-b"),
+                    "every offender is named in one pass: {msg}"
+                );
+                assert!(
+                    msg.contains("retired") && msg.contains("Remove the field to apply"),
+                    "the abort carries the retirement and the recourse: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+        let entries = snap.into_vec();
+        assert_eq!(
+            counter_value_for(
+                &entries,
+                "hort_apply_config_linter_total",
+                &[
+                    ("rule", "repository_quota_bytes_retired"),
+                    ("result", "reject"),
+                ],
+            ),
+            2,
+            "row-17 linter metric must tick once PER offending repository (2)",
+        );
+    }
+
+    /// The write path is never reached: a rejected apply must not have
+    /// created the repository row. Row 17 lands in the pre-write pass, so
+    /// a bundle whose only fault is a declared `quotaBytes` leaves
+    /// nothing behind — which is what makes the reject safe to add to an
+    /// existing tree rather than a half-apply hazard.
+    #[tokio::test]
+    async fn a_rejected_quota_apply_writes_no_repository() {
+        let h = build_harness();
+        let mut repo = repo_env("npm-quota", "hosted");
+        repo.spec.quota_bytes = Some(1_073_741_824);
+        let desired = DesiredState {
+            repositories: vec![repo],
+            ..Default::default()
+        };
+
+        h.uc.apply(desired, env_oidc())
+            .await
+            .expect_err("must reject");
+
+        assert!(
+            h.repos.find_by_key("npm-quota").await.is_err(),
+            "the pre-write pass rejects before the repository stage writes"
+        );
+    }
+
     /// Row-5 multi-offender metric — two trust_pt mappings whose resolved
     /// policy waives scanning ⇒ the counter ticks twice, and the abort
     /// is that rule's error. (Row 5 precedes row 6.)
@@ -9738,7 +9868,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -9772,7 +9902,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -10225,7 +10355,7 @@ mod tests {
                 rescan_interval_hours: 24,
                 negligible_action: "ignore".into(),
                 enforcement: "reject".into(),
-                composite_verdict_mode: "observed".into(),
+                composite_verdict_mode: None,
             },
         }
     }
@@ -10332,7 +10462,6 @@ mod tests {
             index_upstream_url: None,
             is_public: true,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::OnDemand,
             promotion: None,
             curation_rule_names: Vec::new(),

@@ -26,6 +26,7 @@ use hort_app::gitops_apply_status::GitopsApplyStatus;
 use hort_app::use_cases::apply_config_use_case::{
     ApplyConfigUseCase, RetentionApply, UpstreamHostAllowlist,
 };
+use hort_app::use_cases::quarantine_anchor_assembly::QuarantineAnchorResolver;
 use hort_app::use_cases::retention_policy_use_case::RetentionPolicyUseCase;
 use hort_app::use_cases::PolicyUseCase;
 use hort_config::desired::EnvSnapshot;
@@ -298,6 +299,24 @@ async fn apply_inner(
         event_publisher.clone(),
         retention_projections.clone(),
     ));
+    // The one quarantine-anchor assembly (ADR 0054). Built with its own
+    // pool-backed adapters, as every other port on this one-shot boot
+    // path is: the runtime composition's shared instance does not exist
+    // yet here. The pass's re-quarantine arm is the consumer.
+    let anchor_resolver = Arc::new(QuarantineAnchorResolver::new(
+        artifacts.clone(),
+        Arc::new(
+            hort_adapters_postgres::pg_content_reference_repo::PgContentReferenceRepo::new(
+                pool.clone(),
+            ),
+        ),
+        policy_projections.clone(),
+        Arc::new(
+            hort_adapters_postgres::repository_upstream_mapping_repo::PgRepositoryUpstreamMappingRepo::new(
+                pool.clone(),
+            ),
+        ),
+    ));
     let policies = Arc::new(PolicyUseCase::new(
         event_publisher.clone(),
         policy_projections.clone(),
@@ -312,6 +331,7 @@ async fn apply_inner(
         // The compiled-in registry both directions of the re-evaluation
         // pass resolve an artifact's `ArtifactKind` through (ADR 0064 D2).
         hort_formats::compiled_in_format_handlers(),
+        anchor_resolver,
     ));
     // Gitops writer for the
     // `repository_upstream_mappings` table (there is no admin

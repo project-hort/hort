@@ -526,7 +526,7 @@ mod tests {
     use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
     use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
     use hort_app::use_cases::test_support::MockIdentityProvider;
-    use hort_domain::entities::api_token::{ApiToken, TokenKind};
+    use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenKind};
     use hort_domain::entities::rbac::Permission;
     use hort_domain::entities::user::{AuthProvider, User};
     use hort_domain::error::{DomainError, DomainResult};
@@ -834,6 +834,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         };
 
         let pat_cache = Arc::new(PatCache::new(8, Duration::from_secs(60)));

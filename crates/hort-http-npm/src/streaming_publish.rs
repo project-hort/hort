@@ -289,7 +289,7 @@ pub(crate) async fn stream_decode_body(
 /// is exotic — filesystem corruption between the write phase and
 /// the read phase — and is NOT a client-bad-input case; the caller
 /// returns 503 to signal "transient backend failure, retry".
-pub(crate) async fn tempfile_reader(tarball_file: &NamedTempFile) -> Result<File, Response> {
+pub(crate) async fn tempfile_reader(tarball_file: &NamedTempFile) -> Result<File, Box<Response>> {
     let std_file = tarball_file.reopen().map_err(|e| {
         StreamDecodeError::Infrastructure(format!("tempfile reopen-for-read failed: {e}"))
             .into_response()

@@ -45,7 +45,7 @@ use chrono::{DateTime, Duration, Utc};
 use rand::Rng;
 use uuid::Uuid;
 
-use hort_domain::entities::api_token::{ApiToken, TokenKind};
+use hort_domain::entities::api_token::{ApiToken, IssuedVia, TokenKind};
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::entities::user::User;
@@ -342,23 +342,19 @@ pub struct IssueTokenRequest {
     /// as `None`; the field default is also `None` so backward-
     /// compatibility is mechanical.
     pub federation_source: Option<FederationSource>,
-}
-
-impl Default for IssueTokenRequest {
-    /// Helper for tests / call sites that want a quick "no federation"
-    /// baseline. Not used in production wiring (all production
-    /// constructors enumerate every field explicitly).
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            description: None,
-            declared_permissions: Vec::new(),
-            repository_ids: None,
-            expires_in_days: None,
-            expires_in_seconds: None,
-            federation_source: None,
-        }
-    }
+    /// Which issuance path this request came from. Reaches the
+    /// `api_tokens.issued_via` column and the `ApiTokenIssued` event, so
+    /// an operator establishing an identity's authority can exclude the
+    /// rows that are not identities (see [`IssuedVia`]).
+    ///
+    /// **Required, with no default and no `Default` impl on this
+    /// struct.** The column exists because the row has to say where it
+    /// came from, and a path that could omit the field would mint rows
+    /// that say nothing — so every mint path names its own origin and a
+    /// new one does not compile until it does. That is also why
+    /// [`IssuedVia::Unknown`] is not a value a caller picks: it is the
+    /// migration's answer for rows that predate the column.
+    pub issued_via: IssuedVia,
 }
 
 impl IssueTokenRequest {
@@ -1123,6 +1119,13 @@ impl ApiTokenUseCase {
             last_used_user_agent: None,
             created_by_user_id: target.id,
             created_at: now,
+            // Three callers share this mint — the admin CLI's
+            // `issue-svc-token`, the rotation reconciler's tick and the
+            // federation branch of `/auth/token-exchange` — and all
+            // three stamp `created_by_user_id` with the target's own id,
+            // so the request's own origin is the only thing that tells
+            // the resulting rows apart.
+            issued_via: request.issued_via,
         };
 
         // 6.5. Durable anti-replay
@@ -1306,6 +1309,9 @@ impl ApiTokenUseCase {
                 .federation_source
                 .as_ref()
                 .map(|fs| fs.subject.clone()),
+            // Same value the row above carries, so an auditor reading
+            // the stream and an operator reading the row agree.
+            issued_via: request.issued_via,
         });
         let correlation_id = Uuid::new_v4();
         match append_any_with_conflict_retry(
@@ -1344,6 +1350,7 @@ impl ApiTokenUseCase {
         tracing::info!(
             token_id = %token.id,
             kind = ?TokenKind::ServiceAccount,
+            issued_via = token.issued_via.as_str(),
             user_id = %target.id,
             actor = "system",
             declared_permission_count = token.declared_permissions.len(),
@@ -1501,6 +1508,10 @@ impl ApiTokenUseCase {
             last_used_user_agent: None,
             created_by_user_id: target.id,
             created_at: now,
+            // The one path that reaches the reserved break-glass
+            // identity, and the only one that takes no request struct —
+            // the origin is the method, so it is named here.
+            issued_via: IssuedVia::Bootstrap,
         };
 
         // 7. Persist.
@@ -1527,6 +1538,7 @@ impl ApiTokenUseCase {
             source_issuer: None,
             source_jti: None,
             source_sub: None,
+            issued_via: IssuedVia::Bootstrap,
         });
         let correlation_id = Uuid::new_v4();
         append_any_with_conflict_retry(
@@ -1547,6 +1559,7 @@ impl ApiTokenUseCase {
         tracing::info!(
             token_id = %token.id,
             kind = ?TokenKind::Pat,
+            issued_via = token.issued_via.as_str(),
             user_id = %target.id,
             actor = "system",
             declared_permission_count = token.declared_permissions.len(),
@@ -1701,6 +1714,11 @@ impl ApiTokenUseCase {
                 expires_in_days: None,
                 expires_in_seconds: Some(DEFAULT_CLI_SESSION_LIFETIME_SECS),
                 federation_source: None,
+                // `/auth/token-exchange`'s CLI-session branch is an
+                // HTTP issuance like the self-mint route; the denial it
+                // feeds writes no row and no origin, and this request
+                // never reaches a mint.
+                issued_via: IssuedVia::HttpMint,
             };
             self.emit_denial(
                 actor.user_id,
@@ -1768,6 +1786,11 @@ impl ApiTokenUseCase {
             // CLI-session path is not federation;
             // every federation-source field stays None.
             federation_source: None,
+            // The session is minted by an HTTP request to
+            // `/auth/token-exchange`. No row is written (the credential
+            // is a signed JWT), so this value reaches the
+            // `ApiTokenIssued` event and nothing else.
+            issued_via: IssuedVia::HttpMint,
         };
 
         let actor = ApiActor {
@@ -1855,6 +1878,10 @@ impl ApiTokenUseCase {
             source_issuer: None,
             source_jti: None,
             source_sub: None,
+            // No `api_tokens` row carries this one — a CliSession is a
+            // signed JWT — so the event is where the origin is recorded
+            // at all, and it is the origin the request named.
+            issued_via: inner_request.issued_via,
         });
         let correlation_id = Uuid::new_v4();
         append_any_with_conflict_retry(
@@ -2093,6 +2120,7 @@ impl ApiTokenUseCase {
             last_used_user_agent: None,
             created_by_user_id: actor.user_id,
             created_at: now,
+            issued_via: request.issued_via,
         };
 
         // 8. Persist.
@@ -2135,6 +2163,7 @@ impl ApiTokenUseCase {
                 .federation_source
                 .as_ref()
                 .map(|fs| fs.subject.clone()),
+            issued_via: request.issued_via,
         });
         let correlation_id = Uuid::new_v4();
         append_any_with_conflict_retry(
@@ -2155,6 +2184,7 @@ impl ApiTokenUseCase {
         tracing::info!(
             token_id = %token.id,
             kind = ?kind,
+            issued_via = token.issued_via.as_str(),
             user_id = %target.id,
             actor_user_id = %actor.user_id,
             declared_permission_count = token.declared_permissions.len(),
@@ -3272,6 +3302,7 @@ mod tests {
             expires_in_days: Some(90),
             expires_in_seconds: None,
             federation_source: None,
+            issued_via: IssuedVia::HttpMint,
         }
     }
 
@@ -4111,6 +4142,7 @@ mod tests {
             expires_in_days: None,
             expires_in_seconds: Some(24 * 3600),
             federation_source: None,
+            issued_via: IssuedVia::AdminCli,
         }
     }
 
@@ -4709,6 +4741,7 @@ mod tests {
                 exp: 1_700_000_900,
                 require_jti: true,
             }),
+            issued_via: IssuedVia::FederationExchange,
         }
     }
 
@@ -5289,6 +5322,7 @@ mod tests {
                     expires_in_days: Some(MAX_ADMIN_EXPIRY_DAYS),
                     expires_in_seconds: None,
                     federation_source: None,
+                    issued_via: IssuedVia::HttpMint,
                 },
             )
             .await
@@ -5337,6 +5371,7 @@ mod tests {
                     expires_in_days: Some(MAX_EXPIRY_DAYS),
                     expires_in_seconds: None,
                     federation_source: None,
+                    issued_via: IssuedVia::HttpMint,
                 },
             )
             .await
@@ -5398,6 +5433,7 @@ mod tests {
                     expires_in_days: Some(MAX_ADMIN_EXPIRY_DAYS),
                     expires_in_seconds: None,
                     federation_source: None,
+                    issued_via: IssuedVia::HttpMint,
                 },
             )
             .await
@@ -5405,6 +5441,102 @@ mod tests {
         assert_eq!(issued.kind, TokenKind::Pat);
         assert_eq!(tokens.inserts().len(), 1);
         assert_eq!(count_denials(&events), 0);
+    }
+
+    // ---------- issued_via ----------
+    //
+    // One mint, one origin. The compiler already forces every mint path
+    // to NAME an origin (the field is required on `IssueTokenRequest`
+    // and on `ApiToken`, with no `Default` impl on either to route
+    // around); what it cannot check is that the named value reaches the
+    // row AND the event unchanged, which is what these assert — per
+    // path, because the three row-construction sites are three separate
+    // literals.
+
+    #[tokio::test]
+    async fn system_mint_carries_each_caller_origin_into_the_row_and_the_event() {
+        // One mint site, three production callers: the admin CLI's
+        // `issue-svc-token`, the rotation reconciler's tick and the
+        // federation branch of `/auth/token-exchange`. All three stamp
+        // the same `created_by_user_id` (the target's own id), so the
+        // request's origin is the only thing that tells their rows
+        // apart — and a value that reached the row but not the event, or
+        // the reverse, would leave the audit trail and the operator
+        // query disagreeing about what a token is.
+        for origin in [
+            IssuedVia::AdminCli,
+            IssuedVia::ServiceAccountRotation,
+            IssuedVia::FederationExchange,
+        ] {
+            let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+            users.insert(user(true));
+            uc.issue_for_service_account_system(
+                Uuid::from_u128(0xACE),
+                IssueTokenRequest {
+                    issued_via: origin,
+                    ..make_request_system()
+                },
+            )
+            .await
+            .expect("system mint must succeed when target is a service account");
+
+            let inserts = tokens.inserts();
+            assert_eq!(inserts.len(), 1);
+            assert_eq!(inserts[0].issued_via, origin, "row origin for {origin:?}");
+            let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
+            assert_eq!(event.issued_via, origin, "event origin for {origin:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn self_mint_row_and_event_say_http_mint() {
+        // The value the REST handler sets; the gates and the row
+        // construction in `issue_inner` are a different code path from
+        // the system mint above.
+        let (caller, rbac) = full_grants_principal();
+        let (uc, tokens, users, events) =
+            make_use_case_with_rbac(ApiTokenIssuanceConfig::default(), rbac);
+        users.insert(User {
+            id: caller.user_id,
+            ..user(false)
+        });
+
+        uc.issue_self_token(&caller, make_request_pat())
+            .await
+            .expect("self-mint with full grants must succeed");
+
+        let inserts = tokens.inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].issued_via, IssuedVia::HttpMint);
+        assert_eq!(
+            assert_issued_event(&events, caller.user_id).issued_via,
+            IssuedVia::HttpMint
+        );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_mint_row_and_event_say_bootstrap() {
+        // The one mint that takes no request struct — its origin is the
+        // method it was called on, so it is named at the row literal.
+        let (uc, tokens, users, events) = make_use_case(ApiTokenIssuanceConfig::default());
+        users.insert(bootstrap_admin_user());
+
+        uc.issue_for_bootstrap_admin_system(
+            Uuid::from_u128(0xACE),
+            "bootstrap-break-glass".into(),
+            full_admin_cap(),
+            600,
+        )
+        .await
+        .expect("the break-glass mint must succeed for the reserved identity");
+
+        let inserts = tokens.inserts();
+        assert_eq!(inserts.len(), 1);
+        assert_eq!(inserts[0].issued_via, IssuedVia::Bootstrap);
+        assert_eq!(
+            assert_issued_event(&events, Uuid::from_u128(0xACE)).issued_via,
+            IssuedVia::Bootstrap
+        );
     }
 
     // ---------- revoke ----------
@@ -5429,6 +5561,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: Uuid::from_u128(0xACE),
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         };
         tokens.seed_token(token.clone());
 
@@ -5471,6 +5604,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: Uuid::from_u128(0xACE),
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         };
         tokens.seed_token(token.clone());
         events.fail_next_append(DomainError::Conflict(
@@ -5518,6 +5652,7 @@ mod tests {
             last_used_user_agent: None,
             created_by_user_id: Uuid::from_u128(0xACE),
             created_at: Utc::now(),
+            issued_via: IssuedVia::HttpMint,
         };
         tokens.seed_token(token.clone());
         events.fail_all_appends(DomainError::Conflict(
@@ -5565,6 +5700,7 @@ mod tests {
                 created_at: Utc::now(),
                 id: Uuid::nil(),
                 user_id: Uuid::nil(),
+                issued_via: IssuedVia::HttpMint,
             }
         };
         tokens.seed_token(token.clone());
@@ -5599,6 +5735,7 @@ mod tests {
                 created_at: Utc::now(),
                 id: Uuid::nil(),
                 user_id: Uuid::nil(),
+                issued_via: IssuedVia::HttpMint,
             }
         };
         tokens.seed_token(token.clone());
@@ -6432,6 +6569,7 @@ mod tests {
                 last_used_user_agent: None,
                 created_by_user_id: Uuid::from_u128(0xACE),
                 created_at: Utc::now(),
+                issued_via: IssuedVia::HttpMint,
             };
             tokens.seed_token(token.clone());
             uc.revoke(
@@ -6475,6 +6613,7 @@ mod tests {
                 last_used_user_agent: None,
                 created_by_user_id: Uuid::from_u128(0xACE),
                 created_at: Utc::now(),
+                issued_via: IssuedVia::HttpMint,
             };
             tokens.seed_token(token.clone());
             // Admin (different user_id) revokes someone else's token.
@@ -6555,6 +6694,7 @@ mod tests {
                 last_used_user_agent: None,
                 created_by_user_id: Uuid::from_u128(0xACE),
                 created_at: Utc::now(),
+                issued_via: IssuedVia::HttpMint,
             };
             tokens.seed_token(token.clone());
             uc.revoke(
@@ -6841,6 +6981,11 @@ mod tests {
         let event = assert_issued_event(&events, Uuid::from_u128(0xACE));
         assert_eq!(event.kind, TokenKind::CliSession);
         assert_eq!(event.token_id, issued.id);
+        // No row is written on this path, so the event is the only place
+        // the origin is recorded at all. `/auth/token-exchange`'s
+        // CLI-session branch is an HTTP issuance; `kind` is what
+        // separates it from the self-mint route's rows.
+        assert_eq!(event.issued_via, IssuedVia::HttpMint);
     }
 
     #[tokio::test]

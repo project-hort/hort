@@ -1,13 +1,14 @@
 # ScanPolicy for oci-delete-e2e — the permissive posture, mirroring
 # oci-e2e-permissive.yaml.
 #
-# `quarantineDuration: 0s` + `scanBackends: []` is load-bearing rather than
-# incidental: the scenario pushes an image and then immediately reads the
-# manifest body (to record a layer digest), deletes the manifest and reads a
-# layer blob back. Under an observation window the manifest GET would 503
-# and the layer-blob GET would 503 too, so the scenario's closing assertion —
-# the blob STILL resolves after the manifest is gone — could not tell a
-# surviving blob from a held one.
+# `quarantineDuration: 0s` is load-bearing rather than incidental: the scenario
+# pushes an image and then immediately reads the manifest body (to record a
+# layer digest), deletes the manifest and reads a layer blob back. Under an
+# observation window the manifest GET would 503 and the layer-blob GET would 503
+# too, so the scenario's closing assertion — the blob STILL resolves after the
+# manifest is gone — could not tell a surviving blob from a held one. A zero
+# window ingests at `QuarantineStatus::None`, so no release authority is needed
+# and `scanBackends` does not bear on what this scenario reads back.
 apiVersion: project-hort.de/v1
 kind: ScanPolicy
 metadata:
@@ -19,5 +20,13 @@ spec:
   quarantineDuration: 0s
   requireApproval: false
   provenanceMode: off
-  scanBackends: []
+  # `enforcement: record` — a Trivy verdict is recorded, never gating. What
+  # this fixture asserts must not depend on which CVEs an upstream tag
+  # happens to carry on the day the suite runs, only on whether each row got
+  # a completed assessment at all. Omitting the field is the opposite
+  # posture, not a quieter one: it inherits the enforcing default, and this
+  # policy scans, so a `critical` finding would reject the manifest and
+  # answer `403` where the scenario reads its body to parse out the layer
+  # digest it checks after the delete.
+  enforcement: record
   licensePolicy: {}

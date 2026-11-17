@@ -31,6 +31,7 @@ use crate::event_store_publisher::EventStorePublisher;
 use crate::metrics::{
     emit_download_audit_dropped, labels, values, DownloadAuditDropResult, DownloadResult,
 };
+use crate::use_cases::index_filters::HeldVisibility;
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::quarantine_hold::resolve_transient_hold;
 use crate::use_cases::read_artifact_stream;
@@ -1122,6 +1123,42 @@ impl ArtifactUseCase {
         }
     }
 
+    /// Repo-scoped **path** lookup — the sibling of
+    /// [`Self::find_in_repo_by_hash`] for a caller that must resolve the
+    /// same row a later read of that path will resolve. The caller
+    /// supplies a pre-authz'd `repo_id` (typically from
+    /// `WriteRepoAccess` on a manifest PUT), exactly as the hash-keyed
+    /// sibling does.
+    ///
+    /// **Why a second repo-scoped loader rather than a filter on the
+    /// first.** `artifacts` is unique on `(repository_id, path)` and not
+    /// on the checksum, so one repository can hold several rows for one
+    /// hash — a format's own layout is what keeps them apart, and the
+    /// OCI adapter relies on exactly that to let a manifest and a blob
+    /// share bytes. The hash-keyed lookup behind
+    /// [`Self::find_in_repo_by_hash`] is a `LIMIT 1` with no `ORDER BY`,
+    /// so it answers "some row for these bytes" and cannot answer "the
+    /// row a reader addressing this path would get". A caller that must
+    /// agree with a read path — one admitting a document that names
+    /// another, where the admission verdict and the later delivery have
+    /// to be about the same row — asks here instead, and the row it sees
+    /// is the row delivery sees.
+    ///
+    /// Hydrated through [`Self::hydrate_quarantine_deadline`], like
+    /// every other read-path loader, so a consumer cannot tell from the
+    /// row which one produced it.
+    #[tracing::instrument(skip(self))]
+    pub async fn find_in_repo_by_path(
+        &self,
+        repo_id: Uuid,
+        path: &str,
+    ) -> AppResult<Option<Artifact>> {
+        match self.artifacts.find_by_path(repo_id, path).await? {
+            Some(artifact) => Ok(Some(self.hydrate_quarantine_deadline(artifact).await?)),
+            None => Ok(None),
+        }
+    }
+
     /// Range-aware download. Folds the `storage.get_range` bypass from
     /// OCI `blobs.rs:334`. Callers pre-authz'd via
     /// [`Self::find_visible_by_path`] / [`Self::find_visible_by_id`];
@@ -1153,16 +1190,33 @@ impl ArtifactUseCase {
         Ok((artifact, stream))
     }
 
-    /// Stream a **quarantined** artifact's CAS bytes for an authorized
-    /// hold-read (the push-then-sign manifest-GET exemption, ADR 0039 §10).
+    /// Stream a **held** artifact's CAS bytes for an authorized
+    /// hold-read (the push-then-sign manifest-GET exemption, ADR 0039 §10,
+    /// generalised by ADR 0055).
     ///
     /// [`Self::download`] refuses a non-[`is_downloadable`](Artifact::is_downloadable)
-    /// artifact (a held `Quarantined` manifest fails that gate), so it cannot
+    /// artifact (a held manifest fails that gate), so it cannot
     /// serve the held subject a keyed `cosign sign` resolves by `GET` before
-    /// attaching the signature. This method streams the CAS bytes for a
-    /// `Quarantined` artifact **only** — every other status (including
-    /// `Rejected`) is `Forbidden`, so a rejected manifest is never served and
-    /// a released artifact goes through the audited [`Self::download`] path.
+    /// attaching the signature. This method streams the CAS bytes for an
+    /// artifact under a hold **pending a verdict**, so a publisher can sign
+    /// what it uploaded in either hold — and it asks *which* statuses those
+    /// are with [`HeldVisibility::exemption_covers`] rather than naming them
+    /// here. Every status that predicate does not cover is `Forbidden`:
+    /// `Rejected` is a verdict already reached and its manifest is never
+    /// served, and a released artifact goes through the audited
+    /// [`Self::download`] path.
+    ///
+    /// Asking the held-*metadata* predicate on a byte route is right because
+    /// on this one the bytes **are** the resolution document: a manifest's
+    /// bytes are the manifest (ADR 0055 puts a cargo sparse-index entry in
+    /// the same place and the `.crate` download in the layer blob's). Held
+    /// content — the layer blob — stays refused on every path. And asking
+    /// it, rather than keeping a second copy of the status set, is what keeps
+    /// this half from drifting from the caller's gate: the predicate is
+    /// derived from a wildcard-free match, so a future [`QuarantineStatus`]
+    /// variant is decided once instead of being admitted there and refused
+    /// here — which the OCI manifest route reports as `500`, having already
+    /// decided the read was allowed.
     ///
     /// The caller (the OCI manifest handler) has already proven the read is
     /// write-authorized and the artifact is a manifest, not a layer blob; this
@@ -1175,7 +1229,7 @@ impl ArtifactUseCase {
         artifact_id: Uuid,
     ) -> AppResult<(Artifact, Box<dyn AsyncRead + Send + Unpin>)> {
         let artifact = self.artifacts.find_by_id(artifact_id).await?;
-        if !matches!(artifact.quarantine_status, QuarantineStatus::Quarantined) {
+        if !HeldVisibility::exemption_covers(artifact.quarantine_status) {
             return Err(AppError::Domain(DomainError::Forbidden(format!(
                 "artifact {} is not a held manifest hold-read (status: {})",
                 artifact_id, artifact.quarantine_status
@@ -1186,7 +1240,7 @@ impl ArtifactUseCase {
             .get(&artifact.sha256_checksum)
             .await
             .map_err(|e| AppError::Storage(e.to_string()))?;
-        // Security-relevant audit signal: a quarantined manifest's bytes
+        // Security-relevant audit signal: a held manifest's bytes
         // left the hold under the write-authorized exemption. `info!`
         // (not an event) — the documented no-`ArtifactDownloaded` choice
         // stands: a hold-read for signing is a signer's metadata resolve,
@@ -1213,7 +1267,8 @@ impl ArtifactUseCase {
     /// [`Self::download_hold_read`] (the narrow ADR 0039 §10
     /// write-authorized hold-read exemption). Neither is a substitute
     /// here: `download` refuses every held artifact, and
-    /// `download_hold_read` refuses every artifact that is *not* held —
+    /// `download_hold_read` refuses every artifact that is *not* under a
+    /// hold pending a verdict —
     /// so a projection rebuild that must work in both states can use
     /// neither, and reusing the latter would also emit its
     /// hold-read-served audit line for a read that served nobody.
@@ -3250,8 +3305,7 @@ mod visibility_extension_tests {
 
     fn repo_scoped_policy(repo_id: Uuid, duration_secs: i64) -> ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-            SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
 
@@ -3272,7 +3326,6 @@ mod visibility_extension_tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -5056,6 +5109,148 @@ mod visibility_extension_tests {
         assert!(got.is_none());
     }
 
+    // -- find_in_repo_by_path ---------------------------------------------
+
+    /// The whole reason this loader exists beside the hash-keyed one: a
+    /// repository may hold two rows for one hash under different paths,
+    /// and only the path says which one a reader addressing that path
+    /// gets. The hash-keyed lookup is a `LIMIT 1` with no `ORDER BY`, so
+    /// it can answer either — which is why a caller that has to agree
+    /// with a read path cannot be built on it.
+    #[tokio::test]
+    async fn find_in_repo_by_path_picks_the_row_at_that_path_among_rows_sharing_a_hash() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+
+        let blob_row = artifact_in_repo(repo_id, "blobs/sha256:x", VALID_SHA256);
+        let manifest_row = artifact_in_repo(repo_id, "manifests/sha256:x", VALID_SHA256);
+        artifacts.insert(blob_row.clone());
+        artifacts.insert(manifest_row.clone());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert_eq!(
+            uc.find_in_repo_by_path(repo_id, "manifests/sha256:x")
+                .await
+                .unwrap()
+                .expect("the manifest row resolves")
+                .id,
+            manifest_row.id
+        );
+        assert_eq!(
+            uc.find_in_repo_by_path(repo_id, "blobs/sha256:x")
+                .await
+                .unwrap()
+                .expect("the blob row resolves")
+                .id,
+            blob_row.id
+        );
+    }
+
+    /// Repo-scoped, like its hash-keyed sibling: the same path in another
+    /// repository is not a candidate (ADR 0008 cross-repo isolation).
+    #[tokio::test]
+    async fn find_in_repo_by_path_isolates_across_repos() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let repo_a = public_repo("repo-a");
+        let repo_b = public_repo("repo-b");
+        let (id_a, id_b) = (repo_a.id, repo_b.id);
+        repos.insert(repo_a);
+        repos.insert(repo_b);
+        artifacts.insert(artifact_in_repo(id_a, "manifests/sha256:x", VALID_SHA256));
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert!(uc
+            .find_in_repo_by_path(id_a, "manifests/sha256:x")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            uc.find_in_repo_by_path(id_b, "manifests/sha256:x")
+                .await
+                .unwrap()
+                .is_none(),
+            "a path in another repository is not a candidate"
+        );
+    }
+
+    /// Hydrated like every other read-path loader, so a consumer cannot
+    /// tell from the row which one produced it — the deadline measured
+    /// from the stored anchor, not from `now`.
+    #[tokio::test]
+    async fn find_in_repo_by_path_hydrates_the_deadline_from_the_stored_anchor() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let policies = Arc::new(MockPolicyProjectionRepository::new());
+
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        policies.insert(repo_scoped_policy(repo_id, 600));
+
+        let anchor = Utc::now() - chrono::Duration::minutes(5);
+        let mut a = artifact_in_repo(repo_id, "manifests/sha256:x", VALID_SHA256);
+        a.quarantine_status = QuarantineStatus::Quarantined;
+        a.quarantine_window_start = Some(anchor);
+        artifacts.insert(a);
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata)
+            .with_policy_projections(policies);
+        let got = uc
+            .find_in_repo_by_path(repo_id, "manifests/sha256:x")
+            .await
+            .unwrap()
+            .expect("the seeded row must resolve");
+        assert_eq!(
+            got.quarantine_deadline,
+            Some(anchor + chrono::Duration::seconds(600))
+        );
+    }
+
+    /// A port failure propagates rather than reading as "no such row":
+    /// an admission check built on this must not take a failed lookup
+    /// for an absent child.
+    #[tokio::test]
+    async fn find_in_repo_by_path_propagates_a_port_failure() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        artifacts.fail_next_find_by_path(DomainError::Invariant("boom".into()));
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert!(uc
+            .find_in_repo_by_path(Uuid::new_v4(), "manifests/sha256:x")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn find_in_repo_by_path_returns_none_when_the_path_is_not_in_the_repo() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+
+        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+        assert!(uc
+            .find_in_repo_by_path(Uuid::new_v4(), "manifests/sha256:absent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     // -- download_range ---------------------------------------------------
 
     #[tokio::test]
@@ -5154,42 +5349,55 @@ mod visibility_extension_tests {
 
     // -- download_hold_read (push-then-sign manifest-GET exemption) --------
 
-    /// A `Quarantined` artifact streams its CAS bytes — this is the whole
-    /// point of the exemption: keyed `cosign sign` resolves the held subject
-    /// manifest by GET, and `download` refuses it (`is_downloadable()` is
-    /// false), so `download_hold_read` is the CAS-read half that serves it.
+    /// Either hold streams its CAS bytes — this is the whole point of the
+    /// exemption: keyed `cosign sign` resolves the held subject manifest by
+    /// GET, and `download` refuses it (`is_downloadable()` is false), so
+    /// `download_hold_read` is the CAS-read half that serves it.
+    ///
+    /// `ScanIndeterminate` is in the loop because it is a hold pending a
+    /// verdict too — `QuarantineEvent::SupersedeAbsentVerdict` admits it and
+    /// reaches `Quarantined` — so a publisher whose upload is held for want
+    /// of a verdict can sign it exactly as one held by the timed quarantine
+    /// can.
     #[tokio::test]
-    async fn download_hold_read_quarantined_serves_bytes() {
+    async fn download_hold_read_held_statuses_serve_bytes() {
         use tokio::io::AsyncReadExt;
 
-        let artifacts = Arc::new(MockArtifactRepository::new());
-        let storage = Arc::new(MockStoragePort::new());
-        let repos = Arc::new(MockRepositoryRepository::new());
-        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        for status in [
+            QuarantineStatus::Quarantined,
+            QuarantineStatus::ScanIndeterminate,
+        ] {
+            let artifacts = Arc::new(MockArtifactRepository::new());
+            let storage = Arc::new(MockStoragePort::new());
+            let repos = Arc::new(MockRepositoryRepository::new());
+            let metadata = Arc::new(MockArtifactMetadataRepository::new());
 
-        let hash: ContentHash = VALID_SHA256.parse().unwrap();
-        storage.insert_content(hash, b"held manifest bytes".to_vec());
+            let hash: ContentHash = VALID_SHA256.parse().unwrap();
+            storage.insert_content(hash, b"held manifest bytes".to_vec());
 
-        let mut a = artifact_in_repo(Uuid::new_v4(), "manifests/sha256:x", VALID_SHA256);
-        a.quarantine_status = QuarantineStatus::Quarantined;
-        a.quarantine_window_start = Some(Utc::now());
-        let a_id = a.id;
-        artifacts.insert(a);
+            let mut a = artifact_in_repo(Uuid::new_v4(), "manifests/sha256:x", VALID_SHA256);
+            a.quarantine_status = status;
+            a.quarantine_window_start = Some(Utc::now());
+            let a_id = a.id;
+            artifacts.insert(a);
 
-        let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
-        let (got_a, mut stream) = uc.download_hold_read(a_id).await.unwrap();
-        assert_eq!(got_a.id, a_id);
-        let mut buf = Vec::new();
-        stream.read_to_end(&mut buf).await.unwrap();
-        assert_eq!(buf, b"held manifest bytes");
+            let uc = wired_use_case(artifacts, storage, repos, RbacAccess::Disabled, metadata);
+            let (got_a, mut stream) = uc.download_hold_read(a_id).await.unwrap();
+            assert_eq!(got_a.id, a_id, "{status:?}");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            assert_eq!(buf, b"held manifest bytes", "{status:?}");
+        }
     }
 
-    /// Fail-closed: a non-`Quarantined` status is `Forbidden` on the hold-read
-    /// path. `None` / `Released` artifacts go through the audited `download`;
-    /// a `Rejected` manifest must NEVER be served — the exemption is strictly a
-    /// held-manifest-signing read.
+    /// Fail-closed: a status that is not a hold pending a verdict is
+    /// `Forbidden` on the hold-read path. `None` / `Released` artifacts go
+    /// through the audited `download`; a `Rejected` manifest must NEVER be
+    /// served — a verdict has been reached there and no publisher workflow
+    /// makes that version deliverable, which is exactly what separates it
+    /// from the two holds above.
     #[tokio::test]
-    async fn download_hold_read_non_quarantined_is_forbidden() {
+    async fn download_hold_read_unheld_statuses_are_forbidden() {
         for status in [
             QuarantineStatus::None,
             QuarantineStatus::Released,

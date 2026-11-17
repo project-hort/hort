@@ -42,7 +42,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::entities::api_token::TokenKind;
+use crate::entities::api_token::{IssuedVia, TokenKind};
 use crate::entities::rbac::Permission;
 use crate::error::DomainResult;
 
@@ -206,6 +206,37 @@ pub struct ApiTokenIssued {
     /// [`source_issuer`](Self::source_issuer).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sub: Option<String>,
+    /// Which issuance path minted the token — the same value the
+    /// `api_tokens.issued_via` column carries, so an auditor reading
+    /// the stream and an operator reading the row agree on the origin
+    /// without joining them.
+    ///
+    /// **Backward compatibility.** Wire-additive: an event appended
+    /// before the field existed carries no key and decodes as
+    /// [`IssuedVia::Unknown`] through the `#[serde(default = …)]` below,
+    /// which is what such an event records — no origin. The event store
+    /// is append-only and replays every historical row through this
+    /// same `Deserialize` impl, so the default-on-absent contract is
+    /// load-bearing for replay. The event chain is unaffected either
+    /// way: it attests the stored JSON as the column holds it, and this
+    /// change writes no new bytes into any existing row.
+    ///
+    /// Not an `Option`, unlike the three `source_*` fields above: those
+    /// are facts a non-federated mint genuinely does not have, whereas
+    /// every mint has an origin, and every path from here on names one.
+    /// The serde default is a named function rather than a `Default`
+    /// impl on [`IssuedVia`] for the same reason — an impl would make
+    /// `Unknown` reachable through `..Default::default()` at a future
+    /// mint site.
+    #[serde(default = "issued_via_unknown")]
+    pub issued_via: IssuedVia,
+}
+
+/// Serde default for [`ApiTokenIssued::issued_via`] — see that field's
+/// backward-compatibility note for why this is a function and not a
+/// `Default` impl.
+fn issued_via_unknown() -> IssuedVia {
+    IssuedVia::Unknown
 }
 
 impl ApiTokenIssued {
@@ -390,6 +421,7 @@ mod tests {
             source_issuer: None,
             source_jti: None,
             source_sub: None,
+            issued_via: IssuedVia::HttpMint,
         }
     }
 
@@ -551,6 +583,68 @@ mod tests {
         // Sanity — the rest of the payload is preserved.
         assert_eq!(decoded.kind, TokenKind::Pat);
         assert_eq!(decoded.declared_permissions.len(), 2);
+    }
+
+    #[test]
+    fn issued_legacy_json_without_issued_via_deserialises_as_unknown() {
+        // Same load-bearing contract one field later, and asserted over
+        // a fixture rather than by reasoning about serde: a row appended
+        // before the provenance field existed carries no key, and the
+        // event store replays it through this `Deserialize` impl. Its
+        // honest answer is `Unknown` — the event records no origin —
+        // which is also what the migration writes into the rows of that
+        // era.
+        //
+        // The fixture is the full legacy key set INCLUDING the three
+        // federation fields, so the only thing absent is `issued_via`;
+        // the sibling test above covers the older shape that lacks all
+        // four.
+        let legacy_json = r#"{
+            "token_id": "0000000a-cef0-0000-0000-000000000000",
+            "user_id": "00000000-0000-0000-0000-000000000ace",
+            "kind": "ServiceAccount",
+            "declared_permissions": ["Read"],
+            "repository_ids": null,
+            "expires_at": "2026-05-13T12:00:00Z",
+            "minted_by_admin_id": null,
+            "at": "2026-05-13T12:00:00Z",
+            "source_issuer": "github-actions",
+            "source_jti": "jti-1",
+            "source_sub": "repo:acme/app:ref:refs/heads/main"
+        }"#;
+        let decoded: ApiTokenIssued = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(decoded.issued_via, IssuedVia::Unknown);
+        // The rest of the payload is untouched by the new field.
+        assert_eq!(decoded.kind, TokenKind::ServiceAccount);
+        assert_eq!(decoded.source_issuer.as_deref(), Some("github-actions"));
+    }
+
+    #[test]
+    fn issued_via_round_trips_every_variant_on_the_event() {
+        // Each arm has to survive the JSONB round trip with its
+        // discriminant identity intact: an audit consumer routes on the
+        // exact value, and so does the operator query one layer down.
+        for via in [
+            IssuedVia::Unknown,
+            IssuedVia::AdminCli,
+            IssuedVia::HttpMint,
+            IssuedVia::FederationExchange,
+            IssuedVia::Bootstrap,
+            IssuedVia::ServiceAccountRotation,
+        ] {
+            let original = ApiTokenIssued {
+                issued_via: via,
+                ..issued()
+            };
+            let json = serde_json::to_string(&original).unwrap();
+            assert!(
+                json.contains("\"issued_via\""),
+                "a new event always writes the key, got: {json}"
+            );
+            let decoded: ApiTokenIssued = serde_json::from_str(&json).unwrap();
+            assert_eq!(original, decoded);
+            assert_eq!(decoded.issued_via, via);
+        }
     }
 
     #[test]

@@ -34,16 +34,25 @@
 //! `CurationQueueResponseDto` pretty-printed.
 //!
 //! `--output table` (default): one row per entry with columns
-//! `ARTIFACT_ID  REPO  FORMAT  PACKAGE  VERSION  PATH  STATUS  DEADLINE
-//! FINDINGS  SEVERITY  REJECT_REASON`. `PATH` identifies OCI blobs and
-//! manifests whose `VERSION` is absent. An artifact with no completed
-//! scan shows `unscanned` in both finding columns; a clean scan shows
+//! `ARTIFACT_ID  REPO  FORMAT  PACKAGE  VERSION  PATH  DIGEST  STATUS
+//! DEADLINE  FINDINGS  SEVERITY  REJECT_REASON  TAGS`. `PATH` identifies
+//! OCI blobs and manifests whose `VERSION` is absent. An artifact with no
+//! completed scan shows `unscanned` in both finding columns; a clean scan shows
 //! `0` findings. `DEADLINE` renders as ISO-8601
 //! UTC (rather than relative duration — operators viewing the curation
 //! queue care about the exact wall-clock the artifact becomes eligible
 //! for auto-release, not a `in 6h` hand-wave). `REJECT_REASON` is the
 //! `rejection_reason_kind` discriminator for rejected rows; `-` when
 //! absent (only rejected rows carry one).
+//!
+//! `DIGEST` is the artifact's SHA-256 — the bytes the decision is about —
+//! shortened to its first `DIGEST_TABLE_HEX` hex so the table stays
+//! aligned. **The shortening is the table's and nowhere else's:** the JSON
+//! output carries the whole 64, because that is the value a decision is
+//! addressed by and an abbreviated one resolves to nothing while looking
+//! usable. `TAGS` lists the mutable refs pointing at those bytes,
+//! comma-separated, `-` when none; it is an annotation for the reader and
+//! no curation command takes a tag as a target.
 //!
 //! Empty result prints the header row AND a `No curation queue entries`
 //! line (tests pin this).
@@ -103,6 +112,13 @@ pub struct CurationQueueEntryDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub path: String,
+    /// Bare 64 lowercase hex. Carried and re-emitted whole: `--output
+    /// json` is the path an operator pipes into a decision, and the table
+    /// is the only place this is abbreviated.
+    pub checksum_sha256: String,
+    /// Mutable refs pointing at [`Self::checksum_sha256`]. Display only —
+    /// no curation command takes a tag as a target.
+    pub tags: Vec<String>,
     pub quarantine_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quarantine_window_start: Option<DateTime<Utc>>,
@@ -236,11 +252,13 @@ fn render_table(rows: &[CurationQueueEntryDto], out: &mut impl Write) -> std::io
         "PACKAGE",
         "VERSION",
         "PATH",
+        "DIGEST",
         "STATUS",
         "DEADLINE",
         "FINDINGS",
         "SEVERITY",
         "REJECT_REASON",
+        "TAGS",
     ];
 
     let data: Vec<Vec<String>> = rows
@@ -253,6 +271,7 @@ fn render_table(rows: &[CurationQueueEntryDto], out: &mut impl Write) -> std::io
                 r.package_name.clone(),
                 r.version.clone().unwrap_or_else(|| "-".to_string()),
                 r.path.clone(),
+                truncate_digest(&r.checksum_sha256).to_string(),
                 r.quarantine_status.clone(),
                 r.quarantine_deadline
                     .map(|d| d.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
@@ -268,6 +287,11 @@ fn render_table(rows: &[CurationQueueEntryDto], out: &mut impl Write) -> std::io
                 r.rejection_reason_kind
                     .clone()
                     .unwrap_or_else(|| "-".to_string()),
+                if r.tags.is_empty() {
+                    "-".to_string()
+                } else {
+                    r.tags.join(",")
+                },
             ]
         })
         .collect();
@@ -282,6 +306,26 @@ fn render_table(rows: &[CurationQueueEntryDto], out: &mut impl Write) -> std::io
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Hex characters of `checksum_sha256` the **table** renders.
+///
+/// Enough to recognise a digest across a page of rows; the whole value is
+/// one `--output json` away. The table is the only surface that shortens
+/// it, because a shortened digest in a JSON body is unusable as the key a
+/// curation decision is addressed by and the loss would be invisible to
+/// whoever tried to use it.
+const DIGEST_TABLE_HEX: usize = 12;
+
+/// First [`DIGEST_TABLE_HEX`] hex characters of `digest`.
+///
+/// Falls back to the whole value when it is shorter than that — or when
+/// the cut would split a multi-byte character. Neither is reachable from a
+/// well-formed response (the column it comes from is `character(64)`), and
+/// the fallback is there so a malformed one renders as what it is instead
+/// of panicking in the middle of a curator's worklist.
+fn truncate_digest(digest: &str) -> &str {
+    digest.get(..DIGEST_TABLE_HEX).unwrap_or(digest)
+}
 
 /// Percent-encode a query-string value (RFC 3986 unreserved set passes
 /// through; everything else → `%HH`). Inlined rather than shared with
@@ -413,6 +457,10 @@ mod tests {
         assert_eq!(urlencoded("k=v"), "k%3Dv");
     }
 
+    /// A full 64-hex digest — the shape the server projects, so the
+    /// truncation assertions measure a real abbreviation.
+    const SAMPLE_DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
     fn sample_entry() -> CurationQueueEntryDto {
         CurationQueueEntryDto {
             artifact_id: "11111111-1111-1111-1111-111111111111".into(),
@@ -422,6 +470,8 @@ mod tests {
             package_name: "evil-pkg".into(),
             version: Some("1.0.0".into()),
             path: "evil-pkg/-/evil-pkg-1.0.0.tgz".into(),
+            checksum_sha256: SAMPLE_DIGEST.into(),
+            tags: Vec::new(),
             quarantine_status: "quarantined".into(),
             quarantine_window_start: None,
             quarantine_deadline: None,
@@ -504,6 +554,110 @@ mod tests {
         assert_ne!(unscanned_cells[findings], "0");
         assert_eq!(clean_cells[findings], "0");
         assert_ne!(unscanned_cells[severity], clean_cells[severity]);
+    }
+
+    // -- the digest and the tags -------------------------------------------
+
+    #[test]
+    fn truncate_digest_takes_the_leading_twelve_hex() {
+        assert_eq!(truncate_digest(SAMPLE_DIGEST), "9f86d081884c");
+        assert_eq!(truncate_digest(SAMPLE_DIGEST).len(), DIGEST_TABLE_HEX);
+    }
+
+    /// A value shorter than the cut renders whole rather than panicking.
+    /// Unreachable from a well-formed response — the column is
+    /// `character(64)` — and this is the arm that keeps a malformed one
+    /// from taking out the whole listing.
+    #[test]
+    fn truncate_digest_passes_a_short_value_through() {
+        assert_eq!(truncate_digest(""), "");
+        assert_eq!(truncate_digest("abc"), "abc");
+        assert_eq!(truncate_digest("9f86d081884c"), "9f86d081884c");
+    }
+
+    /// A cut that would land *inside* a multi-byte character also falls
+    /// back to the whole value instead of panicking on the byte-slice.
+    ///
+    /// The byte offset is what matters, not the character count: ten ASCII
+    /// bytes followed by a three-byte character puts byte 12 in the middle
+    /// of that character, which is the case `str::get` answers `None` to.
+    /// A string of two-byte characters would land on a boundary at byte 12
+    /// and be cut cleanly — a real answer, and not the one this arm is for.
+    #[test]
+    fn truncate_digest_passes_a_value_cut_mid_character_through() {
+        let mid_character = "aaaaaaaaaa€";
+        assert!(!mid_character.is_char_boundary(DIGEST_TABLE_HEX));
+        assert_eq!(truncate_digest(mid_character), mid_character);
+
+        let on_a_boundary = "αααααα€";
+        assert!(on_a_boundary.is_char_boundary(DIGEST_TABLE_HEX));
+        assert_eq!(truncate_digest(on_a_boundary), "αααααα");
+    }
+
+    /// **The table abbreviates and the JSON does not.** Asserted together
+    /// in one test because the pair is the property: either half alone
+    /// reads as satisfied by a surface that shortened everywhere.
+    #[test]
+    fn the_table_truncates_the_digest_and_the_json_carries_it_whole() {
+        let mut buf = Vec::new();
+        render_table(&[sample_entry()], &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let mut lines = out.lines();
+        let headings: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let digest = headings.iter().position(|h| *h == "DIGEST").unwrap();
+        let cells: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(cells[digest], "9f86d081884c");
+        assert!(
+            !out.contains(SAMPLE_DIGEST),
+            "the table renders the abbreviation, not the whole digest"
+        );
+
+        let json = serde_json::to_value(sample_entry()).expect("entry serializes");
+        assert_eq!(json["checksum_sha256"], SAMPLE_DIGEST);
+        assert_eq!(
+            json["checksum_sha256"].as_str().map(str::len),
+            Some(64),
+            "`--output json` re-emits the whole digest: it is the key a \
+             curation decision is addressed by, and a truncated one would \
+             resolve to nothing while looking usable"
+        );
+    }
+
+    #[test]
+    fn render_table_joins_tags_and_dashes_when_there_are_none() {
+        let mut tagged = sample_entry();
+        tagged.tags = vec!["latest".into(), "v1.0.0".into()];
+        let untagged = sample_entry();
+
+        let mut buf = Vec::new();
+        render_table(&[tagged, untagged], &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let mut lines = out.lines();
+        let headings: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let tags = headings.iter().position(|h| *h == "TAGS").unwrap();
+        let tagged_cells: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        let untagged_cells: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+        assert_eq!(tagged_cells[tags], "latest,v1.0.0");
+        assert_eq!(untagged_cells[tags], "-");
+    }
+
+    /// The `TAGS` column is the last one, and `--tags` is not a flag:
+    /// `QueueArgs` has no tag field, so nothing a caller types can narrow
+    /// the listing by a mutable pointer. Pinned on the built path, which
+    /// is the whole request this command can make.
+    #[test]
+    fn no_filter_is_addressed_by_a_tag() {
+        let args = QueueArgs {
+            repository: Some("npm-main".into()),
+            status: Some("rejected".into()),
+            reason: Some("curator".into()),
+            limit: Some(10),
+        };
+        let path = build_path(&args);
+        assert!(
+            !path.contains("tag"),
+            "the queue request carries no tag parameter: {path}"
+        );
     }
 
     #[test]

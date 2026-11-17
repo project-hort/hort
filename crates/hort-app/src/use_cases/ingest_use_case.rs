@@ -17,9 +17,7 @@ use hort_domain::events::{
 };
 use hort_domain::policy::curation::{evaluate_curation, CurationOutcome};
 use hort_domain::policy::effective_quarantine_deadline;
-use hort_domain::policy::quarantine_anchor::{
-    derive_quarantine_anchor, AnchorEvidence, AnchorSource, DerivedAnchor,
-};
+use hort_domain::policy::quarantine_anchor::{AnchorSource, DerivedAnchor};
 use hort_domain::policy::scan::DefaultPolicy;
 use hort_domain::ports::artifact_lifecycle::{ArtifactLifecyclePort, IngestEnqueue};
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -50,8 +48,8 @@ use crate::use_cases::multi_hash::{
 };
 use crate::use_cases::policy_resolution::resolve_active_policy_for_repo;
 use crate::use_cases::provenance_cascade::ProvenanceCascade;
+use crate::use_cases::quarantine_anchor_assembly::{derive_mint_anchor, MintEvidence};
 use crate::use_cases::quarantine_hold::{resolve_transient_hold, TransientHold};
-use crate::use_cases::referenced_descendant::resolve_referenced_tree_descendant_fail_safe;
 use crate::use_cases::{
     append_any_with_conflict_retry, event_append_backoff, read_unpaired_append_version,
     ArtifactAtVersion, OverCapStream, UnpairedAppend, EVENT_APPEND_RETRY_ATTEMPTS,
@@ -64,6 +62,14 @@ pub(crate) const PROVENANCE_VERIFY_KIND: &str = "provenance-verify";
 
 /// `jobs.kind` of the transitive prefetch cascade driver.
 const PREFETCH_DEPENDENCIES_KIND: &str = "prefetch-dependencies";
+
+/// `producer` log field on the two entry points that mint a cascade
+/// root. Both stamp the same `jobs` row and take the same decisions;
+/// the field is what lets an operator tell a root minted over a push
+/// from one minted over content already in CAS.
+const CASCADE_PRODUCER_INGEST: &str = "ingest";
+/// See [`CASCADE_PRODUCER_INGEST`].
+const CASCADE_PRODUCER_REGISTER_BY_HASH: &str = "register_by_hash";
 
 /// `jobs.trigger_source` every enqueue this use case makes at ingest
 /// time carries, taken from the one definition of the set
@@ -504,37 +510,6 @@ fn actor_to_uploaded_by(actor: &ApiActor) -> Option<Uuid> {
     }
 }
 
-/// Read the live content-level age evidence for `sha256` — the earliest
-/// moment hort itself observed these bytes in any of its own repositories
-/// (ADR 0054). One indexed `MIN(created_at)` per quarantining mint; both
-/// minting paths call it so they cannot derive different anchors for the
-/// same content.
-///
-/// **Fail-safe**: a port error resolves to `None`, exactly as "hort holds
-/// no such observation" does. The two are deliberately indistinguishable
-/// to the caller, because they warrant the same answer — the derivation
-/// falls back on the mint instant and holds the content for a full window.
-/// Inventing an earlier instant for content whose age hort cannot vouch
-/// for would shorten a security window on no evidence; standing on the
-/// mint instant can only hold content longer than the truth justifies.
-async fn read_content_age_evidence(
-    artifacts: &dyn ArtifactRepository,
-    sha256: &ContentHash,
-) -> Option<DateTime<Utc>> {
-    match artifacts.first_seen_for_checksum(sha256).await {
-        Ok(evidence) => evidence,
-        Err(e) => {
-            tracing::warn!(
-                sha256 = %sha256,
-                error = %e,
-                "content age-evidence read failed; anchoring the quarantine window on \
-                 the mint instant (a full window, never a shorter one)"
-            );
-            None
-        }
-    }
-}
-
 fn classify_ingest_error(err: &AppError) -> IngestResult {
     match err {
         AppError::Storage(_) => IngestResult::StorageError,
@@ -607,7 +582,13 @@ enum InnerIngestError {
 /// `ingest_inner`'s error shape: the classified error, the repository key
 /// once resolved (`None` before that), and the `IngestResult` metric label
 /// for the arms that need one.
-type IngestInnerError = (InnerIngestError, Option<String>, Option<IngestResult>);
+///
+/// Boxed because the unboxed tuple is 152 bytes — `InnerIngestError`
+/// carries an `AppError` plus the two rendered checksums — and it is the
+/// `Err` arm of a dozen helpers that `?`-propagate up the ingest path, so
+/// every successful return would move those bytes too. The allocation
+/// lands only on the error path (`clippy::result_large_err`).
+type IngestInnerError = Box<(InnerIngestError, Option<String>, Option<IngestResult>)>;
 
 /// `ingest_inner`'s success shape: `(artifact, was_duplicate, repo_key,
 /// ingested_event_id)` — see [`IngestUseCase::ingest_inner`] docstring.
@@ -1332,7 +1313,8 @@ impl IngestUseCase {
                 false,
             )
             .await
-            .map_err(|(err, repo_key, preclassified)| {
+            .map_err(|boxed| {
+                let (err, repo_key, preclassified) = *boxed;
                 (err.into_app_error(), repo_key, preclassified)
             });
 
@@ -2309,7 +2291,8 @@ impl IngestUseCase {
                     claimed_edges_written,
                 })
             }
-            Err((inner_err, repo_key, preclassified)) => {
+            Err(boxed) => {
+                let (inner_err, repo_key, preclassified) = *boxed;
                 // Verification mismatch emission. A substring
                 // discriminator (`msg.contains("computed=")` against
                 // the inner `Conflict` message) is deliberately avoided
@@ -2553,14 +2536,14 @@ impl IngestUseCase {
             .map_err(|e| (InnerIngestError::Other(AppError::Domain(e)), None, None))?;
 
         if coords.format != repo.format {
-            return Err((
+            return Err(Box::new((
                 InnerIngestError::Other(AppError::Domain(DomainError::Validation(format!(
                     "format mismatch: repository {} is {}, coords declare {}",
                     repo.key, repo.format, coords.format
                 )))),
                 Some(repo.key.clone()),
                 None,
-            ));
+            )));
         }
 
         Ok(repo)
@@ -2675,14 +2658,14 @@ impl IngestUseCase {
                 );
                 return Ok(ControlFlow::Break(early_ok));
             }
-            return Err((
+            return Err(Box::new((
                 InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
                     "path {} already exists with different content (existing={}, declared={})",
                     coords.path, existing.sha256_checksum, declared
                 )))),
                 Some(repo_key.to_string()),
                 None,
-            ));
+            )));
         }
 
         Ok(ControlFlow::Continue(existing))
@@ -2734,14 +2717,14 @@ impl IngestUseCase {
                 tracing::debug!(artifact_id = %artifact_id, "deduplicated");
                 return Ok(ControlFlow::Break(early_ok));
             }
-            return Err((
+            return Err(Box::new((
                 InnerIngestError::Other(AppError::Domain(DomainError::Conflict(format!(
                     "path {} already exists with different content (existing={}, new={})",
                     coords_path, existing.sha256_checksum, put_result.hash
                 )))),
                 Some(repo_key.to_string()),
                 None,
-            ));
+            )));
         }
 
         Ok(ControlFlow::Continue(put_result))
@@ -2792,7 +2775,7 @@ impl IngestUseCase {
         let source = AppError::Domain(DomainError::Conflict(format!(
             "declared sha256 does not match computed hash (declared={declared}, computed={put_hash})",
         )));
-        Err((
+        Err(Box::new((
             InnerIngestError::VerificationMismatch {
                 algorithm: HashAlgorithm::Sha256,
                 upstream_value: declared.to_string(),
@@ -2801,7 +2784,7 @@ impl IngestUseCase {
             },
             Some(repo_key.to_string()),
             Some(IngestResult::DeclaredHashMismatch),
-        ))
+        )))
     }
 
     /// Step 5b: SHA-512 verification arm. Reached only for the npm SRI
@@ -2836,7 +2819,7 @@ impl IngestUseCase {
             "upstream sha512 does not match computed hash \
              (upstream={upstream_value}, computed={computed})"
         )));
-        Err((
+        Err(Box::new((
             InnerIngestError::VerificationMismatch {
                 algorithm: HashAlgorithm::Sha512,
                 upstream_value: upstream_value.clone(),
@@ -2845,7 +2828,7 @@ impl IngestUseCase {
             },
             Some(repo_key.to_string()),
             Some(IngestResult::DeclaredHashMismatch),
-        ))
+        )))
     }
 
     /// Step 5c: SHA-1 transfer-verification *floor* arm (ADR 0033 — the
@@ -2882,7 +2865,7 @@ impl IngestUseCase {
             "upstream sha1 does not match computed hash \
              (upstream={upstream_value}, computed={computed})"
         )));
-        Err((
+        Err(Box::new((
             InnerIngestError::VerificationMismatch {
                 algorithm: HashAlgorithm::Sha1,
                 upstream_value: upstream_value.clone(),
@@ -2891,7 +2874,7 @@ impl IngestUseCase {
             },
             Some(repo_key.to_string()),
             Some(IngestResult::DeclaredHashMismatch),
-        ))
+        )))
     }
 
     /// Resolve the deferred metadata decision into the `(inline
@@ -3131,37 +3114,45 @@ impl IngestUseCase {
     /// on an operator policy) — the artifact stays in `None`, downloadable,
     /// per `Artifact::is_downloadable`.
     ///
-    /// Referenced-tree descendant zero-window carve-out (#46 Item 2,
-    /// design doc §4 final shape + §4a). A SCOPED carve-out of ADR 0007,
-    /// NOT a reversal. This artifact is a "referenced-tree descendant" iff
-    /// it is already a `content_references` **target** of some other,
-    /// already-ingested artifact — a child manifest (`kind =
-    /// "oci_index_member"`), a referrer's subject (`kind = "oci_subject"`),
-    /// or a config/layer blob (`kind = "oci_config"` / `"oci_layer"`, #46
-    /// Item 1). The predicate itself lives in
+    /// Referenced-tree descendant zero-window carve-out. A SCOPED
+    /// carve-out of ADR 0007, NOT a reversal, and **conditional on
+    /// inherited trust**: it applies to an artifact that is already a
+    /// `content_references` **target** of some other, already-ingested
+    /// artifact — a child manifest (`kind = "oci_index_member"`), a
+    /// referrer's subject (`kind = "oci_subject"`), or a config/layer
+    /// blob (`kind = "oci_config"` / `"oci_layer"`) — **of which at least
+    /// one referencing parent is itself `Released`**. A descendant whose
+    /// parents are all still held keeps the full window: on a cold pull
+    /// parent and constituents are minted seconds apart against the same
+    /// advisory data, so there is no earlier trusted assessment for the
+    /// descendant's own scan to be fresher than.
+    ///
+    /// The topology half lives in
     /// [`crate::use_cases::referenced_descendant::is_referenced_tree_descendant`]
-    /// — shared verbatim with the provenance orchestrator's `NoAttestation
-    /// × Required` hold (issue #115 item 3) so the two can never drift;
-    /// see that module for why the self-referential kinds are excluded.
-    /// The lookup + its fail-safe-on-error posture are shared with
-    /// `register_by_hash_inner`'s identical carve-out through
-    /// `resolve_referenced_tree_descendant_fail_safe`, so the two minting
-    /// paths cannot drift either. This lookup does NOT depend on this
-    /// ingest's OWN `content_references` rows — those are resolved further
-    /// down and committed by the transition itself, so nothing this ingest
-    /// claims is visible here. It only ever matches rows written by OTHER,
-    /// already-ingested artifacts.
+    /// — see that module for why the self-referential kinds are
+    /// excluded. The parents' statuses are I/O, so the whole condition is
+    /// resolved by
+    /// [`crate::use_cases::referenced_descendant::resolve_released_parent_trust_fail_safe`],
+    /// which the shared mint assembly calls on behalf of both minting
+    /// paths: the two cannot drift, and both lookups degrade toward the
+    /// FULL window on error. That lookup does NOT depend on this
+    /// ingest's OWN `content_references` rows — those are resolved
+    /// further down and committed by the transition itself, so nothing
+    /// this ingest claims is visible to it. It only ever matches rows
+    /// written by OTHER, already-ingested artifacts.
     ///
     /// Resolves the quarantine-window anchor (`quarantine_window_start`)
-    /// as the MINIMUM of the applicable age sources (ADR 0054), in the one
-    /// shared pure function `register_by_hash_inner` also calls — which is
-    /// what makes the two minting paths derive identically. Every source
-    /// is a "the world has already had this long to look" argument, so
-    /// the honest composition is the earliest deadline any applicable
-    /// rule would set on its own; see
-    /// `hort_domain::policy::quarantine_anchor` for the full rationale,
-    /// including why the descendant carve-out composes rather than
-    /// overrides. The sources assembled:
+    /// as the MINIMUM of the applicable age sources (ADR 0054), through
+    /// [`crate::use_cases::quarantine_anchor_assembly::derive_mint_anchor`]
+    /// — the one place a mint's evidence is assembled, which
+    /// `register_by_hash_inner` also calls and which is what makes the
+    /// two minting paths derive identically. Every source is a "the world
+    /// has already had this long to look" argument, so the honest
+    /// composition is the earliest deadline any applicable rule would set
+    /// on its own; see `hort_domain::policy::quarantine_anchor` for the
+    /// full rationale, including why the descendant carve-out composes
+    /// rather than overrides. The sources, and what this function
+    /// contributes to each:
     ///
     /// - The ingest instant, unconditional — so a missing or unreadable
     ///   source degrades to a FULL window, never a shorter one.
@@ -3181,16 +3172,16 @@ impl IngestUseCase {
     ///   window of one proxying the genuine upstream — the ADR 0016
     ///   cross-opt-in collapse pattern, in the weakening direction.
     /// - The referenced-tree-descendant carve-out's `ingested_at -
-    ///   effective_duration`, i.e. a window that is already over. The
-    ///   RELEASE PREDICATE is completely unchanged (`Artifact::release`
-    ///   still requires its own `ScanSucceeded`/`ScanWaived` authority —
-    ///   ADR 0007's two impossible failure modes stay impossible); this
-    ///   only removes the *timer* wait, so the descendant's own clean scan
-    ///   trips the existing event-driven fast-path release in
-    ///   `QuarantineUseCase::record_scan_result` instead of waiting out a
-    ///   window that provides no additional observation (§4a: no
-    ///   in-window rescan exists, so the window is pure latency for every
-    ///   artifact, not protection).
+    ///   effective_duration`, i.e. a window that is already over —
+    ///   contributed only when a referencing parent is `Released`, so
+    ///   what the descendant skips is a wait on exposure the parent's
+    ///   release already stood for. The RELEASE PREDICATE is completely
+    ///   unchanged (`Artifact::release` still requires its own
+    ///   `ScanSucceeded`/`ScanWaived` authority — ADR 0007's two
+    ///   impossible failure modes stay impossible); this only removes the
+    ///   *timer* wait, so the descendant's own clean scan trips the
+    ///   existing event-driven fast-path release in
+    ///   `QuarantineUseCase::record_scan_result`.
     ///
     /// Invariant: store the **anchor**, never a precomputed deadline. The
     /// release sweep and the proxy-503 read path compute the deadline live
@@ -3225,29 +3216,26 @@ impl IngestUseCase {
             return Ok(None);
         }
 
-        let is_referenced_descendant = resolve_referenced_tree_descendant_fail_safe(
+        let derived = derive_mint_anchor(
+            &*self.artifacts,
             &*self.content_references,
-            repository_id,
-            artifact.id,
-            &artifact.sha256_checksum,
+            MintEvidence {
+                minted_at: now,
+                window_secs: effective_duration_secs,
+                // `ingest_inner` never carries the seed-import override
+                // (the request field is destructured away above and
+                // threaded to `register_by_hash` instead).
+                explicit_override: None,
+                trusted_upstream_published_at: trust_upstream_publish_time
+                    .then_some(upstream_published_at)
+                    .flatten(),
+                repository_id,
+                artifact_id: artifact.id,
+                sha256: &artifact.sha256_checksum,
+            },
         )
         .await;
-
-        let derived = derive_quarantine_anchor(&AnchorEvidence {
-            minted_at: now,
-            window: chrono::Duration::seconds(effective_duration_secs),
-            // `ingest_inner` never carries the seed-import override (the
-            // request field is destructured away above and threaded to
-            // `register_by_hash` instead).
-            explicit_override: None,
-            first_seen_at: read_content_age_evidence(&*self.artifacts, &artifact.sha256_checksum)
-                .await,
-            trusted_upstream_published_at: trust_upstream_publish_time
-                .then_some(upstream_published_at)
-                .flatten(),
-            is_referenced_descendant,
-        });
-        let anchor = derived.anchor;
+        let anchor = derived.anchor();
 
         let quarantine_event = artifact.quarantine(anchor).map_err(|e| {
             (
@@ -3505,11 +3493,11 @@ impl IngestUseCase {
                         {
                             Ok(put_result) => put_result.hash,
                             Err(e) => {
-                                return Err((
+                                return Err(Box::new((
                                     InnerIngestError::Other(AppError::Storage(e.to_string())),
                                     Some(repo_key.to_string()),
                                     None,
-                                ));
+                                )));
                             }
                         };
                         // The link back to the parent wheel. Handed to the
@@ -3550,11 +3538,11 @@ impl IngestUseCase {
                         .increment(1);
                         Ok(None)
                     }
-                    Err(e) => Err((
+                    Err(e) => Err(Box::new((
                         InnerIngestError::Other(AppError::Domain(e)),
                         Some(repo_key.to_string()),
                         None,
-                    )),
+                    ))),
                 }
             }
             Err(e) => {
@@ -3562,11 +3550,11 @@ impl IngestUseCase {
                 // wheel-metadata extraction pipeline could not run, and
                 // nothing has been committed, so the ingest fails whole
                 // and the client retries.
-                Err((
+                Err(Box::new((
                     InnerIngestError::Other(AppError::Domain(e)),
                     Some(repo_key.to_string()),
                     None,
-                ))
+                )))
             }
         }
     }
@@ -3673,14 +3661,15 @@ impl IngestUseCase {
         format: String,
         repo_key: &str,
     ) {
-        let Some(DerivedAnchor {
-            anchor,
-            source: anchor_source,
-            upstream_clamp_fired,
-        }) = quarantine_fired
-        else {
+        let Some(derived) = quarantine_fired else {
             return;
         };
+        let DerivedAnchor {
+            source: anchor_source,
+            upstream_clamp_fired,
+            ..
+        } = derived;
+        let anchor = derived.anchor();
 
         if policy_source_is_default {
             tracing::info!(
@@ -3734,7 +3723,8 @@ impl IngestUseCase {
                 window_duration_secs = effective_duration_secs,
                 anchor_source = "referenced_descendant",
                 "quarantine window collapsed to zero: artifact is a content_references \
-                 target of an already-ingested manifest/index (#46 Item 2 scoped carve-out; \
+                 target of an already-ingested manifest/index with at least one RELEASED \
+                 referencing parent, whose trust it inherits (scoped ADR 0007 carve-out; \
                  release still requires this artifact's own ScanSucceeded/ScanWaived)"
             ),
         }
@@ -3759,6 +3749,36 @@ impl IngestUseCase {
             labels::REPOSITORY => self.repo_label(Some(repo_key)),
         )
         .increment(1);
+    }
+
+    /// Whether the artifact stored at `path` is the document a
+    /// `prefetch-dependencies` walk would read — the format's own
+    /// answer, through
+    /// [`VersionDiscovery::path_carries_dependency_specs`].
+    ///
+    /// **A format that does not declare the capability group answers
+    /// "no" structurally.** `version_discovery()` is `None` for oci,
+    /// helm, rpm, debian and generic, which means there is no
+    /// `extract_dependency_specs` for a walk to call at all: a root job
+    /// over such an artifact has no reachable outcome, so the `is_some`
+    /// arm here is the gate rather than a convenience. Apply-time
+    /// linting already refuses the `transitive_deps` trigger on such a
+    /// format, which makes this the second layer and not the first —
+    /// but a projection written before that rule existed, or any path
+    /// to a policy that does not transit gitops apply, reaches here
+    /// instead.
+    ///
+    /// Per-format knowledge — which stored suffix carries declarations
+    /// — stays behind the port in `hort-formats` (ADR 0008). This
+    /// function reads an answer and spells no suffix of its own; the
+    /// media type is deliberately not consulted, because a stored
+    /// `Content-Type` is a copy of an inbound adapter's presentation
+    /// default and a read decision must not move when a MIME type is
+    /// adjusted.
+    fn artifact_carries_dependency_specs(handler: &dyn FormatHandler, path: &str) -> bool {
+        handler
+            .version_discovery()
+            .is_some_and(|vd| vd.path_carries_dependency_specs(path))
     }
 
     /// Transitive prefetch cascade enqueue hook. Fires per-ingest when the
@@ -3786,14 +3806,55 @@ impl IngestUseCase {
     /// the transitive_depth / max_descendants caps). Seeds (client pulls,
     /// self-service ROOT leaves) leave it `false` so the hook fires as
     /// before.
+    ///
+    /// `artifact_carries_dependency_specs` is the format's own answer to
+    /// "is this artifact the document the walk would read", precomputed
+    /// by the caller via [`Self::artifact_carries_dependency_specs`] for
+    /// the same reason `prefetch_transitive_deps_triggered` is: the
+    /// handler is borrowed by the caller, and the enqueue reaches for no
+    /// port of its own.
+    ///
+    /// `producer` names the entry point for the log line only — the two
+    /// producers of a cascade root (`ingest_inner` and
+    /// `register_by_hash_inner`) share every decision this method makes,
+    /// and an operator still needs to tell a root minted over a push
+    /// from one minted over content already in CAS.
+    #[allow(clippy::too_many_arguments)]
     async fn enqueue_prefetch_cascade(
         &self,
         suppress_cascade_seed: bool,
         prefetch_transitive_deps_triggered: bool,
+        artifact_carries_dependency_specs: bool,
         artifact_id: Uuid,
         repository_id: Uuid,
+        format: &str,
+        producer: &'static str,
     ) {
         if suppress_cascade_seed || !prefetch_transitive_deps_triggered {
+            return;
+        }
+
+        // No job here, and the absence IS the answer rather than a gap:
+        // the format has said that an artifact at this path does not
+        // declare dependencies, so a `prefetch-dependencies` walk over
+        // it has nothing to read and the row it would claim could only
+        // fail. The extractor's refusal is deliberate — `Err` there
+        // means "these bytes are not the manifest", which is what keeps
+        // a genuinely corrupt manifest distinguishable from a file that
+        // was never one — so the question has to be asked before the
+        // enqueue, not survived after it. A format that does not
+        // declare the capability group at all lands here too: there is
+        // no extractor for the walk to call.
+        //
+        // Counted, never logged per artifact: a Maven repository holds
+        // far more jars than poms, so this is the ordinary case and an
+        // `info!` per skip would turn every jar ingest into log volume.
+        if !artifact_carries_dependency_specs {
+            metrics::counter!(
+                "hort_prefetch_cascade_seed_skipped_total",
+                labels::FORMAT => format.to_string(),
+            )
+            .increment(1);
             return;
         }
 
@@ -3823,12 +3884,14 @@ impl IngestUseCase {
             Ok(outcome) => tracing::debug!(
                 artifact_id = %artifact_id,
                 repository_id = %repository_id,
+                producer,
                 ?outcome,
                 "prefetch cascade: enqueued prefetch-dependencies root job",
             ),
             Err(e) => tracing::warn!(
                 artifact_id = %artifact_id,
                 repository_id = %repository_id,
+                producer,
                 error = %e,
                 "prefetch cascade: prefetch-dependencies enqueue failed; \
                  cascade skipped (best-effort — next pull re-triggers)",
@@ -4140,6 +4203,15 @@ impl IngestUseCase {
             .triggers
             .contains(&hort_domain::entities::repository::PrefetchTrigger::TransitiveDeps);
 
+        // The second half of the cascade-seed gate, precomputed here for
+        // the same reason as the trigger above: `handler` is borrowed
+        // from the outer `ingest` for the duration of this call, and the
+        // post-commit hook takes the answer rather than the port. The
+        // path is the row's own — `artifact.path` is built from
+        // `coords.path` below, so the two cannot disagree.
+        let artifact_carries_dependency_specs =
+            Self::artifact_carries_dependency_specs(handler, &coords.path);
+
         let artifact_metadata = ArtifactMetadata {
             artifact_id,
             format: repo.format,
@@ -4211,7 +4283,7 @@ impl IngestUseCase {
         // the single commit below; only the logs/metrics fire late. See
         // `decide_and_apply_quarantine` for the full quarantine-by-default
         // (ADR 0007) rationale and the referenced-tree-descendant
-        // zero-window carve-out (#46 Item 2).
+        // carve-out, which waives the window only on inherited trust.
         let quarantine_fired = self
             .decide_and_apply_quarantine(
                 &mut artifact,
@@ -4384,8 +4456,11 @@ impl IngestUseCase {
         self.enqueue_prefetch_cascade(
             suppress_cascade_seed,
             prefetch_transitive_deps_triggered,
+            artifact_carries_dependency_specs,
             artifact_id,
             repository_id,
+            &scan_enqueue_format,
+            CASCADE_PRODUCER_INGEST,
         )
         .await;
 
@@ -5136,22 +5211,25 @@ impl IngestUseCase {
         //    instant, the live content-level age evidence, and the
         //    referenced-tree-descendant carve-out's `now -
         //    effective_duration`. The carve-out uses the same shared
-        //    predicate and lookup
-        //    (`resolve_referenced_tree_descendant_fail_safe`) with the
-        //    same fail-safe-on-lookup-error posture (a failed lookup
-        //    degrades to "not a descendant" = the full window, never the
-        //    zero window).
+        //    resolver (`resolve_released_parent_trust_fail_safe`) — so
+        //    the same conditional-on-inherited-trust condition and the
+        //    same fail-safe-on-lookup-error posture: a failed topology
+        //    lookup degrades to "not a descendant" and a failed parent
+        //    read to "that parent is not released", both of which mean
+        //    the full window, never the zero window.
         //
         //    Sharing the derivation is what makes the invariant hold:
         //    one artifact in one repository gets ONE quarantine window,
         //    whether its row was minted by `ingest_inner` (the leader of
         //    a pull-through coalesce), by a coalesced follower
         //    re-registering here, or by a cross-repo mount. Both inputs
-        //    are caller-independent — the carve-out is TOPOLOGY-based
-        //    ("is this content already a `content_references` target of
-        //    some other already-ingested artifact in THIS repo") and the
-        //    age evidence is content-level. Anything caller-dependent
-        //    would make the hold depend on which racer won the dedup.
+        //    are caller-independent — the carve-out reads the repo's
+        //    own topology ("is this content already a
+        //    `content_references` target of some other already-ingested
+        //    artifact in THIS repo") and those parents' own statuses,
+        //    and the age evidence is content-level. Anything
+        //    caller-dependent would make the hold depend on which racer
+        //    won the dedup.
         //
         //    The trusted-upstream source is absent on this path: it mints
         //    a per-repo row over content already in CAS with no upstream
@@ -5336,50 +5414,36 @@ impl IngestUseCase {
             "registered_by_hash"
         );
 
-        // Transitive prefetch cascade
-        // enqueue hook (mirror of `ingest_inner`'s hook). Same
-        // contract: gated on `prefetch_policy.triggers.contains(
-        // TransitiveDeps)`, best-effort (warn-and-continue), fires
-        // after the registration commit lands. Covers the OCI
-        // cross-repo blob-mount and any future hash-only registration
-        // paths so the cascade is event-driven uniformly across both
-        // ingest entry points.
-        if repo
-            .prefetch_policy
-            .triggers
-            .contains(&hort_domain::entities::repository::PrefetchTrigger::TransitiveDeps)
-        {
-            let params = serde_json::json!({
-                "artifact_id": artifact.id,
-                "current_depth": 0u32,
-            });
-            match self
-                .jobs
-                .enqueue_task(
-                    PREFETCH_DEPENDENCIES_KIND,
-                    &params,
-                    None,
-                    queue_priority(PREFETCH_DEPENDENCIES_KIND, INGEST_TRIGGER_SOURCE),
-                    INGEST_TRIGGER_SOURCE,
-                    None, // non-destructive task — no DB-side idempotency key (ADR 0028)
-                )
-                .await
-            {
-                Ok(outcome) => tracing::debug!(
-                    artifact_id = %artifact.id,
-                    %repository_id,
-                    ?outcome,
-                    "prefetch cascade: enqueued prefetch-dependencies root job (register_by_hash path)",
-                ),
-                Err(e) => tracing::warn!(
-                    artifact_id = %artifact.id,
-                    %repository_id,
-                    error = %e,
-                    "prefetch cascade: prefetch-dependencies enqueue failed (register_by_hash); \
-                     cascade skipped (best-effort — next pull re-triggers)",
-                ),
-            }
-        }
+        // Transitive prefetch cascade enqueue hook — the second
+        // producer of a cascade root, behind the SAME gate as
+        // `ingest_inner`'s: the repository's `TransitiveDeps` trigger
+        // AND the format's answer to whether this artifact is the
+        // document a walk would read. Covers the OCI cross-repo
+        // blob-mount and any future hash-only registration path, so the
+        // cascade is event-driven uniformly across both ingest entry
+        // points.
+        //
+        // Delegated rather than mirrored. The two hooks' only
+        // requirement has always been that they agree — a root minted
+        // over content already in CAS is the same warm-up walk, stamping
+        // the same pair — and a copy is how they stop agreeing: this one
+        // was a copy, and it would have been the half of the gate a
+        // reader could not find. `suppress_cascade_seed` is `false`
+        // because registration has no cascade-internal caller: a
+        // `prefetch` leaf-ingest goes through `ingest_with_verification`,
+        // never through here, so this path is always a seed.
+        self.enqueue_prefetch_cascade(
+            false,
+            repo.prefetch_policy
+                .triggers
+                .contains(&hort_domain::entities::repository::PrefetchTrigger::TransitiveDeps),
+            Self::artifact_carries_dependency_specs(handler, &artifact.path),
+            artifact.id,
+            repository_id,
+            &scan_enqueue_format,
+            CASCADE_PRODUCER_REGISTER_BY_HASH,
+        )
+        .await;
 
         Ok(RegisterOutcome::Fresh {
             artifact,
@@ -5478,41 +5542,26 @@ impl IngestUseCase {
         let mut events: Vec<EventToAppend> = Vec::new();
 
         if gate.quarantined {
-            // The descendant carve-out, evaluated exactly as
-            // `ingest_inner` evaluates it. The probe is a TOPOLOGY
-            // question — "is this content already a `content_references`
-            // target of some OTHER already-ingested artifact in this
-            // repository" — and `is_referenced_tree_descendant` filters
-            // `primary_content` / `metadata_blob` out as self-referential,
-            // so it answers the same whether or not this artifact's own
-            // edges are written yet. That is what lets the mint (whose
-            // edges ride the commit this feeds) and a catch-up (whose row
-            // has carried its edges since its mint) share it.
-            //
-            // Both probes are skipped entirely when an explicit anchor is
-            // supplied: the override wins absolutely, so they could only
-            // spend two round-trips on values nothing reads.
-            let (is_referenced_descendant, first_seen_at) = match quarantine_anchor_override {
-                Some(_) => (false, None),
-                None => (
-                    resolve_referenced_tree_descendant_fail_safe(
-                        &*self.content_references,
-                        repository_id,
-                        artifact_id,
-                        &artifact.sha256_checksum,
-                    )
-                    .await,
-                    read_content_age_evidence(&*self.artifacts, &artifact.sha256_checksum).await,
-                ),
-            };
-
-            // The SAME derivation `ingest_inner` runs, over the same
+            // The SAME assembly `ingest_inner` runs, over the same
             // sources — which is what makes the leader/follower asymmetry
             // disappear as a property of the model rather than as a patch
             // at each call site. A follower minting its row over
             // already-resident CAS content reads the same content-level
             // age evidence the leader read, so the two agree on the
             // anchor whichever of them won the dedup race.
+            //
+            // That includes the descendant carve-out's two halves — the
+            // TOPOLOGY question ("is this content already a
+            // `content_references` target of some OTHER already-ingested
+            // artifact in this repository") and the TRUST question ("is
+            // at least one of those referencing parents `Released`").
+            // Neither is a fact about the minting path, which is what
+            // lets the mint (whose edges ride the commit this feeds) and
+            // a catch-up (whose row has carried its edges since its mint)
+            // share one resolver: `is_referenced_tree_descendant` filters
+            // `primary_content` / `metadata_blob` out as
+            // self-referential, so the topology answers the same whether
+            // or not this artifact's own edges are written yet.
             //
             // It is also why a catch-up does not punish content that has
             // been resident for weeks with a fresh full window: the row's
@@ -5530,18 +5579,26 @@ impl IngestUseCase {
             // transit this model forbids — the opt-in is a per-mapping
             // trust statement, and an untrusted mirror's claim must not
             // shorten a repository proxying the genuine upstream.
-            let derived = derive_quarantine_anchor(&AnchorEvidence {
-                minted_at: now,
-                window: chrono::Duration::seconds(gate.effective_duration_secs),
-                // The seed-import cutover's backdated anchor. Absolute
-                // precedence: an explicit anchor is never overridden by a
-                // derived one, in either direction.
-                explicit_override: quarantine_anchor_override,
-                first_seen_at,
-                trusted_upstream_published_at: None,
-                is_referenced_descendant,
-            });
-            let anchor = derived.anchor;
+            let derived = derive_mint_anchor(
+                &*self.artifacts,
+                &*self.content_references,
+                MintEvidence {
+                    minted_at: now,
+                    window_secs: gate.effective_duration_secs,
+                    // The seed-import cutover's backdated anchor. Absolute
+                    // precedence: an explicit anchor is never overridden by
+                    // a derived one, in either direction — and it skips
+                    // both of the assembly's own probes, which could only
+                    // spend round-trips on values nothing reads.
+                    explicit_override: quarantine_anchor_override,
+                    trusted_upstream_published_at: None,
+                    repository_id,
+                    artifact_id,
+                    sha256: &artifact.sha256_checksum,
+                },
+            )
+            .await;
+            let anchor = derived.anchor();
             anchor_source = derived.source;
             let quarantine_event = artifact.quarantine(anchor)?;
             events.push(EventToAppend::new(DomainEvent::ArtifactQuarantined(
@@ -6055,7 +6112,7 @@ mod tests {
 
     use chrono::Utc;
     use metrics::{Key, SharedString};
-    use metrics_util::debugging::DebugValue;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use metrics_util::{CompositeKey, MetricKind};
 
     use hort_domain::entities::artifact::QuarantineStatus;
@@ -6163,8 +6220,7 @@ mod tests {
     /// without this seed.
     fn permissive_global_policy_projection() -> ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-            SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
@@ -6184,7 +6240,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -6512,6 +6567,17 @@ mod tests {
     /// for the small payloads these tests build.
     fn test_handler() -> StubFormatHandler {
         StubFormatHandler::new("pypi").with_max_bytes(10 * 1024 * 1024)
+    }
+
+    /// [`test_handler`] for a test that must reach the cascade-seed
+    /// enqueue: the stub admits `sample_coords`' sdist suffix as its
+    /// dependency document, which is half of the hook's gate (the
+    /// repository's `TransitiveDeps` trigger is the other half). The
+    /// default stub admits nothing, so a cascade test that did not say
+    /// this would be asserting over a refusal it did not mean to
+    /// configure.
+    fn test_handler_carrying_dependency_specs() -> StubFormatHandler {
+        test_handler().with_dependency_document_suffixes(vec![".tar.gz"])
     }
 
     fn sample_coords() -> ArtifactCoords {
@@ -7496,7 +7562,7 @@ mod tests {
         let repo_id = repo.id;
         let (
             uc,
-            _artifacts,
+            artifacts,
             _lifecycle,
             _storage,
             repos,
@@ -7512,14 +7578,14 @@ mod tests {
         policies.insert(required);
 
         // A `content_references` row naming these bytes as a member of an
-        // already-ingested parent makes this ingest a referenced-tree
-        // descendant, whose carve-out anchors the window so it is already
-        // over.
+        // already-ingested RELEASED parent makes this ingest a
+        // trust-inheriting referenced-tree descendant, whose carve-out
+        // anchors the window so it is already over.
         let content: &[u8] = b"held-descendant-bytes";
         let target_hash: ContentHash = sha256_of(content).parse().unwrap();
         content_references
             .insert(ContentReference {
-                source_artifact_id: Uuid::new_v4(),
+                source_artifact_id: seed_released_parent(&artifacts, repo_id),
                 target_content_hash: target_hash,
                 kind: "oci_index_member".into(),
                 metadata: serde_json::Value::Null,
@@ -7560,7 +7626,7 @@ mod tests {
     async fn ingest_quarantine_survives_a_failed_clearance_read() {
         let repo = pypi_repository();
         let repo_id = repo.id;
-        let (uc, _artifacts, _lifecycle, _storage, repos, policies, _jobs, content_refs, events) =
+        let (uc, artifacts, _lifecycle, _storage, repos, policies, _jobs, content_refs, events) =
             make_scan_gated_use_case_with_content_references();
         repos.insert(repo);
         let mut required = global_scan_policy();
@@ -7568,12 +7634,13 @@ mod tests {
         required.provenance_mode = ProvenanceMode::Required;
         policies.insert(required);
 
-        // Descendant carve-out → the derived window is already over, which
-        // is the only state that reaches the clearance read at all.
+        // Descendant carve-out off a released parent → the derived window
+        // is already over, which is the only state that reaches the
+        // clearance read at all.
         let content: &[u8] = b"descendant-with-a-broken-event-store";
         content_refs
             .insert(ContentReference {
-                source_artifact_id: Uuid::new_v4(),
+                source_artifact_id: seed_released_parent(&artifacts, repo_id),
                 target_content_hash: sha256_of(content).parse().unwrap(),
                 kind: "oci_index_member".into(),
                 metadata: serde_json::Value::Null,
@@ -10701,6 +10768,7 @@ mod tests {
                     negligible: 0,
                 },
                 findings_blob: None,
+                findings_blob_retained: None,
                 assessment: hort_domain::events::ScanAssessment::Analysed,
             }),
         )];
@@ -14205,6 +14273,40 @@ mod tests {
         artifacts.insert(a);
     }
 
+    /// Seed an already-ingested parent in `repo_id` at `status` and
+    /// return its id, for use as a `content_references` row's
+    /// `source_artifact_id`.
+    ///
+    /// The descendant carve-out is conditional on inherited trust
+    /// (ADR 0007): the window is waived only for a target of which at
+    /// least one referencing parent is itself `Released`. So a test about
+    /// the waived window has to put a real parent row behind the edge,
+    /// and a test about the full window states the parent's status
+    /// instead of leaving the row absent.
+    ///
+    /// The parent carries its own checksum and path so it is neither
+    /// age evidence for the descendant nor a path collision with it.
+    fn seed_parent(
+        artifacts: &MockArtifactRepository,
+        repo_id: Uuid,
+        status: QuarantineStatus,
+    ) -> Uuid {
+        let mut parent = sample_artifact(status);
+        parent.repository_id = repo_id;
+        parent.path = format!("parents/{}/manifest.json", parent.id);
+        parent.sha256_checksum = sha256_of(format!("parent-manifest-{}", parent.id).as_bytes())
+            .parse()
+            .expect("valid sha256 hex");
+        let id = parent.id;
+        artifacts.insert(parent);
+        id
+    }
+
+    /// [`seed_parent`] at the one status that grants the carve-out.
+    fn seed_released_parent(artifacts: &MockArtifactRepository, repo_id: Uuid) -> Uuid {
+        seed_parent(artifacts, repo_id, QuarantineStatus::Released)
+    }
+
     /// Build the ProtocolNative request the tests below ingest through,
     /// varying only the two publish-time knobs.
     fn native_req(
@@ -14526,11 +14628,11 @@ mod tests {
             ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
 
-            // An already-ingested parent references this hash — the
-            // carve-out applies.
+            // An already-ingested RELEASED parent references this hash —
+            // the carve-out applies.
             content_refs
                 .insert(ContentReference {
-                    source_artifact_id: Uuid::new_v4(),
+                    source_artifact_id: seed_released_parent(&artifacts, repo_id),
                     target_content_hash: target_hash,
                     kind: "oci_index_member".into(),
                     metadata: serde_json::Value::Null,
@@ -14561,21 +14663,27 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // #46 Item 2 — referenced-tree descendant zero-window carve-out
+    // Referenced-tree descendant zero-window carve-out
     //
-    // A scoped carve-out of ADR 0007 (design doc §4 final shape + §4a): a
-    // `content_references` TARGET (a referenced-tree descendant) gets its
-    // quarantine anchor backdated so the live-computed deadline
-    // (`anchor + duration`) equals `ingested_at` — a zero-length window —
-    // while the RELEASE PREDICATE stays completely untouched (still
-    // requires the descendant's own `ScanSucceeded`/`ScanWaived`
-    // authority; see `record_scan_result_zero_window_descendant_with_findings_still_rejects`
-    // in `quarantine_use_case.rs` for the fail-closed-intact proof). The
-    // four tests below pin: target → zero window; non-target → full
+    // A scoped carve-out of ADR 0007, conditional on inherited trust: a
+    // `content_references` TARGET of which at least one referencing
+    // parent is itself `Released` gets its quarantine anchor backdated so
+    // the live-computed deadline (`anchor + duration`) equals
+    // `ingested_at` — a zero-length window — while the RELEASE PREDICATE
+    // stays completely untouched (still requires the descendant's own
+    // `ScanSucceeded`/`ScanWaived` authority; see
+    // `record_scan_result_zero_window_descendant_with_findings_still_rejects`
+    // in `quarantine_use_case.rs` for the fail-closed-intact proof).
+    //
+    // The first two tests below are the decision, as the two anchors an
+    // operator can observe: released parent → zero window, held parent →
+    // full window. The rest pin the surrounding shape — non-target → full
     // window; the `primary_content`/`metadata_blob` self-reference
     // exclusion (the bug a naive "any kind" check would introduce, since
     // every artifact's own ingest writes a self-targeting
-    // `primary_content` row); and the lookup-failure fail-safe.
+    // `primary_content` row); and the lookup-failure fail-safe. Every arm
+    // and error direction of the resolver itself is driven in
+    // `referenced_descendant.rs`, against the same mocks.
     // ---------------------------------------------------------------------
 
     /// A `content_references` target (an already-ingested parent
@@ -14595,7 +14703,7 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (
                 uc,
-                _artifacts,
+                artifacts,
                 _lifecycle,
                 _storage,
                 repos,
@@ -14606,12 +14714,14 @@ mod tests {
             ) = make_scan_gated_use_case_with_content_references();
             repos.insert(repo);
 
-            // Simulate an already-ingested parent (e.g. an OCI index)
-            // referencing this artifact's hash BEFORE this artifact is
-            // ingested — exactly the shape #46 Item 1 writes.
+            // Simulate an already-ingested, already-RELEASED parent (e.g.
+            // an OCI index an operator released) referencing this
+            // artifact's hash BEFORE this artifact is ingested — exactly
+            // the shape the OCI membership-edge writers produce, plus the
+            // inherited trust the carve-out is conditional on.
             content_refs
                 .insert(ContentReference {
-                    source_artifact_id: Uuid::new_v4(),
+                    source_artifact_id: seed_released_parent(&artifacts, repo_id),
                     target_content_hash: target_hash,
                     kind: "oci_index_member".into(),
                     metadata: serde_json::Value::Null,
@@ -14645,6 +14755,147 @@ mod tests {
                  (between {before:?} and {after:?}) — a zero-length window"
             );
         });
+    }
+
+    /// The other half of the decision, and the same fixture with one
+    /// field changed: the referencing parent is still `Quarantined`, so
+    /// there is no trust to inherit and the descendant keeps the FULL
+    /// window — anchored at `ingested_at`, not backdated.
+    ///
+    /// This is the cold-pull shape. An index and its children are minted
+    /// seconds apart against the same advisory data, with the index's own
+    /// window still running, so the descendant's first-touch scan is not
+    /// "fresher than an assessment the operator already trusted" — there
+    /// is no such assessment. Pre-amendment this artifact was served by
+    /// digest while its own index answered `503`.
+    #[test]
+    fn ingest_direct_held_parent_keeps_the_full_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"child-manifest-of-a-held-index";
+        let target_hash: ContentHash = sha256_of(content).parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (
+                uc,
+                artifacts,
+                _lifecycle,
+                _storage,
+                repos,
+                _policies,
+                _jobs,
+                content_refs,
+                _events,
+            ) = make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: seed_parent(
+                        &artifacts,
+                        repo_id,
+                        QuarantineStatus::Quarantined,
+                    ),
+                    target_content_hash: target_hash,
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let artifact = uc
+                .ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                .await
+                .unwrap()
+                .artifact;
+            let after = Utc::now();
+
+            assert_eq!(artifact.quarantine_status, QuarantineStatus::Quarantined);
+            let anchor = artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under Default policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "a descendant of a HELD parent must keep the full window — the anchor \
+                 must be the ingest timestamp, not backdated by a duration: \
+                 {anchor:?} not in [{before:?}, {after:?}]"
+            );
+        });
+    }
+
+    /// The zero-window fire is the one anchor an operator is told about
+    /// on its own line, and the line has to name the condition that
+    /// produced it: `anchor_source = "referenced_descendant"` with a
+    /// message saying a RELEASED referencing parent's trust was
+    /// inherited. Without this the only operator-visible account of the
+    /// carve-out is a message describing the pre-amendment rule.
+    #[test]
+    fn ingest_direct_zero_window_logs_the_inherited_trust_condition() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"logged-descendant-bytes";
+        let target_hash: ContentHash = sha256_of(content).parse().unwrap();
+
+        let (_, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("current-thread runtime");
+            rt.block_on(async {
+                let (
+                    uc,
+                    artifacts,
+                    _lifecycle,
+                    _storage,
+                    repos,
+                    _policies,
+                    _jobs,
+                    content_refs,
+                    _events,
+                ) = make_scan_gated_use_case_with_content_references();
+                repos.insert(repo);
+                content_refs
+                    .insert(ContentReference {
+                        source_artifact_id: seed_released_parent(&artifacts, repo_id),
+                        target_content_hash: target_hash,
+                        kind: "oci_index_member".into(),
+                        metadata: serde_json::Value::Null,
+                        repository_id: repo_id,
+                        recorded_at: Utc::now(),
+                    })
+                    .await
+                    .unwrap();
+                uc.ingest_direct(req(repo_id), content_stream(content), &test_handler())
+                    .await
+                    .unwrap()
+                    .artifact
+            })
+        });
+
+        let lines: Vec<_> = captured
+            .iter()
+            .filter(|e| {
+                e.target.starts_with("hort_app::use_cases::ingest_use_case")
+                    && e.fields.get("anchor_source").map(String::as_str)
+                        == Some("referenced_descendant")
+            })
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the zero-window fire must be reported exactly once: {captured:#?}"
+        );
+        assert!(
+            lines[0].message().contains("RELEASED"),
+            "the line must say the waiver rests on a released referencing parent, \
+             not merely on being a target: {:#?}",
+            lines[0]
+        );
     }
 
     /// A non-target artifact (no `content_references` row targets its
@@ -16262,8 +16513,7 @@ mod tests {
     /// awkward and the body is small.
     fn global_scan_policy() -> ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement,
-            SeverityThreshold,
+            NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
@@ -16283,7 +16533,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -16717,9 +16966,13 @@ mod tests {
             // doesn't trip the test fixture's mock.
             seed_permissive_global_policy(&policy_projections);
 
-            uc.ingest_direct(req(repo_id), content_stream(b"x"), &test_handler())
-                .await
-                .expect("ingest");
+            uc.ingest_direct(
+                req(repo_id),
+                content_stream(b"x"),
+                &test_handler_carrying_dependency_specs(),
+            )
+            .await
+            .expect("ingest");
 
             let enqueue_calls = jobs.enqueue_calls();
             let cascade_calls: Vec<_> = enqueue_calls
@@ -16874,9 +17127,14 @@ mod tests {
                 upstream_published_at: None,
                 trust_upstream_publish_time: false,
             };
-            uc.ingest_verified(req, &[], content_stream(content), &test_handler())
-                .await
-                .expect("verified ingest");
+            uc.ingest_verified(
+                req,
+                &[],
+                content_stream(content),
+                &test_handler_carrying_dependency_specs(),
+            )
+            .await
+            .expect("verified ingest");
 
             let cascade_calls: Vec<_> = jobs
                 .enqueue_calls()
@@ -16914,9 +17172,14 @@ mod tests {
             let hash: ContentHash = ZERO_HASH.parse().unwrap();
             storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
 
-            uc.register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
-                .await
-                .expect("register_by_hash must succeed");
+            uc.register_by_hash(
+                req_legacy(repo_id),
+                hash,
+                None,
+                &test_handler_carrying_dependency_specs(),
+            )
+            .await
+            .expect("register_by_hash must succeed");
 
             let cascade_calls: Vec<_> = jobs
                 .enqueue_calls()
@@ -16952,6 +17215,257 @@ mod tests {
                 jobs.enqueue_priorities()[0] < scan_queue_priority(REGISTER_BY_HASH_TRIGGER_SOURCE),
                 "a mount's warm-up walk must not outrank the gates the mount itself is \
                  waiting on"
+            );
+        });
+    }
+
+    // =====================================================================
+    // Cascade-seed gate: the artifact has to BE the dependency document
+    // =====================================================================
+    //
+    // The trigger is the repository's opt-in; it says the operator wants
+    // dependency closures warmed. It does not say that THIS artifact
+    // declares any. A Maven repository holds far more jars than poms,
+    // and a root `prefetch-dependencies` job over a jar can only fail —
+    // the extractor reads the POM's own bytes and reports `Err` for
+    // anything whose root element is not `<project>`. So the enqueue
+    // asks the format first, through
+    // `VersionDiscovery::path_carries_dependency_specs`.
+    //
+    // `hort-app` cannot name `MavenFormatHandler` (the dependency
+    // direction forbids `hort-formats` here), so these tests stand a
+    // `StubFormatHandler` in its place with the same answer shape —
+    // `.pom` admitted, everything else refused. The real handler's own
+    // answers are pinned in `hort-formats`
+    // (`maven::tests::path_carries_dependency_specs_*` and the
+    // cross-format `version_discovery_participation` guard).
+
+    /// A maven-shaped stub: the POM is the dependency document, nothing
+    /// else a coordinate's directory holds is.
+    fn maven_shaped_handler() -> StubFormatHandler {
+        StubFormatHandler::new("maven")
+            .with_dependency_document_suffixes(vec![".pom"])
+            .with_max_bytes(10 * 1024 * 1024)
+    }
+
+    /// A Maven repository carrying the `TransitiveDeps` trigger — the
+    /// configuration the defect was reported on. The format is Maven
+    /// rather than inherited from `pypi_repository` so the skip
+    /// counter's `format` label reads the way an operator would see it.
+    fn maven_repo_with_transitive_deps_trigger() -> Repository {
+        let mut repo = repo_with_transitive_deps_trigger();
+        repo.format = RepositoryFormat::Maven;
+        repo
+    }
+
+    /// Maven-format coords at `path` — the one input the gate reads,
+    /// with the format matching the repository above (ingest refuses a
+    /// coords/repository format mismatch before it reaches the hook).
+    fn maven_coords_at(path: &str) -> ArtifactCoords {
+        ArtifactCoords {
+            path: path.into(),
+            format: RepositoryFormat::Maven,
+            ..sample_coords()
+        }
+    }
+
+    fn req_at_path(repo_id: Uuid, path: &str) -> DirectIngestRequest {
+        DirectIngestRequest {
+            coords: maven_coords_at(path),
+            ..req(repo_id)
+        }
+    }
+
+    fn cascade_enqueues(jobs: &MockJobsRepository) -> usize {
+        jobs.enqueue_calls()
+            .iter()
+            .filter(|(kind, _, _)| kind == PREFETCH_DEPENDENCIES_KIND)
+            .count()
+    }
+
+    /// The reported defect, in one test: a `.jar` ingest on a repository
+    /// with the `TransitiveDeps` trigger seeds NO cascade root, and the
+    /// skip is counted rather than logged.
+    #[test]
+    fn cascade_seed_refused_for_an_artifact_that_is_not_the_dependency_document() {
+        let repo = maven_repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let jobs = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (uc, _artifacts, _lifecycle, _storage, repos, policy_projections, jobs) =
+                        make_scan_gated_use_case();
+                    repos.insert(repo);
+                    seed_permissive_global_policy(&policy_projections);
+
+                    uc.ingest_direct(
+                        req_at_path(repo_id, "com/example/lib/1.0.0/lib-1.0.0.jar"),
+                        content_stream(b"PK\x03\x04 not a pom"),
+                        &maven_shaped_handler(),
+                    )
+                    .await
+                    .expect("the ingest itself must still succeed");
+                    jobs
+                })
+        });
+
+        let enqueue_calls = jobs.enqueue_calls();
+        assert_eq!(
+            cascade_enqueues(&jobs),
+            0,
+            "a jar declares no dependencies, so there is nothing for a \
+             prefetch-dependencies walk to read and no job may be enqueued; \
+             got {enqueue_calls:?}"
+        );
+
+        // Counted on the format axis, so an operator who enabled the
+        // trigger and sees no cascade can tell "nothing was warmable"
+        // from "the hook is broken".
+        let snap = snapshotter.snapshot().into_vec();
+        let skipped = snap
+            .iter()
+            .find(|(ck, _, _, _)| {
+                ck.kind() == MetricKind::Counter
+                    && ck.key().name() == "hort_prefetch_cascade_seed_skipped_total"
+                    && ck
+                        .key()
+                        .labels()
+                        .any(|l| l.key() == labels::FORMAT && l.value() == "maven")
+            })
+            .expect("hort_prefetch_cascade_seed_skipped_total{format=maven} must fire");
+        let value = &skipped.3;
+        assert!(
+            matches!(value, DebugValue::Counter(1)),
+            "the refusal is counted exactly once per refused artifact; got {value:?}"
+        );
+    }
+
+    /// The other direction, same coordinate: the `.pom` IS the document,
+    /// so it seeds exactly one root — and the skip counter stays silent,
+    /// which is what separates "gated correctly" from "gated always".
+    #[test]
+    fn cascade_seed_fires_for_the_pom_of_the_same_coordinate() {
+        let repo = maven_repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        let jobs = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let (uc, _artifacts, _lifecycle, _storage, repos, policy_projections, jobs) =
+                        make_scan_gated_use_case();
+                    repos.insert(repo);
+                    seed_permissive_global_policy(&policy_projections);
+
+                    uc.ingest_direct(
+                        req_at_path(repo_id, "com/example/lib/1.0.0/lib-1.0.0.pom"),
+                        content_stream(b"<project/>"),
+                        &maven_shaped_handler(),
+                    )
+                    .await
+                    .expect("ingest");
+                    jobs
+                })
+        });
+
+        assert_eq!(
+            cascade_enqueues(&jobs),
+            1,
+            "the POM of the same coordinate still seeds the cascade",
+        );
+        assert!(
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .iter()
+                .all(|(ck, _, _, _)| ck.key().name() != "hort_prefetch_cascade_seed_skipped_total"),
+            "nothing was skipped, so the skip counter must not fire",
+        );
+    }
+
+    /// A format that declares no `VersionDiscovery` group at all (oci,
+    /// helm, rpm, debian, generic) seeds nothing, however the policy is
+    /// configured: there is no `extract_dependency_specs` for a walk to
+    /// call, so the root job it would claim has no reachable outcome.
+    ///
+    /// Apply-time linting already refuses the `transitive_deps` trigger
+    /// on such a format, which makes this the second layer — reached by
+    /// a projection written before that rule, or by any route to a
+    /// policy that does not transit a gitops apply.
+    #[test]
+    fn cascade_seed_refused_for_a_format_with_no_version_discovery_group() {
+        let repo = repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, _storage, repos, policy_projections, jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            seed_permissive_global_policy(&policy_projections);
+
+            let handler = StubFormatHandler::new("oci")
+                .without_version_discovery()
+                .with_max_bytes(10 * 1024 * 1024);
+            assert!(
+                handler.version_discovery().is_none(),
+                "the premise: this stub stands for a non-participating format",
+            );
+
+            uc.ingest_direct(req(repo_id), content_stream(b"x"), &handler)
+                .await
+                .expect("ingest");
+
+            let enqueue_calls = jobs.enqueue_calls();
+            assert_eq!(
+                cascade_enqueues(&jobs),
+                0,
+                "a format with no VersionDiscovery group has no extractor for the walk to \
+                 call, so the trigger alone cannot seed a root; got {enqueue_calls:?}"
+            );
+        });
+    }
+
+    /// The gate reaches the SECOND producer of a cascade root too.
+    /// `register_by_hash` (the OCI cross-repository blob mount and the
+    /// pull-dedup followers) carried its own copy of this hook; a copy
+    /// is how the two stop agreeing, so it now delegates to the same
+    /// method and inherits the same refusal.
+    #[test]
+    fn cascade_seed_gate_also_governs_register_by_hash() {
+        let repo = maven_repo_with_transitive_deps_trigger();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _lifecycle, storage, repos, policy_projections, jobs) =
+                make_scan_gated_use_case();
+            repos.insert(repo);
+            seed_permissive_global_policy(&policy_projections);
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"mounted bytes".to_vec());
+
+            let req = IngestRequest {
+                coords: maven_coords_at("com/example/lib/1.0.0/lib-1.0.0.jar"),
+                ..req_legacy(repo_id)
+            };
+            uc.register_by_hash(req, hash, None, &maven_shaped_handler())
+                .await
+                .expect("register_by_hash must succeed");
+
+            let enqueue_calls = jobs.enqueue_calls();
+            assert_eq!(
+                cascade_enqueues(&jobs),
+                0,
+                "the mount of a jar seeds no cascade either; got {enqueue_calls:?}"
             );
         });
     }
@@ -17619,7 +18133,7 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (
                 uc,
-                _artifacts,
+                artifacts,
                 _lifecycle,
                 storage,
                 repos,
@@ -17637,10 +18151,11 @@ mod tests {
 
             // Exactly the shape the OCI manifest-PUT path writes for an
             // index's children, and the one the coalesced-follower leg
-            // then registers against.
+            // then registers against — with the index already released,
+            // which is what the carve-out is conditional on.
             content_refs
                 .insert(ContentReference {
-                    source_artifact_id: Uuid::new_v4(),
+                    source_artifact_id: seed_released_parent(&artifacts, repo_id),
                     target_content_hash: hash.clone(),
                     kind: "oci_index_member".into(),
                     metadata: serde_json::Value::Null,
@@ -17677,6 +18192,59 @@ mod tests {
         });
     }
 
+    /// …and the held-parent half of the decision reaches the same answer
+    /// on this path too. The condition is a fact about the repository,
+    /// not about the minting path, so a coalesced follower registering a
+    /// constituent of a still-held index gets the full window exactly as
+    /// the leader's `ingest_inner` would give it.
+    #[test]
+    fn register_by_hash_held_parent_keeps_the_full_window() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, artifacts, _lifecycle, storage, repos, policies, _jobs, content_refs, _events) =
+                make_scan_gated_use_case_with_content_references();
+            repos.insert(repo);
+            policies.insert(global_scan_policy());
+            let hash: ContentHash = ZERO_HASH.parse().unwrap();
+            storage.insert_content(hash.clone(), b"child of a held index".to_vec());
+
+            content_refs
+                .insert(ContentReference {
+                    source_artifact_id: seed_parent(
+                        &artifacts,
+                        repo_id,
+                        QuarantineStatus::Quarantined,
+                    ),
+                    target_content_hash: hash.clone(),
+                    kind: "oci_index_member".into(),
+                    metadata: serde_json::Value::Null,
+                    repository_id: repo_id,
+                    recorded_at: Utc::now(),
+                })
+                .await
+                .unwrap();
+
+            let before = Utc::now();
+            let outcome = uc
+                .register_by_hash(req_legacy(repo_id), hash, None, &test_handler())
+                .await
+                .expect("registering a constituent of a held parent must succeed");
+            let after = Utc::now();
+
+            let anchor = outcome
+                .artifact
+                .quarantine_window_start
+                .expect("quarantine_window_start set under a duration>0 policy");
+            assert!(
+                anchor >= before && anchor <= after,
+                "a descendant of a HELD parent must keep the full window on the \
+                 registration path too: {anchor:?} not in [{before:?}, {after:?}]"
+            );
+        });
+    }
+
     /// The seed-import cutover's explicit backdated anchor keeps absolute
     /// precedence: a descendant edge must NOT displace it, in either
     /// direction. Pins the `Some(seed_anchor)` arm of the precedence
@@ -17689,7 +18257,7 @@ mod tests {
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let (
                 uc,
-                _artifacts,
+                artifacts,
                 _lifecycle,
                 storage,
                 repos,
@@ -17703,9 +18271,12 @@ mod tests {
             let hash: ContentHash = ZERO_HASH.parse().unwrap();
             storage.insert_content(hash.clone(), b"seeded child manifest".to_vec());
 
+            // A released parent, so the carve-out genuinely applies and
+            // the override is beating a live rule rather than an inert
+            // one.
             content_refs
                 .insert(ContentReference {
-                    source_artifact_id: Uuid::new_v4(),
+                    source_artifact_id: seed_released_parent(&artifacts, repo_id),
                     target_content_hash: hash.clone(),
                     kind: "oci_index_member".into(),
                     metadata: serde_json::Value::Null,
@@ -17850,7 +18421,7 @@ mod tests {
     /// A provenance policy projection (global scope) at the requested mode.
     fn provenance_policy(mode: ProvenanceMode) -> ScanPolicyProjection {
         use hort_domain::entities::scan_policy::{
-            CompositeVerdictMode, NegligibleAction, ScanEnforcement, SeverityThreshold,
+            NegligibleAction, ScanEnforcement, SeverityThreshold,
         };
         use hort_domain::events::PolicyScope;
         ScanPolicyProjection {
@@ -17879,7 +18450,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: Utc::now(),
             updated_at: Utc::now(),

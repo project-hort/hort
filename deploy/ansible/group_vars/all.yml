@@ -9,7 +9,18 @@ registry_fqdn: registry.hort.rs
 # Container images — override per-host or in group_vars/production/.
 hort_server_image: ghcr.io/project-hort/hort-server:latest
 hort_worker_image: ghcr.io/project-hort/hort-worker:latest
-postgres_image: postgres:15
+# Podman flavour only — the native flavour installs PostgreSQL from Debian apt
+# and pulls no image. Alpine (musl), not the Debian (glibc) tag: the glibc
+# images add an unfixable libxml2 CRITICAL and a much larger HIGH surface. The
+# base supplies the C library behind PostgreSQL's collations, so a host data
+# directory (hort_postgres_data_dir) first initdb'd under a glibc image needs
+# its collation-dependent indexes rebuilt (`REINDEX`) after this switch — this
+# variable sets the default and nothing here migrates the directory for you.
+# Ownership, by contrast, is handled: the `postgres` uid differs between the
+# bases (999 on Debian, 70 on Alpine), and the quadlet bind-mounts the data
+# directory with `:U`, so Podman re-chowns it to the container's uid on first
+# start. That walk costs time proportional to the directory's size.
+postgres_image: postgres:15-alpine
 
 # hort_version selects which native-flavor release binary is downloaded (the
 # Podman flavor uses the OCI image tags above instead). It is NOT pinned here —

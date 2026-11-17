@@ -36,6 +36,34 @@
 //! in dry-run mode. No new metrics are introduced; the handler returns
 //! `result_summary` JSON only.
 //!
+//! # One repository, or every one
+//!
+//! An invocation may name a repository
+//! (`hort_domain::events::task_invocation_repository_scope` reads it out
+//! of the params), and the run then evaluates only that repository's
+//! artifact rows. That is what lets a destructive authority held for one
+//! repository run retention for it: the enqueue gate asks
+//! `authorize(actor, DestroyContent, Some(repository_id))` for a scoped
+//! invocation, and this handler reads the scope back through the **same
+//! domain call**, so the repository the run was authorized for and the
+//! repository it evaluates cannot be two different repositories.
+//!
+//! The scope bounds *which artifact rows are evaluated* and nothing
+//! else. Content is shared across repositories by construction — that is
+//! what CAS is — so the one way a scoped run could reach past its
+//! boundary is a blob a second repository still references. It does not:
+//! this sweep only appends `ArtifactExpired`, and the bytes go in the
+//! separate purge stage behind a refcount check over
+//! `content_references` (visible as `blobs_kept` / `blobs_deferred` in
+//! that sweep's summary). A dry run reports the same thing through
+//! `preview.freed_bytes`, whose simulation asks the same question: a
+//! hash another repository's live artifact points at is not reclaimable
+//! and contributes nothing to the figure.
+//!
+//! An unscoped invocation — the shipped CronJob's `{}` body — is the
+//! instance-wide sweep and behaves exactly as it did before the scope
+//! existed, including its rotation (below).
+//!
 //! # Cross-tick rotation
 //!
 //! One run evaluates at most `MAX_BATCHES_PER_TICK * BATCH_SIZE`
@@ -87,6 +115,17 @@
 //!   same decision it would have reached earlier. The same bound covers
 //!   a policy activated mid-pass: it reaches the artifacts behind the
 //!   cursor on the following pass.
+//!
+//! **The rotation position is the instance-wide sweep's own state.** A
+//! scoped run neither resumes from it nor advances it: it walks its
+//! repository from the beginning every time and writes the position back
+//! exactly as it read it. Resuming from it would leave every artifact
+//! below it in the scoped repository unreachable until the instance-wide
+//! pass wrapped; advancing it would move the window the instance-wide
+//! execution is working through. One run's stride
+//! (`MAX_BATCHES_PER_TICK * BATCH_SIZE`) covers a repository at any size
+//! a deployment holds, and a scoped run that does reach the cap reports
+//! `partial` coverage rather than claiming it saw everything.
 //!
 //! **A dry run is an observation and leaves the rotation where it found
 //! it.** `dry_run` takes no per-UTC-day single-flight claim (ADR 0028),
@@ -154,7 +193,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use hort_domain::error::{DomainError, DomainResult};
+use hort_domain::error::DomainResult;
+use hort_domain::events::task_invocation_repository_scope;
 use hort_domain::ports::jobs_repository::JobsRepository;
 use hort_domain::ports::retention_candidate_reader::RetentionCandidateReader;
 use hort_domain::ports::retention_policy_projection_repository::RetentionPolicyProjectionRepository;
@@ -164,7 +204,7 @@ use hort_domain::ports::retention_preview::{
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
-use hort_domain::retention::RetentionEvaluationMode;
+use hort_domain::retention::{HeldState, RetentionEvaluationMode};
 use hort_domain::types::ContentHash;
 
 use crate::use_cases::retention_use_case::{
@@ -443,11 +483,50 @@ impl TaskHandler for RetentionEvaluateHandler {
                 Err(message) => return Ok(TaskOutcome::fail(message, false)),
             };
 
+            // **The single resolution of the repository scope** — one
+            // call to the domain's one reader of the convention, which
+            // is literally the same call
+            // `TaskUseCase::authorize_kind` made to decide which
+            // repository the destructive authority was asked about, and
+            // the same call `DestructiveTaskReauthorizer` made before
+            // this handler was reached. Nothing else in this run reads
+            // the params for a repository, so the repository this run
+            // was authorized for and the repository it evaluates are
+            // one value.
+            //
+            // An unreadable scope fails the run without a retry: the
+            // params are fixed on the row, so a retry reaches the same
+            // dead end, and the one thing this must not do is treat it
+            // as the instance-wide sweep.
+            let scope = match task_invocation_repository_scope(self.kind(), params) {
+                Ok(scope) => scope,
+                Err(err) => return Ok(TaskOutcome::fail(err.to_string(), false)),
+            };
+
             // Read before the policy check, so that an execution's own
             // walk is the only thing that ever moves the sweep's
             // position: every other completing path below writes back
             // the value read here unchanged.
-            let resume_after = self.read_cursor().await;
+            let persisted_cursor = self.read_cursor().await;
+
+            // The rotation position belongs to the **instance-wide**
+            // sweep, and a scoped run is not that sweep: it starts at
+            // the beginning of its own repository every time and writes
+            // the position back exactly as it read it (see
+            // `next_cursor` below). Resuming from the instance-wide
+            // position instead would leave every artifact below it in
+            // the scoped repository unreachable until the instance-wide
+            // pass happened to wrap, and advancing it would move the
+            // window the instance-wide execution is working through —
+            // the same reason a dry run echoes it. One run's stride
+            // covers a repository at any size a deployment holds, and a
+            // run that does hit the cap reports `partial` coverage
+            // rather than claiming it saw everything.
+            let resume_after = if scope.is_some() {
+                None
+            } else {
+                persisted_cursor
+            };
 
             let policies = match self.policies.list_active().await {
                 Ok(p) => p,
@@ -468,12 +547,14 @@ impl TaskHandler for RetentionEvaluateHandler {
                     result_summary: json!({
                         "policies": 0,
                         "mode": mode.as_str(),
+                        "repository_id": scope,
                         "coverage": "complete",
-                        "cursor": resume_after,
+                        "cursor": persisted_cursor,
                         "evaluated": 0,
                         "expired": 0,
                         "already_expired": 0,
                         "skipped_protected": 0,
+                        "skipped_unanchored_held_state": 0,
                         "skipped_stale_scan": 0,
                         "errors": 0,
                         "preview": if mode == RetentionEvaluationMode::DryRun {
@@ -502,6 +583,37 @@ impl TaskHandler for RetentionEvaluateHandler {
                 });
             }
 
+            // The held states this sweep admits into the enumeration:
+            // the union of every active policy's opt-in. A union is the
+            // right granularity and the only available one — the
+            // candidate query takes no policy, so it cannot know which
+            // policy a held artifact would be evaluated against. What
+            // it widens is who is *looked at*; which policy may expire
+            // which state stays the evaluator's decision, taken
+            // per-policy against the artifact's own stream.
+            //
+            // Empty unless some policy opted in, and that matters
+            // beyond tidiness: widening the shared query
+            // unconditionally is not decision-inert, because held rows
+            // consume slots in a bounded page and move the per-policy
+            // evaluated / skipped counters even when nothing could
+            // expire them.
+            let admit_held: Vec<HeldState> = {
+                let union: BTreeSet<HeldState> = policies
+                    .iter()
+                    .filter(|p| !p.archived)
+                    .flat_map(|p| p.held_states.iter().copied())
+                    .collect();
+                union.into_iter().collect()
+            };
+            if !admit_held.is_empty() {
+                tracing::info!(
+                    admit_held = ?admit_held,
+                    "retention-evaluate: at least one active policy opts in to a held \
+                     state — the candidate enumeration is widened to admit it"
+                );
+            }
+
             let mut total = EvaluateSummary::default();
             let mut matches = Vec::new();
             let mut cursor: Option<uuid::Uuid> = resume_after.map(|c| c.after_artifact_id);
@@ -512,7 +624,7 @@ impl TaskHandler for RetentionEvaluateHandler {
             for _ in 0..self.max_batches_per_tick {
                 let rows = match self
                     .candidates
-                    .list_candidates(self.batch_size, cursor, now)
+                    .list_candidates(self.batch_size, cursor, now, &admit_held, scope)
                     .await
                 {
                     Ok(r) => r,
@@ -584,8 +696,13 @@ impl TaskHandler for RetentionEvaluateHandler {
             // do and writes back the position it read, so previewing —
             // which takes no per-UTC-day claim and may happen any number
             // of times — cannot walk the rotation forward.
-            let next_cursor = if mode == RetentionEvaluationMode::DryRun {
-                resume_after
+            // A scoped run echoes the position for the same reason a
+            // dry run does — neither is the instance-wide execution
+            // whose progress the position records, and an operator
+            // reclaiming one repository must be able to do it without
+            // moving or resetting that window.
+            let next_cursor = if mode == RetentionEvaluationMode::DryRun || scope.is_some() {
+                persisted_cursor
             } else if pass_complete {
                 None
             } else {
@@ -598,10 +715,12 @@ impl TaskHandler for RetentionEvaluateHandler {
             // one that re-walked the same page.
             tracing::info!(
                 policies = policies.len(),
+                repository_scope = ?scope,
                 evaluated = total.evaluated,
                 expired = total.expired,
                 already_expired = total.already_expired,
                 skipped_protected = total.skipped_protected,
+                skipped_unanchored_held_state = total.skipped_unanchored_held_state,
                 skipped_stale_scan = total.skipped_stale_scan,
                 errors = total.errors,
                 resumed = resume_after.is_some(),
@@ -618,6 +737,11 @@ impl TaskHandler for RetentionEvaluateHandler {
             Ok(TaskOutcome::Completed {
                 result_summary: json!({
                     "mode": mode.as_str(),
+                    // What the run covered, beside what it did. A scoped
+                    // run's totals are about one repository, and a
+                    // reader who cannot tell that from the summary takes
+                    // them for the instance's.
+                    "repository_id": scope,
                     "coverage": if coverage_complete { "complete" } else { "partial" },
                     "cursor": next_cursor,
                     "policies": policies.len(),
@@ -625,6 +749,7 @@ impl TaskHandler for RetentionEvaluateHandler {
                     "expired": total.expired,
                     "already_expired": total.already_expired,
                     "skipped_protected": total.skipped_protected,
+                    "skipped_unanchored_held_state": total.skipped_unanchored_held_state,
                     "skipped_stale_scan": total.skipped_stale_scan,
                     "errors": total.errors,
                     "preview": preview,
@@ -719,7 +844,23 @@ impl RetentionEvaluateHandler {
         {
             Ok(RetentionContentSimulation::Exact(hashes)) => {
                 match sum_target_sizes(self.storage.as_ref(), hashes).await {
-                    Ok(bytes) => json!({ "status": "exact", "bytes": bytes }),
+                    // `exact` is reserved for a sum over every target, and
+                    // the literal zero in the pattern is what reserves it: a
+                    // figure that left a target out travels as `at_least`,
+                    // carrying the count that says how many are missing from
+                    // it. The common case keeps its shape on the wire.
+                    Ok(TargetSizes {
+                        bytes,
+                        unresolved_targets: 0,
+                    }) => json!({ "status": "exact", "bytes": bytes }),
+                    Ok(TargetSizes {
+                        bytes,
+                        unresolved_targets,
+                    }) => json!({
+                        "status": "at_least",
+                        "bytes": bytes,
+                        "unresolved_targets": unresolved_targets,
+                    }),
                     Err(reason) => json!({ "status": "omitted", "reason": reason }),
                 }
             }
@@ -836,62 +977,84 @@ fn proposal_digest(scope: &str, pairs: &ProposalPairs) -> serde_json::Value {
     })
 }
 
-/// Sum the stored size of every reclaimable target, or say why no sum may be
-/// reported. Fans the probes out [`SIZE_PROBE_CONCURRENCY`] at a time.
+/// What probing every reclaimable target's stored size established: the sum
+/// over the targets storage answered for, and how many it did not.
 ///
-/// # Why the two failure reasons are ranked rather than raced
+/// The two halves travel together because neither is interpretable alone.
+/// `bytes` is a total when `unresolved_targets` is zero and a lower bound
+/// otherwise, so the count is the only thing that says which — a consumer
+/// handed the figure without it is holding a floor it will render as a total.
+struct TargetSizes {
+    bytes: u64,
+    unresolved_targets: u64,
+}
+
+/// Sum the stored size of every reclaimable target, counting the targets
+/// storage did not answer for instead of abandoning the figure. Fans the
+/// probes out [`SIZE_PROBE_CONCURRENCY`] at a time.
 ///
-/// Concurrently, "the first error" is a property of the scheduler, not of the
-/// input: which of several failing probes lands first varies run to run, and
-/// so would the sentence the operator reads. Both failures are ranked instead,
-/// so the verdict is a function of the target set and the storage's answers
-/// alone and reproduces across runs:
+/// # A failed probe lowers the figure; it does not erase it
 ///
-/// 1. **A failed probe outranks everything.** It is not a preference: a failed
-///    probe means the set of measured targets is incomplete, and no claim
-///    about the total — including the claim that it overflowed — can be
-///    founded on addends that were never observed. The fan-out is abandoned
-///    the moment one probe fails, which also keeps a doomed preview from
-///    paying for the remaining round trips.
-/// 2. **Overflow is decided only over a complete set.** The accumulator is
-///    widened to `u128`, which cannot overflow for any input this path admits
-///    (at most [`MAX_SIMULATION_TARGETS`] addends below `2^64`, so below
-///    `2^81`), and the narrowing to `u64` happens once, at the end. Order
-///    therefore cannot change the answer: addition commutes, and the
-///    intermediate sums no longer have a ceiling to trip over. `saturating_add`
-///    keeps the impossible case impossible rather than a debug-build panic; a
-///    saturated total still fails the narrowing and is reported as an
-///    overflow.
+/// The sum over the targets that resolved is a lower bound on what a purge
+/// would free in **every** failure mode, which is why one count covers all of
+/// them and the two modes need not be ranked:
 ///
-/// A partial sum is never returned: the only `Ok` is a total over every
-/// target, narrowed without loss.
+/// - a target storage reports as **absent** frees nothing when purged anyway
+///   — [`StoragePort::delete`] is success-on-missing and the purge treats an
+///   already-absent blob as a clean no-op — so the sum is in fact exact for
+///   what would really be freed;
+/// - any **other** storage error leaves that target's size unknown and the
+///   object possibly present, so the sum is a genuine floor.
+///
+/// An informational figure must therefore degrade rather than vanish: one
+/// unanswered probe out of thousands used to suppress the whole number, which
+/// told an operator strictly less than the floor does. Each failure still
+/// emits its own `warn` naming its hash — the log is where an operator finds
+/// *which* objects, the count says *how many* — and the summary names no
+/// hash, because "whichever probe failed first" under a concurrent fan-out is
+/// a property of the scheduler rather than of the target set, and cannot tell
+/// one missing object from a thousand.
+///
+/// # Overflow is the one outcome with no number behind it
+///
+/// The accumulator is widened to `u128`, which cannot overflow for any input
+/// this path admits (at most [`MAX_SIMULATION_TARGETS`] addends below `2^64`,
+/// so below `2^81`), and the narrowing to `u64` happens once, at the end.
+/// Order therefore cannot change the answer: addition commutes, and the
+/// intermediate sums have no ceiling to trip over. `saturating_add` keeps the
+/// impossible case impossible rather than a debug-build panic; a saturated
+/// total still fails the narrowing.
+///
+/// A sum that does not fit in `u64` is the only `Err` this reports, and it
+/// outranks any count of unresolved targets — not as a preference, but
+/// because a floor that cannot be represented is not a floor anyone can read,
+/// and `u64::MAX` would be a saturated number dressed up as a sum.
 async fn sum_target_sizes(
     storage: &dyn StoragePort,
     hashes: Vec<ContentHash>,
-) -> Result<u64, String> {
+) -> Result<TargetSizes, String> {
     let mut probes = futures::stream::iter(hashes)
         .map(|hash| async move { (hash.clone(), storage.size_of(&hash).await) })
         .buffer_unordered(SIZE_PROBE_CONCURRENCY);
 
     let mut total: u128 = 0;
+    let mut unresolved_targets: u64 = 0;
     while let Some((hash, outcome)) = probes.next().await {
         match outcome {
             Ok(size) => total = total.saturating_add(u128::from(size)),
             Err(error) => {
                 tracing::warn!(hash = %hash, error = %error, "retention dry-run storage size lookup failed");
-                return Err(match error {
-                    DomainError::NotFound {
-                        entity: "content", ..
-                    } => {
-                        format!("reclaimable target {hash} is missing from storage")
-                    }
-                    _ => format!("storage did not answer for reclaimable target {hash}: {error}"),
-                });
+                unresolved_targets += 1;
             }
         }
     }
 
-    u64::try_from(total).map_err(|_| "byte total overflowed u64".to_string())
+    u64::try_from(total)
+        .map(|bytes| TargetSizes {
+            bytes,
+            unresolved_targets,
+        })
+        .map_err(|_| "byte total overflowed u64".to_string())
 }
 
 /// Phrase a bound rejection so the operator can act on it: which ceiling, what
@@ -918,6 +1081,7 @@ fn accumulate(
     total.expired += batch.summary.expired;
     total.already_expired += batch.summary.already_expired;
     total.skipped_protected += batch.summary.skipped_protected;
+    total.skipped_unanchored_held_state += batch.summary.skipped_unanchored_held_state;
     total.skipped_stale_scan += batch.summary.skipped_stale_scan;
     total.errors += batch.summary.errors;
     matches.extend(batch.matches);
@@ -1056,19 +1220,40 @@ mod tests {
     struct MockCandidates {
         pages: Mutex<Vec<Vec<RetentionCandidateRow>>>,
         err: Mutex<Option<DomainError>>,
+        /// What the handler asked the enumeration to admit, one entry
+        /// per call. The widening is the only way a held artifact can
+        /// reach the sweep at all, so a test that asserts the
+        /// *absence* of held candidates has to be able to see what was
+        /// requested rather than inferring it from an empty page.
+        admitted: Mutex<Vec<Vec<HeldState>>>,
+        /// The repository scope the handler asked for, one entry per
+        /// call. Recorded for the same reason `admitted` is: the
+        /// confinement is the adapter's to apply, so a handler-level
+        /// test can only see it by observing what was asked for.
+        scopes: Mutex<Vec<Option<Uuid>>>,
     }
     impl MockCandidates {
         fn new(pages: Vec<Vec<RetentionCandidateRow>>) -> Self {
             Self {
                 pages: Mutex::new(pages),
                 err: Mutex::new(None),
+                admitted: Mutex::new(Vec::new()),
+                scopes: Mutex::new(Vec::new()),
             }
         }
         fn failing() -> Self {
             Self {
                 pages: Mutex::new(Vec::new()),
                 err: Mutex::new(Some(DomainError::Invariant("boom".into()))),
+                admitted: Mutex::new(Vec::new()),
+                scopes: Mutex::new(Vec::new()),
             }
+        }
+        fn admitted(&self) -> Vec<Vec<HeldState>> {
+            self.admitted.lock().unwrap().clone()
+        }
+        fn scopes(&self) -> Vec<Option<Uuid>> {
+            self.scopes.lock().unwrap().clone()
         }
     }
     impl RetentionCandidateReader for MockCandidates {
@@ -1077,7 +1262,11 @@ mod tests {
             _b: u32,
             _after: Option<Uuid>,
             _now: DateTime<Utc>,
+            admit_held: &'a [HeldState],
+            repository_id: Option<Uuid>,
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
+            self.admitted.lock().unwrap().push(admit_held.to_vec());
+            self.scopes.lock().unwrap().push(repository_id);
             if let Some(e) = self.err.lock().unwrap().take() {
                 return Box::pin(async move { Err(e) });
             }
@@ -1088,6 +1277,16 @@ mod tests {
                 } else {
                     p.remove(0)
                 }
+            };
+            // The confinement is the adapter's; this double applies it
+            // so a handler test reads the rows a scoped run would
+            // actually be handed rather than every seeded row.
+            let next = match repository_id {
+                None => next,
+                Some(scope) => next
+                    .into_iter()
+                    .filter(|r| r.artifact.repository_id == scope)
+                    .collect(),
             };
             Box::pin(async move { Ok(next) })
         }
@@ -1177,11 +1376,15 @@ mod tests {
     struct InertStorage {
         sizes: std::collections::HashMap<ContentHash, u64>,
         fail_size: bool,
-        missing_size: Option<ContentHash>,
-        /// When set, only this target's probe fails and every other one
-        /// answers from `sizes`. Lets one run carry both a failing probe and
-        /// a sum that would overflow, which is what pins which verdict wins.
-        fail_only: Option<ContentHash>,
+        /// Targets whose probe answers `NotFound`.
+        missing_sizes: std::collections::HashSet<ContentHash>,
+        /// Targets whose probe answers a non-`NotFound` error; every other
+        /// one answers from `sizes`. A set rather than one hash because two
+        /// properties need more than a single failure: that a run can carry
+        /// failing probes *and* a sum that would overflow, which pins which
+        /// verdict wins, and that several failures report a count rather
+        /// than one of themselves.
+        unanswered: std::collections::HashSet<ContentHash>,
         /// How many `yield_now` points each probe passes before answering.
         /// Zero — the default — resolves on the first poll, which is what
         /// every test that is not about the fan-out wants. A non-zero value
@@ -1200,7 +1403,7 @@ mod tests {
         }
         fn missing(hash: ContentHash) -> Self {
             Self {
-                missing_size: Some(hash),
+                missing_sizes: [hash].into(),
                 ..Default::default()
             }
         }
@@ -1216,7 +1419,22 @@ mod tests {
         ) -> Self {
             Self {
                 sizes,
-                fail_only: Some(hash),
+                unanswered: [hash].into(),
+                ..Default::default()
+            }
+        }
+        /// Several unresolved targets at once, across both failure modes:
+        /// `missing` answers `NotFound`, `unanswered` answers some other
+        /// error, and every other target answers from `sizes`.
+        fn with_unresolved(
+            sizes: std::collections::HashMap<ContentHash, u64>,
+            missing: impl IntoIterator<Item = ContentHash>,
+            unanswered: impl IntoIterator<Item = ContentHash>,
+        ) -> Self {
+            Self {
+                sizes,
+                missing_sizes: missing.into_iter().collect(),
+                unanswered: unanswered.into_iter().collect(),
                 ..Default::default()
             }
         }
@@ -1266,13 +1484,13 @@ mod tests {
                     tokio::task::yield_now().await;
                 }
                 self.in_flight.fetch_sub(1, Ordering::SeqCst);
-                if self.missing_size.as_ref() == Some(&hash) {
+                if self.missing_sizes.contains(&hash) {
                     return Err(DomainError::NotFound {
                         entity: "content",
                         id: hash.to_string(),
                     });
                 }
-                if self.fail_size || self.fail_only.as_ref() == Some(&hash) {
+                if self.fail_size || self.unanswered.contains(&hash) {
                     return Err(DomainError::Invariant("size unavailable".into()));
                 }
                 Ok(self.sizes.get(&hash).copied().unwrap_or(0))
@@ -1335,12 +1553,79 @@ mod tests {
         }
     }
 
+    /// An age policy opting in to `states`, with a span long enough
+    /// that nothing in these fixtures matches — the handler tests are
+    /// about the enumeration request and the counters, not the match.
+    fn held_state_policy(states: &[HeldState]) -> RetentionPolicy {
+        RetentionPolicy::project(&[hort_domain::retention::RetentionPolicyEvent::Created {
+            id: Uuid::new_v4(),
+            name: "collect-held".into(),
+            predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(100 * 365 * 24 * 3600),
+            scope: hort_domain::retention::RetentionScope::AllRepos,
+            held_states: states.iter().copied().collect(),
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        }])
+        .expect("an age-bounded opt-in is valid")
+    }
+
+    /// **With no active policy opted in, the old enumeration runs.**
+    ///
+    /// Asserted on what the sweep *asked for* and on the counters, not
+    /// on the absence of an expiry: the hazard the empty default
+    /// guards against is not a wrong decision, it is held rows
+    /// consuming slots in a bounded page and moving the per-policy
+    /// counters in a deployment that opted in to nothing.
+    #[tokio::test]
+    async fn with_no_opt_in_the_enumeration_admits_no_held_state() {
+        let candidates = Arc::new(MockCandidates::new(vec![vec![]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates.clone(),
+        );
+        match h.run(&serde_json::Value::Null, ctx()).await.expect("Ok") {
+            TaskOutcome::Completed { result_summary } => {
+                assert_eq!(result_summary["skipped_protected"], 0);
+                assert_eq!(result_summary["skipped_unanchored_held_state"], 0);
+                assert_eq!(result_summary["evaluated"], 0);
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        assert_eq!(
+            candidates.admitted(),
+            vec![Vec::<HeldState>::new()],
+            "no policy opted in, so the enumeration is the pre-exception one"
+        );
+    }
+
+    /// The admitted set is the **union** over active policies, ordered
+    /// and de-duplicated, because the enumeration takes no policy and
+    /// the per-policy decision stays in the evaluator.
+    #[tokio::test]
+    async fn the_admitted_set_is_the_union_over_active_policies() {
+        let candidates = Arc::new(MockCandidates::new(vec![vec![]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![
+                held_state_policy(&[HeldState::Rejected]),
+                held_state_policy(&[HeldState::ScanIndeterminate, HeldState::Rejected]),
+                age_policy(),
+            ])),
+            candidates.clone(),
+        );
+        h.run(&serde_json::Value::Null, ctx()).await.expect("Ok");
+        assert_eq!(
+            candidates.admitted(),
+            vec![vec![HeldState::Rejected, HeldState::ScanIndeterminate]],
+            "the union, de-duplicated, in the enum's own order"
+        );
+    }
+
     fn age_policy() -> RetentionPolicy {
         // A pure-age policy that matches nothing here (artifacts are
         // UNIX_EPOCH..now; the evaluator's pure match is exercised by
         // the use-case's own tests — this handler test only asserts
         // orchestration counts + the projection/JSON shape).
         RetentionPolicy::project(&[hort_domain::retention::RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::new_v4(),
             name: "p".into(),
             predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(100 * 365 * 24 * 3600),
@@ -1354,6 +1639,7 @@ mod tests {
         let id = Uuid::new_v4();
         RetentionPolicy::project(&[
             hort_domain::retention::RetentionPolicyEvent::Created {
+                held_states: Default::default(),
                 id,
                 name: "archived".into(),
                 predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(1),
@@ -2039,25 +2325,63 @@ mod tests {
         );
     }
 
+    /// Nothing resolving is the boundary of the floor rather than a case of
+    /// its own: the sum over no answers is zero, and the count beside it is
+    /// what keeps that zero from reading as "nothing to free".
     #[tokio::test]
-    async fn preview_omits_bytes_when_storage_size_is_unavailable() {
-        let hash: ContentHash = "1111111111111111111111111111111111111111111111111111111111111111"
-            .parse()
-            .unwrap();
+    async fn a_run_where_no_probe_answers_reports_a_zero_floor_and_the_full_count() {
+        let targets: Vec<ContentHash> = (0..3).map(hash_n).collect();
         let h = preview_handler(
-            Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![hash]))),
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
             Arc::new(InertStorage::failing()),
         );
-        let omitted = h.build_preview(Utc::now(), &[]).await;
-        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
-        assert!(omitted["freed_bytes"]["reason"]
-            .as_str()
-            .unwrap()
-            .contains("size"));
+
+        let freed = h.build_preview(Utc::now(), &[]).await["freed_bytes"].clone();
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(freed["bytes"], 0, "{freed}");
+        assert_eq!(freed["unresolved_targets"], 3, "{freed}");
     }
 
+    /// The common case is the one real cost of adding a status, so pin its
+    /// shape and not only its value: an all-resolved run carries the two keys
+    /// it has always carried and no third one, so a consumer written against
+    /// the older wire reads it exactly as before.
     #[tokio::test]
-    async fn preview_distinguishes_missing_target_from_store_failure_without_partial_bytes() {
+    async fn every_target_resolving_keeps_the_shape_the_wire_already_had() {
+        let targets: Vec<ContentHash> = (0..3).map(hash_n).collect();
+        let sizes = targets
+            .iter()
+            .map(|t| (t.clone(), 7_u64))
+            .collect::<std::collections::HashMap<_, _>>();
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
+            Arc::new(InertStorage::with_sizes(sizes)),
+        );
+
+        let freed = h.build_preview(Utc::now(), &[]).await["freed_bytes"].clone();
+        assert_eq!(freed["status"], "exact");
+        assert_eq!(freed["bytes"], 21, "{freed}");
+        let keys: BTreeSet<&str> = freed
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            BTreeSet::from(["status", "bytes"]),
+            "an all-resolved run carries no count: {freed}"
+        );
+    }
+
+    /// Both failure modes support the same claim — the figure is a floor —
+    /// so both report it, and nothing in the summary tells them apart. An
+    /// absent target frees nothing when purged, so the floor is in fact exact
+    /// there; any other error leaves the size unknown and the object possibly
+    /// present, so the floor is a genuine bound. Neither supports a sentence
+    /// the other does not.
+    #[tokio::test]
+    async fn an_absent_target_and_an_unanswered_one_report_the_same_floor() {
         let hash = hash_n(7);
         let preview = || {
             Arc::new(FixedPreview(RetentionContentSimulation::Exact(vec![
@@ -2071,27 +2395,16 @@ mod tests {
             .build_preview(Utc::now(), &[])
             .await;
 
-        for outcome in [&missing, &unavailable] {
-            assert_eq!(outcome["freed_bytes"]["status"], "omitted");
-            assert!(outcome["freed_bytes"]["bytes"].is_null(), "{outcome}");
-        }
-        let missing_reason = missing["freed_bytes"]["reason"].as_str().expect("reason");
-        let unavailable_reason = unavailable["freed_bytes"]["reason"]
-            .as_str()
-            .expect("reason");
-        assert!(missing_reason.contains("missing"), "{missing_reason}");
-        assert!(
-            unavailable_reason.contains("storage did not answer"),
-            "{unavailable_reason}"
+        assert_eq!(
+            missing["freed_bytes"], unavailable["freed_bytes"],
+            "one label covers both failure modes"
         );
-        assert_ne!(missing_reason, unavailable_reason);
+        let freed = &missing["freed_bytes"];
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(freed["unresolved_targets"], 1, "{freed}");
         assert!(
-            missing_reason.contains(&hash.to_string()),
-            "{missing_reason}"
-        );
-        assert!(
-            unavailable_reason.contains(&hash.to_string()),
-            "{unavailable_reason}"
+            !freed.to_string().contains(&hash.to_string()),
+            "the hash belongs in the log, not the summary: {freed}"
         );
     }
 
@@ -2156,14 +2469,14 @@ mod tests {
         );
     }
 
-    /// The property with no acceptable failure mode: whatever a failing probe
-    /// does to the verdict, it must never leave a figure behind. The failing
-    /// target is the last of 128 here and every other one answers, so a
-    /// short-circuit that kept its accumulator would be holding a large,
-    /// plausible, wrong number at the moment it gave up.
+    /// One unanswered probe out of 128 used to suppress the whole figure,
+    /// which told an operator strictly less than the floor does. The failing
+    /// target is the last one here and every other answers, so the figure
+    /// reported is the sum over the rest — never presented as a total.
     #[tokio::test]
-    async fn a_failed_probe_omits_the_figure_instead_of_reporting_what_it_did_measure() {
+    async fn one_unresolved_target_reports_the_floor_over_the_targets_that_answered() {
         let targets: Vec<ContentHash> = (0..SIZE_PROBE_CONCURRENCY * 2).map(hash_n).collect();
+        let answered = targets.len() as u64 - 1;
         let sizes = targets
             .iter()
             .map(|t| (t.clone(), 1_000_u64))
@@ -2174,16 +2487,115 @@ mod tests {
             Arc::new(InertStorage::failing_only(doomed, sizes)),
         );
 
-        let omitted = h.build_preview(Utc::now(), &[]).await;
-        assert_eq!(omitted["freed_bytes"]["status"], "omitted");
-        assert!(
-            omitted["freed_bytes"]["bytes"].is_null(),
-            "a partial sum must never be emitted, as `exact` or otherwise: {omitted}"
+        let freed = h.build_preview(Utc::now(), &[]).await["freed_bytes"].clone();
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(freed["unresolved_targets"], 1, "{freed}");
+        assert_eq!(
+            freed["bytes"],
+            serde_json::json!(answered * 1_000),
+            "the floor is the sum over the targets that answered: {freed}"
         );
-        assert!(omitted["freed_bytes"]["reason"]
-            .as_str()
-            .expect("reason")
-            .contains("size"));
+    }
+
+    /// The assertion that pins the actual defect. The old summary named
+    /// whichever probe failed first under the fan-out — a scheduler property
+    /// that cannot tell one missing object from a thousand. A count can, and
+    /// it is a count in both failure modes at once.
+    #[tokio::test]
+    async fn several_unresolved_targets_report_how_many_rather_than_which_one() {
+        let targets: Vec<ContentHash> = (0..10).map(hash_n).collect();
+        let sizes = targets
+            .iter()
+            .map(|t| (t.clone(), 5_u64))
+            .collect::<std::collections::HashMap<_, _>>();
+        let absent = [hash_n(0), hash_n(1), hash_n(2)];
+        let unanswered = [hash_n(9)];
+        let h = preview_handler(
+            Arc::new(FixedPreview(RetentionContentSimulation::Exact(targets))),
+            Arc::new(InertStorage::with_unresolved(
+                sizes,
+                absent.clone(),
+                unanswered.clone(),
+            )),
+        );
+
+        let freed = h.build_preview(Utc::now(), &[]).await["freed_bytes"].clone();
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(
+            freed["unresolved_targets"], 4,
+            "four targets did not resolve, in two different modes: {freed}"
+        );
+        assert_eq!(
+            freed["bytes"], 30,
+            "six targets of five bytes answered: {freed}"
+        );
+        let rendered = freed.to_string();
+        for hash in absent.iter().chain(unanswered.iter()) {
+            assert!(
+                !rendered.contains(&hash.to_string()),
+                "the summary says how many, never which: {rendered}"
+            );
+        }
+    }
+
+    /// The count says how many; the log says which. Every failing probe keeps
+    /// its own line, because the hash an operator needs in order to act on a
+    /// target the registry references and storage does not hold is only there.
+    #[test]
+    fn every_failed_probe_names_its_own_hash_in_its_own_warning() {
+        use crate::use_cases::test_support::tracing_capture::capture_audit_events;
+
+        let targets: Vec<ContentHash> = (0..4).map(hash_n).collect();
+        let sizes = targets
+            .iter()
+            .map(|t| (t.clone(), 2_u64))
+            .collect::<std::collections::HashMap<_, _>>();
+        let unresolved = [hash_n(0), hash_n(2), hash_n(3)];
+        let (preview, captured) = capture_audit_events(|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a current-thread runtime, so every warning is captured");
+            rt.block_on(async {
+                preview_handler(
+                    Arc::new(FixedPreview(RetentionContentSimulation::Exact(
+                        targets.clone(),
+                    ))),
+                    Arc::new(InertStorage::with_unresolved(
+                        sizes,
+                        [hash_n(0), hash_n(2)],
+                        [hash_n(3)],
+                    )),
+                )
+                .build_preview(Utc::now(), &[])
+                .await
+            })
+        });
+
+        assert_eq!(preview["freed_bytes"]["unresolved_targets"], 3);
+        let probe_lines: Vec<_> = captured
+            .iter()
+            .filter(|e| e.message().contains("storage size lookup failed"))
+            .collect();
+        assert_eq!(
+            probe_lines.len(),
+            unresolved.len(),
+            "one warning per failed probe, not one for the run"
+        );
+        assert!(
+            probe_lines.iter().all(|e| e.level == tracing::Level::WARN),
+            "a target the registry references and storage cannot size is a warning"
+        );
+        let logged: BTreeSet<String> = probe_lines
+            .iter()
+            .filter_map(|e| e.field("hash"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            logged,
+            unresolved.iter().map(ContentHash::to_string).collect(),
+            "each line names its own target"
+        );
     }
 
     /// Overflow is decided once, over the complete target set, and by a
@@ -2214,14 +2626,14 @@ mod tests {
             .contains("overflowed"));
     }
 
-    /// Concurrently there is no "first" error, so the two failure reasons are
-    /// ranked rather than raced. A failed probe wins: with one target
-    /// unmeasured, "the total overflowed" would be a claim about addends that
-    /// were never observed. The run here makes both conditions true at once —
-    /// the two measured targets alone overflow `u64`, and a third probe fails
-    /// — so only the ranking decides the sentence the operator reads.
+    /// A floor the wire cannot carry is the one outcome with no number
+    /// behind it, so overflow outranks the count. The run here makes both
+    /// conditions true at once — the two targets that answer overflow `u64`
+    /// between them, and a third probe fails — so only the ranking decides
+    /// what the operator reads. Saturating to `u64::MAX` and labelling it a
+    /// floor would be a figure nothing measured.
     #[tokio::test]
-    async fn a_failed_probe_outranks_an_overflowing_total() {
+    async fn an_unrepresentable_floor_is_omitted_whatever_the_unresolved_count() {
         let measured = [hash_n(1), hash_n(2)];
         let doomed = hash_n(3);
         let sizes = measured
@@ -2238,10 +2650,17 @@ mod tests {
         assert_eq!(omitted["freed_bytes"]["status"], "omitted");
         let reason = omitted["freed_bytes"]["reason"].as_str().expect("reason");
         assert!(
-            reason.contains("unavailable"),
-            "an unmeasured target outranks an overflow verdict it would have to invent: {reason}"
+            reason.contains("overflowed"),
+            "a floor that does not fit in u64 is no floor to report: {reason}"
         );
-        assert!(!reason.contains("overflowed"), "{reason}");
+        assert!(
+            omitted["freed_bytes"]["bytes"].is_null(),
+            "an omission never carries a figure: {omitted}"
+        );
+        assert!(
+            omitted["freed_bytes"]["unresolved_targets"].is_null(),
+            "nor a count, which would read as a floor it does not carry: {omitted}"
+        );
     }
 
     /// The width's justification is a range rather than a point: a fan-out
@@ -2287,6 +2706,8 @@ mod tests {
             batch_size: u32,
             _after: Option<Uuid>,
             _now: DateTime<Utc>,
+            _admit_held: &'a [HeldState],
+            _repository_id: Option<Uuid>,
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
             let rows = vec![self.row.clone(); batch_size as usize];
             Box::pin(async move { Ok(rows) })
@@ -2380,6 +2801,8 @@ mod tests {
             batch_size: u32,
             after: Option<Uuid>,
             _now: DateTime<Utc>,
+            _admit_held: &'a [HeldState],
+            _repository_id: Option<Uuid>,
         ) -> BoxFuture<'a, DomainResult<Vec<RetentionCandidateRow>>> {
             let page: Vec<RetentionCandidateRow> = self
                 .rows
@@ -2786,5 +3209,418 @@ mod tests {
         );
         assert_eq!(h.batch_size, BATCH_SIZE);
         assert_eq!(h.max_batches_per_tick, MAX_BATCHES_PER_TICK);
+    }
+    // =====================================================================
+    // Repository scope. The run's boundary, and the proof that it holds.
+    // =====================================================================
+
+    /// A candidate row in a named repository, so a scoped run's page can
+    /// be built out of rows from two of them.
+    fn candidate_in(repository_id: Uuid, repository_key: &str) -> RetentionCandidateRow {
+        let mut artifact = art(Uuid::new_v4());
+        artifact.repository_id = repository_id;
+        RetentionCandidateRow {
+            artifact,
+            format: hort_domain::entities::repository::RepositoryFormat::Generic,
+            repository_key: repository_key.into(),
+            resolved_rescan_interval_hours: None,
+            keep_rank: None,
+            tag_targeted: false,
+        }
+    }
+
+    fn scoped(mode: &str, repository_id: Uuid) -> serde_json::Value {
+        json!({ "mode": mode, "repository_id": repository_id.to_string() })
+    }
+
+    /// The scope reaches the enumeration, which is where the confinement
+    /// has to happen: the page is bounded, so a run that fetched every
+    /// repository's rows and filtered afterwards would spend its whole
+    /// budget on rows it discards and could not tell a short page from a
+    /// filtered-empty one.
+    #[tokio::test]
+    async fn a_scoped_run_confines_the_enumeration_to_its_repository() {
+        let repository = Uuid::new_v4();
+        let candidates = Arc::new(MockCandidates::new(vec![vec![]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates.clone(),
+        );
+        let TaskOutcome::Completed { result_summary } = h
+            .run(&scoped("execute", repository), ctx())
+            .await
+            .expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(candidates.scopes(), vec![Some(repository)]);
+        assert_eq!(
+            result_summary["repository_id"],
+            json!(repository.to_string()),
+            "a scoped run's totals are about one repository, and a reader who cannot see \
+             that in the summary takes them for the instance's",
+        );
+    }
+
+    /// An unscoped invocation — the shipped CronJob's body — enumerates
+    /// every repository and says so.
+    #[tokio::test]
+    async fn an_unscoped_run_enumerates_every_repository() {
+        let candidates = Arc::new(MockCandidates::new(vec![vec![]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates.clone(),
+        );
+        let TaskOutcome::Completed { result_summary } = h.run(&json!({}), ctx()).await.expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(candidates.scopes(), vec![None]);
+        assert_eq!(result_summary["repository_id"], serde_json::Value::Null);
+    }
+
+    /// The no-policies short circuit is a completing path like any
+    /// other: it carries the scope, and it echoes the standing rotation
+    /// position rather than the `None` the scoped walk started from.
+    /// Writing the walk's start value here would **reset** the
+    /// instance-wide rotation every time an operator previewed one
+    /// repository with no policy configured.
+    #[tokio::test]
+    async fn the_no_policy_short_circuit_reports_the_scope_and_echoes_the_position() {
+        let repository = Uuid::new_v4();
+        let standing = Uuid::from_u128(42);
+        let jobs = Arc::new(MockJobsRepository::default());
+        jobs.set_last_result_summary_by_kind(
+            "retention-evaluate",
+            json!({ "cursor": cursor_value(standing) }),
+        );
+        let h = handler_with_jobs(
+            Arc::new(MockPolicies::new(vec![])),
+            Arc::new(MockCandidates::new(vec![])),
+            jobs,
+        );
+        let TaskOutcome::Completed { result_summary } = h
+            .run(&scoped("dry_run", repository), ctx())
+            .await
+            .expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(
+            result_summary["repository_id"],
+            json!(repository.to_string())
+        );
+        assert_eq!(
+            result_summary["cursor"],
+            cursor_value(standing),
+            "the standing instance-wide position is echoed, never cleared",
+        );
+    }
+
+    /// An unreadable scope fails the run and does **not** retry: the
+    /// params are fixed on the row, so a retry reaches the same dead
+    /// end. The one outcome this must never have is the instance-wide
+    /// sweep.
+    #[tokio::test]
+    async fn an_unreadable_scope_fails_the_run_rather_than_sweeping_the_instance() {
+        let candidates = Arc::new(MockCandidates::new(vec![vec![candidate_in(
+            Uuid::new_v4(),
+            "npm-proxy",
+        )]]));
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![age_policy()])),
+            candidates.clone(),
+        );
+        let outcome = h
+            .run(
+                &json!({ "mode": "execute", "repository_id": "not-a-uuid" }),
+                ctx(),
+            )
+            .await
+            .expect("outcome");
+        let TaskOutcome::Failed { retry, reason } = outcome else {
+            panic!("expected Failed, got {outcome:?}");
+        };
+        assert!(
+            !retry,
+            "the params are fixed; a retry reaches the same dead end"
+        );
+        assert!(reason.contains("repository_id"), "{reason}");
+        assert!(
+            candidates.scopes().is_empty(),
+            "the enumeration must never have been asked at all"
+        );
+    }
+
+    /// The rotation position belongs to the instance-wide sweep. A
+    /// scoped run neither resumes from it — which would leave every
+    /// artifact below it in the scoped repository unreachable until the
+    /// instance-wide pass wrapped — nor advances it, which would move
+    /// the window the instance-wide execution is working through.
+    #[tokio::test]
+    async fn a_scoped_run_neither_resumes_from_nor_moves_the_instance_wide_position() {
+        let repository = Uuid::new_v4();
+        let standing = Uuid::from_u128(42);
+        // Three rows over a 2x2 stride: page one is full, page two is
+        // short, so the walk reaches the end inside one run.
+        let candidates = Arc::new(KeysetCandidates::with_rows(3));
+        let jobs = Arc::new(MockJobsRepository::default());
+        jobs.set_last_result_summary_by_kind(
+            "retention-evaluate",
+            json!({ "cursor": cursor_value(standing) }),
+        );
+        let h = rotation_handler(candidates.clone(), jobs.clone(), 2, 2);
+
+        let summary = tick(&h, &jobs, scoped("execute", repository)).await;
+
+        assert_eq!(
+            summary["cursor"],
+            cursor_value(standing),
+            "a scoped run echoes the instance-wide position back unchanged",
+        );
+        assert_eq!(
+            summary["coverage"], "complete",
+            "the scoped walk started at the beginning of its own repository and reached \
+             the end, so it saw everything it claims to have seen — the standing \
+             instance-wide position is not a gap in *its* coverage",
+        );
+        assert_eq!(
+            candidates.take_served().len(),
+            3,
+            "the walk started from the beginning rather than after the standing cursor, \
+             which sits above every id in this corpus",
+        );
+    }
+
+    /// A scoped run that reaches its per-run cap reports `partial`, so
+    /// the honest answer survives for the repository too big to finish
+    /// in one run.
+    #[tokio::test]
+    async fn a_scoped_run_that_hits_the_cap_reports_partial_coverage() {
+        let row = candidate_in(Uuid::new_v4(), "npm-proxy");
+        let repository = row.artifact.repository_id;
+        let h = handler(
+            Arc::new(MockPolicies::new(vec![archived_age_policy()])),
+            Arc::new(FullPageCandidates { row }),
+        );
+        let TaskOutcome::Completed { result_summary } = h
+            .run(&scoped("dry_run", repository), ctx())
+            .await
+            .expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["coverage"], "partial");
+    }
+
+    /// The genesis event every candidate needs in order to reach the
+    /// predicate at all: the evaluator resolves the policy's scope input
+    /// from `ArtifactIngested` and fails safe (no match) without one.
+    fn persisted_ingested(artifact: &Artifact) -> hort_domain::events::PersistedEvent {
+        hort_domain::events::PersistedEvent {
+            event_id: Uuid::new_v4(),
+            stream_id: StreamId::artifact(artifact.id),
+            stream_position: 0,
+            global_position: 0,
+            event: hort_domain::events::DomainEvent::ArtifactIngested(
+                hort_domain::events::ArtifactIngested {
+                    artifact_id: artifact.id,
+                    repository_id: artifact.repository_id,
+                    name: artifact.name.clone(),
+                    version: artifact.version.clone(),
+                    sha256: artifact.sha256_checksum.clone(),
+                    size_bytes: artifact.size_bytes,
+                    source: hort_domain::events::IngestSource::Proxied,
+                    metadata: serde_json::Value::Null,
+                    metadata_blob: None,
+                    upstream_published_at: None,
+                },
+            ),
+            correlation_id: Uuid::new_v4(),
+            causation_id: None,
+            actor: system_actor(),
+            event_version: 1,
+            stored_at: DateTime::<Utc>::UNIX_EPOCH,
+        }
+    }
+
+    /// A policy whose age bound every `UNIX_EPOCH` candidate clears, so
+    /// the end-to-end run below produces real matches to preview.
+    fn matching_age_policy() -> RetentionPolicy {
+        RetentionPolicy::project(&[hort_domain::retention::RetentionPolicyEvent::Created {
+            held_states: Default::default(),
+            id: Uuid::new_v4(),
+            name: "collect-everything".into(),
+            predicate: hort_domain::retention::PolicyPredicate::AgeExceeds(1),
+            // Instance-wide by scope: what confines the run is the
+            // invocation, not the policy, so only the enumeration's
+            // boundary can keep a repository out of the preview.
+            scope: hort_domain::retention::RetentionScope::AllRepos,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        }])
+        .expect("a one-second age bound is valid")
+    }
+
+    /// A handler over the shared `MockEventStore`, seeded so each
+    /// candidate's stream carries its genesis event. The store
+    /// round-trips and refuses what the production adapter refuses, so
+    /// a corpus it accepts is one a producer could have written.
+    fn previewing_handler(rows: Vec<RetentionCandidateRow>) -> RetentionEvaluateHandler {
+        let events = Arc::new(crate::use_cases::test_support::MockEventStore::new());
+        for row in &rows {
+            events.set_stream(
+                &StreamId::artifact(row.artifact.id),
+                vec![persisted_ingested(&row.artifact)],
+            );
+        }
+        RetentionEvaluateHandler::new(
+            Arc::new(MockPolicies::new(vec![matching_age_policy()])),
+            Arc::new(MockCandidates::new(vec![rows])),
+            Arc::new(RetentionUseCase::new(
+                crate::event_store_publisher::wrap_for_test(events),
+                Arc::new(InertScan),
+            )),
+            Arc::new(InertPreview),
+            Arc::new(InertStorage::default()),
+            Arc::new(MockJobsRepository::default()),
+        )
+    }
+
+    /// **A scoped dry run previews only that repository's groups.**
+    ///
+    /// Driven through `run()` rather than `build_preview` directly, so
+    /// what is asserted is the whole path: the scope resolved once out
+    /// of the params, the enumeration confined by it, the evaluator over
+    /// the rows that survived, and the preview built from those matches.
+    /// Both repositories' artifacts would match the policy, so the
+    /// boundary is the only thing that can keep one of them out of the
+    /// rollup.
+    #[tokio::test]
+    async fn a_scoped_dry_run_previews_only_that_repositorys_groups() {
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        let h = previewing_handler(vec![
+            candidate_in(mine, "npm-proxy"),
+            candidate_in(theirs, "pypi-proxy"),
+        ]);
+
+        let TaskOutcome::Completed { result_summary } =
+            h.run(&scoped("dry_run", mine), ctx()).await.expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        let preview = &result_summary["preview"];
+        assert_eq!(
+            preview["rows"], 1,
+            "one repository's row, not both: {preview}"
+        );
+        let groups = preview["groups"].as_array().expect("groups array");
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["repository_id"], json!(mine.to_string()));
+        assert_eq!(groups[0]["repository_key"], json!("npm-proxy"));
+        let sample_repos: BTreeSet<&str> = preview["sample"]
+            .as_array()
+            .expect("sample array")
+            .iter()
+            .map(|row| row["repository_id"].as_str().expect("repository_id"))
+            .collect();
+        assert_eq!(
+            sample_repos,
+            [mine.to_string().as_str()].into_iter().collect(),
+            "the sample names only the scoped repository too",
+        );
+        assert_eq!(result_summary["evaluated"], 1);
+    }
+
+    /// The counter-assertion the test above needs: unscoped, the same
+    /// fixture previews **both** groups. Without it "one group" would
+    /// also hold for a fixture whose second row never matched.
+    #[tokio::test]
+    async fn the_same_fixture_unscoped_previews_both_repositories() {
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        let h = previewing_handler(vec![
+            candidate_in(mine, "npm-proxy"),
+            candidate_in(theirs, "pypi-proxy"),
+        ]);
+
+        let TaskOutcome::Completed { result_summary } = h
+            .run(&json!({ "mode": "dry_run" }), ctx())
+            .await
+            .expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        let preview = &result_summary["preview"];
+        assert_eq!(preview["rows"], 2, "{preview}");
+        assert_eq!(preview["groups"].as_array().expect("groups").len(), 2);
+    }
+
+    /// And the execute side of the same boundary: a scoped execution
+    /// appends `ArtifactExpired` for its own repository's artifact and
+    /// for nothing else. The counts are the handler's visible half of
+    /// what the DB-backed
+    /// `a_scoped_run_cannot_reclaim_content_a_second_repository_references`
+    /// proves over real streams and real `content_references` edges.
+    #[tokio::test]
+    async fn a_scoped_execute_expires_only_its_own_repositorys_artifact() {
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        let rows = vec![
+            candidate_in(mine, "npm-proxy"),
+            candidate_in(theirs, "pypi-proxy"),
+        ];
+        let mine_artifact = rows[0].artifact.id;
+        let theirs_artifact = rows[1].artifact.id;
+        let events = Arc::new(crate::use_cases::test_support::MockEventStore::new());
+        for row in &rows {
+            events.set_stream(
+                &StreamId::artifact(row.artifact.id),
+                vec![persisted_ingested(&row.artifact)],
+            );
+        }
+        let h = RetentionEvaluateHandler::new(
+            Arc::new(MockPolicies::new(vec![matching_age_policy()])),
+            Arc::new(MockCandidates::new(vec![rows])),
+            Arc::new(RetentionUseCase::new(
+                crate::event_store_publisher::wrap_for_test(events.clone()),
+                Arc::new(InertScan),
+            )),
+            Arc::new(InertPreview),
+            Arc::new(InertStorage::default()),
+            Arc::new(MockJobsRepository::default()),
+        );
+
+        let TaskOutcome::Completed { result_summary } =
+            h.run(&scoped("execute", mine), ctx()).await.expect("Ok")
+        else {
+            panic!("expected Completed");
+        };
+        assert_eq!(result_summary["expired"], 1);
+        assert_eq!(result_summary["evaluated"], 1);
+
+        let appended: Vec<StreamId> = events
+            .appended_batches()
+            .into_iter()
+            .filter(|batch| {
+                batch.events.iter().any(|e| {
+                    matches!(
+                        e.event,
+                        hort_domain::events::DomainEvent::ArtifactExpired(_)
+                    )
+                })
+            })
+            .map(|batch| batch.stream_id)
+            .collect();
+        assert_eq!(
+            appended,
+            vec![StreamId::artifact(mine_artifact)],
+            "exactly one stream gained an ArtifactExpired, and it is the scoped \
+             repository's artifact",
+        );
+        assert!(
+            !appended.contains(&StreamId::artifact(theirs_artifact)),
+            "the other repository's artifact must never be appended to: {appended:?}",
+        );
     }
 }

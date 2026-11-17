@@ -101,8 +101,7 @@ use hort_app::use_cases::test_support::sample_repository;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::entities::scan_policy::{
-    CompositeVerdictMode, NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection,
-    SeverityThreshold,
+    NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::events::{
     Actor, ApiActor, ArtifactIngested, ArtifactQuarantined, DomainEvent, IngestSource, PolicyScope,
@@ -677,7 +676,6 @@ fn fully_waived_policy(repo_id: Uuid) -> ScanPolicyProjection {
         rescan_interval_hours: 24,
         negligible_action: NegligibleAction::Ignore,
         enforcement: ScanEnforcement::Reject,
-        composite_verdict_mode: CompositeVerdictMode::Observed,
         stream_version: 0,
         created_at: now,
         updated_at: now,

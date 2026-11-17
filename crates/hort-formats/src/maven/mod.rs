@@ -48,7 +48,7 @@ use hort_domain::types::{
 };
 
 use crate::publish_identity::IdentityCheck;
-use crate::sbom_helpers::build_subject_component;
+use crate::sbom_helpers::{build_subject_component, subject_only};
 
 pub use coords::{
     build_logical_path, parse_download_path, parse_sidecar_hex, split_ga,
@@ -713,14 +713,44 @@ impl VersionDiscovery for MavenFormatHandler {
         Vec::new()
     }
 
-    /// Extract the edges a stored POM declares: its `<parent>`
-    /// coordinate, then its compile- and runtime-scope `<dependencies>`.
+    /// The `.pom`, and nothing else a Maven repository stores.
     ///
-    /// The parent leads the returned order. A consumer cannot read this
-    /// POM's dependency list at all until it has the parent, so a caller
-    /// that truncates in this order keeps the edge the rest depends on;
-    /// the parent is otherwise an ordinary edge and spends the cascade's
-    /// descendant budget and depth bound like any other.
+    /// Maven is the one participating format whose declared manifest is
+    /// stored BESIDE the binary rather than inside it — the POM is its
+    /// own group member — so a `.jar`, a `-sources.jar`, a
+    /// `-javadoc.jar`, a `.module`, a `.asc` signature, a checksum
+    /// sidecar and `maven-metadata.xml` are all not input to
+    /// [`extract_dependency_specs`](VersionDiscovery::extract_dependency_specs)
+    /// at all. That method reads the POM's own bytes and reports `Err`
+    /// for anything whose root element is not `<project>`, so a walk
+    /// pointed at a jar could only fail — and a jar is what a Maven
+    /// repository mostly holds.
+    ///
+    /// A jar's embedded `META-INF/maven/**/pom.xml` is a different
+    /// reader's input: [`PayloadSbom`] opens the archive, this method's
+    /// consumer does not. Answering `true` for a jar on the strength of
+    /// what is inside it would point the cascade at a reader that never
+    /// looks there.
+    ///
+    /// Extension-driven via [`is_pom_filename`], the same signal
+    /// [`classify_scan_kind`] reads, because a Maven repository path
+    /// carries no other marker: a POM's own `<packaging>` element lives
+    /// inside XML that a path-level predicate does not open.
+    fn path_carries_dependency_specs(&self, path: &str) -> bool {
+        is_pom_filename(path.rsplit('/').next().unwrap_or(path))
+    }
+
+    /// Extract the edges a stored POM declares: its `<parent>`
+    /// coordinate, then the BOM imports in its `<dependencyManagement>`,
+    /// then its compile- and runtime-scope `<dependencies>`.
+    ///
+    /// The two resolution inputs lead the returned order. A consumer
+    /// cannot read this POM's dependency list at all until it has the
+    /// parent, nor resolve the versions that list is written against
+    /// until it has the imported BOMs, so a caller that truncates in this
+    /// order keeps the edges the rest depends on; both are otherwise
+    /// ordinary edges and spend the cascade's descendant budget and depth
+    /// bound like any other.
     ///
     /// **Input is the POM's own bytes** — unlike npm/cargo/pypi, Maven's
     /// declared dependencies are not inside an archive: the `.pom` IS the
@@ -735,6 +765,17 @@ impl VersionDiscovery for MavenFormatHandler {
     /// cascade genuinely warmed from one whose versions all live in a
     /// parent.
     ///
+    /// One case the per-reason diagnosis cannot report, and the reason
+    /// for the `info!` below: a POM that yields no edge at all while
+    /// declaring `<dependencyManagement>` entries. A managed entry that
+    /// is not a BOM import is a version-table row rather than an edge
+    /// this reader declined, so there is nothing to count and the
+    /// diagnosis is silent — leaving a pure BOM indistinguishable from a
+    /// leaf artifact in the cascade's own `deps_extracted=0`. The figure
+    /// that separates them is how many managed coordinates the POM
+    /// declared, and it is reported at a level an operator reads rather
+    /// than at `debug`.
+    ///
     /// **`Err` versus `Ok`.** `Err` means the bytes are not a POM (not
     /// XML, wrong root element, over the size cap). A well-formed POM
     /// always yields `Ok`, however little of it resolved — a POM whose
@@ -748,6 +789,17 @@ impl VersionDiscovery for MavenFormatHandler {
         content: &mut dyn Read,
     ) -> DomainResult<Vec<DependencySpec>> {
         let extraction = pom::parse_pom_dependencies(content)?;
+        if extraction.specs.is_empty() && extraction.managed_coordinates > 0 {
+            tracing::info!(
+                managed_coordinates = extraction.managed_coordinates,
+                "maven.pom: no edge extracted, but this POM declares managed \
+                 coordinates — a <dependencyManagement> entry supplies versions \
+                 to the dependency list rather than being an edge of its own, \
+                 unless it is a BOM import (type=pom, scope=import), the one \
+                 kind this reader follows. The cascade's deps_extracted=0 for \
+                 this artifact is therefore not a leaf",
+            );
+        }
         for (reason, count) in extraction.skip_counts() {
             if count > 0 {
                 tracing::debug!(
@@ -955,22 +1007,6 @@ fn maven_sbom_components(specs: &[DependencySpec]) -> Vec<SbomComponent> {
             })
         })
         .collect()
-}
-
-/// A subject-only [`PayloadSbomExtraction`] — no components, just the
-/// artifact's own coordinate. Used for every degrade-soft arm: a
-/// `.jar`/`.war` with no embedded POM still lets OSV query the artifact's
-/// own coordinate, and a POM that failed to parse degrades to the same
-/// shape rather than dropping the SBOM entirely.
-fn subject_only(subject: SbomComponent, resolution: SbomResolution) -> PayloadSbomExtraction {
-    PayloadSbomExtraction {
-        sbom: Some(Sbom {
-            subject: Some(subject),
-            components: Vec::new(),
-        }),
-        resolution,
-        skipped_non_registry: 0,
-    }
 }
 
 /// Whether any `/`-separated segment of a zip entry name is a literal
@@ -2073,6 +2109,57 @@ mod tests {
             .expect("maven declares VersionDiscovery")
     }
 
+    /// The POM is the only stored shape a cascade can read, and the
+    /// jar — which is most of what a Maven repository holds — is not
+    /// one. Every refused name below is a real member of a published
+    /// Maven coordinate's directory, and handing any of them to
+    /// `extract_dependency_specs` yields `Err`, because none of them is
+    /// XML with a `<project>` root.
+    #[test]
+    fn path_carries_dependency_specs_admits_the_pom_and_nothing_else() {
+        let vd = discovery();
+
+        for admitted in [
+            "com/example/lib/1.0.0/lib-1.0.0.pom",
+            "com/example/lib/1.0.0/LIB-1.0.0.POM",
+            "lib-1.0.0.pom",
+        ] {
+            assert!(
+                vd.path_carries_dependency_specs(admitted),
+                "the POM carries the declarations: {admitted}"
+            );
+        }
+
+        for refused in [
+            // The measured failure: the extractor is handed a ZIP and
+            // reports its header as the XML root element.
+            "com/example/lib/1.0.0/lib-1.0.0.jar",
+            "com/example/lib/1.0.0/lib-1.0.0-sources.jar",
+            "com/example/lib/1.0.0/lib-1.0.0-javadoc.jar",
+            "com/example/lib/1.0.0/lib-1.0.0.war",
+            "com/example/lib/1.0.0/lib-1.0.0.aar",
+            "com/example/lib/1.0.0/lib-1.0.0.module",
+            "com/example/lib/1.0.0/lib-1.0.0.jar.asc",
+            // A sidecar beside the POM is still not the POM.
+            "com/example/lib/1.0.0/lib-1.0.0.pom.sha1",
+            "com/example/lib/maven-metadata.xml",
+        ] {
+            assert!(
+                !vd.path_carries_dependency_specs(refused),
+                "not a POM, so nothing declares dependencies here: {refused}"
+            );
+        }
+    }
+
+    /// A directory component that happens to carry a dot does not make
+    /// the artifact a POM — the predicate reads the file name, the way
+    /// `classify_scan_kind` does, not the longest dotted run in the
+    /// path.
+    #[test]
+    fn path_carries_dependency_specs_reads_the_file_name_not_the_directory() {
+        assert!(!discovery().path_carries_dependency_specs("com/example.pom/lib/1.0.0/lib.jar"));
+    }
+
     #[test]
     fn maven_declares_version_discovery() {
         assert!(handler().version_discovery().is_some());
@@ -2196,6 +2283,66 @@ mod tests {
                 range: "3.2.0".to_string(),
             }]
         );
+    }
+
+    /// The two-level cascade a Spring Boot pull produces: the consumer POM
+    /// warms its parent and the BOM its `<dependencyManagement>` imports,
+    /// and the version-table row beside that import stays a row.
+    #[test]
+    fn extract_dependency_specs_follows_the_parent_and_the_bom_import() {
+        let body = br#"<project>
+            <parent><groupId>org.springframework.boot</groupId>
+              <artifactId>spring-boot-starter-parent</artifactId>
+              <version>3.3.5</version></parent>
+            <artifactId>demo</artifactId>
+            <dependencyManagement><dependencies>
+              <dependency><groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>3.3.5</version><type>pom</type><scope>import</scope></dependency>
+              <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>
+                <version>2.0.9</version></dependency>
+            </dependencies></dependencyManagement>
+        </project>"#;
+        let specs = discovery()
+            .extract_dependency_specs(&mut Cursor::new(&body[..]))
+            .expect("a BOM-importing POM is valid input");
+        assert_eq!(
+            specs,
+            [
+                DependencySpec {
+                    name: "org.springframework.boot:spring-boot-starter-parent".to_string(),
+                    range: "3.3.5".to_string(),
+                },
+                DependencySpec {
+                    name: "org.springframework.boot:spring-boot-dependencies".to_string(),
+                    range: "3.3.5".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// A pure BOM with no imports of its own: `Ok` with no edge, which is
+    /// what the cascade's `deps_extracted=0` reports for a leaf too. The
+    /// `info!` this exercises is what tells the two apart, carrying the
+    /// managed-coordinate count the POM declared.
+    #[test]
+    fn extract_dependency_specs_is_ok_and_empty_for_a_pure_bom() {
+        let body = br#"<project>
+            <groupId>org.junit</groupId><artifactId>junit-bom</artifactId>
+            <version>5.14.4</version><packaging>pom</packaging>
+            <dependencyManagement><dependencies>
+              <dependency><groupId>org.junit.jupiter</groupId>
+                <artifactId>junit-jupiter-api</artifactId>
+                <version>5.14.4</version></dependency>
+              <dependency><groupId>org.junit.platform</groupId>
+                <artifactId>junit-platform-launcher</artifactId>
+                <version>1.14.4</version></dependency>
+            </dependencies></dependencyManagement>
+        </project>"#;
+        let specs = discovery()
+            .extract_dependency_specs(&mut Cursor::new(&body[..]))
+            .expect("a pure BOM is valid input");
+        assert!(specs.is_empty());
     }
 
     #[test]

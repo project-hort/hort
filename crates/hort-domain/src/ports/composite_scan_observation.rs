@@ -1,28 +1,40 @@
-//! Outbound port for the **shadow** composite-scan observation
-//! projection — the durable evidence behind ADR 0064 D6's promotion
-//! decision.
+//! Outbound port for the composite-scan observation projection — the
+//! durable per-manifest record of what assessing the composition
+//! contributed.
 //!
-//! # Why a projection and not an event
+//! # The verdict decides; this row does not carry it
 //!
-//! The composed assessment of an OCI image manifest carries **no release
-//! authority** (ADR 0064 D6): it is produced, compared against what the
-//! manifest's own bytes concluded, and recorded for an operator to read.
-//! An artifact's event stream is where release authority is derived from
-//! (ADR 0007's scan authority, ADR 0062's closure), so a shadow verdict
-//! written there is a verdict a future reader can mistake for one that
-//! counts — and `EventStore::read_stream`'s consumers are exactly the
-//! code that must never see it. A projection keeps the two apart by
-//! construction.
+//! The composed assessment of an OCI image manifest **is** the
+//! manifest's filesystem verdict (ADR 0064 D2) and decides its release
+//! unconditionally. It reaches the release gate the way the manifest's
+//! own verdict always has — through the orchestrator's per-unit
+//! bookkeeping and the `ScanCompleted` on the artifact's stream — and
+//! not through this table.
+//!
+//! So what carries no authority is **the projection**, not the
+//! assessment. An artifact's event stream is where release authority is
+//! derived from (ADR 0007's scan authority, ADR 0062's closure), and a
+//! second write of the same verdict there is a verdict a future reader
+//! can mistake for an independent one; `EventStore::read_stream`'s
+//! consumers are exactly the code that must not see one. A projection
+//! keeps the measurement surface and the decision path apart by
+//! construction — which is also why this row is written outside the
+//! transaction that records the artifact's scan result, through a sink
+//! whose `record` cannot fail the scan.
 //!
 //! # One row per manifest, replaced on each assessment
 //!
 //! The question this table exists to answer is about the estate's
-//! *current* state: "if the composite verdict carried authority, how many
-//! artifacts would change outcome, and in which direction?" That is a
-//! `GROUP BY` over one row per artifact. An append-only per-scan history
-//! would answer the same question only after a window filter, and it
-//! would grow without bound on a population the rescan cadence re-visits
-//! every day — so the row is keyed on the artifact and replaced.
+//! *current* state: "what did assessing the composition contribute, over
+//! how many artifacts, and in which direction?" — which is why the row
+//! carries the **decision pair** (what the gate concluded over the
+//! composition's findings, and what the same gate under the same policy
+//! and exclusion set concluded over the manifest's own bytes) rather
+//! than one verdict. That is a `GROUP BY` over one row per artifact. An
+//! append-only per-scan history would answer the same question only
+//! after a window filter, and it would grow without bound on a
+//! population the rescan cadence re-visits every day — so the row is
+//! keyed on the artifact and replaced.
 //!
 //! It is bounded by the artifact population and goes away with its
 //! artifact (`ON DELETE CASCADE`), the way every other per-artifact
@@ -35,8 +47,8 @@
 //! collection, and a claim written by a path that must carry no authority
 //! is the beginning of the entanglement this whole unit exists to avoid.
 //! The distinct vulnerability ids plus the exact counts answer the
-//! promotion question; the full report is reproducible by re-running the
-//! scan.
+//! contribution question; the full report is reproducible by re-running
+//! the scan.
 //!
 //! The id list is **capped** at [`MAX_OBSERVED_VULNERABILITY_IDS`] so a
 //! pathological image cannot write an unbounded column. The cap applies
@@ -56,12 +68,12 @@ use super::BoxFuture;
 /// Ceiling on how many distinct vulnerability ids one observation stores.
 ///
 /// A real image's composite report runs to a few hundred advisories; a
-/// deliberately-constructed one has no natural bound at all, and this
-/// column is written by a path an operator did not ask to run. 256 keeps
-/// the auditable core of "what would change" for every realistic image
-/// (≈4 KB of text at the per-id cap below) while making the column's
-/// worst case a number rather than a function of the upstream's
-/// imagination.
+/// deliberately-constructed one has no natural bound at all, and the
+/// upstream picks which of the two this row is about. 256 keeps the
+/// auditable core of "what the composition contributed" for every
+/// realistic image (≈4 KB of text at the per-id cap below) while making
+/// the column's worst case a number rather than a function of the
+/// upstream's imagination.
 pub const MAX_OBSERVED_VULNERABILITY_IDS: usize = 256;
 
 /// Per-id length ceiling. Mirrors the `Finding::vulnerability_id` cap
@@ -84,11 +96,11 @@ pub const MAX_OBSERVED_SCANNER_LEN: usize = 128;
 // CompositeAssessment
 // ---------------------------------------------------------------------------
 
-/// What one shadow composite assessment arrived at.
+/// What one composite assessment arrived at.
 ///
 /// The four arms are the four arms of the composite resolution plus the
-/// run's disposition, which is the whole outcome space a shadow run has:
-/// it either assessed the composition, or it did not, for one of three
+/// run's disposition, which is the whole outcome space a run has: it
+/// either assessed the composition, or it did not, for one of three
 /// reasons that ask three different things of an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompositeAssessment {
@@ -99,7 +111,9 @@ pub enum CompositeAssessment {
     Assessed,
     /// This manifest is not a composed image at all — an index, a cosign
     /// signature, an SBOM attachment, a Helm chart. The steady state for
-    /// a large share of OCI rows, and nothing for a promotion to change.
+    /// a large share of OCI rows, and a row the composition contributed
+    /// nothing to: the verdict is `Withheld`, which neither holds the
+    /// manifest nor gates it.
     NothingToCompose,
     /// A composition was expected and could not be assembled, for a
     /// reason re-running reproduces exactly.
@@ -146,8 +160,8 @@ impl CompositeAssessment {
 ///
 /// The persisted shape of [`ScanOutcome`], which is a domain outcome enum
 /// and deliberately not serialisable. Both sides of an observation row
-/// carry this same type, because "would promoting the composite verdict
-/// have changed this artifact's outcome?" is only a question if the two
+/// carry this same type, because "what did assessing the composition
+/// contribute to this artifact's outcome?" is only a question if the two
 /// answers live in one value space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateDecision {
@@ -162,9 +176,10 @@ pub enum GateDecision {
 
 impl GateDecision {
     /// Project a [`ScanOutcome`] onto the stored decision. The violations
-    /// themselves are not stored: the promotion question is about the
-    /// *direction* of a change across an estate, and a per-rule violation
-    /// list is the full report this row deliberately does not duplicate.
+    /// themselves are not stored: the contribution question is about the
+    /// *direction* of a difference across an estate, and a per-rule
+    /// violation list is the full report this row deliberately does not
+    /// duplicate.
     #[must_use]
     pub const fn of(outcome: &ScanOutcome) -> Self {
         match outcome {
@@ -204,10 +219,10 @@ impl GateDecision {
 /// What assembling the composition cost, in constituents and bytes.
 ///
 /// Stored beside the verdict it bought because the fetches are **egress
-/// an operator did not ask for**: the composite path acquires a proxy
-/// image's absent layers in order to assess it, and an operator deciding
-/// whether to promote the verdict is also deciding whether to keep paying
-/// for it.
+/// the pull did not ask for**: the composite path acquires a proxy
+/// image's absent layers in order to assess it, so an operator reading
+/// what the composition contributed is also reading what it cost to
+/// find out.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AcquisitionCost {
     /// Constituents already in CAS when the survey ran.
@@ -222,7 +237,7 @@ pub struct AcquisitionCost {
 // CompositeScanObservation
 // ---------------------------------------------------------------------------
 
-/// One manifest artifact's current shadow composite assessment.
+/// One manifest artifact's current composite assessment.
 ///
 /// # The two decision columns are gate decisions, not dispositions
 ///
@@ -247,8 +262,8 @@ pub struct CompositeScanObservation {
     /// The manifest artifact row this is about. The table's primary key:
     /// one row per artifact, replaced on each assessment.
     pub artifact_id: Uuid,
-    /// The artifact's repository, so the promotion question can be asked
-    /// per repository without a join.
+    /// The artifact's repository, so the contribution question can be
+    /// asked per repository without a join.
     pub repository_id: Uuid,
     /// The manifest's own content hash — the composition's identity
     /// (ADR 0064 D4). Present on every arm, including the refusals: the
@@ -289,7 +304,8 @@ pub struct CompositeScanObservation {
     /// What the same gate, with the same policy and the same exclusion
     /// set, decided over the findings the **primary** axis produced on
     /// this run — the manifest's own bytes. The other half of the
-    /// comparison, in the same row so the promotion question is one read.
+    /// comparison, in the same row so the contribution question is one
+    /// read.
     ///
     /// Both fields name a finding set because that is the only thing
     /// that differs between them, and **neither is this artifact's
@@ -423,10 +439,15 @@ pub fn bounded_reason(reason: &str) -> String {
 
 /// Outbound port for the `composite_scan_observations` projection.
 ///
-/// **Nothing that decides delivery or release may hold this.** The row it
-/// writes is a shadow verdict; a release predicate that read one would be
-/// the authority ADR 0064 D6 withholds, arrived at by accident. The
-/// property is held structurally by
+/// **Nothing that decides delivery or release may hold this.** Not
+/// because the composed verdict lacks authority — it decides the
+/// manifest's release unconditionally (ADR 0064 D2) — but because it
+/// already exercised that authority through the artifact's event stream,
+/// which is the single point release is derived from (ADR 0007). This row
+/// is the same verdict written a second time, best-effort and outside
+/// that transaction, so a release predicate reading it would decide on a
+/// copy that is allowed to be missing or stale, and would reject
+/// artifacts irreversibly on one. The property is held structurally by
 /// `crates/hort-app/tests/shadow_observation_has_no_authority.rs`, not by
 /// inspection.
 pub trait CompositeScanObservationRepository: Send + Sync {
@@ -445,8 +466,9 @@ pub trait CompositeScanObservationRepository: Send + Sync {
     ) -> BoxFuture<'a, DomainResult<()>>;
 
     /// The current observation for `artifact_id`, if one has been
-    /// written. Read-only: the promotion question is a `GROUP BY` over
-    /// the table, and this is the single-artifact surface behind it.
+    /// written. Read-only: the contribution question is a `GROUP BY`
+    /// over the table, and this is the single-artifact surface behind
+    /// it.
     fn find_by_artifact(
         &self,
         artifact_id: Uuid,
@@ -559,9 +581,9 @@ mod tests {
     }
 
     /// The projection keeps the outcome and drops the violation list —
-    /// the promotion question is about the direction of a change, and
-    /// the per-rule detail is the full report this row does not
-    /// duplicate.
+    /// the contribution question is about the direction of a
+    /// difference, and the per-rule detail is the full report this row
+    /// does not duplicate.
     #[test]
     fn a_scan_outcome_projects_onto_its_decision() {
         let violation = PolicyViolation {

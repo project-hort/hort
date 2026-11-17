@@ -12,7 +12,13 @@
   `RbacEvaluator::effective_grants`
   (`crates/hort-app/src/rbac.rs`), each with a permanent regression guard
   (`metrics_reader_admin_claim_without_explicit_grant_is_denied`,
-  `effective_grants_agrees_with_authorize_per_cell`). Route placement is
+  `effective_grants_agrees_with_authorize_per_cell`). **This carve-out is now
+  one member of a shared mechanism rather than its own comparison: the
+  admin-orthogonal set is declared once as
+  `hort_domain::entities::rbac::ADMIN_ORTHOGONAL_PERMISSIONS` and read through
+  `Permission::is_admin_orthogonal` by every consumer, so `ReadMetrics` sits
+  beside the two destructive permissions in one list — the decision below is
+  unchanged, only the mechanism is shared.** Route placement is
   enforced structurally: no router built by `hort_http_core::router` registers
   `/metrics` at all, so the public listener 404s it
   (`get_metrics_on_main_listener_returns_404`). The linter's

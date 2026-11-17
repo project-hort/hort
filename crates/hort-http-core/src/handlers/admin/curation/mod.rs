@@ -19,6 +19,12 @@
 //!     ([`reevaluate::post_reevaluate`])
 //!   - `POST /api/v1/admin/curation/block-versions`
 //!     ([`block_versions::post_block_versions`])
+//!   - `POST /api/v1/admin/curation/block-digests`
+//!     ([`block_digests::post_block_digests`])
+//!   - `POST /api/v1/admin/curation/waive-versions`
+//!     ([`waive_bulk::post_waive_versions`])
+//!   - `POST /api/v1/admin/curation/waive-digests`
+//!     ([`waive_bulk::post_waive_digests`])
 //! - **Read endpoints:**
 //!   - `GET  /api/v1/admin/curation/queue`
 //!     ([`queue::get_queue`])
@@ -28,6 +34,21 @@
 //!     ([`exclusions::get_exclusions`])
 //!
 //! Body shapes and status-code mappings: see each module's handler doc.
+//!
+//! ## The bulk verbs are not symmetric, and that is deliberate
+//!
+//! `block-versions` / `block-digests` are **fail-safe**: they cap at
+//! [`MAX_VERSIONS_PER_CALL`] entries and continue on error, so a call
+//! blocks what it resolved and reports what it did not.
+//! `waive-versions` / `waive-digests` are **fail-open**: they cap at
+//! [`MAX_WAIVE_ENTRIES_PER_CALL`] and are all-or-nothing, so one
+//! unreadable entry aborts the whole batch with `409` and zero releases.
+//!
+//! The reason is `ArtifactReleased`: it is history that cannot be
+//! retracted, while a block the curator did not mean is reversible by the
+//! same curator a minute later. A future editor tidying the two
+//! contracts into one shape would be removing the asymmetry on purpose
+//! — do not.
 //!
 //! See `docs/architecture/how-to/curator-workflow.md` for the operator
 //! workflow and ADR 0007 for the release-gate posture this surface
@@ -45,15 +66,22 @@ use std::sync::Arc;
 use axum::routing::{get, post};
 use axum::Router;
 
+use hort_app::error::AppError;
+use hort_app::use_cases::CallerPrivileges;
+use hort_domain::error::DomainError;
+
 use crate::context::AppContext;
+use crate::error::ApiError;
 
 pub mod block;
+pub mod block_digests;
 pub mod block_versions;
 pub mod decisions;
 pub mod exclusions;
 pub mod queue;
 pub mod reevaluate;
 pub mod waive;
+pub mod waive_bulk;
 
 /// Build the curation sub-router.
 ///
@@ -74,6 +102,9 @@ pub fn curation_routes() -> Router<Arc<AppContext>> {
             post(reevaluate::post_reevaluate),
         )
         .route("/block-versions", post(block_versions::post_block_versions))
+        .route("/block-digests", post(block_digests::post_block_digests))
+        .route("/waive-versions", post(waive_bulk::post_waive_versions))
+        .route("/waive-digests", post(waive_bulk::post_waive_digests))
         .route("/queue", get(queue::get_queue))
         .route("/decisions", get(decisions::get_decisions))
         .route("/exclusions", get(exclusions::get_exclusions))
@@ -99,11 +130,87 @@ pub(crate) const MAX_LIST_LIMIT: u32 = 500;
 /// path, so the gate is fail-safe-by-construction at both layers.
 pub(crate) const MAX_JUSTIFICATION_BYTES: usize = 512;
 
-/// Maximum number of versions accepted per `POST /api/v1/admin/curation/block-versions`
-/// call. Mirrors `CurationUseCase::MAX_VERSIONS_PER_CALL` (bounded
-/// per-call work, same shape as the queue listing cap).
-/// Empty `versions` is also rejected at the handler boundary (`< 1`).
+/// Maximum number of entries accepted per bulk **block** call
+/// (`block-versions`, `block-digests`). Mirrors
+/// `CurationUseCase::MAX_VERSIONS_PER_CALL` (bounded per-call work, same
+/// shape as the queue listing cap). An empty list is also rejected at the
+/// handler boundary (`< 1`).
 pub(crate) const MAX_VERSIONS_PER_CALL: usize = 100;
+
+/// Maximum number of entries accepted per bulk **waive** call
+/// (`waive-versions`, `waive-digests`). Mirrors
+/// `CurationUseCase::MAX_WAIVE_ENTRIES_PER_CALL`, and is deliberately a
+/// quarter of the block cap above — see this module's docs for why the
+/// two bulk verbs are not symmetric.
+///
+/// Enforced here *and* in the use case, exactly as the block cap is: a
+/// cap that lived only at the handler would be bypassable by every other
+/// caller of `CurationUseCase`.
+pub(crate) const MAX_WAIVE_ENTRIES_PER_CALL: usize = 25;
+
+/// The operator-supplied justification boundary check shared by every
+/// decision endpoint: non-empty after trimming, and within
+/// [`MAX_JUSTIFICATION_BYTES`].
+///
+/// Trimming is intentional — whitespace-only input is the same UX failure
+/// as empty (an operator copy-pasting a stray newline), and an auditor
+/// reading `"    "` as a justification is the same negative outcome as a
+/// missing one. The length check is on the **untrimmed** bytes, because
+/// that is the string the event carries.
+pub(crate) fn check_justification(justification: &str) -> Result<(), ApiError> {
+    if justification.trim().is_empty() {
+        return Err(ApiError(AppError::Domain(DomainError::Validation(
+            "justification must not be empty".into(),
+        ))));
+    }
+    if justification.len() > MAX_JUSTIFICATION_BYTES {
+        return Err(ApiError(AppError::Domain(DomainError::Validation(
+            format!(
+                "justification exceeds {MAX_JUSTIFICATION_BYTES} bytes (got {})",
+                justification.len()
+            ),
+        ))));
+    }
+    Ok(())
+}
+
+/// The entry-count boundary check shared by every bulk endpoint:
+/// non-empty, and within the verb's own `max`.
+///
+/// `field` names the request field in the message (`versions` /
+/// `digests`) so the operator is told which list was wrong; `max` is
+/// passed rather than read from a constant because the two bulk verbs
+/// cap differently on purpose.
+pub(crate) fn check_entry_count(field: &str, len: usize, max: usize) -> Result<(), ApiError> {
+    if len == 0 {
+        return Err(ApiError(AppError::Domain(DomainError::Validation(
+            format!("{field} must not be empty"),
+        ))));
+    }
+    if len > max {
+        return Err(ApiError(AppError::Domain(DomainError::Validation(
+            format!("{field} length {len} exceeds {max} cap"),
+        ))));
+    }
+    Ok(())
+}
+
+/// The `CallerPrivileges` every curation handler hands the use case.
+///
+/// [`CurateOrAdminPrincipal`](crate::authz::CurateOrAdminPrincipal) has
+/// already proved the caller carries Curate **or** Admin, so
+/// `is_curator = true` makes the use case's own
+/// `require_curate_or_admin()` a no-op. The use-case gate stays engaged
+/// all the same: it is the canonical info-log and metric-emission site,
+/// and it is what a non-HTTP caller meets.
+pub(crate) fn curator_privileges() -> CallerPrivileges {
+    CallerPrivileges {
+        is_admin: false,
+        is_reviewer: false,
+        is_curator: true,
+        writable_repository_ids: Vec::new(),
+    }
+}
 
 #[cfg(test)]
 mod authz_scope_tests {

@@ -1943,7 +1943,43 @@ mod tests {
             Some(self)
         }
     }
+    /// The dispatch stubs' dependency-document predicate, exercised
+    /// where it is declared — see the stance on `CargoDispatchStub`
+    /// below. A leaf-ingest fetches and stores one artifact; it never
+    /// asks whether that artifact declares dependencies (the root
+    /// enqueue, which does ask, is upstream of it).
+    #[test]
+    fn dispatch_stubs_admit_every_path() {
+        let cargo = CargoDispatchStub {
+            cksum_hex: String::new(),
+        };
+        let npm = NpmDispatchStub {
+            cksum_hex: String::new(),
+            tarball: String::new(),
+            fail_resolve: false,
+        };
+        let stubs: Vec<Box<dyn FormatHandler>> = vec![Box::new(cargo), Box::new(npm)];
+        for s in stubs {
+            let vd = s
+                .version_discovery()
+                .expect("both dispatch stubs declare the group");
+            assert!(vd.path_carries_dependency_specs("whatever/it/is-1.0.0.bin"));
+        }
+    }
+
     impl VersionDiscovery for CargoDispatchStub {
+        // These tests hand the handler a manifest they built
+        // themselves, so the dependency-document predicate is not on the
+        // path they drive and no assertion below reads it. Answered
+        // `true` rather than left to panic because a refusal here would
+        // be an answer to a question this double was never asked — and
+        // `true` is the stance its sibling methods already take: this
+        // double's `extract_dependency_specs` deliberately parses plain
+        // JSON instead of the format's real container, so it stands for
+        // the walk's logic, not for any format's stored layout.
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn extract_upstream_versions(
             &self,
             _body: &mut dyn std::io::Read,
@@ -2066,6 +2102,9 @@ mod tests {
         }
     }
     impl VersionDiscovery for NpmDispatchStub {
+        fn path_carries_dependency_specs(&self, _path: &str) -> bool {
+            true
+        }
         fn extract_upstream_versions(
             &self,
             _body: &mut dyn std::io::Read,

@@ -196,14 +196,40 @@ stateless and re-derivable.
 
 ## The transitive cascade
 
-When a repository's triggers include `transitive_deps`, every ingest
-fires a seed hook (`crates/hort-app/src/use_cases/ingest_use_case.rs`,
-the block guarded by `suppress_cascade_seed` and the
-`TransitiveDeps` membership check) that enqueues one root
-`prefetch-dependencies` row for the just-ingested artifact at depth 0.
-The hook runs strictly after the ingest transition commits and is
-best-effort: an enqueue failure logs a warning and leaves the ingest's
-success untouched — the next pull re-triggers.
+When a repository's triggers include `transitive_deps`, an ingest fires
+a seed hook (`IngestUseCase::enqueue_prefetch_cascade` in
+`crates/hort-app/src/use_cases/ingest_use_case.rs`) that enqueues one
+root `prefetch-dependencies` row for the just-ingested artifact at
+depth 0. `register_by_hash` — the OCI cross-repository blob mount and
+the pull-dedup followers — is the second producer of a root and
+delegates to the same method, so both take the same decisions. The hook
+runs strictly after the transition commits and is best-effort: an
+enqueue failure logs a warning and leaves the ingest's success
+untouched — the next pull re-triggers.
+
+**The trigger is not the whole gate: the artifact has to be the
+document.** The trigger is the operator's opt-in, and it says nothing
+about whether *this* artifact declares any dependencies. So the hook
+asks the format, through
+`VersionDiscovery::path_carries_dependency_specs` — Maven answers for
+the `.pom` and refuses the jar, the sources jar, the signature and the
+checksum sidecar; cargo answers for the `.crate` and npm for the
+`.tgz`, where the archive IS the document; PyPI answers for the wheel
+and the gzip sdist. A format that declares no `VersionDiscovery` group
+at all (oci, helm, rpm, debian, generic) refuses structurally: there is
+no `extract_dependency_specs` for a walk to call, so a root over its
+artifacts has no reachable outcome.
+
+Without that question the hook enqueued a root per ingest, and for
+Maven most of those roots could not succeed: the extractor reads the
+POM's own bytes and reports `Err` for anything whose root element is
+not `<project>`, which is the correct contract — `Err` is what keeps a
+genuinely corrupt POM distinguishable from a file that was never one —
+so the refusal has to happen before the enqueue rather than be absorbed
+after it. The refusals are counted on
+`hort_prefetch_cascade_seed_skipped_total{format}` and deliberately not
+logged per artifact: a Maven repository holds far more jars than POMs,
+so the skip is the ordinary case.
 
 `PrefetchDependenciesHandler`
 (`crates/hort-app/src/task_handlers/prefetch_dependencies.rs`) drives
@@ -339,10 +365,27 @@ it directly rather than reaching into a container. What it resolves:
   parent; otherwise it is an ordinary edge, spending the descendant
   budget and the depth bound like any other rather than being exempt from
   them.
+- A `<dependencyManagement>` entry that is a **BOM import**
+  (`<type>pom</type><scope>import</scope>`), emitted after the parent
+  and ahead of the `<dependencies>` specs. It is not a dependency of
+  the project: Maven requires the type to be `pom` because the entry's
+  whole effect is to supply versions, which makes the imported
+  document a precondition of resolving the dependency list — the same
+  argument that puts `<parent>` in this set, and the reason neither
+  passes through the scope filter. Like the parent, ordering within
+  the bound is all it gets: an import edge spends the descendant
+  budget and the depth bound like any other. A managed entry that is
+  **not** an import stays a version-table row and is never an edge of
+  its own; warming every coordinate a BOM manages is a separate
+  question this reader does not answer.
 - `<dependencies>` entries whose effective scope is `compile` or
   `runtime` (an absent `<scope>` is Maven's own `compile` default) —
   the same runtime-declaration class boundary ADR 0053 D5 draws for
-  every format.
+  every format. `import` is not one of the scopes this boundary
+  excludes, because Maven accepts it in `<dependencyManagement>` only
+  and an import is a resolution input rather than a dependency —
+  unlike `provided`/`test`/`system`, which are real dependencies
+  outside the warmed class.
 - Versions written literally, or through a property this POM's own
   `<properties>` declares, or through the model built-ins computable
   from the POM alone (`${project.version}`, `${project.groupId}`, and
@@ -354,32 +397,42 @@ it directly rather than reaching into a container. What it resolves:
 and of an imported BOM.** `extract_dependency_specs` is a pure function
 over one artifact's own bytes — it holds no port, no HTTP client, no
 fetcher — so a parent's `<dependencyManagement>` and `<properties>`, and
-any BOM pulled in through `<dependencyManagement>`'s `<import>` scope,
-are structurally unreachable from here, and that is exactly where a
-Spring Boot or Quarkus tree keeps most of its versions. **A project that
-keeps its dependency versions in a parent or a BOM will still see a high
-skip count** — the reason is architectural, not a bug in this cut:
-resolving a version held beyond a single POM needs a change to the
+the managed coordinates inside a BOM this POM imports, are structurally
+unreachable from here, and that is exactly where a Spring Boot or
+Quarkus tree keeps most of its versions. **A project that keeps its
+dependency versions in a parent or a BOM will still see a high skip
+count** — the reason is architectural, not a bug in this cut: resolving
+a version held beyond a single POM needs a change to the
 `VersionDiscovery` (ADR 0005) contract itself, not more effort spent
-against the current one. The parent's own *coordinate* is the one thing
-that is not beyond a single POM, which is why warming the parent
-artifact is in reach while reading what it manages is not — and why the
-cascade walks the parent chain one level per cascade depth rather than
-one level per quarantine window.
+against the current one. What is *not* beyond a single POM is the
+*coordinate* of the parent and of each imported BOM, both written out in
+full in this document — which is why warming those artifacts is in reach
+while reading what they manage is not, and why the cascade walks the
+parent chain and the import chain one level per cascade depth rather
+than one level per quarantine window.
+
+**A POM that emits no edge at all while declaring managed coordinates
+says so at `info`.** A pure BOM declares no `<dependencies>` and, unless
+it imports BOMs of its own, yields no spec — and no skip either, because
+a version-table row is not an edge the reader declined and there is
+nothing to count. That leaves it reading exactly like a leaf artifact in
+the walk's `deps_extracted=0`. The signal that separates the two carries
+how many managed coordinates the POM declared; see
+[the metrics catalog](../../metrics-catalog.md#maven-pom-dependency-extraction-skip-accounting).
 
 Everything this reader cannot resolve is a **counted skip, never an
 `Err`** — a POM whose every dependency version lives in its parent is a
-*valid* POM and yields `Ok` carrying just the parent edge, with every
-`<dependencies>` entry skipped, so the cascade partially warms the tree
-instead of aborting the walk.
+*valid* POM and yields `Ok` carrying just the parent and import edges,
+with every `<dependencies>` entry skipped, so the cascade partially
+warms the tree instead of aborting the walk.
 `PomSkipReason` (`crates/hort-formats/src/maven/pom.rs`) names five
 reasons, and an operator must read them as **two different classes**:
 
 - **Deliberate class boundary — expected, not a coverage gap:**
-  `scope_excluded` (`provided` / `test` / `system` / `import` scope,
-  declined on purpose per ADR 0053 D4/D5). A high count here is
-  normal and simply explains why the warmed set is smaller than the
-  full dependency list in the POM.
+  `scope_excluded` (`provided` / `test` / `system` scope on a
+  `<dependencies>` entry, declined on purpose per ADR 0053 D4/D5). A
+  high count here is normal and simply explains why the warmed set is
+  smaller than the full dependency list in the POM.
 - **Reader limits — the tree really was only partly reached:**
   `version_from_parent_or_bom` (the dominant reason on a managed
   tree — the version lives in a parent or an imported BOM),

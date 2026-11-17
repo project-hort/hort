@@ -2,7 +2,7 @@
 # Scenario 9: Curator-waive then admin-block sequence.
 #
 # Ingest an artifact; quarantine-default →
-# `hort-cli curation waive` → confirm `Released`; admin-block via the
+# `hort-cli curation waive artifact` → confirm `Released`; admin-block via the
 # existing admin path → confirm `Rejected`; assert the stream carries
 # `[ArtifactReleased{CuratorWaiver, …}, ArtifactRejected{rejected_by:
 # …admin…}]` in order. Both events reconstructable via `hort-cli curation
@@ -69,7 +69,7 @@ PRE_REJ_COUNT="$(psql_count "SELECT COUNT(*) FROM events \
 # 2. Curator-waive
 # -----------------------------------------------------------------------------
 
-WAIVE_OUT="$(run_hort_cli "$ADMIN_TOKEN" -- curation waive "$QUARANTINED_AID" \
+WAIVE_OUT="$(run_hort_cli "$ADMIN_TOKEN" -- curation waive artifact "$QUARANTINED_AID" \
     --justification "E2E scenario 9 step 1: curator waive, $(date -Is)" 2>&1)" || {
     assert_fail "scenario 9 waive call" "$WAIVE_OUT"
     print_summary

@@ -7,7 +7,10 @@
 //!    `AppError::Domain(DomainError::Validation(…))`.
 //!
 //! 2. **RBAC gate** — checks `Permission::AdminTaskInvoke` against the
-//!    caller's resolved grants via [`RbacEvaluator::authorize`].
+//!    caller's resolved grants via [`RbacEvaluator::authorize`], plus —
+//!    for a destructive invocation — the destructive authority that
+//!    invocation needs (`Permission::DestroyContent` or
+//!    `Permission::DestroyRecord`), through the same `authorize`.
 //!    Denial is logged at `info!` (audit signal, not error) and returns
 //!    `AppError::Domain(DomainError::Forbidden(…))`.
 //!
@@ -62,19 +65,20 @@
 //! atomic two-phase write.
 
 use std::sync::Arc;
-use std::time::Duration as StdDuration;
 
 use arc_swap::ArcSwap;
 use uuid::Uuid;
 
+use hort_domain::entities::api_token::TokenKind;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::rbac::Permission;
 use hort_domain::error::DomainError;
 use hort_domain::events::{
-    task_invocation_is_destructive, task_kind_is_destructive, Actor, ApiActor, DomainEvent,
-    StreamId, TaskInvoked, ADMIN_INVOKABLE_TASK_KINDS, DESTRUCTIVE_TASK_CLAIM,
+    describe_repository_scope, task_invocation_destructive_authority,
+    task_invocation_repository_scope, task_kind_is_destructive, Actor, ApiActor, DomainEvent,
+    StreamId, TaskInvoked, ADMIN_INVOKABLE_TASK_KINDS,
 };
-use hort_domain::ports::event_store::{AppendEvents, EventStore, EventToAppend, ExpectedVersion};
+use hort_domain::ports::event_store::{AppendEvents, EventToAppend, ExpectedVersion};
 use hort_domain::ports::jobs_repository::{
     CompensatingDelete, EnqueueOutcome, JobRow, JobsRepository, ListJobsFilter, ListJobsPage,
     TriggerSource,
@@ -85,18 +89,9 @@ use hort_domain::types::IdempotencyKey;
 use crate::error::{AppError, AppResult};
 use crate::event_store_publisher::EventStorePublisher;
 use crate::rbac::RbacEvaluator;
-
-/// Bounded CAS-retry budget for the `TaskInvoked` append on the
-/// kind-routed audit stream (issue #86, mirroring the #62 SA-stream
-/// precedent in `ApiTokenUseCase`). Every non-destructive kind routes to
-/// the single global [`StreamId::authorization`] stream, so concurrent
-/// enqueues race the same `(stream, position)` unique index; a loser
-/// re-appends the same event (`ExpectedVersion::Any` means the adapter
-/// re-reads the tail itself on each attempt — no client-side expected-
-/// version bookkeeping is needed). 5 is generous headroom for realistic
-/// parallelism; exhausting it falls through to the existing
-/// compensating-delete-and-surface-the-error path unchanged.
-const TASK_AUDIT_APPEND_RETRY_ATTEMPTS: u32 = 5;
+use crate::use_cases::{
+    append_any_with_conflict_retry, event_append_backoff, EVENT_APPEND_RETRY_ATTEMPTS,
+};
 
 /// `jobs.trigger_source` every admin task invoke carries.
 ///
@@ -135,23 +130,68 @@ impl TaskUseCase {
     /// 2. **For destructive invocations only**: every
     ///    `retention-purge` / `eventstore-archive`, plus
     ///    `retention-evaluate` in execute mode (including the default):
-    ///    the caller's resolved `principal.claims` must additionally
-    ///    satisfy the [`DESTRUCTIVE_TASK_CLAIM`] requirement, evaluated
-    ///    through the **same** `RbacEvaluator` claim subset-match the
-    ///    grant model uses for `GrantSubject::Claims` — *not* a hand-rolled
-    ///    parallel evaluator. The synthetic `"admin"` claim short-circuits
-    ///    it exactly as it short-circuits every other authz decision
-    ///    (a full admin already holds every authority).
+    ///    the caller must additionally hold the destructive authority
+    ///    that invocation needs —
+    ///    [`Permission::DestroyContent`] for the artifact-content kinds,
+    ///    [`Permission::DestroyRecord`] for `eventstore-archive` —
+    ///    through the **same** [`RbacEvaluator::authorize`] the coarse
+    ///    gate uses, so one grant model decides both factors.
     ///
     /// Ordinary kinds keep **exactly** today's `AdminTaskInvoke`-only
     /// gate — zero behaviour change for `noop`/`scan`/etc.
     ///
-    /// Factor 2 reads [`task_invocation_is_destructive`], the domain's
-    /// single answer to "will this call destroy anything?". The invoke
-    /// handler's durable per-UTC-day idempotency key (ADR 0028) reads the
-    /// same function, so the authority an invocation needs and the
-    /// single-flight claim it takes cannot come apart. Re-deriving either
-    /// one locally is how they came apart before.
+    /// **Neither destructive authority is implied by `Admin`.** Both are
+    /// in `ADMIN_ORTHOGONAL_PERMISSIONS`, so an admin caller with no such
+    /// grant is refused here: destructive authority is conferred by an
+    /// explicit, audited grant rather than inherited from the admin bit,
+    /// and the evaluator is where that is enforced rather than restated.
+    ///
+    /// **And one of the two is refused to a machine identity outright.**
+    /// A `TokenKind::ServiceAccount` caller is refused
+    /// [`Permission::DestroyRecord`] before the grant set is consulted
+    /// at all — `Permission::service_account_refusal`, the domain's one
+    /// declaration of what no service account may hold. This is the
+    /// *identity* half of that rule and it has to live here, because
+    /// the three declaration/mint points that carry the other half all
+    /// key on the form of the declaration: a hand-written
+    /// `subject: { kind: user }` naming an SA's backing user is
+    /// syntactically ordinary, materialises unchanged at apply, and the
+    /// linter's rejection of it is downgradable to `Pass`. Refusing a
+    /// form of declaration is not refusing an identity. `destroy_content`
+    /// is deliberately **not** refused — scheduled storage reclamation is
+    /// exactly what a machine identity is for, and the shipped
+    /// `cronjob-tasks` SA holds it.
+    ///
+    /// Factor 2 reads [`task_invocation_destructive_authority`], the domain's
+    /// single answer to "will this call destroy anything, and under whose
+    /// authority?". The invoke handler's durable per-UTC-day idempotency
+    /// key (ADR 0028) reads the same function, so the authority an
+    /// invocation needs and the single-flight claim it takes cannot come
+    /// apart. Re-deriving either one locally is how they came apart
+    /// before — and a *second* function answering "which authority" beside
+    /// one answering "whether" would re-open it one level up.
+    ///
+    /// **The destructive authority is asked at the invocation's own
+    /// repository scope.** An invocation that names a repository in its
+    /// params (only `retention-evaluate` can — see
+    /// [`task_invocation_repository_scope`]) is asked
+    /// `authorize(actor, authority, Some(repository_id))`, so a grant
+    /// scoped to that repository authorizes it; an invocation that names
+    /// none is asked with `None` exactly as before. The asymmetry is the
+    /// guarantee rather than an accident of the evaluator: a
+    /// repository-less grant matches either question
+    /// (`RbacEvaluator`'s `None => true` scope arm), and a
+    /// repository-scoped grant matches only the scoped one, so a narrow
+    /// grant can never authorize an instance-wide destruction.
+    ///
+    /// The scope read here is the *same call* the handler makes to
+    /// confine its run, so the repository this gate answers about and
+    /// the repository the run evaluates are one value by construction.
+    /// Factor 1 is deliberately **not** scoped: `AdminTaskInvoke` is
+    /// "may this caller drive admin tasks at all", a question most kinds
+    /// have no repository for, and narrowing it would let a
+    /// repository-scoped `AdminTaskInvoke` grant admit a task invoke it
+    /// does not admit today.
     ///
     /// Denial is logged at `info!` (audit signal, NOT `err`) naming the
     /// missing authority and returns
@@ -191,35 +231,93 @@ impl TaskUseCase {
             ))));
         }
 
-        // Factor 2 — destructive invocations need the extra claim. Reuse the
-        // RbacEvaluator claim subset-match (incl. the synthetic-`admin`
-        // short-circuit) by checking a synthetic single-claim requirement
-        // against the same evaluator semantics, rather than re-deriving
-        // the subset test here. The destructive/not answer is likewise the
-        // domain's, shared with the idempotency-key derivation.
-        let requires_destructive_claim = task_invocation_is_destructive(kind, params)?;
-        if requires_destructive_claim
-            && !rbac.claims_satisfy(actor, std::slice::from_ref(&DESTRUCTIVE_TASK_CLAIM))
-        {
+        // Factor 2 — a destructive invocation needs the destructive
+        // authority for what it destroys, through the same evaluator and
+        // the same grant model as factor 1. Which authority (and whether
+        // one is needed at all) is the domain's single answer, shared with
+        // the idempotency-key derivation; this gate does not re-derive it.
+        let required_authority = task_invocation_destructive_authority(kind, params)?;
+        // …and *over what*. The scope is a second, orthogonal question
+        // about the same params, read through the domain's single
+        // resolution of it — the same call the handler confining the run
+        // makes with its own `kind()`, so the repository this gate
+        // answers about and the repository the run evaluates cannot come
+        // apart. It is deliberately not folded into the authority
+        // answer: a scoped dry run needs no destructive authority and is
+        // still confined, so a scope carried inside `Ok(Some(_))` would
+        // have nowhere to live on the one path that proves the point.
+        //
+        // Unreadable is an error, propagated here before any grant is
+        // consulted: a scope that cannot be read is not an instance-wide
+        // run, and treating it as one would widen an operator's narrow
+        // request into the broadest possible one.
+        let repository_scope = task_invocation_repository_scope(kind, params)?;
+        if let Some(authority) = required_authority {
+            // Factor 2a — the identity refusal, asked **before** the
+            // grants are consulted because it is not a question about
+            // grants. A machine identity may not hold every destructive
+            // authority (`destroy_record`: nothing reconstructs a
+            // sealed audit stream), and the three declaration/mint
+            // points that refuse it all key on the *form of the
+            // declaration* — a `serviceAccount`-subject envelope, or a
+            // `--permission` on the mint. A hand-written
+            // `subject: { kind: user }` naming the SA's backing user is
+            // syntactically ordinary, passes the per-spec validator
+            // unchanged, and the linter's rejection of it is
+            // downgradable to `Pass`. So the identity has to be refused
+            // where the caller is, which is here. Membership comes from
+            // the domain's one declaration, read by all five points.
+            if let Some(reason) = actor
+                .token_kind
+                .filter(|kind| *kind == TokenKind::ServiceAccount)
+                .and_then(|_| authority.service_account_refusal())
+            {
+                tracing::info!(
+                    actor_user_id = %actor.user_id,
+                    kind,
+                    required_permission = %authority,
+                    "TaskUseCase authz denied — a ServiceAccount caller may not hold this \
+                     destructive authority, whatever the grant set says",
+                );
+                return Err(AppError::Domain(DomainError::Forbidden(format!(
+                    "task kind {kind:?} requires Permission::{authority}, which a \
+                     ServiceAccount may not hold: {reason}"
+                ))));
+            }
+            // Factor 2b — the authority, asked at the invocation's own
+            // scope. `user_grants_authorize`'s `None => true` arm means
+            // a repository-less grant still covers a scoped run, so
+            // nothing an operator holds today stops working; what is new
+            // is that a grant scoped to *this* repository now matches.
+            //
+            // An instance-wide invocation keeps asking with `None`, and
+            // the asymmetry is the whole guarantee: a repository-scoped
+            // grant does not match a `None` question, so a narrow grant
+            // can never authorize the broad action. Asking per
+            // repository and accepting any single match would hand every
+            // scoped grant holder the instance.
+            if !rbac.authorize(actor, authority, repository_scope) {
+                tracing::info!(
+                    actor_user_id = %actor.user_id,
+                    kind,
+                    required_permission = %authority,
+                    repository_scope = ?repository_scope,
+                    "TaskUseCase authz denied — destructive task kind requires its \
+                     destructive permission in addition to Permission::AdminTaskInvoke",
+                );
+                return Err(AppError::Domain(DomainError::Forbidden(format!(
+                    "destructive task kind {kind:?} requires Permission::{authority} \
+                     {scope} in addition to Permission::AdminTaskInvoke",
+                    scope = describe_repository_scope(repository_scope),
+                ))));
+            }
             tracing::info!(
                 actor_user_id = %actor.user_id,
                 kind,
-                required_claim = DESTRUCTIVE_TASK_CLAIM,
-                "TaskUseCase authz denied — destructive task kind requires the \
-                 task:destructive claim in addition to Permission::AdminTaskInvoke",
-            );
-            return Err(AppError::Domain(DomainError::Forbidden(format!(
-                "destructive task kind {kind:?} requires the {DESTRUCTIVE_TASK_CLAIM:?} \
-                 claim in addition to Permission::AdminTaskInvoke"
-            ))));
-        }
-
-        if requires_destructive_claim {
-            tracing::info!(
-                actor_user_id = %actor.user_id,
-                kind,
-                "destructive admin task authorized (Permission::AdminTaskInvoke + \
-                 task:destructive claim)",
+                granted_permission = %authority,
+                repository_scope = ?repository_scope,
+                "destructive admin task authorized (Permission::AdminTaskInvoke + the \
+                 invocation's destructive permission)",
             );
         }
 
@@ -252,9 +350,9 @@ impl TaskUseCase {
     /// `DESTRUCTIVE_TASK_KINDS`'s doc warns against).
     ///
     /// **Per kind, deliberately — not per invocation.** Unlike the
-    /// `task:destructive` claim gate and the durable idempotency key,
+    /// destructive-authority gate and the durable idempotency key,
     /// which both read
-    /// [`task_invocation_is_destructive`](hort_domain::events::task_invocation_is_destructive),
+    /// [`task_invocation_destructive_authority`](hort_domain::events::task_invocation_destructive_authority),
     /// audit routing asks the coarser question on purpose: a
     /// `retention-evaluate` dry run's `TaskInvoked` belongs on the
     /// never-deleted stream with the executions it is deciding about, so
@@ -287,7 +385,7 @@ impl TaskUseCase {
     /// 1. Validate `kind` is in the v1 allowlist.
     /// 2. Per-invocation authz via [`Self::authorize_kind`] (coarse
     ///    `AdminTaskInvoke` AND, for destructive invocations, the
-    ///    `task:destructive` claim).
+    ///    destructive permission that invocation needs).
     /// 3. Insert a `jobs` row with `status='pending'` via `JobsRepository::enqueue_task`.
     /// 4. Append `TaskInvoked` on the kind-routed audit stream
     ///    ([`Self::task_audit_stream`] — destructive kinds land on the
@@ -414,18 +512,28 @@ impl TaskUseCase {
         });
         let correlation_id = Uuid::new_v4();
 
-        // Bounded CAS retry (issue #86): `ExpectedVersion::Any` means the
-        // adapter re-reads the stream tail itself on every attempt, so a
-        // losing `DomainError::Conflict` is resolved by simply
-        // re-invoking `append` with a fresh `AppendEvents` — no
-        // client-side expected-version re-read is needed (contrast the
-        // #62 SA-stream precedent, which retries a *specific* expected
-        // version and therefore does re-read). Only `Conflict` is
+        // Bounded CAS retry through the crate's one `ExpectedVersion::Any`
+        // conflict-retry helper. `Any` means the adapter re-reads the
+        // stream tail itself on every attempt, so a losing
+        // `DomainError::Conflict` is resolved by re-invoking `append`
+        // with a fresh, byte-identical `AppendEvents` — this append
+        // protects no decision taken from the stream's content, which is
+        // exactly the shape that helper is for. Only `Conflict` is
         // retried; any other error fails fast and consumes none of the
-        // budget.
-        let mut attempt: u32 = 0;
-        let append_result = loop {
-            let append = AppendEvents {
+        // budget, and an exhausted budget returns the final `Conflict`
+        // verbatim into the compensating-delete path below.
+        //
+        // `TaskFailed`, the other half of this audit pair, appends to the
+        // stream `task_audit_stream` routes it to through the same helper
+        // and the same budget. The two halves are written to one stream on
+        // purpose, so one of them retrying while the other did not left
+        // the pair with two durability promises — and the half that could
+        // vanish under contention did so as a log line only.
+        let append_result = append_any_with_conflict_retry(
+            self.events.as_ref(),
+            EVENT_APPEND_RETRY_ATTEMPTS,
+            event_append_backoff,
+            || AppendEvents {
                 stream_id: stream_id.clone(),
                 expected_version: ExpectedVersion::Any,
                 events: vec![EventToAppend::new(event.clone())],
@@ -434,35 +542,21 @@ impl TaskUseCase {
                 actor: Actor::Api(ApiActor {
                     user_id: actor.user_id,
                 }),
-            };
-            match self.events.append(append).await {
-                Ok(result) => break Ok(result),
-                Err(DomainError::Conflict(_)) if attempt + 1 < TASK_AUDIT_APPEND_RETRY_ATTEMPTS => {
-                    attempt += 1;
-                    tracing::debug!(
-                        job_id = %audit_job_id,
-                        kind,
-                        attempt,
-                        "TaskInvoked append conflict — retrying with a fresh append",
-                    );
-                    let jitter_ms = u64::from(rand::random::<u8>() % 3);
-                    tokio::time::sleep(StdDuration::from_millis(
-                        u64::from(attempt) * 2 + jitter_ms,
-                    ))
-                    .await;
-                }
-                Err(err @ DomainError::Conflict(_)) => {
-                    tracing::warn!(
-                        job_id = %audit_job_id,
-                        kind,
-                        attempts = TASK_AUDIT_APPEND_RETRY_ATTEMPTS,
-                        "TaskInvoked append retry budget exhausted (transient contention)",
-                    );
-                    break Err(err);
-                }
-                Err(other) => break Err(other),
-            }
-        };
+            },
+        )
+        .await;
+
+        // A `Conflict` can only reach here with the budget spent — the
+        // helper absorbs every intermediate one — so this is the
+        // exhausted-budget signal and not a first-attempt failure.
+        if let Err(DomainError::Conflict(_)) = &append_result {
+            tracing::warn!(
+                job_id = %audit_job_id,
+                kind,
+                attempts = EVENT_APPEND_RETRY_ATTEMPTS,
+                "TaskInvoked append retry budget exhausted (transient contention)",
+            );
+        }
 
         if let Err(append_err) = append_result {
             // 6. Compensating delete — best-effort; log the outcome but do
@@ -974,6 +1068,32 @@ mod tests {
         Arc::new(ArcSwap::from_pointee(evaluator))
     }
 
+    /// Build an `RbacEvaluator` granting `AdminTaskInvoke` to the
+    /// `"task-admin"` claim **plus** both destructive permissions to the
+    /// `"destructive"` claim — the two-factor shape a destructive caller
+    /// needs now that factor 2 is a grant rather than a claim.
+    fn rbac_with_task_invoke_and_destructive() -> Arc<ArcSwap<RbacEvaluator>> {
+        let evaluator = RbacEvaluator::new(vec![
+            claim_grant(&["task-admin"], Permission::AdminTaskInvoke),
+            claim_grant(&["destructive"], Permission::DestroyContent),
+            claim_grant(&["destructive"], Permission::DestroyRecord),
+        ]);
+        Arc::new(ArcSwap::from_pointee(evaluator))
+    }
+
+    /// A global claims-subject grant.
+    fn claim_grant(required: &[&str], permission: Permission) -> PermissionGrant {
+        PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::Claims(required.iter().map(|c| (*c).to_string()).collect()),
+            repository_id: None,
+            permission,
+            created_at: chrono::Utc::now(),
+            managed_by: hort_domain::entities::managed_by::ManagedBy::Local,
+            managed_by_digest: None,
+        }
+    }
+
     /// Build an `RbacEvaluator` that has NO grants at all (denies everything).
     fn rbac_deny_all() -> Arc<ArcSwap<RbacEvaluator>> {
         let evaluator = RbacEvaluator::new(vec![]);
@@ -994,15 +1114,32 @@ mod tests {
         }
     }
 
-    /// Build a `CallerPrincipal` that carries `task-admin` AND the
-    /// `task:destructive` claim — authorised for destructive kinds.
-    fn caller_with_destructive_claim() -> CallerPrincipal {
+    /// Build a `CallerPrincipal` carrying `task-admin` AND `destructive`
+    /// — both factors under [`rbac_with_task_invoke_and_destructive`],
+    /// i.e. authorised for every destructive kind.
+    fn caller_with_destructive_grants() -> CallerPrincipal {
         CallerPrincipal {
             user_id: Uuid::new_v4(),
             external_id: "destructive-user".into(),
             username: "destructive-user".into(),
             email: "destructive@example.com".into(),
-            claims: vec!["task-admin".into(), "task:destructive".into()],
+            claims: vec!["task-admin".into(), "destructive".into()],
+            token_kind: None,
+            issued_at: chrono::Utc::now(),
+            token_cap: None,
+        }
+    }
+
+    /// Build a `CallerPrincipal` carrying the synthetic `admin` claim —
+    /// a full admin, who holds every authority **except** the
+    /// admin-orthogonal ones.
+    fn caller_admin() -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: Uuid::new_v4(),
+            external_id: "admin-user".into(),
+            username: "admin-user".into(),
+            email: "admin@example.com".into(),
+            claims: vec!["admin".into()],
             token_kind: None,
             issued_at: chrono::Utc::now(),
             token_cap: None,
@@ -1213,18 +1350,17 @@ mod tests {
             let job_id = Uuid::new_v4();
             let jobs = Arc::new(RecordingJobsRepository::new(job_id));
             let events = Arc::new(RecordingEventStore::new());
-            let rbac = rbac_with_task_invoke();
+            // Caller carries BOTH factors (AdminTaskInvoke + both
+            // destructive permissions) so this "every valid kind is
+            // accepted" assertion holds across ordinary AND destructive
+            // kinds under the per-kind destructive tier.
+            let rbac = rbac_with_task_invoke_and_destructive();
             let use_case = TaskUseCase::new(
                 Arc::clone(&jobs) as _,
                 crate::event_store_publisher::wrap_for_test(Arc::clone(&events)),
                 rbac,
             );
-
-            // Caller carries BOTH factors (AdminTaskInvoke + the
-            // task:destructive claim) so this "every valid kind is
-            // accepted" assertion holds across ordinary AND destructive
-            // kinds under the per-kind destructive tier.
-            let actor = caller_with_destructive_claim();
+            let actor = caller_with_destructive_grants();
             let params = serde_json::json!({});
             let result = use_case.enqueue(&actor, kind, &params, None).await;
             assert!(
@@ -1285,15 +1421,21 @@ mod tests {
         ));
     }
 
-    /// `authorize_kind`: a destructive kind is DENIED when the caller
-    /// holds `AdminTaskInvoke` but NOT the `task:destructive` claim.
-    #[tokio::test]
-    async fn authorize_kind_destructive_denied_without_destructive_claim() {
+    /// Helper: a `TaskUseCase` over panicking ports (authz must answer
+    /// before any port is touched) with the given evaluator.
+    fn authz_only_use_case(rbac: Arc<ArcSwap<RbacEvaluator>>) -> TaskUseCase {
         let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
         let events: Arc<EventStorePublisher> =
             crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
-        let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
-        let actor = caller_with_task_admin_role(); // has AdminTaskInvoke, no task:destructive
+        TaskUseCase::new(jobs, events, rbac)
+    }
+
+    /// `authorize_kind`: a destructive kind is DENIED when the caller
+    /// holds `AdminTaskInvoke` but neither destructive permission.
+    #[tokio::test]
+    async fn authorize_kind_destructive_denied_without_the_destructive_permission() {
+        let use_case = authz_only_use_case(rbac_with_task_invoke_and_destructive());
+        let actor = caller_with_task_admin_role(); // AdminTaskInvoke only
         for kind in [
             "retention-purge",
             "eventstore-archive",
@@ -1302,20 +1444,19 @@ mod tests {
             let r = use_case.authorize_kind(&actor, kind, &serde_json::json!({}));
             assert!(
                 matches!(r, Err(AppError::Domain(DomainError::Forbidden(_)))),
-                "destructive kind {kind:?} must be Forbidden without the claim; got {r:?}"
+                "destructive kind {kind:?} must be Forbidden without its destructive \
+                 permission; got {r:?}"
             );
         }
     }
 
     /// `authorize_kind`: a destructive kind is ALLOWED when the caller
-    /// holds `AdminTaskInvoke` AND the `task:destructive` claim.
+    /// holds `AdminTaskInvoke` AND the destructive permission that kind
+    /// needs.
     #[tokio::test]
-    async fn authorize_kind_destructive_allowed_with_destructive_claim() {
-        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
-        let events: Arc<EventStorePublisher> =
-            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
-        let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
-        let actor = caller_with_destructive_claim();
+    async fn authorize_kind_destructive_allowed_with_the_destructive_permission() {
+        let use_case = authz_only_use_case(rbac_with_task_invoke_and_destructive());
+        let actor = caller_with_destructive_grants();
         for kind in [
             "retention-purge",
             "eventstore-archive",
@@ -1325,23 +1466,288 @@ mod tests {
                 use_case
                     .authorize_kind(&actor, kind, &serde_json::json!({}))
                     .is_ok(),
-                "destructive kind {kind:?} must be allowed with the claim"
+                "destructive kind {kind:?} must be allowed with its destructive permission"
+            );
+        }
+    }
+
+    /// **The confusion case.** The two authorities are split by what is
+    /// destroyed, so holding the record authority must not authorise a
+    /// purge, and holding the content authority must not authorise an
+    /// archive. Asserted in both directions over the same caller shape,
+    /// because one grant conferring both is exactly the collapse the
+    /// split exists to prevent.
+    #[tokio::test]
+    async fn authorize_kind_one_destructive_permission_does_not_authorise_the_other() {
+        // Holds only `destroy_record`.
+        let record_only = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            claim_grant(&["task-admin"], Permission::AdminTaskInvoke),
+            claim_grant(&["task-admin"], Permission::DestroyRecord),
+        ])));
+        let use_case = authz_only_use_case(record_only);
+        let actor = caller_with_task_admin_role();
+        for kind in ["retention-purge", "retention-evaluate"] {
+            let r = use_case.authorize_kind(&actor, kind, &serde_json::json!({}));
+            assert!(
+                matches!(r, Err(AppError::Domain(DomainError::Forbidden(_)))),
+                "destroy_record must not authorise {kind:?}, which destroys content; got {r:?}"
+            );
+        }
+        assert!(
+            use_case
+                .authorize_kind(&actor, "eventstore-archive", &serde_json::json!({}))
+                .is_ok(),
+            "destroy_record is exactly the authority eventstore-archive needs"
+        );
+
+        // Holds only `destroy_content`.
+        let content_only = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            claim_grant(&["task-admin"], Permission::AdminTaskInvoke),
+            claim_grant(&["task-admin"], Permission::DestroyContent),
+        ])));
+        let use_case = authz_only_use_case(content_only);
+        let r = use_case.authorize_kind(&actor, "eventstore-archive", &serde_json::json!({}));
+        assert!(
+            matches!(r, Err(AppError::Domain(DomainError::Forbidden(_)))),
+            "destroy_content must not authorise an archive, which destroys the record; got {r:?}"
+        );
+        for kind in ["retention-purge", "retention-evaluate"] {
+            assert!(
+                use_case
+                    .authorize_kind(&actor, kind, &serde_json::json!({}))
+                    .is_ok(),
+                "destroy_content is exactly the authority {kind:?} needs"
+            );
+        }
+    }
+
+    /// A `ServiceAccount` principal, built the way the shipped
+    /// `cronjob-tasks` svc-token arrives: `TokenKind::ServiceAccount`,
+    /// no claims (SAs never consume `ClaimMappings`), and a cap that is
+    /// a snapshot of its own grants at issuance.
+    fn caller_service_account(cap: Vec<Permission>) -> CallerPrincipal {
+        CallerPrincipal {
+            user_id: Uuid::from_u128(0x5A),
+            external_id: "sa:cronjob-tasks".into(),
+            username: "sa:cronjob-tasks".into(),
+            email: "sa+cronjob-tasks@example.invalid".into(),
+            claims: vec![],
+            token_kind: Some(TokenKind::ServiceAccount),
+            issued_at: chrono::Utc::now(),
+            token_cap: Some(hort_domain::entities::api_token::TokenCap {
+                permissions: cap,
+                repository_ids: None,
+                per_repository_permissions: None,
+            }),
+        }
+    }
+
+    /// A global `User`-subject grant — the shape a
+    /// `serviceAccount`-subject gitops grant resolves to at apply
+    /// (ADR 0037), **and** the shape a hand-written
+    /// `subject: { kind: user }` naming the SA's backing user produces.
+    /// The two are indistinguishable once materialised, which is the
+    /// whole reason the runtime gate below exists.
+    fn user_grant(user_id: Uuid, permission: Permission) -> PermissionGrant {
+        PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::User(user_id),
+            repository_id: None,
+            permission,
+            created_at: chrono::Utc::now(),
+            managed_by: hort_domain::entities::managed_by::ManagedBy::GitOps,
+            managed_by_digest: Some([0u8; 32]),
+        }
+    }
+
+    /// The acceptance criterion for a machine identity holding the
+    /// content-destructive authority through the grant path that
+    /// exists: a token minted for the SA authorises `retention-purge`
+    /// and `retention-evaluate` in execute mode, and does **not**
+    /// authorise `eventstore-archive`.
+    ///
+    /// The grants here reach the identity through a **direct `User`
+    /// subject**, not a `serviceAccount` one, deliberately: that is the
+    /// path the three declaration/mint checks do not close. The
+    /// apply-parse validator only sees a `serviceAccount` arm, the
+    /// linter's rejection of this shape is downgradable to `Pass`, and
+    /// both SA mint functions screen `declared_permissions` rather than
+    /// the grant table. So the cap below *also* carries
+    /// `DestroyRecord` — the strongest form of the test, in which every
+    /// upstream check has been walked around and the runtime gate is
+    /// the only thing left.
+    #[tokio::test]
+    async fn authorize_kind_service_account_may_destroy_content_but_never_the_record() {
+        let sa = caller_service_account(vec![
+            Permission::AdminTaskInvoke,
+            Permission::DestroyContent,
+            Permission::DestroyRecord,
+        ]);
+        let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            user_grant(sa.user_id, Permission::AdminTaskInvoke),
+            user_grant(sa.user_id, Permission::DestroyContent),
+            // Present on purpose: the refusal below must not depend on
+            // the grant being absent.
+            user_grant(sa.user_id, Permission::DestroyRecord),
+        ])));
+        let use_case = authz_only_use_case(rbac);
+
+        for kind in ["retention-purge", "retention-evaluate"] {
+            assert!(
+                use_case
+                    .authorize_kind(&sa, kind, &serde_json::json!({}))
+                    .is_ok(),
+                "a machine identity holding destroy_content must be authorised for {kind:?} \
+                 in execute mode — that is what the grant is for"
+            );
+        }
+
+        let r = use_case.authorize_kind(&sa, "eventstore-archive", &serde_json::json!({}));
+        let Err(AppError::Domain(DomainError::Forbidden(message))) = r else {
+            panic!("a ServiceAccount caller must be refused eventstore-archive; got {r:?}");
+        };
+        assert!(
+            message.contains("which a ServiceAccount may not hold"),
+            "the refusal must name the identity, not a missing grant: {message}"
+        );
+        assert!(
+            message.contains("nothing reconstructs a sealed stream"),
+            "the refusal must name why: {message}"
+        );
+    }
+
+    /// The identity refusal is scoped to the credential form, not to
+    /// the authority: the same grant set and the same cap authorise
+    /// `eventstore-archive` for a non-ServiceAccount caller. Without
+    /// this counter-assertion the test above would also pass if the
+    /// gate had simply stopped authorising `destroy_record` for
+    /// everyone.
+    #[tokio::test]
+    async fn authorize_kind_record_authority_still_reachable_for_a_human_identity() {
+        let human = CallerPrincipal {
+            token_kind: Some(TokenKind::CliSession),
+            ..caller_service_account(vec![Permission::AdminTaskInvoke, Permission::DestroyRecord])
+        };
+        let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            user_grant(human.user_id, Permission::AdminTaskInvoke),
+            user_grant(human.user_id, Permission::DestroyRecord),
+        ])));
+        let use_case = authz_only_use_case(rbac);
+        assert!(
+            use_case
+                .authorize_kind(&human, "eventstore-archive", &serde_json::json!({}))
+                .is_ok(),
+            "the record authority must stay reachable for a human identity that holds it"
+        );
+    }
+
+    /// A grant alone does not suffice, and this is the frozen-cap trap
+    /// (ADR 0012) stated as a test: the identity holds `destroy_content`
+    /// in the live grant table, and the invocation is still refused,
+    /// because the token's cap was snapshotted before the grant existed
+    /// and the cap leg of `RbacEvaluator::authorize` is an AND.
+    ///
+    /// This is why adding the grant to the gitops tree is only half of
+    /// provisioning a machine identity for the retention tasks — the
+    /// token has to be re-minted too. `cronjob-tasks` is PAT-only with
+    /// no `fallbackRotation`, so no reconciler interval closes it for an
+    /// operator.
+    #[tokio::test]
+    async fn authorize_kind_grant_without_the_cap_is_still_refused() {
+        // Cap frozen at `admin_task_invoke` — the shipped mint before
+        // the content permission was declared.
+        let sa = caller_service_account(vec![Permission::AdminTaskInvoke]);
+        let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            user_grant(sa.user_id, Permission::AdminTaskInvoke),
+            // Applied after the token was minted.
+            user_grant(sa.user_id, Permission::DestroyContent),
+        ])));
+        let use_case = authz_only_use_case(rbac);
+        let r = use_case.authorize_kind(&sa, "retention-purge", &serde_json::json!({}));
+        assert!(
+            matches!(r, Err(AppError::Domain(DomainError::Forbidden(_)))),
+            "a grant the token's frozen cap does not carry authorises nothing; got {r:?}"
+        );
+
+        // Rotating the token re-snapshots the cap, and the same grant
+        // set then authorises the same invocation — so the refusal above
+        // is the cap, not the grant.
+        let rotated = caller_service_account(vec![
+            Permission::AdminTaskInvoke,
+            Permission::DestroyContent,
+        ]);
+        assert!(
+            use_case
+                .authorize_kind(&rotated, "retention-purge", &serde_json::json!({}))
+                .is_ok(),
+            "after rotation the same grant set must authorise the invocation"
+        );
+    }
+
+    /// **Neither destructive authority is implied by `Admin`.** An admin
+    /// principal with no destructive grant is refused every destructive
+    /// kind; the same principal with the grant is admitted. This is the
+    /// tightening the capability exists for — an admin bit nobody decided
+    /// to confer destructive authority with no longer confers it.
+    #[tokio::test]
+    async fn authorize_kind_destructive_is_not_implied_by_admin() {
+        let admin = caller_admin();
+
+        // An admin holds `AdminTaskInvoke` by the short-circuit, so factor
+        // 1 passes with an empty grant set and factor 2 is what refuses.
+        let use_case = authz_only_use_case(rbac_deny_all());
+        assert!(
+            use_case
+                .authorize_kind(&admin, "noop", &serde_json::json!({}))
+                .is_ok(),
+            "an ordinary kind is still implied by Admin — only the destructive \
+             authorities are orthogonal"
+        );
+        for kind in [
+            "retention-purge",
+            "eventstore-archive",
+            "retention-evaluate",
+        ] {
+            let r = use_case.authorize_kind(&admin, kind, &serde_json::json!({}));
+            assert!(
+                matches!(r, Err(AppError::Domain(DomainError::Forbidden(_)))),
+                "an admin without the grant must be refused {kind:?}; got {r:?}"
+            );
+        }
+
+        // The same admin, with the grants applied on the `admin` claim.
+        let granted = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            claim_grant(&["admin"], Permission::DestroyContent),
+            claim_grant(&["admin"], Permission::DestroyRecord),
+        ])));
+        let use_case = authz_only_use_case(granted);
+        for kind in [
+            "retention-purge",
+            "eventstore-archive",
+            "retention-evaluate",
+        ] {
+            assert!(
+                use_case
+                    .authorize_kind(&admin, kind, &serde_json::json!({}))
+                    .is_ok(),
+                "an admin holding the explicit grant must be admitted to {kind:?}"
             );
         }
     }
 
     /// `authorize_kind`: a destructive kind is still DENIED for a caller
-    /// who has the `task:destructive` claim but NOT `AdminTaskInvoke`
-    /// (the two-factor AND — claim alone is insufficient).
+    /// who holds the destructive permission but NOT `AdminTaskInvoke`
+    /// (the two-factor AND — the destructive authority alone is
+    /// insufficient).
     #[tokio::test]
-    async fn authorize_kind_destructive_denied_with_claim_but_no_admin_task_invoke() {
-        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
-        let events: Arc<EventStorePublisher> =
-            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
-        // rbac_deny_all → AdminTaskInvoke never granted.
-        let use_case = TaskUseCase::new(jobs, events, rbac_deny_all());
+    async fn authorize_kind_destructive_denied_with_permission_but_no_admin_task_invoke() {
+        let destructive_only = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            claim_grant(&["destructive"], Permission::DestroyContent),
+            claim_grant(&["destructive"], Permission::DestroyRecord),
+        ])));
+        let use_case = authz_only_use_case(destructive_only);
         let mut actor = caller_no_roles();
-        actor.claims = vec!["task:destructive".into()];
+        actor.claims = vec!["destructive".into()];
         assert!(matches!(
             use_case.authorize_kind(&actor, "retention-purge", &serde_json::json!({}),),
             Err(AppError::Domain(DomainError::Forbidden(_)))
@@ -1349,11 +1755,8 @@ mod tests {
     }
 
     #[test]
-    fn authorize_kind_retention_dry_run_needs_no_destructive_claim() {
-        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
-        let events: Arc<EventStorePublisher> =
-            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
-        let use_case = TaskUseCase::new(jobs, events, rbac_with_task_invoke());
+    fn authorize_kind_retention_dry_run_needs_no_destructive_permission() {
+        let use_case = authz_only_use_case(rbac_with_task_invoke_and_destructive());
         let actor = caller_with_task_admin_role();
 
         assert!(use_case
@@ -1396,10 +1799,11 @@ mod tests {
     }
 
     /// Defense-in-depth: a direct `enqueue` call (bypassing the handler)
-    /// is still gated by the same per-kind authz — destructive kind
-    /// without the claim is denied even though ports would otherwise run.
+    /// is still gated by the same per-kind authz — a destructive kind
+    /// without its destructive permission is denied even though ports
+    /// would otherwise run.
     #[tokio::test]
-    async fn enqueue_destructive_denied_without_claim_does_not_call_ports() {
+    async fn enqueue_destructive_denied_without_permission_does_not_call_ports() {
         let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
         let events: Arc<EventStorePublisher> =
             crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
@@ -1464,16 +1868,16 @@ mod tests {
     /// Defense-in-depth: a direct `enqueue` of a destructive kind WITH
     /// both factors succeeds and reaches the ports.
     #[tokio::test]
-    async fn enqueue_destructive_allowed_with_claim_reaches_ports() {
+    async fn enqueue_destructive_allowed_with_permission_reaches_ports() {
         let job_id = Uuid::new_v4();
         let jobs = Arc::new(RecordingJobsRepository::new(job_id));
         let events = Arc::new(RecordingEventStore::new());
         let use_case = TaskUseCase::new(
             Arc::clone(&jobs) as _,
             crate::event_store_publisher::wrap_for_test(Arc::clone(&events)),
-            rbac_with_task_invoke(),
+            rbac_with_task_invoke_and_destructive(),
         );
-        let actor = caller_with_destructive_claim();
+        let actor = caller_with_destructive_grants();
         let result = use_case
             .enqueue(&actor, "retention-purge", &serde_json::json!({}), None)
             .await;
@@ -1533,9 +1937,9 @@ mod tests {
         let use_case = TaskUseCase::new(
             Arc::clone(&jobs) as _,
             crate::event_store_publisher::wrap_for_test(Arc::clone(&events)),
-            rbac_with_task_invoke(),
+            rbac_with_task_invoke_and_destructive(),
         );
-        let actor = caller_with_destructive_claim();
+        let actor = caller_with_destructive_grants();
         use_case
             .enqueue(&actor, "eventstore-archive", &serde_json::json!({}), None)
             .await
@@ -1755,7 +2159,7 @@ mod tests {
 
     /// Pathological contention — EVERY append attempt conflicts. The
     /// bounded retry loop must exhaust
-    /// (`TASK_AUDIT_APPEND_RETRY_ATTEMPTS`) and fall through to exactly
+    /// ([`EVENT_APPEND_RETRY_ATTEMPTS`]) and fall through to exactly
     /// today's failure behaviour: the error is surfaced, and — on the
     /// fresh-enqueue branch — the compensating delete fires.
     #[tokio::test]
@@ -2114,6 +2518,223 @@ mod tests {
         assert!(
             !msg.contains("matched no pending row"),
             "branch 3 must not claim the row was claimed — nothing is executing; got {msg}"
+        );
+    }
+
+    // -- The destructive authority is asked at the invocation's scope ---
+
+    /// An evaluator granting `AdminTaskInvoke` globally plus
+    /// `DestroyContent` scoped to exactly one repository — the grant
+    /// shape this change makes able to authorize something, and the one
+    /// the apply linter accepts without a downgrade.
+    fn rbac_with_destroy_content_on(repository_id: Uuid) -> Arc<ArcSwap<RbacEvaluator>> {
+        let mut scoped = claim_grant(&["destructive"], Permission::DestroyContent);
+        scoped.repository_id = Some(repository_id);
+        let evaluator = RbacEvaluator::new(vec![
+            claim_grant(&["task-admin"], Permission::AdminTaskInvoke),
+            scoped,
+        ]);
+        Arc::new(ArcSwap::from_pointee(evaluator))
+    }
+
+    fn scope_use_case(rbac: Arc<ArcSwap<RbacEvaluator>>) -> TaskUseCase {
+        let jobs: Arc<dyn JobsRepository> = Arc::new(PanicJobsRepository);
+        let events: Arc<EventStorePublisher> =
+            crate::event_store_publisher::wrap_for_test(Arc::new(PanicEventStore));
+        TaskUseCase::new(jobs, events, rbac)
+    }
+
+    fn scoped_execute(repository_id: Uuid) -> serde_json::Value {
+        serde_json::json!({
+            "mode": "execute",
+            "repository_id": repository_id.to_string(),
+        })
+    }
+
+    /// The whole point: a `destroy_content` grant scoped to one
+    /// repository authorizes an execute confined to that repository.
+    /// Before the gate asked at the invocation's scope this grant could
+    /// authorize nothing at all.
+    #[test]
+    fn a_repository_scoped_grant_authorizes_a_run_confined_to_that_repository() {
+        let repository = Uuid::new_v4();
+        let use_case = scope_use_case(rbac_with_destroy_content_on(repository));
+        assert!(use_case
+            .authorize_kind(
+                &caller_with_destructive_grants(),
+                "retention-evaluate",
+                &scoped_execute(repository),
+            )
+            .is_ok());
+    }
+
+    /// A grant for repository A does not authorize a run confined to
+    /// repository B. The scope is compared, not merely carried.
+    #[test]
+    fn a_grant_for_another_repository_refuses_a_scoped_execute() {
+        let granted = Uuid::new_v4();
+        let asked_about = Uuid::new_v4();
+        let use_case = scope_use_case(rbac_with_destroy_content_on(granted));
+        let err = use_case
+            .authorize_kind(
+                &caller_with_destructive_grants(),
+                "retention-evaluate",
+                &scoped_execute(asked_about),
+            )
+            .expect_err("a grant on a different repository authorizes nothing here");
+        let AppError::Domain(DomainError::Forbidden(message)) = err else {
+            panic!("expected Forbidden, got {err:?}");
+        };
+        assert!(
+            message.contains(&asked_about.to_string()),
+            "the refusal must name the repository that was asked about so an operator can \
+             tell it from the one they hold: {message}"
+        );
+    }
+
+    /// The asymmetry, which is the guarantee rather than an accident: an
+    /// instance-wide execute keeps asking at `None`, and a
+    /// repository-scoped grant does not match a `None` question. A
+    /// narrow grant must never authorize the broad action.
+    #[test]
+    fn a_repository_scoped_grant_refuses_the_instance_wide_execute() {
+        let use_case = scope_use_case(rbac_with_destroy_content_on(Uuid::new_v4()));
+        for params in [
+            serde_json::json!({ "mode": "execute" }),
+            // The shipped CronJob's body — an absent mode is execute,
+            // and an absent repository is the instance.
+            serde_json::json!({}),
+            serde_json::json!({ "mode": "execute", "repository_id": null }),
+        ] {
+            let err = use_case
+                .authorize_kind(
+                    &caller_with_destructive_grants(),
+                    "retention-evaluate",
+                    &params,
+                )
+                .expect_err("params {params} must stay refused to a scoped grant");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Forbidden(_))),
+                "params {params}: expected Forbidden, got {err:?}",
+            );
+        }
+    }
+
+    /// The other half of the scope rule: a repository-less grant covers
+    /// every repository, so nothing an operator holds today stops
+    /// working when they start naming one.
+    #[test]
+    fn a_repository_less_grant_covers_a_scoped_run_too() {
+        let use_case = scope_use_case(rbac_with_task_invoke_and_destructive());
+        let actor = caller_with_destructive_grants();
+        assert!(use_case
+            .authorize_kind(
+                &actor,
+                "retention-evaluate",
+                &scoped_execute(Uuid::new_v4())
+            )
+            .is_ok());
+        assert!(use_case
+            .authorize_kind(&actor, "retention-evaluate", &serde_json::json!({}))
+            .is_ok());
+    }
+
+    /// A scoped dry run needs no destructive authority at all — the
+    /// mode split is untouched by the scope. This is also why the scope
+    /// cannot ride inside the authority answer: here there is no
+    /// authority and still a scope.
+    #[test]
+    fn a_scoped_dry_run_still_needs_no_destructive_authority() {
+        let use_case = scope_use_case(rbac_with_task_invoke());
+        assert!(use_case
+            .authorize_kind(
+                &caller_with_task_admin_role(),
+                "retention-evaluate",
+                &serde_json::json!({
+                    "mode": "dry_run",
+                    "repository_id": Uuid::new_v4().to_string(),
+                }),
+            )
+            .is_ok());
+    }
+
+    /// A sweep that cannot be confined is never asked about a
+    /// repository, whatever its params say. `retention-purge` and
+    /// `eventstore-archive` take permissive pass-through bodies, so if
+    /// the gate read the key for them a repository-scoped grant would
+    /// authorize an instance-wide purge.
+    #[test]
+    fn a_scope_in_an_unconfinable_kinds_params_does_not_narrow_the_gate() {
+        let repository = Uuid::new_v4();
+        let use_case = scope_use_case(rbac_with_destroy_content_on(repository));
+        let actor = caller_with_destructive_grants();
+        for kind in ["retention-purge", "eventstore-archive"] {
+            let err = use_case
+                .authorize_kind(
+                    &actor,
+                    kind,
+                    &serde_json::json!({ "repository_id": repository.to_string() }),
+                )
+                .expect_err("an unconfinable sweep still needs a repository-less grant");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Forbidden(_))),
+                "kind {kind:?}: expected Forbidden, got {err:?}",
+            );
+        }
+    }
+
+    /// An unreadable scope is refused before any grant is consulted,
+    /// and as a `Validation` rather than a `Forbidden`: the request is
+    /// malformed, and the one answer it must never get is the
+    /// instance-wide run.
+    #[test]
+    fn an_unreadable_scope_is_refused_rather_than_widened() {
+        let use_case = scope_use_case(rbac_with_task_invoke_and_destructive());
+        for params in [
+            serde_json::json!({ "mode": "execute", "repository_id": "not-a-uuid" }),
+            serde_json::json!({ "mode": "dry_run", "repository_id": 7 }),
+        ] {
+            let err = use_case
+                .authorize_kind(
+                    &caller_with_destructive_grants(),
+                    "retention-evaluate",
+                    &params,
+                )
+                .expect_err("an unreadable scope cannot be authorized");
+            assert!(
+                matches!(err, AppError::Domain(DomainError::Validation(_))),
+                "params {params}: expected Validation, got {err:?}",
+            );
+        }
+    }
+
+    /// Factor 1 is deliberately still asked at `None`. A caller holding
+    /// only a repository-scoped `AdminTaskInvoke` could not invoke any
+    /// task before this change and still cannot: narrowing the coarse
+    /// gate would be a widening nobody asked for.
+    #[test]
+    fn the_coarse_gate_is_not_scoped_by_the_invocation() {
+        let repository = Uuid::new_v4();
+        let mut scoped_invoke = claim_grant(&["task-admin"], Permission::AdminTaskInvoke);
+        scoped_invoke.repository_id = Some(repository);
+        let rbac = Arc::new(ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            scoped_invoke,
+            claim_grant(&["destructive"], Permission::DestroyContent),
+        ])));
+        let use_case = scope_use_case(rbac);
+        let err = use_case
+            .authorize_kind(
+                &caller_with_destructive_grants(),
+                "retention-evaluate",
+                &scoped_execute(repository),
+            )
+            .expect_err("a repository-scoped AdminTaskInvoke grant admits no task invoke");
+        let AppError::Domain(DomainError::Forbidden(message)) = err else {
+            panic!("expected Forbidden, got {err:?}");
+        };
+        assert!(
+            message.contains("AdminTaskInvoke"),
+            "the coarse gate is the one that refused: {message}"
         );
     }
 }

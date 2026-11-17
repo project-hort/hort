@@ -31,10 +31,12 @@
 //! # Authorization
 //!
 //! Nothing new. The preview half needs only
-//! `Permission::AdminTaskInvoke`; the execute half additionally needs the
-//! `task:destructive` claim, which the server — not this CLI — enforces.
-//! A session without it gets as far as reading the proposal and is
-//! refused at the execute step, which is the intended split.
+//! `Permission::AdminTaskInvoke`; the execute half additionally needs
+//! `Permission::DestroyContent`, which the server — not this CLI —
+//! enforces. A session without it gets as far as reading the proposal and
+//! is refused at the execute step, which is the intended split. The
+//! permission is not implied by being an admin: it is held through an
+//! explicit grant.
 
 use std::io::{BufRead, Write};
 

@@ -28,12 +28,15 @@
 //! through the real Postgres event-store adapter and round-tripping
 //! there is the adapter layer's job.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{DomainError, DomainResult};
 
+use super::held_state_entry::HeldState;
 use super::predicate::PolicyPredicate;
 use super::scope::RetentionScope;
 
@@ -63,6 +66,13 @@ pub enum RetentionPolicyEvent {
         name: String,
         predicate: PolicyPredicate,
         scope: RetentionScope,
+        /// The held states this policy may expire — see
+        /// [`RetentionPolicy::held_states`]. Additive and
+        /// `#[serde(default)]`: a stream written before the held-state
+        /// exception existed decodes as the empty set, which is the
+        /// behaviour it had.
+        #[serde(default)]
+        held_states: BTreeSet<HeldState>,
         created_at: DateTime<Utc>,
     },
     /// The policy's predicate and/or scope was replaced wholesale.
@@ -70,6 +80,14 @@ pub enum RetentionPolicyEvent {
         id: Uuid,
         predicate: PolicyPredicate,
         scope: RetentionScope,
+        /// The replacement held-state opt-in. Re-stated wholesale with
+        /// the predicate and the scope, for the same reason they are:
+        /// retention has one configuration per policy and an update
+        /// replaces it. An update that omits it therefore **clears**
+        /// the opt-in, which is the direction that cannot surprise an
+        /// operator into a wider exception than the YAML states.
+        #[serde(default)]
+        held_states: BTreeSet<HeldState>,
         updated_at: DateTime<Utc>,
     },
     /// The policy was archived (terminal — no further mutation).
@@ -109,23 +127,62 @@ impl RetentionPolicyEvent {
                 name,
                 predicate,
                 scope,
+                held_states,
                 ..
             } => {
                 validate_name(name)?;
                 predicate.validate()?;
                 scope.validate()?;
+                validate_held_states(predicate, held_states)?;
                 Ok(())
             }
             Self::Updated {
-                predicate, scope, ..
+                predicate,
+                scope,
+                held_states,
+                ..
             } => {
                 predicate.validate()?;
                 scope.validate()?;
+                validate_held_states(predicate, held_states)?;
                 Ok(())
             }
             Self::Archived { .. } | Self::Evaluated { .. } => Ok(()),
         }
     }
+}
+
+/// The held-state opt-in's own invariant: an opt-in that is not empty
+/// requires a predicate whose **every** successful branch carries a
+/// positive age bound
+/// ([`PolicyPredicate::every_branch_has_positive_age_bound`]).
+///
+/// Enforced at replay as well as at apply, and that is the point of it
+/// being here. The apply pipeline rejects such an envelope with an
+/// operator-facing message, but the aggregate is event-sourced: a
+/// stream is also written by a future code path, replayed by a future
+/// binary, and seeded by a fixture. An opt-in without a bound is a
+/// policy that expires retained evidence the instant it is first
+/// judged, so the aggregate refuses to replay into that state at all.
+///
+/// An empty opt-in is unconditionally valid: it is the state every
+/// existing policy is in and it changes no decision.
+fn validate_held_states(
+    predicate: &PolicyPredicate,
+    held_states: &BTreeSet<HeldState>,
+) -> DomainResult<()> {
+    if held_states.is_empty() {
+        return Ok(());
+    }
+    if !predicate.every_branch_has_positive_age_bound() {
+        return Err(DomainError::Validation(format!(
+            "RetentionPolicy opts in to held states {held_states:?} but its predicate \
+             has a branch that can match with no positive AgeExceeds bound; a held-state \
+             expiry must be bounded by time spent in the state on every branch that can \
+             fire"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str) -> DomainResult<()> {
@@ -156,6 +213,29 @@ pub struct RetentionPolicy {
     pub name: String,
     pub predicate: PolicyPredicate,
     pub scope: RetentionScope,
+    /// The **held** quarantine states this policy may expire an
+    /// artifact out of — empty for every policy that does not say
+    /// otherwise, which is every policy that predates the exception.
+    ///
+    /// A held artifact (`quarantined` / `rejected` /
+    /// `scan_indeterminate`) is retained evidence or an artifact
+    /// awaiting a decision, and is refused by five independent gates
+    /// on the way to collection. This set is the only thing that opens
+    /// them, per policy and per state: a policy that does not name a
+    /// state cannot expire an artifact in it, and an empty set leaves
+    /// every gate exactly as shut as it was.
+    ///
+    /// Paired invariant, enforced by
+    /// [`RetentionPolicyEvent::validate`]: a non-empty opt-in requires
+    /// a predicate whose every successful branch carries a positive
+    /// `AgeExceeds`
+    /// ([`PolicyPredicate::every_branch_has_positive_age_bound`]), and
+    /// for such an evaluation `AgeExceeds` is re-anchored to the
+    /// artifact's held-state **entry** rather than to its content
+    /// anchor. Without both halves the opt-in would expire an artifact
+    /// the moment it was judged — a two-year-old artifact rejected five
+    /// minutes ago is already past any span measured from its content.
+    pub held_states: BTreeSet<HeldState>,
     pub archived: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -186,6 +266,7 @@ impl RetentionPolicy {
                 name,
                 predicate,
                 scope,
+                held_states,
                 created_at,
             } => {
                 first.validate()?;
@@ -194,6 +275,7 @@ impl RetentionPolicy {
                     name: name.clone(),
                     predicate: predicate.clone(),
                     scope: scope.clone(),
+                    held_states: held_states.clone(),
                     archived: false,
                     created_at: *created_at,
                     updated_at: *created_at,
@@ -256,12 +338,14 @@ impl RetentionPolicy {
             RetentionPolicyEvent::Updated {
                 predicate,
                 scope,
+                held_states,
                 updated_at,
                 ..
             } => {
                 event.validate()?;
                 self.predicate = predicate.clone();
                 self.scope = scope.clone();
+                self.held_states = held_states.clone();
                 self.updated_at = *updated_at;
             }
             RetentionPolicyEvent::Archived { archived_at, .. } => {
@@ -306,6 +390,7 @@ mod tests {
 
     fn created(id: Uuid) -> RetentionPolicyEvent {
         RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id,
             name: "expire-old".into(),
             predicate: PolicyPredicate::AgeExceeds(86_400),
@@ -322,6 +407,7 @@ mod tests {
         assert_eq!(created(id).aggregate_id(), id);
         assert_eq!(
             RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id,
                 predicate: PolicyPredicate::HasFixAvailable,
                 scope: RetentionScope::AllRepos,
@@ -361,6 +447,7 @@ mod tests {
     #[test]
     fn created_validate_empty_name_rejected() {
         let e = RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: String::new(),
             predicate: PolicyPredicate::HasFixAvailable,
@@ -377,6 +464,7 @@ mod tests {
     #[test]
     fn created_validate_oversize_name_rejected() {
         let e = RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "x".repeat(MAX_POLICY_NAME_LEN + 1),
             predicate: PolicyPredicate::HasFixAvailable,
@@ -393,6 +481,7 @@ mod tests {
     #[test]
     fn created_validate_name_at_limit_ok() {
         let e = RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "x".repeat(MAX_POLICY_NAME_LEN),
             predicate: PolicyPredicate::HasFixAvailable,
@@ -405,6 +494,7 @@ mod tests {
     #[test]
     fn created_validate_bad_predicate_rejected() {
         let e = RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "p".into(),
             predicate: PolicyPredicate::AgeExceeds(0),
@@ -421,6 +511,7 @@ mod tests {
     #[test]
     fn created_validate_bad_scope_rejected() {
         let e = RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: "p".into(),
             predicate: PolicyPredicate::HasFixAvailable,
@@ -437,6 +528,7 @@ mod tests {
     #[test]
     fn updated_validate_bad_predicate_rejected() {
         let e = RetentionPolicyEvent::Updated {
+            held_states: Default::default(),
             id: Uuid::nil(),
             predicate: PolicyPredicate::KeepLastN(0),
             scope: RetentionScope::AllRepos,
@@ -452,6 +544,7 @@ mod tests {
     #[test]
     fn updated_validate_bad_scope_rejected() {
         let e = RetentionPolicyEvent::Updated {
+            held_states: Default::default(),
             id: Uuid::nil(),
             predicate: PolicyPredicate::HasFixAvailable,
             scope: RetentionScope::PackageNamePattern(String::new()),
@@ -467,6 +560,7 @@ mod tests {
     #[test]
     fn updated_validate_ok() {
         RetentionPolicyEvent::Updated {
+            held_states: Default::default(),
             id: Uuid::nil(),
             predicate: PolicyPredicate::HasFixAvailable,
             scope: RetentionScope::AllRepos,
@@ -518,6 +612,7 @@ mod tests {
         let p = RetentionPolicy::project(&[
             created(id),
             RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id,
                 predicate: PolicyPredicate::KeepLastN(5),
                 scope: RetentionScope::AllRepos,
@@ -588,6 +683,7 @@ mod tests {
         );
         let stream = vec![
             RetentionPolicyEvent::Created {
+                held_states: Default::default(),
                 id,
                 name: "high-with-fix-7d".into(),
                 predicate: canonical.clone(),
@@ -602,6 +698,7 @@ mod tests {
                 expired_count: 3,
             },
             RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id,
                 predicate: canonical.clone(),
                 scope: RetentionScope::AllRepos,
@@ -634,6 +731,7 @@ mod tests {
         let id = Uuid::nil();
         for opener in [
             RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id,
                 predicate: PolicyPredicate::HasFixAvailable,
                 scope: RetentionScope::AllRepos,
@@ -688,6 +786,7 @@ mod tests {
         let id = Uuid::from_u128(8);
         for trailing in [
             RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id,
                 predicate: PolicyPredicate::HasFixAvailable,
                 scope: RetentionScope::AllRepos,
@@ -726,6 +825,7 @@ mod tests {
         let err = RetentionPolicy::project(&[
             created(id),
             RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id,
                 predicate: PolicyPredicate::AgeExceeds(0),
                 scope: RetentionScope::AllRepos,
@@ -740,6 +840,7 @@ mod tests {
     #[test]
     fn project_malformed_created_rejected_at_replay() {
         let err = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+            held_states: Default::default(),
             id: Uuid::nil(),
             name: String::new(),
             predicate: PolicyPredicate::HasFixAvailable,
@@ -758,6 +859,7 @@ mod tests {
         assert_eq!(variant_name(&created(id)), "Created");
         assert_eq!(
             variant_name(&RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id,
                 predicate: PolicyPredicate::HasFixAvailable,
                 scope: RetentionScope::AllRepos,
@@ -792,6 +894,7 @@ mod tests {
         let events = vec![
             created(id),
             RetentionPolicyEvent::Updated {
+                held_states: Default::default(),
                 id,
                 predicate: PolicyPredicate::Composite(
                     BooleanOp::And,
@@ -849,5 +952,177 @@ mod tests {
             }
         );
         assert!(format!("{e:?}").contains("Created"));
+    }
+
+    // -- the held-state opt-in -----------------------------------------------
+
+    fn opt_in(states: &[HeldState]) -> BTreeSet<HeldState> {
+        states.iter().copied().collect()
+    }
+
+    /// An opt-in with a positive age bound on the only branch replays.
+    #[test]
+    fn an_age_bounded_opt_in_replays() {
+        let id = Uuid::from_u128(11);
+        let policy = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+            id,
+            name: "collect-rejected-after-90d".into(),
+            predicate: PolicyPredicate::AgeExceeds(90 * 86_400),
+            scope: RetentionScope::AllRepos,
+            held_states: opt_in(&[HeldState::Rejected]),
+            created_at: ts(1_000),
+        }])
+        .expect("an age-bounded opt-in is valid");
+        assert_eq!(policy.held_states, opt_in(&[HeldState::Rejected]));
+    }
+
+    /// The default is no opt-in, so every policy that does not say
+    /// otherwise — including every policy already deployed — leaves
+    /// every gate shut.
+    #[test]
+    fn the_default_opt_in_is_empty() {
+        let id = Uuid::from_u128(12);
+        let policy = RetentionPolicy::project(&[created(id)]).expect("valid");
+        assert!(policy.held_states.is_empty());
+    }
+
+    /// An opt-in whose predicate has an unbounded successful branch is
+    /// refused **at replay**, not only at apply. The decisive shape is
+    /// the `Or` whose other arm matches immediately.
+    #[test]
+    fn an_unbounded_opt_in_is_refused_at_replay() {
+        let id = Uuid::from_u128(13);
+        let err = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+            id,
+            name: "collect-rejected".into(),
+            predicate: PolicyPredicate::Composite(
+                BooleanOp::Or,
+                vec![
+                    PolicyPredicate::AgeExceeds(90 * 86_400),
+                    PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High),
+                ],
+            ),
+            scope: RetentionScope::AllRepos,
+            held_states: opt_in(&[HeldState::Rejected]),
+            created_at: ts(1_000),
+        }])
+        .expect_err("an unbounded opt-in must not replay");
+        match err {
+            DomainError::Validation(msg) => {
+                assert!(msg.contains("held states"), "msg = {msg}");
+                assert!(msg.contains("AgeExceeds"), "msg = {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// The same predicate is fine with **no** opt-in: the invariant is
+    /// the opt-in's, not the predicate's. A policy expiring released
+    /// artifacts on a severity match is an existing, supported shape and
+    /// this change must not have outlawed it.
+    #[test]
+    fn an_unbounded_predicate_without_an_opt_in_still_replays() {
+        let id = Uuid::from_u128(14);
+        RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+            id,
+            name: "expire-severe".into(),
+            predicate: PolicyPredicate::Composite(
+                BooleanOp::Or,
+                vec![
+                    PolicyPredicate::AgeExceeds(90 * 86_400),
+                    PolicyPredicate::HasFindingAboveSeverity(SeverityThreshold::High),
+                ],
+            ),
+            scope: RetentionScope::AllRepos,
+            held_states: BTreeSet::new(),
+            created_at: ts(1_000),
+        }])
+        .expect("no opt-in, no held-state invariant");
+    }
+
+    /// An `Updated` re-states the opt-in wholesale, and an update that
+    /// names no state **clears** it — the direction that cannot widen
+    /// an exception past what the YAML says.
+    #[test]
+    fn an_update_restates_the_opt_in_and_an_omission_clears_it() {
+        let id = Uuid::from_u128(15);
+        let mut policy = RetentionPolicy::project(&[RetentionPolicyEvent::Created {
+            id,
+            name: "collect-held".into(),
+            predicate: PolicyPredicate::AgeExceeds(90 * 86_400),
+            scope: RetentionScope::AllRepos,
+            held_states: opt_in(&[HeldState::Rejected, HeldState::ScanIndeterminate]),
+            created_at: ts(1_000),
+        }])
+        .expect("valid");
+        assert_eq!(policy.held_states.len(), 2);
+
+        policy
+            .apply_appended(&RetentionPolicyEvent::Updated {
+                id,
+                predicate: PolicyPredicate::AgeExceeds(90 * 86_400),
+                scope: RetentionScope::AllRepos,
+                held_states: BTreeSet::new(),
+                updated_at: ts(2_000),
+            })
+            .expect("clearing the opt-in is valid");
+        assert!(policy.held_states.is_empty());
+    }
+
+    /// An `Updated` that opts in while replacing the predicate with an
+    /// unbounded one is refused — the invariant is re-checked on the
+    /// pair, not only when the policy is created.
+    #[test]
+    fn an_update_to_an_unbounded_opt_in_is_refused() {
+        let id = Uuid::from_u128(16);
+        let mut policy = RetentionPolicy::project(&[created(id)]).expect("valid");
+        let err = policy
+            .apply_appended(&RetentionPolicyEvent::Updated {
+                id,
+                predicate: PolicyPredicate::HasFixAvailable,
+                scope: RetentionScope::AllRepos,
+                held_states: opt_in(&[HeldState::Quarantined]),
+                updated_at: ts(2_000),
+            })
+            .expect_err("an unbounded opt-in must not apply");
+        assert!(matches!(err, DomainError::Validation(_)));
+    }
+
+    /// A pre-change stream decodes as carrying no opt-in: the event's
+    /// `held_states` is `#[serde(default)]`, and that is what lets this
+    /// field ship without a rewrite of the existing policy streams.
+    #[test]
+    fn a_legacy_created_payload_decodes_with_no_opt_in() {
+        let legacy = serde_json::json!({
+            "Created": {
+                "id": "00000000-0000-4000-8000-000000000001",
+                "name": "retain-30d",
+                "predicate": { "AgeExceeds": 2_592_000 },
+                "scope": "AllRepos",
+                "created_at": "2026-01-01T00:00:00Z"
+            }
+        });
+        let event: RetentionPolicyEvent =
+            serde_json::from_value(legacy).expect("a pre-change payload decodes");
+        match event {
+            RetentionPolicyEvent::Created { held_states, .. } => assert!(held_states.is_empty()),
+            other => panic!("expected Created, got {}", variant_name(&other)),
+        }
+    }
+
+    /// The opt-in survives the round trip the projection and the event
+    /// store both depend on, as a JSON array of state names.
+    #[test]
+    fn the_opt_in_round_trips_through_serde() {
+        let states = opt_in(&[HeldState::Rejected, HeldState::Quarantined]);
+        let json = serde_json::to_value(&states).expect("serialises");
+        // `BTreeSet` orders by the enum's declaration order, so
+        // `Quarantined` precedes `Rejected` — deterministic, which is
+        // what a JSONB column written on every apply needs.
+        assert_eq!(json, serde_json::json!(["Quarantined", "Rejected"]));
+        assert_eq!(
+            serde_json::from_value::<BTreeSet<HeldState>>(json).expect("deserialises"),
+            states
+        );
     }
 }

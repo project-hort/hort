@@ -216,7 +216,6 @@ mod tests {
     use crate::entities::repository::{
         IndexMode, PrefetchPolicy, ReplicationPriority, RepositoryFormat, RepositoryType,
     };
-    use crate::entities::scan_policy::CompositeVerdictMode;
     use crate::entities::scan_policy::{
         NegligibleAction, ProvenanceMode, ScanEnforcement, SeverityThreshold,
     };
@@ -273,7 +272,6 @@ mod tests {
             index_upstream_url: None,
             is_public: true,
             download_audit_enabled: false,
-            quota_bytes: None,
             replication_priority: ReplicationPriority::OnDemand,
             promotion: None,
             curation_rule_names: Vec::new(),
@@ -304,7 +302,6 @@ mod tests {
             rescan_interval_hours: 24,
             negligible_action: NegligibleAction::Ignore,
             enforcement: ScanEnforcement::Reject,
-            composite_verdict_mode: CompositeVerdictMode::Observed,
             stream_version: 0,
             created_at: ts(0),
             updated_at: ts(0),

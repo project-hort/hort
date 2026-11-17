@@ -4,12 +4,19 @@
 //! `Admin`, `Get`) — NOT under `admin`. Operational curator verbs sit
 //! alongside `Admin`, not nested under it.
 //!
-//! Five curator decision subcommands:
+//! Curator decision subcommands:
 //!
-//! - `waive <artifact_id> --justification <text>` →
+//! - `waive artifact <artifact_id> --justification <text>` →
 //!   POST `/api/v1/admin/curation/quarantine/:artifact_id/waive`
-//!   (manual release of a `Quarantined` or `ScanIndeterminate`
-//!   artifact, with curator attribution).
+//!   (manual release of one held artifact, with curator attribution).
+//! - `waive versions --repo <key> --package <name> --versions <v1>,<v2>,…
+//!   --justification <text>` →
+//!   POST `/api/v1/admin/curation/waive-versions`
+//!   (bulk-by-version-list curator release; all-or-nothing).
+//! - `waive digests --repo <key> --digests <d1>,<d2>,…
+//!   --justification <text>` →
+//!   POST `/api/v1/admin/curation/waive-digests`
+//!   (bulk-by-content-digest curator release; all-or-nothing).
 //! - `block artifact <artifact_id> --justification <text>` →
 //!   POST `/api/v1/admin/curation/quarantine/:artifact_id/block`
 //!   (single-artifact curator block).
@@ -17,6 +24,10 @@
 //!   --justification <text>` →
 //!   POST `/api/v1/admin/curation/block-versions`
 //!   (bulk-by-version-list curator block; continue-on-error).
+//! - `block digests --repo <key> --digests <d1>,<d2>,…
+//!   --justification <text>` →
+//!   POST `/api/v1/admin/curation/block-digests`
+//!   (bulk-by-content-digest curator block; continue-on-error).
 //! - `reevaluate <artifact_id>` →
 //!   POST `/api/v1/admin/curation/quarantine/:artifact_id/reevaluate`
 //!   (recompute a `Rejected` artifact's verdict from stored findings
@@ -27,6 +38,26 @@
 //! - `unexclude-finding --policy <id> --cve <id> --justification <text>` →
 //!   DELETE `/api/v1/admin/policies/:policy_id/exclusions/:cve_id`
 //!   (remove a policy-scoped CVE exclusion).
+//!
+//! # One verb, three ways to name its target
+//!
+//! Both decision verbs are addressed the same three ways, because an
+//! operator who has learned one must be able to guess the other: by
+//! artifact id for the one-off, by version list where
+//! `artifacts.version` is populated, and by content digest where it is
+//! not (OCI) or where the bytes are what was reviewed. `waive` used to
+//! be a flat command taking a UUID positionally; that form is **removed**
+//! rather than deprecated — see [`waive`]'s own docs for the message a
+//! caller of the old shape gets.
+//!
+//! **The two bulk contracts are not symmetric, and a reader must not
+//! tidy them into one.** A bulk block is fail-safe: 100 entries per
+//! call, continue-on-error, so it blocks what resolved and reports what
+//! did not. A bulk waive is fail-open: 25 entries per call,
+//! all-or-nothing, so one unresolvable, ambiguous or non-releasable
+//! entry refuses the whole batch and releases nothing. `ArtifactReleased`
+//! is history that cannot be retracted, while a block the curator did not
+//! mean is reversible by the same curator a minute later.
 //!
 //! # Single vs bulk `block`
 //!
@@ -85,21 +116,29 @@ pub struct CurationArgs {
 /// `curation` sub-subcommands.
 #[derive(Subcommand, Debug)]
 pub enum CurationCommand {
-    /// Waive a held artifact — release with curator attribution.
+    /// Release held artifacts — with curator attribution.
     ///
     /// Emits `ArtifactReleased { authority: CuratorWaiver, reason:
-    /// Curator }`. Source states: `Quarantined` or `ScanIndeterminate`
-    /// (the stuck-scanner case). `--justification` is required
+    /// Curator }` per released artifact. `--justification` is required
     /// (≤ 512 bytes).
+    ///
+    /// Three addressing modes: `waive artifact <id>` (one artifact),
+    /// `waive versions --repo ... --package ... --versions ...` and
+    /// `waive digests --repo ... --digests ...` (bulk,
+    /// all-or-nothing — one entry the server cannot release refuses the
+    /// whole batch). The flat `waive <id>` form was removed.
     Waive(waive::WaiveArgs),
 
-    /// Block one or more artifacts — `Quarantined`/`Released` →
-    /// `Rejected` with curator attribution.
+    /// Block artifacts — `Quarantined`/`Released` → `Rejected` with
+    /// curator attribution.
     ///
-    /// Two modes: `block artifact <id>` (single) and `block versions
-    /// --repo ... --package ... --versions ...` (bulk-by-version-list,
-    /// continue-on-error). See module-level docs for the
-    /// rationale on the sub-subcommand split vs the original design.
+    /// The same three addressing modes as `waive`: `block artifact
+    /// <id>`, `block versions --repo ... --package ... --versions ...`
+    /// and `block digests --repo ... --digests ...`. Both bulk modes are
+    /// continue-on-error, which is the opposite of the bulk waive's
+    /// contract — see module-level docs for why the two are not
+    /// symmetric, and for the rationale on the sub-subcommand split vs
+    /// the original design.
     Block(block::BlockArgs),
 
     /// Recompute a `Rejected` artifact's verdict from its stored
@@ -183,8 +222,13 @@ pub async fn run(
     let client = AkClient::new(&cfg)?;
 
     match args.cmd {
+        // The only arm that propagates its own exit code. A bulk waive
+        // can be refused whole — zero releases — and a script must be
+        // able to tell that from the applied case without parsing the
+        // output it just printed. Mirrors `admin retention`, which
+        // propagates for the same reason.
         CurationCommand::Waive(waive_args) => {
-            waive::run(client, waive_args, output).await?;
+            return waive::run(client, waive_args, output).await;
         }
         CurationCommand::Block(block_args) => {
             block::run(client, block_args, output).await?;
@@ -223,6 +267,19 @@ pub async fn run(
 /// CLI-side gives operators a fast feedback loop and avoids burning an
 /// audit-log 400 on operator error.
 pub(crate) const MAX_JUSTIFICATION_BYTES: usize = 512;
+
+/// The one digest algorithm a curation decision can be addressed by.
+/// Hort addresses content by SHA-256 (ADR 0003), so this is the only
+/// prefix [`normalize_digest`] strips rather than refuses.
+pub(crate) const SHA256_DIGEST_ALGORITHM: &str = "sha256";
+
+/// ANSI escapes used by the decision verbs' table output to draw the
+/// operator's eye to a non-zero count that needs acting on. Inline
+/// literals keep the dependency set tight (no `colored` crate), and
+/// both verbs share them so one of them cannot start highlighting in a
+/// different colour than the other.
+pub(crate) const ANSI_RED: &str = "\x1b[31m";
+pub(crate) const ANSI_RESET: &str = "\x1b[0m";
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -285,6 +342,107 @@ pub(crate) fn encode_path_segment(segment: &str) -> String {
     encoded
 }
 
+/// Wrap `n` in ANSI red when `n > 0` AND `use_ansi` is true.
+///
+/// Used for the counts an operator has to act on (`not_found`,
+/// `failed`) so their eye is drawn to a non-zero one on an interactive
+/// TTY — but the wrap is suppressed when stdout is piped or redirected
+/// so raw escape bytes don't corrupt a downstream `grep` / `awk` / log
+/// aggregator (mirrors `auth::login`'s `is_terminal()` gating). Zero is
+/// never highlighted: a plain `0` is unambiguous.
+pub(crate) fn highlight_if_nonzero(n: usize, use_ansi: bool) -> String {
+    if n > 0 && use_ansi {
+        format!("{ANSI_RED}{n}{ANSI_RESET}")
+    } else {
+        n.to_string()
+    }
+}
+
+/// The `(red, reset)` pair to interpolate into a section header, or two
+/// empty strings when colour is suppressed. One definition so a caller
+/// cannot gate the column highlight on `use_ansi` and forget the
+/// section header beside it.
+pub(crate) fn ansi_pair(use_ansi: bool) -> (&'static str, &'static str) {
+    if use_ansi {
+        (ANSI_RED, ANSI_RESET)
+    } else {
+        ("", "")
+    }
+}
+
+/// Normalise one operator-supplied digest to the bare 64-lowercase-hex
+/// form `artifacts.checksum_sha256` stores and both digest-addressed
+/// routes resolve against.
+///
+/// `sha256:<hex>` and a bare `<hex>` are the same address: an operator
+/// copying a digest off an OCI manifest or off a `curation queue` row
+/// must not have to know which spelling this surface wanted, so the two
+/// produce the same request body.
+///
+/// **Any other algorithm prefix is an error, never a strip** — the same
+/// rule, and the same wording, as the server's own
+/// `normalize_curation_digest`. Hort addresses content by SHA-256, so a
+/// `sha512:` digest cannot match a stored row; stripping its prefix
+/// would turn "you asked with the wrong algorithm" into "that artifact
+/// is not here", and send the curator looking for a missing artifact
+/// instead of a mistyped request.
+///
+/// `index` is the entry's position in the caller's list (0-based, as the
+/// server counts it) and is the only thing the message says about
+/// *which* entry failed: the offending text is operator-supplied and
+/// unbounded up to the first `:`, so it stays in the caller's own
+/// command line rather than being reflected back.
+pub(crate) fn normalize_digest(index: usize, raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    let hex = match trimmed.split_once(':') {
+        Some((algorithm, rest)) => {
+            if algorithm != SHA256_DIGEST_ALGORITHM {
+                return Err(anyhow::anyhow!(
+                    "digest at entry {index}: unsupported algorithm prefix — hort addresses \
+                     content by SHA-256, so pass a bare 64-hex digest or a \
+                     `{SHA256_DIGEST_ALGORITHM}:`-prefixed one"
+                ));
+            }
+            rest
+        }
+        None => trimmed,
+    };
+    // Mirrors `ContentHash::is_valid_sha256_hex` — 64 lowercase hex. The
+    // CLI checks it for the same reason it checks `--justification`: the
+    // server refuses the same input, and refusing it here costs the
+    // operator no round trip. Uppercase hex is refused rather than
+    // lowercased, because accepting what the API rejects would make this
+    // surface's "same request body" promise hide a divergence.
+    if hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        Ok(hex.to_string())
+    } else {
+        Err(anyhow::anyhow!(
+            "digest at entry {index}: invalid SHA-256 hash: expected 64 lowercase hex \
+             characters, got {len} characters",
+            len = hex.len()
+        ))
+    }
+}
+
+/// Normalise a whole `--digests` list, rejecting an empty one.
+///
+/// Shared by `waive digests` and `block digests` so the two verbs cannot
+/// disagree about which spellings name one address — the client-side
+/// half of the single resolver the server runs for both.
+pub(crate) fn normalize_digests(raw: &[String]) -> anyhow::Result<Vec<String>> {
+    if raw.is_empty() {
+        return Err(anyhow::anyhow!("--digests must not be empty"));
+    }
+    raw.iter()
+        .enumerate()
+        .map(|(index, d)| normalize_digest(index, d))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,6 +485,109 @@ mod tests {
         // Mirrors `hort-http-core::handlers::admin::curation::MAX_JUSTIFICATION_BYTES`.
         // If the server cap changes, this test breaks loudly.
         assert_eq!(MAX_JUSTIFICATION_BYTES, 512);
+    }
+
+    // -- the shared digest address ------------------------------------------
+
+    const DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+    /// The property the acceptance criterion names: the two spellings of
+    /// one digest are one address, so they put the same bytes on the wire.
+    #[test]
+    fn a_prefixed_and_a_bare_digest_normalise_to_the_same_request_body() {
+        let bare = normalize_digests(&[DIGEST.to_string()]).expect("bare hex is accepted");
+        let prefixed =
+            normalize_digests(&[format!("sha256:{DIGEST}")]).expect("a sha256: prefix is stripped");
+        assert_eq!(bare, prefixed);
+        assert_eq!(bare, vec![DIGEST.to_string()]);
+        // And mixed spellings inside one list land on one address too.
+        let mixed = normalize_digests(&[DIGEST.to_string(), format!("sha256:{DIGEST}")])
+            .expect("mixed spellings are accepted");
+        assert_eq!(mixed, vec![DIGEST.to_string(), DIGEST.to_string()]);
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_not_part_of_the_address() {
+        assert_eq!(
+            normalize_digest(0, &format!("  sha256:{DIGEST}\n")).expect("trimmed"),
+            DIGEST
+        );
+    }
+
+    /// A `sha512:` digest is a request written wrongly, not an artifact
+    /// that is absent — so it is refused by name rather than stripped
+    /// into a repo-wide scan for a hash that cannot exist.
+    #[test]
+    fn another_algorithm_prefix_is_refused_rather_than_stripped() {
+        let err = normalize_digest(3, &format!("sha512:{}", "a".repeat(128)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("entry 3"), "names the entry: {err}");
+        assert!(
+            err.contains("unsupported algorithm prefix"),
+            "names the cause: {err}"
+        );
+        assert!(err.contains("sha256:"), "names what to pass: {err}");
+        // An uppercase algorithm is the same refusal — the server
+        // compares the prefix exactly, so accepting it here would admit
+        // what the API rejects.
+        assert!(normalize_digest(0, &format!("SHA256:{DIGEST}")).is_err());
+    }
+
+    #[test]
+    fn a_digest_that_is_not_64_lowercase_hex_is_refused() {
+        for bad in [
+            "deadbeef",
+            &"z".repeat(64),
+            &DIGEST.to_uppercase(),
+            &format!("{DIGEST}0"),
+        ] {
+            let err = normalize_digest(1, bad).unwrap_err().to_string();
+            assert!(err.contains("entry 1"), "names the entry: {err}");
+            assert!(
+                err.contains("64 lowercase hex"),
+                "names the expected shape: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_digest_list_is_refused_before_the_round_trip() {
+        let err = normalize_digests(&[]).unwrap_err().to_string();
+        assert!(err.contains("--digests"), "names the flag: {err}");
+    }
+
+    // -- the shared highlight ----------------------------------------------
+
+    #[test]
+    fn highlight_if_nonzero_zero_no_ansi() {
+        // Zero carries NO escape whatever `use_ansi` says — a plain "0"
+        // is unambiguous and not worth an operator's attention.
+        assert_eq!(highlight_if_nonzero(0, true), "0");
+        assert_eq!(highlight_if_nonzero(0, false), "0");
+    }
+
+    #[test]
+    fn highlight_if_nonzero_positive_with_ansi_wraps_in_red() {
+        let s = highlight_if_nonzero(3, true);
+        assert!(s.contains('3'));
+        assert!(s.contains(ANSI_RED));
+        assert!(s.contains(ANSI_RESET));
+    }
+
+    #[test]
+    fn highlight_if_nonzero_positive_without_ansi_is_plain() {
+        // Non-TTY path (pipe / file redirect / CI log capture): plain
+        // digits, so downstream `grep`/`awk` never see escape bytes.
+        let s = highlight_if_nonzero(3, false);
+        assert_eq!(s, "3");
+        assert!(!s.contains('\x1b'));
+    }
+
+    #[test]
+    fn ansi_pair_is_empty_when_colour_is_suppressed() {
+        assert_eq!(ansi_pair(true), (ANSI_RED, ANSI_RESET));
+        assert_eq!(ansi_pair(false), ("", ""));
     }
 
     #[test]
