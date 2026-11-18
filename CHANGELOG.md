@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pushing an OCI manifest whose config or layer digest is held by a
   terminally-blocked artifact is now refused every time, instead of sometimes
   being accepted and then undeliverable on every pull (#432).
+- An event-chain checkpoint now anchors the stream seals since the last
+  anchored checkpoint rather than the whole seal history, so the anchor store
+  no longer grows with every tick (#423).
 
 ## [0.17.5] - 2026-11-17
 

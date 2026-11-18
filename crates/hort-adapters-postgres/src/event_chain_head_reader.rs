@@ -6,7 +6,7 @@
 //! consistent-cut `max_global_position`, and the `StreamSealed` records
 //! on the never-deleted `StreamId::eventstore_retention()` audit-meta
 //! stream (the derived `admin-<v5-uuid>` id) since the
-//! previous checkpoint.
+//! previous **anchored** checkpoint.
 //!
 //! ## Read posture
 //!
@@ -29,14 +29,34 @@
 //! row between the head read and the
 //! global-position read cannot smear the cut.
 //!
-//! ## `StreamSealed`
+//! ## `StreamSealed` — a windowed delta, not the history
 //!
 //! The `DomainEvent::StreamSealed` variant is emitted (ADR 0002 + 0004)
-//! to the `StreamId::eventstore_retention()` stream. `sealed_since_previous`
-//! therefore carries one `SealedStreamRecord` per seal since the
-//! previous checkpoint — empty only on a DB where nothing has been
-//! sealed yet (still a valid, expected result the emitter handles
-//! cleanly).
+//! to the `StreamId::eventstore_retention()` stream.
+//! `sealed_since_previous` therefore carries one `SealedStreamRecord`
+//! per seal **past the boundary the caller supplied** — the audit-meta
+//! stream position an anchored checkpoint already covered. Empty is a
+//! valid, expected result the emitter handles cleanly, and is the steady
+//! state: nothing was sealed since the last anchor.
+//!
+//! The boundary is a `stream_position` on the stream being read, not the
+//! `max_global_position` cut, and the difference is load-bearing.
+//! `events.global_position` comes from a sequence, so it is assigned in
+//! INSERT order and rows become visible in COMMIT order; a seal holding
+//! a lower `global_position` than an already-committed neighbour is
+//! invisible at the cut, is not carried, and a `global_position >` window
+//! past that cut would never read it again — leaving a live seal anchored
+//! by no checkpoint, which the verifier reports forever as
+//! `AnchorBreak::SealUnanchored`. `UNIQUE (stream_id, stream_position)`
+//! is the append path's serializer, so on one stream a visible position
+//! implies every lower position is visible: the anchored head is an exact
+//! frontier. Read inside the same `REPEATABLE READ` cut as the head
+//! query, the windows therefore tile without gaps.
+//!
+//! The verification half (`PgEventChainReader::read_sealed_records`)
+//! issues its own, deliberately **unwindowed** read of this same stream
+//! — it justifies a now-absent anchored stream and needs the full seal
+//! history permanently. Only this query is windowed.
 
 use sqlx::{PgPool, Row};
 
@@ -86,6 +106,30 @@ pub(crate) fn to_event_hash(bytes: &[u8], col: &str) -> DomainResult<EventHash> 
     Ok(EventHash(arr))
 }
 
+/// Translate the caller's anchored audit-meta stream position into the
+/// bound the windowed `StreamSealed` read binds.
+///
+/// `events.stream_position` is a 0-based `bigint`, so `-1` is the
+/// "no boundary" value that admits the whole stream — which is what
+/// `None` must mean: no checkpoint has anchored this stream, so no seal
+/// is anchored yet. `Some(0)` is a real boundary (one event anchored)
+/// and stays distinct from it.
+///
+/// A position wider than `bigint` cannot have come out of the column it
+/// is about, so it is an operational invariant breach — surfaced as
+/// `Err`, never silently clamped into a window that would skip seals.
+pub(crate) fn sealed_position_bound(anchored: Option<u64>) -> DomainResult<i64> {
+    match anchored {
+        None => Ok(-1),
+        Some(position) => i64::try_from(position).map_err(|_| {
+            DomainError::Invariant(format!(
+                "anchored audit-meta stream position {position} exceeds the \
+                 bigint stream_position column it is compared against"
+            ))
+        }),
+    }
+}
+
 /// Parse a stored `StreamSealed` event payload (the `event_data->'data'`
 /// JSON) into the verifier-facing [`SealedStreamRecord`]. The stored
 /// envelope is `{"type":"StreamSealed","data":{…}}`
@@ -119,8 +163,16 @@ pub(crate) fn sealed_record_from_row(
 }
 
 impl EventChainHeadReaderPort for PgEventChainHeadReader {
-    fn snapshot_live_chain(&self) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>> {
+    fn snapshot_live_chain(
+        &self,
+        anchored_retention_position: Option<u64>,
+    ) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>> {
         Box::pin(async move {
+            // Resolve the window bound before opening the cut: a bound
+            // that cannot be expressed is this cycle's failure, not a
+            // snapshot to take and then throw away.
+            let sealed_after = sealed_position_bound(anchored_retention_position)?;
+
             // One REPEATABLE READ transaction → a consistent cut.
             // All three reads see the same snapshot.
             let mut tx =
@@ -172,16 +224,27 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
                     })?
                     .get("max_gp");
 
-            // (3) StreamSealed records on the audit-meta stream (ADR 0004).
-            //     May be empty on a DB where nothing has been sealed yet —
-            //     valid result. Ordered for determinism.
+            // (3) StreamSealed records on the audit-meta stream (ADR 0004),
+            //     windowed past what an anchored checkpoint already
+            //     carried. Empty is the steady state (nothing sealed since
+            //     the last anchor) and a valid result. Ordered for
+            //     determinism.
+            //
+            //     The window tiles because the bound is a position on this
+            //     same stream read in this same cut, and (1) above records
+            //     that stream's head for the next run's bound: a seal this
+            //     query cannot see sits above the head it records. Deriving
+            //     the bound from `max_global_position` instead would not
+            //     tile — see the module doc.
             let sealed_rows = sqlx::query(
                 r#"SELECT event_data
                    FROM events
                    WHERE stream_id = $1 AND event_type = 'StreamSealed'
+                     AND stream_position > $2
                    ORDER BY stream_position ASC"#,
             )
             .bind(retention_stream_id())
+            .bind(sealed_after)
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| {
@@ -208,6 +271,7 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
 mod tests {
     use super::*;
     use hort_domain::events::StreamSealed;
+    use hort_domain::ports::event_store::EventStore;
     use serial_test::serial;
     use uuid::Uuid;
 
@@ -268,6 +332,47 @@ mod tests {
     }
 
     #[test]
+    fn no_boundary_admits_the_whole_stream() {
+        // `stream_position` is 0-based, so the sentinel has to sit below
+        // every real position: with no checkpoint anchoring the
+        // audit-meta stream no seal is anchored, and the next checkpoint
+        // must carry all of them.
+        assert_eq!(sealed_position_bound(None).unwrap(), -1);
+    }
+
+    #[test]
+    fn position_zero_is_a_boundary_not_an_absence() {
+        // The distinction the sentinel exists for: `Some(0)` windows out
+        // the seal at position 0, `None` keeps it.
+        assert_eq!(sealed_position_bound(Some(0)).unwrap(), 0);
+        assert_ne!(
+            sealed_position_bound(Some(0)).unwrap(),
+            sealed_position_bound(None).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_real_boundary_passes_through_unchanged() {
+        assert_eq!(sealed_position_bound(Some(41)).unwrap(), 41);
+        assert_eq!(
+            sealed_position_bound(Some(i64::MAX as u64)).unwrap(),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn a_boundary_wider_than_bigint_is_an_invariant_breach() {
+        // Unreachable from a position that came out of the column, so it
+        // is a breach rather than a clamp: clamping down would re-anchor
+        // the history and clamping up would window seals away for good.
+        let e = sealed_position_bound(Some(u64::MAX)).unwrap_err();
+        assert!(
+            e.to_string().contains("exceeds the"),
+            "unexpected message: {e}"
+        );
+    }
+
+    #[test]
     fn retention_stream_id_is_derived_from_the_ctor() {
         // The audit-meta stream identity is
         // `StreamId::eventstore_retention().to_string()`
@@ -308,7 +413,7 @@ mod tests {
         // assert the structural invariants that always hold rather than
         // exact emptiness.
         let reader = PgEventChainHeadReader::new(pool);
-        let snap = reader.snapshot_live_chain().await.unwrap();
+        let snap = reader.snapshot_live_chain(None).await.unwrap();
         assert!(snap.max_global_position >= snap.heads.len() as u64 || snap.heads.is_empty());
         // `sealed_since_previous` is NOT empty in a shared DB that has
         // had sealing activity. The invariant that still always holds: every record the
@@ -320,5 +425,145 @@ mod tests {
             .sealed_since_previous
             .iter()
             .all(|r| !r.sealed_stream_id.is_empty()));
+    }
+
+    /// The window is real SQL, so assert it against real rows: seal two
+    /// streams through the production `delete_stream` path, then read the
+    /// audit-meta stream at each boundary the emission cycle could hand
+    /// this adapter.
+    ///
+    /// Asserts on the two tombstones this test created rather than on the
+    /// whole set, so it states the window and not the database's
+    /// emptiness.
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn the_sealed_read_is_windowed_on_the_boundary_it_is_handed() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let store = crate::event_store::PgEventStore::new(pool.clone())
+            .await
+            .unwrap();
+        let reader = PgEventChainHeadReader::new(pool.clone());
+
+        // Two seals through the real tombstone path, so the audit-meta
+        // rows are exactly what production writes.
+        let first_id = seal_one_stream(&store, 0).await;
+        let second_id = seal_one_stream(&store, 1).await;
+
+        // The audit-meta positions those two tombstones landed at.
+        let positions: Vec<i64> = sqlx::query_scalar(
+            r#"SELECT stream_position FROM events
+               WHERE stream_id = $1 AND event_type = 'StreamSealed'
+               ORDER BY stream_position ASC"#,
+        )
+        .bind(retention_stream_id())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let (first_pos, second_pos) = match positions[..] {
+            [.., a, b] => (a as u64, b as u64),
+            _ => panic!("both tombstones must be on the audit-meta stream"),
+        };
+        assert!(first_pos < second_pos, "the tombstones must be ordered");
+
+        let carried = |b: Option<u64>| {
+            let reader = &reader;
+            async move {
+                reader
+                    .snapshot_live_chain(b)
+                    .await
+                    .unwrap()
+                    .sealed_since_previous
+                    .iter()
+                    .map(|r| r.sealed_stream_id.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // No boundary ⇒ both (the first-checkpoint case).
+        let all = carried(None).await;
+        assert!(all.contains(&first_id) && all.contains(&second_id));
+
+        // Boundary at the first tombstone ⇒ only the second survives.
+        let after_first = carried(Some(first_pos)).await;
+        assert!(
+            !after_first.contains(&first_id),
+            "a seal at or below the boundary must be windowed out"
+        );
+        assert!(
+            after_first.contains(&second_id),
+            "a seal past the boundary must still be carried"
+        );
+
+        // Boundary at the second ⇒ neither: the steady state in which
+        // nothing was sealed since the last anchor.
+        let after_second = carried(Some(second_pos)).await;
+        assert!(!after_second.contains(&first_id) && !after_second.contains(&second_id));
+
+        // The boundary the NEXT cycle derives is this snapshot's own
+        // audit-meta head, and it must cover every seal this cut returned
+        // — the property that makes the windows tile. A head below it
+        // would re-anchor; a head above it would window a seal away for
+        // good.
+        let head = reader
+            .snapshot_live_chain(Some(second_pos))
+            .await
+            .unwrap()
+            .heads
+            .into_iter()
+            .find(|h| h.stream_id == retention_stream_id())
+            .expect("the audit-meta stream is live and never deleted");
+        assert!(head.final_stream_position >= second_pos);
+    }
+
+    /// Append one event to a fresh artifact stream and seal it through
+    /// `delete_stream`, returning the sealed stream's wire id. A
+    /// single-event fresh stream has head `stream_position` 0, so the
+    /// seal authority needs no tail query.
+    async fn seal_one_stream(store: &crate::event_store::PgEventStore, marker: u8) -> String {
+        use hort_domain::events::{system_actor, ArtifactIngested, IngestSource};
+        use hort_domain::ports::event_store::{
+            AppendEvents, EventToAppend, ExpectedVersion, SealAuthority,
+        };
+
+        let artifact_id = Uuid::new_v4();
+        let stream = StreamId::artifact(artifact_id);
+        store
+            .append(AppendEvents {
+                stream_id: stream.clone(),
+                expected_version: ExpectedVersion::NoStream,
+                events: vec![EventToAppend::new(DomainEvent::ArtifactIngested(
+                    ArtifactIngested {
+                        artifact_id,
+                        repository_id: Uuid::new_v4(),
+                        name: format!("seal-window-{marker}"),
+                        version: Some("1.0.0".into()),
+                        sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                            .parse()
+                            .unwrap(),
+                        size_bytes: 10,
+                        source: IngestSource::Direct,
+                        metadata: serde_json::Value::Null,
+                        metadata_blob: None,
+                        upstream_published_at: None,
+                    },
+                ))],
+                correlation_id: Uuid::new_v4(),
+                causation_id: None,
+                actor: system_actor(),
+            })
+            .await
+            .unwrap();
+        store
+            .delete_stream(
+                stream.clone(),
+                SealAuthority {
+                    final_stream_position: 0,
+                },
+            )
+            .await
+            .unwrap();
+        stream.to_string()
     }
 }
