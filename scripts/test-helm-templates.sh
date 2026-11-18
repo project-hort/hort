@@ -156,6 +156,65 @@ test-values-upstream-timeout.yaml|^ *value: "1234"$|2|and both carry the operato
 EOF
 }
 
+# Two more rows for the expectations() table above, emitted from here
+# because their expected count is DERIVED rather than re-typed: it is
+# read out of that table's own `^kind: CronJob$` row for the same
+# fixture, so the two can never drift apart. A hardcoded second copy of
+# that number would go stale the next time a scheduled task's default
+# flips, and the stale copy would then be the one asserting the pairing.
+#
+# What the rows pin: a CronJob's pod template must set
+# `restartPolicy: Never`, never `OnFailure`. Under `OnFailure` kubelet
+# restarts the container in the SAME pod and the Job controller counts
+# `containerStatuses[*].restartCount` — not pod failures — against
+# `backoffLimit`, comparing with `>=`. So `backoffLimit: 1` paired with
+# `OnFailure` tolerates ZERO retries despite reading like one: the retry
+# still runs and still succeeds, but its result can no longer change the
+# verdict, and the Job is marked `Failed`. `failedJobsHistoryLimit` then
+# keeps that object — and the failed-job gauge an operator alerts on —
+# until someone deletes it by hand. Under `Never` each attempt is its
+# own pod, so the limit counts attempts and a failed attempt keeps its
+# own log.
+#
+# There is no shared CronJob partial — all twenty `cronjob-*.yaml`
+# templates are copies — so nothing but these two rows keeps the
+# twenty-first from bringing the pairing back.
+#
+# BOTH patterns are anchored to the CronJob indent, the way the table's
+# existing indent-sensitive rows anchor theirs. A CronJob's pod spec
+# sits at `spec.jobTemplate.spec.template.spec`, so its `restartPolicy`
+# renders at TEN spaces; a bare Job's sits at `spec.template.spec`, six.
+# `helm template` renders the hook manifests too, and `job-migrate.yaml`
+# + `prepull-job.yaml` keep `OnFailure` deliberately (an in-place
+# restart is the cheaper retry for a migration that hit a not-yet-ready
+# database, and their `backoffLimit: 3` leaves room for it) — so an
+# unanchored `OnFailure` count sees those two as well and could never
+# reach zero. Symmetrically, `svc-token-bootstrap-job.yaml` and
+# `tests/test-connection.yaml` already set `Never` at six spaces, so an
+# unanchored `Never` count would run two above the CronJob count.
+cronjob_render_count=$(expectations |
+    awk -F'|' '$1 == "test-values-cronjobs.yaml" && $2 == "^kind: CronJob$" { print $3 }')
+
+if [[ ! "${cronjob_render_count}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: could not read a single CronJob-document count out of the" >&2
+    echo "       expectations() '^kind: CronJob\$' row for" >&2
+    echo "       test-values-cronjobs.yaml (got: '${cronjob_render_count}')." >&2
+    echo "       The restartPolicy rows derive their expected count from that" >&2
+    echo "       row; failing here rather than falling back to a literal is" >&2
+    echo "       deliberate — a silently-skipped row asserts nothing." >&2
+    exit 2
+fi
+
+# Unquoted heredoc, so ${cronjob_render_count} interpolates; the `$`
+# regex anchors are escaped for that reason and mean the same as the
+# bare `$` in the quoted tables above.
+derived_expectations() {
+    cat <<EOF
+test-values-cronjobs.yaml|^          restartPolicy: Never\$|${cronjob_render_count}|every rendered CronJob sets restartPolicy: Never — count derived from this fixture's own kind: CronJob row, so a new cronjob-*.yaml template that keeps OnFailure lowers this below the CronJob count and fails here
+test-values-cronjobs.yaml|^          restartPolicy: OnFailure\$|0|and NO rendered CronJob sets restartPolicy: OnFailure — paired with backoffLimit it counts in-place container restarts with >=, so backoffLimit: 1 tolerates zero retries and a transient error becomes a permanent Failed
+EOF
+}
+
 # Template-scoped expectations — like expectations() but rendered via
 # `--show-only` so the assertion targets one template's output instead
 # of the whole multi-template render. Use this when the full-render grep
@@ -346,7 +405,7 @@ while IFS='|' read -r fixture pattern expected_count label; do
     else
         echo "PASS: ${fixture} → ${label} (${actual_count} match(es))"
     fi
-done < <(expectations)
+done < <(expectations; derived_expectations)
 
 # Process scoped expectations (see scoped_expectations() above) — each
 # row renders only the named template via `--show-only` and asserts a
