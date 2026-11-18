@@ -32,8 +32,8 @@ auditable option available, at the cost of not being full CommonMark. It
 covers exactly the constructs the source corpus actually uses (checked by
 grep before writing it): ATX headings, paragraphs, one level of nested
 lists, fenced code, GFM tables, blockquotes, inline bold/italic/code/links,
-and hr. No images are used in any in-scope doc (verified by grep), so image
-support is omitted.
+and hr. Markdown images resolve to files copied from site/assets/ and require
+non-empty alt text.
 
 Usage: python3 scripts/site/generate.py [--site {project-hort.de,hort.rs}] [--dist DIR]
   (default: builds both sites)
@@ -167,6 +167,13 @@ SITES = {
 # ---------------------------------------------------------------------------
 
 
+def resolve_source_path(source_rel, path_part):
+    """Resolve a Markdown-relative path against its source file in the repo."""
+    return os.path.normpath(os.path.join(os.path.dirname(source_rel), path_part)).replace(
+        os.sep, "/"
+    )
+
+
 def make_link_resolver(site_key, source_rel, output_rel):
     """href as written in `source_rel` (repo-relative .md file) -> href to
     emit in `output_rel` (dist-relative .html file, within `site_key`'s own
@@ -198,10 +205,7 @@ def make_link_resolver(site_key, source_rel, output_rel):
         if not path_part:
             return href
 
-        src_dir = os.path.dirname(source_rel)
-        resolved = os.path.normpath(os.path.join(src_dir, path_part)).replace(
-            os.sep, "/"
-        )
+        resolved = resolve_source_path(source_rel, path_part)
 
         if path_part.endswith(".md") and current["in_scope"](resolved):
             target_output = current["to_output"](resolved)
@@ -226,6 +230,33 @@ def make_link_resolver(site_key, source_rel, output_rel):
         else:
             gh = GITHUB_BLOB + resolved
         return gh + (f"#{frag}" if frag else "")
+
+    return resolve
+
+
+def make_image_resolver(source_rel, output_rel):
+    """Map a source-relative image to the matching file copied from site/assets/."""
+    asset_root = "site/assets/"
+
+    def resolve(src):
+        if src.lower().startswith(("http://", "https://", "//")):
+            raise ValueError(
+                f"{source_rel}: remote image source {src!r} is unsupported; "
+                "keep the badge outside rendered Markdown or vendor the asset "
+                "into site/assets/"
+            )
+        resolved = resolve_source_path(source_rel, src)
+        if not resolved.startswith(asset_root) or not os.path.isfile(
+            os.path.join(REPO_ROOT, resolved)
+        ):
+            raise ValueError(
+                f"{source_rel}: image source {src!r} is not a published "
+                "site/assets/ file"
+            )
+        published = "assets/" + resolved[len(asset_root):]
+        return os.path.relpath(published, os.path.dirname(output_rel) or ".").replace(
+            os.sep, "/"
+        )
 
     return resolve
 
@@ -447,7 +478,9 @@ def build_project_hort_de_docs(dist):
         with open(os.path.join(REPO_ROOT, src_rel), encoding="utf-8") as fh:
             text = fh.read()
         resolver = make_link_resolver(PROJECT_HORT_DE, src_rel, output_rel)
-        body_html, headings = mdconv.convert(text, resolver)
+        body_html, headings = mdconv.convert(
+            text, resolver, image_resolver=make_image_resolver(src_rel, output_rel)
+        )
         title = headings[0][2] if headings else humanize_filename(src_rel)
         title = mdconv.strip_inline_markup(title)
 
@@ -493,7 +526,8 @@ def build_project_hort_de_docs(dist):
             text = fh.read()
         resolver = make_link_resolver(PROJECT_HORT_DE, src_rel, output_rel)
         body_html, headings = mdconv.convert(
-            text, resolver, lambda source: diagrams.html_figure(source, output_rel)
+            text, resolver, lambda source: diagrams.html_figure(source, output_rel),
+            image_resolver=make_image_resolver(src_rel, output_rel)
         )
         title = mdconv.strip_inline_markup(headings[0][2]) if headings else humanize_filename(src_rel)
         chrome = '<div class="op-layout">' + operator_docs.sidebar(output_rel) + '<article class="op-article">' + body_html + '<p class="op-source"><a href="' + GITHUB_BLOB + src_rel + '">View Markdown source on GitHub</a></p></article>' + operator_docs.toc(headings) + '</div>'
@@ -609,7 +643,8 @@ def build_hort_rs_docs(dist):
         text = (Path(REPO_ROOT) / src_rel).read_text(encoding="utf-8")
         resolver = make_link_resolver(HORT_RS, src_rel, output_rel)
         body_html, headings = mdconv.convert(text, resolver,
-            lambda source: diagrams.html_figure(source, output_rel))
+            lambda source: diagrams.html_figure(source, output_rel),
+            image_resolver=make_image_resolver(src_rel, output_rel))
         title = mdconv.strip_inline_markup(headings[0][2]) if headings else humanize_filename(src_rel)
         records.append((src_rel, output_rel, title))
         page = render_page(HORT_RS, output_rel, title,
