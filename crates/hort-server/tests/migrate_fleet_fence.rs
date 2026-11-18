@@ -12,15 +12,17 @@
 //! into that old fleet's face. This suite drives the fence that closes
 //! that operational-ordering gap against a real Postgres, using the
 //! workspace's *actual* migration set and the *actual* checked-in
-//! `migrations/CONTRACTIONS.toml` (versions 9, 14, 20 are declared
+//! `migrations/CONTRACTIONS.toml` (versions 9, 14, 20, 31, 39 are declared
 //! contractions there) — no fixtures needed, since the manifest already
 //! gives us both a contraction and several expand-only migrations to test
 //! against.
 //!
 //! 1. `pending_contraction_with_older_fleet_blocks_and_names_offender` —
-//!    a pending contraction + an older-version hort-shaped connection ⇒
+//!    a pending contraction + a client below its declared floor ⇒
 //!    the fence blocks and names the offender; `gate_on_fleet_fence`
 //!    refuses without the override and proceeds with it.
+//!    The focused tests below pin tolerated older clients, the boundary,
+//!    the strictest of two floors, and register agreement.
 //! 2. `pending_contraction_with_unversioned_hort_client_blocks` — same,
 //!    but the other connection is hort-shaped with NO version segment
 //!    (predates this fence) ⇒ fail-closed, treated as older.
@@ -70,6 +72,7 @@ use std::env;
 use std::str::FromStr;
 use std::time::Duration;
 
+use hort_server::contractions::contraction_minimum_binary_versions;
 use hort_server::migrate::{
     evaluate_fleet_fence, gate_on_fleet_fence, run as migrate_run, MIGRATOR,
 };
@@ -80,7 +83,7 @@ use uuid::Uuid;
 
 /// This test binary's own `CARGO_PKG_VERSION` — identical to
 /// `hort-server`'s (workspace-inherited `version.workspace = true`), so
-/// it is the correct "current version" side of the fence's comparison.
+/// it is the correct binary-version input for the fence's fallback.
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
@@ -153,7 +156,7 @@ async fn connect_with_application_name(db_name: &str, application_name: &str) ->
 
 /// A migration version, strictly below the lowest declared contraction
 /// (9), so `MIGRATOR.run_to(BEFORE_FIRST_CONTRACTION, ..)` leaves every
-/// declared contraction (9, 14, 20) pending.
+/// declared contraction (9, 14, 20, 31, 39) pending.
 const BEFORE_FIRST_CONTRACTION: i64 = 8;
 
 /// The highest migration version below the workspace's current max —
@@ -172,6 +175,129 @@ fn expand_only_target() -> i64 {
 // ---------------------------------------------------------------------------
 // 1 — pending contraction + older fleet member: blocked, override works.
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn client_at_declared_floor_is_tolerated_and_migration_applies() {
+    let Some(admin) = admin_pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR
+        .run_to(38, &pool)
+        .await
+        .expect("partial migration run succeeds");
+
+    let _client = connect_with_application_name(&db_name, "hort-server/0.17.3").await;
+    let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
+        .await
+        .expect("fence evaluates");
+    assert!(
+        !fence.blocked,
+        "a client at the inclusive floor is tolerated"
+    );
+    gate_on_fleet_fence(&fence, false).expect("migration may proceed without override");
+    migrate_run(&pool)
+        .await
+        .expect("migrate::run applies the pending contraction cleanly");
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn client_below_declared_floor_is_blocked_and_message_names_floor() {
+    let Some(admin) = admin_pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR
+        .run_to(38, &pool)
+        .await
+        .expect("partial migration run succeeds");
+
+    let _client = connect_with_application_name(&db_name, "hort-worker/0.17.2").await;
+    let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
+        .await
+        .expect("fence evaluates");
+    assert!(fence.blocked, "the client is below migration 39's floor");
+    let refusal = gate_on_fleet_fence(&fence, false).expect_err("must refuse");
+    assert!(refusal.contains("migration 39"), "{refusal}");
+    assert!(refusal.contains("0.17.3"), "{refusal}");
+    assert!(refusal.contains("hort-worker/0.17.2 x1"), "{refusal}");
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn strictest_pending_floor_governs_two_declared_contractions() {
+    let Some(admin) = admin_pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR
+        .run_to(30, &pool)
+        .await
+        .expect("partial migration run succeeds");
+
+    let _client = connect_with_application_name(&db_name, "hort-server/0.17.2").await;
+    let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
+        .await
+        .expect("fence evaluates");
+    assert!(
+        fence.blocked,
+        "migration 39's floor governs over migration 31's"
+    );
+    let refusal = gate_on_fleet_fence(&fence, false).expect_err("must refuse");
+    assert!(refusal.contains("migration 39"), "{refusal}");
+    assert!(refusal.contains("0.17.3"), "{refusal}");
+    assert!(!refusal.contains("migration 31"), "{refusal}");
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn fence_floor_agrees_with_recorded_schema_compat_floor() {
+    let Some(admin) = admin_pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR
+        .run_to(38, &pool)
+        .await
+        .expect("partial migration run succeeds");
+
+    let declared = contraction_minimum_binary_versions();
+    let floor = declared.get(&39).expect("migration 39 is declared");
+    let _client = connect_with_application_name(&db_name, "hort-server/0.17.2").await;
+    let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
+        .await
+        .expect("fence evaluates");
+    let refusal = gate_on_fleet_fence(&fence, false).expect_err("must refuse");
+    assert!(
+        refusal.contains(&format!("migration 39: declared fleet floor {floor}")),
+        "{refusal}"
+    );
+
+    migrate_run(&pool)
+        .await
+        .expect("migration and register write succeed");
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT min_binary_version FROM schema_compat_register WHERE version = 39",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("register row for migration 39");
+    assert_eq!(recorded.as_deref(), Some(floor.as_str()));
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
 
 #[tokio::test]
 #[serial(hort_pg_db)]
