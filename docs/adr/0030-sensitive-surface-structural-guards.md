@@ -170,9 +170,17 @@ keeping the intended deletions.
 #215.*
 
 **The policy.** Destructive DDL — `DROP COLUMN`, `DROP TABLE`, `RENAME` of a
-table or a column, a column type change, and `SET NOT NULL` on an existing
-column — may ship only in a release **strictly after** the last release whose
-code references the affected identifier. **Expand and contract never share a
+table or a column, a column type change, `SET NOT NULL` on an existing column,
+and a `CHECK` constraint added to a column the migration did not create — may
+ship only in a release **strictly after** the last release whose code
+references the affected identifier.
+
+`SET NOT NULL` is the special case `CHECK (c IS NOT NULL)`, and the general
+form carries the same obligation for the same reason: every column the `CHECK`
+body names loses values its writers could previously emit, so from the instant
+the migration commits the still-running previous release can produce a value
+the database now refuses. `NOT VALID` is not an escape — it exempts existing
+rows, never a future `INSERT` or `UPDATE`. **Expand and contract never share a
 release.** Schema change is therefore always two releases:
 
 1. **Expand.** Add the new column or table, dual-write if there is a cutover,
@@ -196,7 +204,8 @@ identifiers compared as whole tokens, never substrings; the shared lexer both
 guards walk lives in `crates/hort-app/tests/sql_scan/mod.rs`. Recognised
 destructive shapes yield either a **removal** (`DROP TABLE`, `DROP COLUMN`,
 the source side of a `RENAME`) or a **narrowing** (`ALTER COLUMN … TYPE`,
-`SET NOT NULL`). Each is cross-checked against the checked-in manifest
+`SET NOT NULL`, and `ADD CONSTRAINT … CHECK` / `ADD CHECK` naming a column the
+migration did not create). Each is cross-checked against the checked-in manifest
 `migrations/CONTRACTIONS.toml`, whose entries carry the migration file name,
 the affected identifiers (`table` or `table.column`), a
 `reference_removed_in = "X.Y.Z"` release, and a required `note`. The guard
@@ -216,6 +225,36 @@ fails when:
 - **(c) the claim is untrue of the present** — SQL text in the workspace's
   production sources (`crates/*/src/**/*.rs`) still names a removed
   identifier.
+
+**The widening exemption, and why it is syntactic.** The commonest `CHECK`
+edit is not a narrowing at all: replacing an enum `CHECK` with one whose
+admitted set has *grown* takes nothing away from any writer that has ever
+existed. Such a statement is exempt — but only on four conditions the guard
+can establish without understanding semantics: the same migration drops the
+same constraint name, the previous definition of that name is findable in the
+migration set, both definitions are `<col> IN (<literal>, …)` over the same
+single column, and the new set is a superset of the old. Every other case
+**fails closed** and is reported, including an unfindable previous definition,
+either side not in the `IN` form, and a set that is neither superset nor
+comparable. The comparison is deliberately two enumerated literal lists and
+**not** an effects analysis: establishing that a predicate refuses nothing an
+older binary could write means reasoning about satisfaction across column
+defaults and disjunctions, which this guard does not do — so where it cannot
+decide it asks for a manifest entry it may not have needed, and the entry's
+`note` carries the reasoning a human did instead. A `CHECK` on a column the
+*same* migration creates is likewise not a narrowing, and the guard derives
+that from the migration set rather than from a list.
+
+This is a different question from the `_check` allow-list in the 2026-06-28
+amendment above, which asks whether a **sensitive table** emerges still
+constrained and deliberately does not compare admitted sets. Both apply
+independently: a drop-and-re-add on a sensitive table must satisfy that
+allow-list, and its re-added `CHECK` must satisfy this comparison.
+
+Getting that exemption right is load-bearing beyond the build: the runtime
+fence below keys on *whether* a pending migration is declared, so a widening
+declared as a contraction would fence a routine rolling upgrade this policy
+never intended to stop.
 
 The manifest is seeded with the tree's existing destructive migrations
 (`009`, `014`, `020`) so the guard starts from reality; `020`'s entry records
