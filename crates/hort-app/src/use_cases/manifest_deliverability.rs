@@ -239,6 +239,44 @@ impl ManifestDeliverabilityUseCase {
             .await
     }
 
+    /// The **direct** half of the same question, answered per
+    /// constituent: which of `constituents` carry a terminal status in
+    /// `repository_id`, strongest first.
+    ///
+    /// For the admission side of a document whose references the caller
+    /// has already derived from the bytes it is admitting. There is no
+    /// closure walk and none is missing: these are blob constituents and
+    /// a blob binds nothing, so the direct question is the whole question
+    /// for them — which is why a single-image push still costs one
+    /// catalog call and no CAS read.
+    ///
+    /// **Why a caller holding the rows still asks.** `artifacts` is
+    /// unique on `(repository_id, path)` and not on the checksum, so one
+    /// repository may hold several live rows for one hash — a blob and a
+    /// manifest sharing bytes, with independent statuses. A hash-keyed
+    /// identity lookup answers "some row for these bytes" and cannot
+    /// answer "the verdict that stands against them"; this does, by the
+    /// same derivation and the same precedence [`Self::resolve`] serves a
+    /// read with, so admission and delivery cannot name different
+    /// constituents for one document.
+    ///
+    /// Per constituent rather than one answer, because the caller's
+    /// refusal names one of them and its per-reference record is the
+    /// record of the others. The first entry is the one a refusal names:
+    /// the order is the refusal precedence, ties by the caller's own
+    /// position, so it is the answer [`Self::resolve`] would give over
+    /// the same set.
+    pub async fn terminal_constituents(
+        &self,
+        repository_id: Uuid,
+        constituents: &[ContentHash],
+    ) -> AppResult<Vec<TerminalConstituent>> {
+        Ok(self
+            .constituents
+            .terminal_constituents(repository_id, constituents)
+            .await?)
+    }
+
     /// Resolve the question over a root document whose bytes are in
     /// hand, whichever way they were obtained.
     async fn resolve_over(
@@ -564,6 +602,10 @@ mod tests {
         repo: Uuid,
         storage: Arc<MockStoragePort>,
         artifacts: Arc<MockArtifactRepository>,
+        /// The reader the use case holds, so a test can arm its
+        /// fail-closed arm without rebuilding the use case around a
+        /// second double.
+        constituents: Arc<MockConstituentStatusReader>,
         use_case: ManifestDeliverabilityUseCase,
     }
 
@@ -575,6 +617,7 @@ mod tests {
             repo: Uuid::new_v4(),
             storage: storage.clone(),
             artifacts,
+            constituents: constituents.clone(),
             use_case: ManifestDeliverabilityUseCase::new(storage, constituents),
         }
     }
@@ -1109,17 +1152,140 @@ mod tests {
             ) -> BoxFuture<'a, Result<Option<TerminalConstituent>, DomainError>> {
                 Box::pin(async { Ok(None) })
             }
+
+            fn terminal_constituents<'a>(
+                &'a self,
+                _repository_id: Uuid,
+                _constituents: &'a [ContentHash],
+            ) -> BoxFuture<'a, Result<Vec<TerminalConstituent>, DomainError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
         }
         let storage = Arc::new(MockStoragePort::new());
         let (manifest, config) = (hash_of("m"), hash_of("c"));
         storage.insert_content(manifest.clone(), image_manifest(&config, &[]));
         let use_case = ManifestDeliverabilityUseCase::new(storage, Arc::new(Silent));
+        let repo = Uuid::new_v4();
         assert_eq!(
             use_case
-                .resolve(Uuid::new_v4(), &manifest)
+                .resolve(repo, &manifest)
                 .await
                 .expect("resolution succeeds"),
             ManifestDeliverability::Deliverable
+        );
+        // The same contract on the per-constituent answer, which the
+        // admission side asks: knowing nothing is an empty list, not an
+        // invented hold.
+        assert_eq!(
+            use_case
+                .terminal_constituents(repo, &[config])
+                .await
+                .expect("the read succeeds"),
+            Vec::new()
+        );
+    }
+
+    // -- terminal_constituents: the direct half, per constituent --------
+
+    /// One entry per hash carrying a terminal verdict, strongest first,
+    /// and nothing for a hash that is absent or deliverable — the same
+    /// three answers [`ManifestDeliverabilityUseCase::resolve`] gives,
+    /// reported per constituent so the caller can record each one.
+    #[tokio::test]
+    async fn terminal_constituents_answers_per_hash_strongest_first() {
+        let h = fixture();
+        let (rejected, held, deliverable, absent) = (
+            hash_of("rej"),
+            hash_of("ind"),
+            hash_of("ok"),
+            hash_of("gone"),
+        );
+        h.catalog(&rejected, QuarantineStatus::Rejected);
+        h.catalog(&held, QuarantineStatus::ScanIndeterminate);
+        h.catalog(&deliverable, QuarantineStatus::Released);
+        // `rejected` listed twice, because a manifest may legitimately
+        // name the same layer twice and the answer carries one entry per
+        // hash — the `WITH ORDINALITY` array's repeated member collapsing
+        // to its earliest position.
+        let asked = vec![
+            deliverable.clone(),
+            absent.clone(),
+            held.clone(),
+            rejected.clone(),
+            rejected.clone(),
+        ];
+        assert_eq!(
+            h.use_case
+                .terminal_constituents(h.repo, &asked)
+                .await
+                .expect("the read succeeds"),
+            vec![
+                TerminalConstituent {
+                    content_hash: rejected,
+                    status: QuarantineStatus::Rejected,
+                },
+                TerminalConstituent {
+                    content_hash: held,
+                    status: QuarantineStatus::ScanIndeterminate,
+                },
+            ],
+            "strongest first, whatever order the caller listed them in"
+        );
+    }
+
+    /// **The reason a caller holding the row still asks.** `artifacts` is
+    /// unique on `(repository_id, path)` and not on the checksum, so one
+    /// repository holds a blob row and a manifest row for one set of
+    /// bytes with independent statuses. The verdict is the strongest of
+    /// them; "some row for these bytes" is not a verdict, and the first
+    /// entry here is what `resolve` reports over the same closure.
+    #[tokio::test]
+    async fn a_hash_held_by_two_rows_answers_with_the_strongest_verdict() {
+        let h = fixture();
+        let (manifest, twinned) = (hash_of("m"), hash_of("twin"));
+        h.catalog(&twinned, QuarantineStatus::Released);
+        h.catalog(&twinned, QuarantineStatus::Rejected);
+        let per_hash = h
+            .use_case
+            .terminal_constituents(h.repo, std::slice::from_ref(&twinned))
+            .await
+            .expect("the read succeeds");
+        assert_eq!(
+            per_hash,
+            vec![TerminalConstituent {
+                content_hash: twinned.clone(),
+                status: QuarantineStatus::Rejected,
+            }],
+            "the terminal row decides, not whichever row a lookup returns first"
+        );
+        // And the same constellation read as a document: one question,
+        // so the two entry points cannot name different constituents.
+        h.store(&manifest, image_manifest(&twinned, &[]));
+        assert_eq!(
+            h.resolve(&manifest).await.expect("resolution succeeds"),
+            ManifestDeliverability::TerminalConstituent(
+                per_hash.first().expect("a verdict was reported").clone()
+            ),
+            "the document-shaped answer is the per-hash answer's first entry"
+        );
+    }
+
+    /// A catalog that cannot answer is not a catalog answering "nothing
+    /// terminal": the failure reaches the caller, which refuses the push
+    /// over it (ADR 0007).
+    #[tokio::test]
+    async fn a_failed_read_is_an_error_and_not_an_empty_answer() {
+        let h = fixture();
+        let hash = hash_of("rej");
+        h.catalog(&hash, QuarantineStatus::Rejected);
+        h.constituents
+            .fail_next(DomainError::Invariant("catalog down".into()));
+        assert!(
+            h.use_case
+                .terminal_constituents(h.repo, &[hash])
+                .await
+                .is_err(),
+            "a failed read must not read as a deliverable constituent"
         );
     }
 
