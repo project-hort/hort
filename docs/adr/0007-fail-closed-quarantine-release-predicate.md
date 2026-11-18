@@ -319,6 +319,83 @@ The narrow reading is the one that survives.
 
 **Decision recorded ahead of the code.** This section is the standing decision. The `(Admin, AdminOverride)` pairing row, the `ReleaseCuratorWaiver` source-state table (`crates/hort-domain/src/entities/quarantine_transitions.rs`), the `Rejected` override predicate beside `is_scan_clearable`, and the admin route and CLI command the decision removes all land with the implementing change under the same issue. Until they do, the code still carries two manual paths and the narrower curator bound; this section, not the code, is what the decision says. The amendment sections *above* keep their contemporaneous wording, as every earlier amendment to this ADR has — where one of them counts five authorities or names `AdminOverride`, it is reporting the predicate as it stood on its own date.
 
+### The predicate is only as honest as the read behind it (amended 2026-11-18)
+
+*Built under issue #324; the two deliberate consequences below were put to
+the maintainer separately and confirmed on issue #329.*
+
+Every authority above is a claim about the artifact's **whole** event stream:
+`ScanSucceeded` and `ScanRecorded` are derived from the *latest*
+`ScanCompleted` plus the absence of an `ArtifactRejected` *later than it*, and
+the `Required`-mode provenance conjunct from the presence of a
+`ProvenanceVerified` *anywhere* on the stream. A capped `ReadFrom::Start` read
+answers those questions only while the stream fits inside the per-artifact
+event cap (`hort_app::use_cases::STREAM_EVENT_CAP`, 1000) — past it, the
+reverse scan finds the latest verdict *among the oldest 1000* and the
+suffix check runs over events that are not the suffix. A stale clean scan then
+reads as the current one and the rejection that superseded it is invisible:
+the predicate returns `ScanSucceeded` for an artifact the scanner condemned.
+No amount of headroom removes this; a larger cap only moves the point at
+which it happens.
+
+So the cap is enforced on both sides, and both halves are load-bearing:
+
+- **Write side.** The cap is what makes the bounded read sufficient, so no
+  *repeatable* writer may breach it. Every `ExpectedVersion::Exact` writer is
+  bounded by `read_expected_version`'s refusal. `ExpectedVersion::Any` gets
+  *no* version check from the adapter at all, so an `Any` writer to an
+  artifact stream must carry its own refusal. The exemplar is the
+  retention-expiry append (`RetentionUseCase::append_expired`): it runs once
+  per policy per day against an artifact it has already expired, which makes
+  it repeatable, and it refuses. The rule is deliberately not a list of
+  writers, because a list rots with the next one: **every production append to
+  an artifact stream either calls the one cap predicate in the function that
+  appends, or declares at the site why it cannot accumulate.**
+  `crates/hort-app/tests/capped_stream_writes.rs` is what holds it — its
+  corpus is derived from `ArtifactLifecyclePort`'s own methods rather than
+  enumerated, so a new writer is in scope by construction.
+
+  The remaining `Any` appends on that category are **terminal and
+  single-shot** — `ArtifactPurged` (`PurgeUseCase`), `ArtifactDeleted`
+  (`PgArtifactRepository::delete`), the `ArtifactCorrupted` +
+  `ArtifactRejected` tombstone pair (`CasScrubUseCase`) — each guarded from
+  re-firing by a state transition or a conditional `UPDATE`. They are
+  deliberately **not** given a cap refusal: they are the last events a stream
+  ever takes, the destructive work they record has already happened, and
+  refusing one would strand content rather than protect a later decision. The
+  purge batch is one event per distinct referenced content hash, so it is the
+  one batch whose size is not a small constant; an artifact whose reference
+  count plus lifecycle length crosses the cap therefore ends with a stream
+  that is *unsealable* (the terminal proof cannot read to its tail and reports
+  a per-stream error). That is a retention-sweep noise cost on an already-dead
+  artifact, not a gate decided from a truncated read — no reader consults an
+  artifact's stream after its terminal event.
+- **Read side.** Every consumer of an artifact stream's history reads through
+  `hort_app::use_cases::read_artifact_stream`, which reads `cap + 1` events so
+  that a read returning at most `cap` has provably reached the tail, and
+  refuses one that has not. Refusing is fail-closed in the release direction —
+  the candidate stays quarantined — and it is reported, not silent: the sweep
+  logs the artifact at `error!` and skips it, so one unreadable stream cannot
+  stall the release of every other candidate. The correct idiom predated this
+  amendment — one site already read `cap + 1` and refused — and
+  **convention alone did not hold it** — ten capped-read sites across seven
+  files got it wrong, nine of them reading the cap's then-current value as a
+  bare literal with no overflow detection, and six files each carrying their
+  own copy of that number. Hence
+  the structural guard `crates/hort-app/tests/capped_stream_reads.rs`: a
+  bounded `read_stream` in production code is permitted in exactly one file.
+
+**Consequence, recorded deliberately: an artifact at the cap is frozen.** It
+accepts no further lifecycle event and no gate can be decided from its stream,
+so it can neither release nor expire nor be purged. That is the correct
+fail-closed outcome for a stream far longer than any legitimate lifecycle —
+a verdict-less rescan does not spend the budget, so reaching the cap at all
+means something repeatable was appending — and it is *not* currently surfaced as its own operator signal — the
+`error!` line and the unexplained absence from every sweep's counters are all
+an operator gets. Should that state ever be observed in the field, a dedicated
+signal (a counter, or a `GET /admin/quarantine` field) is the follow-on; the
+predicate itself needs no change.
+
 ### Read-path bounded-await pattern (issue #65, amended 2026-07-20)
 
 The zero-window carve-out above still leaves a **read-side** race: a cold pull-through blob GET resolves the just-ingested, still-`Quarantined` artifact and would 503 before that artifact's own async scan lands the `ScanSucceeded` that (per the carve-out) releases it almost immediately once it runs — the gap is the scan's own turnaround (~1–5s observed), not an observation window. `hort-http-oci::blobs::maybe_bounded_await_release` closes this by polling the artifact for up to a tunable bound (`HORT_OCI_PULLTHROUGH_RELEASE_WAIT_SECS`, default 10s, `0` = off) before falling through to the existing `check_quarantine` 503 decision.
