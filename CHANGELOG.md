@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer reported as declaring nothing, or as declaring a complete list;
   such a distribution now holds for scan review instead of completing as
   not-applicable (#430).
+- Pushing an OCI manifest whose config or layer digest is held by a
+  terminally-blocked artifact is now refused every time, instead of sometimes
+  being accepted and then undeliverable on every pull (#432).
 
 ## [0.17.5] - 2026-11-17
 

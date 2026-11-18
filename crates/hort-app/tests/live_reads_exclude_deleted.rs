@@ -438,11 +438,15 @@ const CENSUS: [(&str, usize, usize, usize, usize); 18] = [
         0,
         1,
     ),
+    // The admission/delivery derivation, in two statements: the single
+    // strongest constituent for the manifest read, and the per-hash set the
+    // per-reference log is rendered from. Both filter — a soft-deleted
+    // constituent is no longer a reference anything is delivering.
     (
         "crates/hort-adapters-postgres/src/constituent_status.rs",
-        1,
-        1,
-        1,
+        2,
+        2,
+        2,
         0,
     ),
     (

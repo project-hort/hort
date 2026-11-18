@@ -538,22 +538,34 @@ impl MockArtifactRepository {
         self.insert(artifact);
     }
 
-    /// The status of `hash` inside `repo` as a **deliverability** read
-    /// sees it: repository-scoped and `deleted_at`-filtered, which is
-    /// what the Postgres constituent statement does and what every live
-    /// `ArtifactRepository` read does.
+    /// The status of **every** live row for `hash` inside `repo`, as a
+    /// **deliverability** read sees them: repository-scoped and
+    /// `deleted_at`-filtered, which is what the Postgres constituent
+    /// statements do and what every live `ArtifactRepository` read does.
+    ///
+    /// Plural, and that is the point. `artifacts` is unique on
+    /// `(repository_id, path)` and not on the checksum, so one repository
+    /// legitimately holds several live rows for one hash — a blob and a
+    /// manifest sharing bytes, with independent statuses — and the
+    /// Postgres statements join **all** of them before keeping the
+    /// strongest. A singular helper would hand
+    /// [`MockConstituentStatusReader`] one arbitrarily-chosen row, which
+    /// is the identity lookup's answer and not the verdict: the double
+    /// would then answer a question production answers differently, and
+    /// every test standing on it would be proving the wrong thing.
     ///
     /// Deliberately narrower than this mock's own
     /// `find_by_repo_and_checksum`, which does not filter retirement.
     /// [`MockConstituentStatusReader`] serves from here so a test cannot
     /// prove a manifest withheld by a row no read path can see.
-    pub fn live_status_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Option<QuarantineStatus> {
-        self.live_row_in_repo(repo, hash)
+    pub fn live_statuses_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Vec<QuarantineStatus> {
+        self.live_rows_in_repo(repo, hash)
+            .into_iter()
             .map(|(_id, status)| status)
+            .collect()
     }
 
-    /// The same live, repository-scoped row as
-    /// [`Self::live_status_in_repo`], but carrying its **id** as well.
+    /// One live, repository-scoped row for `hash`, carrying its **id**.
     ///
     /// [`MockListDeliverabilityCensus`] needs the id because the
     /// membership projection keys its edges on `source_artifact_id`, so
@@ -567,14 +579,23 @@ impl MockArtifactRepository {
         repo: Uuid,
         hash: &ContentHash,
     ) -> Option<(Uuid, QuarantineStatus)> {
+        self.live_rows_in_repo(repo, hash).into_iter().next()
+    }
+
+    /// Every live, repository-scoped row for `hash`, as `(id, status)` —
+    /// the one place the retirement and repository filters are written,
+    /// which is what keeps the singular and plural readers above from
+    /// drifting apart.
+    fn live_rows_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Vec<(Uuid, QuarantineStatus)> {
         self.artifacts
             .lock()
             .unwrap()
             .values()
-            .find(|a| {
+            .filter(|a| {
                 a.repository_id == repo && a.sha256_checksum == *hash && a.deleted_at.is_none()
             })
             .map(|a| (a.id, a.quarantine_status))
+            .collect()
     }
 
     /// Seed a synthetic `(name, version, status)`
@@ -739,12 +760,27 @@ impl ArtifactRepository for MockArtifactRepository {
             return Box::pin(async move { Err(err) });
         }
         let sha = sha256.as_ref().to_string();
+        // The adapter's statement is `LIMIT 1` with no `ORDER BY` over a
+        // set a repository may legitimately hold more than one member of
+        // (unique on `(repository_id, path)`, not on the checksum), so
+        // production may answer with **either** row and a double has to
+        // pick one. It picks the **most permissive** — the row whose
+        // status would let a caller through — because that is the plan
+        // choice a verdict read off this lookup gets wrong, and a double
+        // that flipped a coin instead would turn the test that catches it
+        // into one that catches it half the time. The id breaks the
+        // remaining tie so the answer is the same on every run.
+        //
+        // This is identity, not a verdict: whoever needs a verdict over
+        // these bytes asks `ConstituentStatusReader`, which ranks every
+        // row by the domain's refusal precedence.
         let result = self
             .artifacts
             .lock()
             .unwrap()
             .values()
-            .find(|a| a.repository_id == repository_id && a.sha256_checksum.as_ref() == sha)
+            .filter(|a| a.repository_id == repository_id && a.sha256_checksum.as_ref() == sha)
+            .min_by_key(|a| (a.quarantine_status.is_terminal(), a.id))
             .map(Self::projected);
         Box::pin(async move { Ok(result) })
     }
@@ -6428,7 +6464,7 @@ impl EventRepositoryResolver for MockEventRepositoryResolver {
 /// on behaviour production does not have:
 ///
 /// - **repository scope** and **retirement** — served through
-///   [`MockArtifactRepository::live_status_in_repo`];
+///   [`MockArtifactRepository::live_statuses_in_repo`];
 /// - **which statuses are terminal** — filtered through
 ///   `QuarantineStatus::is_terminal`, never a written-out list;
 /// - **which verdict wins, and which constituent is named** — the
@@ -6459,9 +6495,74 @@ impl MockConstituentStatusReader {
     }
 
     /// How many times the reader was asked — the handle for the
-    /// "one lookup, not one per constituent" assertion.
+    /// "one lookup, not one per constituent" assertion. Both port
+    /// methods count, because the property is about round trips and not
+    /// about which of the two a caller needed.
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
+    }
+
+    /// The ranked answer both port methods are a slice of: one entry per
+    /// hash carrying a terminal status, strongest first, ties by the
+    /// caller's own position.
+    ///
+    /// One ranking for both answers, so the double cannot disagree with
+    /// itself where production cannot: the `LIMIT 1` statement and the
+    /// per-hash one share their CTEs, their binding and their
+    /// `(precedence, position)` key, and the adapter has a DB-backed test
+    /// pinning that the first per-hash entry is the single answer.
+    ///
+    /// **Every** live row for a hash is considered, not one of them. A
+    /// repository may hold a blob row and a manifest row for the same
+    /// bytes with independent statuses; the statements join all of them
+    /// and keep the strongest, and a double that read one arbitrary row
+    /// would be answering the identity lookup's question instead — the
+    /// very confusion the admission path had.
+    fn ranked(
+        &self,
+        repository_id: Uuid,
+        constituents: &[ContentHash],
+    ) -> Vec<TerminalConstituent> {
+        let precedence = terminal_statuses_by_refusal_precedence();
+        let mut ranked: Vec<(usize, usize, ContentHash, QuarantineStatus)> = Vec::new();
+        for (position, hash) in constituents.iter().enumerate() {
+            // One entry per hash: the statement's ranking partitions by
+            // the hash and keeps `rank = 1`, so an array that repeats a
+            // hash keeps its earliest position — and a manifest may
+            // legitimately name the same layer twice.
+            if ranked.iter().any(|(_, _, held, _)| held == hash) {
+                continue;
+            }
+            let strongest = self
+                .artifacts
+                .live_statuses_in_repo(repository_id, hash)
+                .into_iter()
+                .filter_map(|status| {
+                    // `position` in the derived set is the rank; a status
+                    // the predicate does not call terminal is not in it,
+                    // which is the filter and never a written-out list.
+                    Some((precedence.iter().position(|s| *s == status)?, status))
+                })
+                .min_by_key(|(rank, _)| *rank);
+            if let Some((rank, status)) = strongest {
+                ranked.push((rank, position, hash.clone(), status));
+            }
+        }
+        ranked.sort_by_key(|(rank, position, _, _)| (*rank, *position));
+        ranked
+            .into_iter()
+            .map(|(_, _, content_hash, status)| TerminalConstituent {
+                content_hash,
+                status,
+            })
+            .collect()
+    }
+
+    /// The injected-failure arm, shared by both methods: one FIFO, so a
+    /// test arming a failure drives whichever call its consumer makes.
+    fn armed_error(&self) -> Option<DomainError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.errors.lock().unwrap().pop_front()
     }
 }
 
@@ -6471,27 +6572,22 @@ impl ConstituentStatusReader for MockConstituentStatusReader {
         repository_id: Uuid,
         constituents: &'a [ContentHash],
     ) -> BoxFut<'a, DomainResult<Option<TerminalConstituent>>> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        if let Some(err) = self.errors.lock().unwrap().pop_front() {
+        if let Some(err) = self.armed_error() {
             return Box::pin(async move { Err(err) });
         }
-        // Rank by the domain's refusal precedence, then by the caller's
-        // closure position — the statement's `ORDER BY t.precedence,
-        // w.position`.
-        let precedence = terminal_statuses_by_refusal_precedence();
-        let answer = constituents
-            .iter()
-            .enumerate()
-            .filter_map(|(position, hash)| {
-                let status = self.artifacts.live_status_in_repo(repository_id, hash)?;
-                let rank = precedence.iter().position(|s| *s == status)?;
-                Some((rank, position, hash.clone(), status))
-            })
-            .min_by_key(|(rank, position, _, _)| (*rank, *position))
-            .map(|(_, _, content_hash, status)| TerminalConstituent {
-                content_hash,
-                status,
-            });
+        let answer = self.ranked(repository_id, constituents).into_iter().next();
+        Box::pin(async move { Ok(answer) })
+    }
+
+    fn terminal_constituents<'a>(
+        &'a self,
+        repository_id: Uuid,
+        constituents: &'a [ContentHash],
+    ) -> BoxFut<'a, DomainResult<Vec<TerminalConstituent>>> {
+        if let Some(err) = self.armed_error() {
+            return Box::pin(async move { Err(err) });
+        }
+        let answer = self.ranked(repository_id, constituents);
         Box::pin(async move { Ok(answer) })
     }
 }
