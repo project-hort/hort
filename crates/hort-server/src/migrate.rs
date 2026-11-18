@@ -62,7 +62,7 @@ fn embedded_migration_versions() -> BTreeSet<i64> {
 /// embeds gets a `schema_compat_register` row carrying the oldest binary
 /// version it tolerates, read out of `migrations/CONTRACTIONS.toml` — the
 /// manifest this binary embeds precisely because it also embeds that
-/// migration. `ON CONFLICT DO NOTHING` makes this write double as a
+/// migration. The conditional conflict update makes this write double as a
 /// backfill: it covers both what this call just applied and whatever an
 /// older binary — one that predates the register, or one that crashed
 /// between applying a migration and recording it — already applied before
@@ -109,7 +109,7 @@ fn embedded_migration_versions() -> BTreeSet<i64> {
 /// the worker's boot gate read them.
 pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
     let applied = applied_migration_versions(pool).await?;
-    let mut register = read_schema_compat_register(pool).await?;
+    let register = read_schema_compat_register(pool).await?;
     let compatibility = SchemaCompatibility::evaluate(
         &applied,
         &embedded_migration_versions(),
@@ -169,7 +169,7 @@ pub async fn run(pool: &PgPool) -> anyhow::Result<()> {
         }
     };
 
-    register.extend(record_schema_compat(pool, &embedded_migration_versions()).await?);
+    let register = record_schema_compat(pool, &embedded_migration_versions()).await?;
     let applied_after: BTreeSet<i64> = applied.union(&applied_now).copied().collect();
     tracing::info!(
         tolerates_binaries_from = %schema_rollback_floor(&applied_after, &register),
@@ -405,28 +405,26 @@ async fn read_schema_compat_register(pool: &PgPool) -> anyhow::Result<SchemaComp
 }
 
 /// Record one register row per migration `embedded` names — every migration
-/// this binary embeds, not only whatever this run applied — and return the
-/// rows written so the caller can report the resulting rollback floor
-/// without a second read.
+/// this binary embeds, not only whatever this run applied — then read the
+/// register back so the reported rollback floor reflects stored values.
 ///
 /// A migration named by `migrations/CONTRACTIONS.toml` records that
 /// entry's `reference_removed_in`; every other migration removed nothing
 /// and records `NULL`.
 ///
-/// `ON CONFLICT DO NOTHING` rather than an upsert: an applied migration is
-/// frozen (ADR 0022), so its contraction status can never change and an
-/// existing row is already the right answer. That is what makes it safe to
-/// pass the whole embedded set on every call rather than just what this run
-/// applied: a row already written by the release that shipped the migration
-/// is never overwritten, so this both records a fresh migration and
-/// backfills a migration an older, pre-register binary already applied. It
-/// also makes a re-run after a partial failure safe.
+/// An applied migration's SQL is frozen (ADR 0022), but its manifest entry
+/// can be declared later. An earlier register row may therefore hold `NULL`
+/// for a migration now declared as a contraction. `NULL` claims an expansion;
+/// only an absent row means the floor is unknown. Fill that `NULL` from a
+/// new declaration, but never overwrite a recorded floor. A genuine
+/// expansion has no incoming floor and receives no update. The conditional
+/// write makes re-runs and backfills of pre-register migrations idempotent.
 async fn record_schema_compat(
     pool: &PgPool,
     embedded: &BTreeSet<i64>,
 ) -> anyhow::Result<SchemaCompatRegister> {
     if embedded.is_empty() {
-        return Ok(SchemaCompatRegister::new());
+        return read_schema_compat_register(pool).await;
     }
     let minimums = crate::contractions::contraction_minimum_binary_versions();
     let versions: Vec<i64> = embedded.iter().copied().collect();
@@ -438,7 +436,10 @@ async fn record_schema_compat(
     sqlx::query(
         "INSERT INTO schema_compat_register (version, min_binary_version) \
          SELECT * FROM UNNEST($1::bigint[], $2::text[]) \
-         ON CONFLICT (version) DO NOTHING",
+         ON CONFLICT (version) DO UPDATE \
+         SET min_binary_version = EXCLUDED.min_binary_version \
+         WHERE schema_compat_register.min_binary_version IS NULL \
+           AND EXCLUDED.min_binary_version IS NOT NULL",
     )
     .bind(&versions)
     .bind(&recorded)
@@ -446,7 +447,7 @@ async fn record_schema_compat(
     .await
     .context("recording schema compatibility register rows")?;
 
-    Ok(register_from_rows(versions.into_iter().zip(recorded)))
+    read_schema_compat_register(pool).await
 }
 
 /// Map a `_sqlx_migrations` read failure onto an operator-actionable
