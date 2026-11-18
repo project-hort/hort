@@ -7,7 +7,31 @@
 //! `(stream_id, final_stream_position, head_event_hash)` plus the
 //! consistent-cut `max_global_position`, and the `StreamSealed` records
 //! on the `StreamId::eventstore_retention()` audit-meta stream (the
-//! derived `admin-<v5-uuid>` id) since the previous checkpoint.
+//! derived `admin-<v5-uuid>` id) since the previous **anchored**
+//! checkpoint.
+//!
+//! ## The seal read is a delta, and the boundary is a parameter
+//!
+//! The seal set is scoped to what no checkpoint has anchored yet, so
+//! the caller supplies the boundary: the audit-meta stream position an
+//! anchored checkpoint already covered
+//! (`hort_domain::events::anchored_retention_position`, derived from the
+//! signed witness the emission cycle has already read). Carrying the
+//! whole seal history in every checkpoint would re-anchor every seal on
+//! every tick, growing each anchor object with the seal count and the
+//! anchor store with seals x ticks.
+//!
+//! **Why that boundary and not the previous tick.** A failed emission
+//! writes no anchor, so the boundary does not advance and the next run
+//! reads the same seals again: catch-up is structural rather than a
+//! property of re-reading everything. The windows tile without gaps
+//! because the boundary is the *same snapshot's* head of the stream the
+//! seals are read from.
+//!
+//! **This is the emission half only.** The verification half
+//! (`EventChainReaderPort::read_sealed_records`) stays unwindowed: it
+//! justifies a now-absent anchored stream, which needs the full seal
+//! history permanently.
 //!
 //! ## Why a new sibling port (not `EventStore`)
 //!
@@ -47,9 +71,11 @@ pub struct LiveChainSnapshot {
     pub max_global_position: u64,
     /// `StreamSealed` records read from the never-deleted
     /// `StreamId::eventstore_retention()` audit-meta stream (the derived
-    /// `admin-<v5-uuid>` id) since the previous checkpoint. **Empty is
-    /// valid and expected** when nothing has been sealed since the previous
-    /// checkpoint — the emitter handles an empty set cleanly.
+    /// `admin-<v5-uuid>` id) since the previous **anchored** checkpoint —
+    /// the records at a stream position past the boundary
+    /// `snapshot_live_chain` was handed. **Empty is valid and expected**
+    /// when nothing has been sealed since that cut — the emitter handles
+    /// an empty set cleanly.
     pub sealed_since_previous: Vec<SealedStreamRecord>,
 }
 
@@ -78,10 +104,21 @@ impl LiveChainSnapshot {
 /// outcome, never a silently-skipped checkpoint.
 pub trait EventChainHeadReaderPort: Send + Sync {
     /// Snapshot every live stream's head + the consistent-cut
-    /// `max_global_position` + the `StreamSealed` records since the
-    /// previous checkpoint. A single consistent read (the id set is
-    /// small — thousands of streams).
-    fn snapshot_live_chain(&self) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>>;
+    /// `max_global_position` + the `StreamSealed` records past
+    /// `anchored_retention_position`. A single consistent read (the id
+    /// set is small — thousands of streams).
+    ///
+    /// `anchored_retention_position` is the audit-meta stream position an
+    /// anchored checkpoint already covered, as
+    /// `hort_domain::events::anchored_retention_position` derives it from
+    /// the signed witness. `None` means no checkpoint has anchored that
+    /// stream, so no seal is anchored yet and the whole seal history is
+    /// returned; because the position is 0-based, `Some(0)` is a real
+    /// boundary and an implementation must not collapse the two.
+    fn snapshot_live_chain(
+        &self,
+        anchored_retention_position: Option<u64>,
+    ) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>>;
 }
 
 #[cfg(test)]

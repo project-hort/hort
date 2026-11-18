@@ -8,10 +8,31 @@
 //! [`EventChainHeadReaderPort`] — a consistent-cut snapshot of every
 //! live stream's `(stream_id, final_stream_position, head_event_hash)`
 //! plus `max_global_position` plus the `StreamSealed` records on
-//! `admin-eventstore-retention` since the previous checkpoint (the
-//! set may be empty when nothing has been
-//! sealed since the previous checkpoint). Runtime-DML DSN, `SELECT`-only
-//! (the adapter's posture).
+//! `admin-eventstore-retention` since the previous **anchored**
+//! checkpoint (the set may be empty, and empty is the steady state:
+//! nothing has been sealed since the last anchor). Runtime-DML DSN,
+//! `SELECT`-only (the adapter's posture).
+//!
+//! ## The seal set is a delta, and this cycle supplies the boundary
+//!
+//! Each checkpoint carries the seals **no anchored checkpoint has
+//! carried yet**, not the whole seal history: re-anchoring the history
+//! on every tick would grow each anchor object with the seal count and
+//! the anchor store with seals x ticks, permanently — the checkpoint
+//! leaves through [`CheckpointEmitterPort::emit`] rather than
+//! `EventStore::append`, so no event cap bounds it.
+//!
+//! The boundary is [`anchored_retention_position`] over the checkpoints
+//! step 1 of [`EventstoreCheckpointHandler::emit_once`] already read, so
+//! it costs no extra I/O and **only an anchored checkpoint moves it**.
+//! That is what makes catch-up structural: a cycle that fails to emit
+//! writes no anchor, the boundary stands, and the next successful cycle
+//! carries the failed one's seals too.
+//!
+//! The verifier needs no counterpart change: it unions the sealed sets
+//! of *every* signature-verified checkpoint and asks only that each live
+//! seal be anchored by *some* checkpoint, and the checkpoint that first
+//! carried a seal carries it forever.
 //!
 //! [`CheckpointAnchorPort`] — the read port, reused byte-unchanged to
 //! derive the next monotonic `checkpoint_seq` (max existing + 1) and
@@ -77,7 +98,9 @@ use chrono::{DateTime, Utc};
 use serde_json::json;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::events::{build_checkpoint, BackfillBaseline, CheckpointToEmit};
+use hort_domain::events::{
+    anchored_retention_position, build_checkpoint, BackfillBaseline, CheckpointToEmit,
+};
 use hort_domain::ports::checkpoint_anchor::CheckpointAnchorPort;
 use hort_domain::ports::checkpoint_emitter::CheckpointEmitterPort;
 use hort_domain::ports::event_chain_head_reader::EventChainHeadReaderPort;
@@ -258,10 +281,15 @@ impl EventstoreCheckpointHandler {
             .await
             .map_err(CheckpointCycleError::AnchorReadFailed)?;
 
-        // 2. Snapshot the live chain (runtime DSN, SELECT-only).
+        // 2. Snapshot the live chain (runtime DSN, SELECT-only), with
+        //    the seal read windowed past what an anchored checkpoint
+        //    already carried. The boundary comes out of the signed
+        //    witness read in step 1 — no extra I/O, and it advances only
+        //    when a checkpoint is actually anchored, which is why a
+        //    failed cycle's seals land in the next successful one.
         let snapshot = self
             .heads
-            .snapshot_live_chain()
+            .snapshot_live_chain(anchored_retention_position(&existing))
             .await
             .map_err(CheckpointCycleError::HeadSnapshotFailed)?;
 
@@ -466,7 +494,7 @@ mod tests {
     use std::sync::Mutex;
 
     use chrono::TimeZone;
-    use hort_domain::events::{Checkpoint, EventHash, SealedStreamRecord, StreamHead};
+    use hort_domain::events::{Checkpoint, EventHash, SealedStreamRecord, StreamHead, StreamId};
     use hort_domain::ports::event_chain_head_reader::LiveChainSnapshot;
     use metrics::SharedString;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshot};
@@ -478,25 +506,78 @@ mod tests {
     struct MockHeads {
         snapshot: Mutex<Option<LiveChainSnapshot>>,
         fail: bool,
+        /// The simulated audit-meta stream: `(stream_position, record)`.
+        /// When set, the mock answers the way the adapter does — the head
+        /// query sees the whole stream, the seal query is windowed on the
+        /// bound it was handed — so a test asserts the cycle's boundary
+        /// handling rather than a canned set.
+        audit_meta_stream: Option<Vec<(u64, SealedStreamRecord)>>,
+        /// Every bound the cycle handed this reader, in call order.
+        bounds: Mutex<Vec<Option<u64>>>,
     }
     impl MockHeads {
         fn ok(s: LiveChainSnapshot) -> Self {
             Self {
                 snapshot: Mutex::new(Some(s)),
                 fail: false,
+                audit_meta_stream: None,
+                bounds: Mutex::new(vec![]),
             }
         }
         fn failing() -> Self {
             Self {
                 snapshot: Mutex::new(None),
                 fail: true,
+                audit_meta_stream: None,
+                bounds: Mutex::new(vec![]),
             }
+        }
+        /// A reader backed by a simulated audit-meta stream, windowing
+        /// its seal answer exactly as `PgEventChainHeadReader` does.
+        fn over_audit_meta_stream(records: Vec<(u64, SealedStreamRecord)>) -> Self {
+            Self {
+                snapshot: Mutex::new(None),
+                fail: false,
+                audit_meta_stream: Some(records),
+                bounds: Mutex::new(vec![]),
+            }
+        }
+        fn bounds_seen(&self) -> Vec<Option<u64>> {
+            self.bounds.lock().unwrap().clone()
         }
     }
     impl EventChainHeadReaderPort for MockHeads {
-        fn snapshot_live_chain(&self) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>> {
+        fn snapshot_live_chain(
+            &self,
+            anchored_retention_position: Option<u64>,
+        ) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>> {
+            self.bounds
+                .lock()
+                .unwrap()
+                .push(anchored_retention_position);
             let fail = self.fail;
-            let s = self.snapshot.lock().unwrap().clone();
+            let s = match &self.audit_meta_stream {
+                // The adapter's two reads over one consistent cut: the
+                // head query reports the stream's real head whatever the
+                // bound, and only the seal query is windowed. Recording
+                // the un-windowed head is what makes the next cycle's
+                // boundary advance.
+                Some(stream) => {
+                    let head = stream.iter().map(|(pos, _)| *pos).max();
+                    let heads = head
+                        .map(|pos| vec![head_of(&retention_stream_id(), pos, 0xaa)])
+                        .unwrap_or_default();
+                    let sealed = stream
+                        .iter()
+                        .filter(|(pos, _)| {
+                            anchored_retention_position.is_none_or(|bound| *pos > bound)
+                        })
+                        .map(|(_, rec)| rec.clone())
+                        .collect();
+                    Some(LiveChainSnapshot::new(heads, head.unwrap_or(0), sealed))
+                }
+                None => self.snapshot.lock().unwrap().clone(),
+            };
             Box::pin(async move {
                 if fail {
                     Err(DomainError::Invariant("db unreachable".into()))
@@ -574,11 +655,60 @@ mod tests {
     }
 
     fn head(id: &str, pos: u64, b: u8) -> StreamHead {
+        head_of(id, pos, b)
+    }
+
+    /// `head` under a name the `MockHeads` impl above can call without
+    /// shadowing its own `head` local.
+    fn head_of(id: &str, pos: u64, b: u8) -> StreamHead {
         StreamHead {
             stream_id: id.to_string(),
             final_stream_position: pos,
             head_event_hash: EventHash([b; 32]),
         }
+    }
+
+    fn retention_stream_id() -> String {
+        StreamId::eventstore_retention().to_string()
+    }
+
+    fn seal(id: &str, b: u8) -> SealedStreamRecord {
+        SealedStreamRecord {
+            sealed_stream_id: id.to_string(),
+            final_event_hash: EventHash([b; 32]),
+        }
+    }
+
+    /// The emitted checkpoint as the anchor store hands it back on the
+    /// next cycle — the same projection `read_all` performs on a
+    /// signature-verified object. Using it (rather than a hand-built
+    /// `Checkpoint`) is what makes the boundary in these tests come from
+    /// the previous tick's own witness.
+    fn anchored(cp: &CheckpointToEmit) -> Checkpoint {
+        Checkpoint {
+            chain_format_version: cp.chain_format_version.clone(),
+            checkpoint_seq: cp.checkpoint_seq,
+            created_at: cp.created_at,
+            stream_heads: cp
+                .stream_heads
+                .iter()
+                .map(|h| {
+                    (
+                        h.stream_id.clone(),
+                        h.final_stream_position,
+                        h.head_event_hash,
+                    )
+                })
+                .collect(),
+            sealed_streams: cp.sealed_streams.clone(),
+        }
+    }
+
+    fn sealed_ids(cp: &CheckpointToEmit) -> Vec<&str> {
+        cp.sealed_streams
+            .iter()
+            .map(|s| s.sealed_stream_id.as_str())
+            .collect()
     }
 
     fn cp(seq: u64) -> Checkpoint {
@@ -668,6 +798,170 @@ mod tests {
             None,
         );
         assert_eq!(h.kind(), "eventstore-checkpoint");
+    }
+
+    // ---- the seal set is a delta on the last ANCHORED checkpoint -------
+
+    /// Run one cycle and return the checkpoint it emitted, plus the
+    /// bound the cycle handed the reader.
+    fn tick(
+        stream: Vec<(u64, SealedStreamRecord)>,
+        existing: Vec<Checkpoint>,
+        emitter: &Arc<MockEmitter>,
+    ) -> (Option<CheckpointToEmit>, Vec<Option<u64>>) {
+        let heads = Arc::new(MockHeads::over_audit_meta_stream(stream));
+        let h = EventstoreCheckpointHandler::new(
+            heads.clone(),
+            Arc::new(MockAnchorRead::with(existing)),
+            emitter.clone(),
+            None,
+        );
+        rt().block_on(h.run(&serde_json::Value::Null, ctx()))
+            .unwrap();
+        (emitter.last(), heads.bounds_seen())
+    }
+
+    /// Two successful ticks over a growing audit-meta stream, with the
+    /// first tick's emitted checkpoint fed back as the anchor store's
+    /// content for the second. Returns `(first, second, bound the second
+    /// tick derived)`.
+    ///
+    /// The second tick's boundary therefore comes from the first tick's
+    /// own signed witness rather than from a literal, which is the whole
+    /// property under test.
+    fn two_ticks(
+        first_stream: Vec<(u64, SealedStreamRecord)>,
+        second_stream: Vec<(u64, SealedStreamRecord)>,
+    ) -> (CheckpointToEmit, CheckpointToEmit, Vec<Option<u64>>) {
+        let first_emitter = Arc::new(MockEmitter::ok());
+        let (first, first_bounds) = tick(first_stream, vec![], &first_emitter);
+        let first = first.expect("tick 1 emitted");
+        assert_eq!(
+            first_bounds,
+            vec![None],
+            "with nothing anchored there is no boundary — the first \
+             checkpoint carries the whole history"
+        );
+
+        let second_emitter = Arc::new(MockEmitter::ok());
+        let (second, second_bounds) = tick(second_stream, vec![anchored(&first)], &second_emitter);
+        let second = second.expect("tick 2 emitted");
+        (first, second, second_bounds)
+    }
+
+    /// Two consecutive successful ticks: the second checkpoint carries
+    /// ONLY the seals created between the two cuts. Re-anchoring the
+    /// whole seal history on every tick is what grows each anchor object
+    /// with the seal count and the anchor store with seals x ticks —
+    /// and nothing caps a checkpoint, which leaves the emitter rather
+    /// than `EventStore::append`.
+    #[test]
+    fn the_second_checkpoint_carries_only_the_seals_since_the_first() {
+        // Tick 1 sees two seals, at audit-meta positions 0 and 1; tick 2
+        // sees a third appended at position 2.
+        let (cp1, cp2, bounds) = two_ticks(
+            vec![(0, seal("admin-gone-a", 1)), (1, seal("admin-gone-b", 2))],
+            vec![
+                (0, seal("admin-gone-a", 1)),
+                (1, seal("admin-gone-b", 2)),
+                (2, seal("admin-gone-c", 3)),
+            ],
+        );
+        assert_eq!(sealed_ids(&cp1), vec!["admin-gone-a", "admin-gone-b"]);
+        assert_eq!(
+            bounds,
+            vec![Some(1)],
+            "the boundary is the audit-meta head the first checkpoint's \
+             own witness anchored"
+        );
+        assert_eq!(
+            sealed_ids(&cp2),
+            vec!["admin-gone-c"],
+            "the second checkpoint re-anchors nothing the first one \
+             already anchored"
+        );
+    }
+
+    /// Catch-up pin: a cycle that fails to emit writes no anchor, so the
+    /// boundary does not advance and the next successful checkpoint
+    /// carries the failed cycle's seals too. Without this the property
+    /// is convention — and convention is exactly what let the field name
+    /// drift from the query it was named after.
+    #[test]
+    fn a_failed_emission_is_caught_up_by_the_next_successful_one() {
+        let failing = Arc::new(MockEmitter::failing());
+        let (cp1, bounds1) = tick(
+            vec![(0, seal("admin-gone-a", 1)), (1, seal("admin-gone-b", 2))],
+            vec![],
+            &failing,
+        );
+        assert!(cp1.is_none(), "the emitter refused — nothing was anchored");
+        assert_eq!(bounds1, vec![None]);
+
+        // The anchor store is still empty: a refused emission writes no
+        // object, so `read_all` has nothing new to report.
+        let ok_emitter = Arc::new(MockEmitter::ok());
+        let (cp2, bounds2) = tick(
+            vec![
+                (0, seal("admin-gone-a", 1)),
+                (1, seal("admin-gone-b", 2)),
+                (2, seal("admin-gone-c", 3)),
+            ],
+            vec![],
+            &ok_emitter,
+        );
+        let cp2 = cp2.expect("tick 2 emitted");
+        assert_eq!(
+            bounds2,
+            vec![None],
+            "only an ANCHORED checkpoint moves the boundary — a failed \
+             tick must not"
+        );
+        assert_eq!(
+            sealed_ids(&cp2),
+            vec!["admin-gone-a", "admin-gone-b", "admin-gone-c"],
+            "the failed tick's seals have to land in this checkpoint, or \
+             they are anchored by none and the verifier reports \
+             SealUnanchored forever"
+        );
+    }
+
+    /// A first seal sits at audit-meta position 0, so the boundary the
+    /// next tick derives is `Some(0)` — which has to window it out. A
+    /// derivation that collapsed `Some(0)` into "no boundary" would
+    /// re-anchor that seal on every tick for the life of the store, and
+    /// every assertion above would still pass.
+    #[test]
+    fn position_zero_boundary_windows_out_the_first_seal() {
+        let (cp1, cp2, bounds) = two_ticks(
+            vec![(0, seal("admin-gone-a", 1))],
+            vec![(0, seal("admin-gone-a", 1)), (1, seal("admin-gone-b", 2))],
+        );
+        assert_eq!(sealed_ids(&cp1), vec!["admin-gone-a"]);
+        assert_eq!(bounds, vec![Some(0)], "0-based: one anchored event is 0");
+        assert_eq!(
+            sealed_ids(&cp2),
+            vec!["admin-gone-b"],
+            "a boundary of Some(0) must window out the seal at position 0 \
+             — collapsing it into None would re-anchor that seal on every \
+             tick for the life of the store"
+        );
+    }
+
+    /// A tick with nothing sealed since the last anchor emits a
+    /// checkpoint with an empty seal delta — the steady state, and the
+    /// whole point of the window.
+    #[test]
+    fn nothing_sealed_since_the_last_anchor_is_an_empty_delta() {
+        let (_, cp2, bounds) = two_ticks(
+            vec![(0, seal("admin-gone-a", 1))],
+            vec![(0, seal("admin-gone-a", 1))],
+        );
+        assert_eq!(bounds, vec![Some(0)]);
+        assert!(
+            cp2.sealed_streams.is_empty(),
+            "an unchanged audit-meta stream must produce no seal records"
+        );
     }
 
     // ---- first checkpoint: seq 1 + backfill_baseline -------------------
