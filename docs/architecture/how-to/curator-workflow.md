@@ -1069,8 +1069,22 @@ shape would be removing the asymmetry deliberately — don't.
 | --- | --- | --- |
 | entries per call | 100 | **25** |
 | one bad entry | reported, the rest still applies | **the whole batch is refused** |
-| partial application | yes, and it is not rolled back | **never** |
+| partial application | yes, and it is not rolled back | **only through the validate→apply race, and it says so** |
 | HTTP answer on a bad entry | `200 OK` with the outcome body | `409 Conflict` with the per-entry report |
+| HTTP answer on a partial apply | `200 OK` | `200 OK` with `outcome: "partial"`, CLI exit **4** |
+
+Read the partial-application row carefully, because it is the one that is
+not a flat "never". Every apply precondition the batch can establish
+*before* it releases anybody it does establish — each entry's resolution,
+its state, and whether its artifact's event stream has room for the
+release event the entry would append. What cannot be established in
+advance is an artifact **moving between the check and the append**: each
+release is its own transaction and hort offers no transaction across
+artifacts, so that window is a consistency boundary rather than an
+oversight. A batch that loses an entry in that window has released the
+others — irreversibly — and reports itself as `outcome: "partial"` with
+the failed entries named (§9.4). What it never does is report that as
+success.
 
 ### 9.1 Why the two differ
 
@@ -1090,9 +1104,10 @@ mode is a hold, not an exposure.
 
 ### 9.2 What an abort looks like
 
-One entry that is unresolvable, ambiguous, or in a state the bulk waive
-does not reach (anything other than `Quarantined` / `Released`) refuses
-the call:
+One entry that is unresolvable, ambiguous, in a state the bulk waive does
+not reach (anything other than `Quarantined` / `Released`), or on an
+artifact whose event stream has no room for its release event refuses the
+call:
 
 ```sh
 hort-cli curation waive versions --repo npm-proxy --package left-pad \
@@ -1112,9 +1127,10 @@ KEY    ARTIFACT_ID                           VERDICT       DETAIL
 The report names **every** entry, the fine ones included, so you can see
 which one stopped the batch without bisecting your list. `--output json`
 hands back the server's report verbatim for a script to branch on; the
-command exits **3** (distinct from `0` for an applied batch and from `1`
-for a request that never got an answer — a 403, a bad repository key, a
-transport failure).
+command exits **3** — distinct from `0` for a fully applied batch, from
+**4** for one that applied in part (§9.4), and from `1` for a request that
+never got an answer at all (a 403, a bad repository key, a transport
+failure).
 
 Per-entry verdicts you will see:
 
@@ -1125,25 +1141,57 @@ Per-entry verdicts you will see:
 | `unresolvable` | no live row matches the key | check the spelling, or the repository, or whether the artifact was ever ingested |
 | `ambiguous` | the digest names more than one live row | release the row you reviewed with `waive artifact <artifact_id>` — the report lists the candidates |
 | `state_not_releasable` | the row is in a state a bulk waive does not reach | read the `DETAIL` status; a `Rejected` verdict is overridden one artifact at a time (§4.1), and a `scan_indeterminate` hold has an exit that is not a curator override (the rescan sweep re-picks it) |
+| `stream_full` | the artifact's event stream is on the event cap, so the `ArtifactReleased` this entry would append has nowhere to go | drop the entry so the rest of the batch can apply, and raise the artifact: a stream on the cap takes no further lifecycle event, so no surface releases it — `waive artifact` refuses it too |
 
-### 9.3 After an applied batch
+### 9.3 After a fully applied batch
 
-A `200` partitions the call into three lists, and the first two are
-**different facts**:
+A `200` carrying `outcome: "ok"` partitions the call into two lists, and
+they are **different facts**:
 
 - `released_artifact_ids` — released **by this call**; one
   `ArtifactReleased` event each.
 - `already_released_ids` — released **earlier**; idempotent, no event
   appended now. An operator who reads this as the first believes a
   waiver took effect now when it took effect before.
-- `failed` — entries that passed pre-validation and then lost their
-  append (a concurrent decision on the same artifact, say). The CLI
-  highlights the count; re-issue for that subset, with the same
-  justification text, exactly as §8.3 describes for the block side.
 
-A non-empty `failed` is still a `200` and still exits `0`: those entries
-are per-artifact apply failures inside a batch that *was* valid, and the
-envelope is how you learn which.
+`failed` is present and empty. The command exits `0`.
+
+### 9.4 After a partially applied batch
+
+A `200` carrying `outcome: "partial"` means every entry passed
+pre-validation and at least one then **lost its append** — the artifact
+moved, or its stream did, inside the window between the check and the
+append. The releases that landed are in `released_artifact_ids` and
+nothing retracts them; the entries that did not are in `failed` with the
+artifact id and the per-entry error, and the CLI highlights the count.
+
+```sh
+hort-cli curation waive digests --repo oci-proxy \
+  --digests sha256:7c0e…,sha256:9a41… --justification "…"
+# exit status 4
+```
+
+The exit code is **4**, distinct from `3` because the two need opposite
+reactions:
+
+- **3 (aborted)** — nothing was released. Fix the entries the report
+  names and re-run the whole list.
+- **4 (partial)** — part of it was released. Re-issue **the failed subset
+  only**, with the same justification text, exactly as §8.3 describes for
+  the block side. Re-running the whole list would be a second decision
+  over artifacts that are already released.
+
+This is still a `200` rather than a `409`, and deliberately so: releases
+landed, so the call succeeded at the HTTP semantics level and `409` has to
+keep meaning "nothing was released" (§8.1 takes the same stance for the
+block side's partial success). The distinction lives on the body's
+`outcome` field — do not infer it from `failed.length`, branch on
+`outcome`.
+
+Note the asymmetry with the block side, which is deliberate: a partial
+**block** exits `0`, because what landed there is the restrictive
+direction and a retry costs an operator nothing. The two verbs print the
+same `FAILED` section and reach opposite verdicts about it.
 
 ---
 

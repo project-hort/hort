@@ -18,6 +18,7 @@ use hort_cli::config::{EffectiveConfig, OutputFormat};
 use hort_cli::curation::waive::{
     run, run_artifact_with_output, run_digests_with_output, run_versions_with_output, WaiveArgs,
     WaiveArtifactArgs, WaiveCommand, WaiveDigestsArgs, WaiveVersionsArgs, WAIVE_ABORTED_EXIT,
+    WAIVE_PARTIAL_EXIT,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,10 +64,31 @@ const DIGESTS_ROUTE: &str = "/api/v1/admin/curation/waive-digests";
 fn applied_envelope() -> String {
     format!(
         r#"{{
+            "outcome": "ok",
             "correlation_id": "{CORRELATION_ID}",
             "released_artifact_ids": ["{ARTIFACT_ID}"],
             "already_released_ids": ["{ARTIFACT_B}"],
             "failed": []
+        }}"#
+    )
+}
+
+/// A `200` body for a batch that released one entry and could not
+/// release the other — the answer whose exit code is the whole point.
+fn partial_envelope() -> String {
+    format!(
+        r#"{{
+            "outcome": "partial",
+            "correlation_id": "{CORRELATION_ID}",
+            "released_artifact_ids": ["{ARTIFACT_ID}"],
+            "already_released_ids": [],
+            "failed": [
+                {{
+                    "artifact_id": "{ARTIFACT_B}",
+                    "error_kind": "conflict",
+                    "message": "event-store version conflict"
+                }}
+            ]
         }}"#
     )
 }
@@ -408,6 +430,155 @@ async fn a_prefixed_and_a_bare_digest_list_send_the_same_body() {
             code(&ExitCode::SUCCESS),
             "{spelling} is accepted, so the command exits 0"
         );
+    }
+}
+
+/// A partial apply: `200`, the `FAILED` section printed, and an exit
+/// code that is neither `0` nor the abort's.
+///
+/// The server has always named the failed entries and this command has
+/// always printed them; what an unattended caller saw was a zero exit
+/// beside a batch that released part of what it was asked to.
+#[tokio::test]
+async fn waive_digests_partial_apply_prints_the_failures_and_exits_nonzero() {
+    {
+        let _g = lock_env();
+        clear_env();
+    }
+
+    let mut server = Server::new_async().await;
+    let m = server
+        .mock("POST", DIGESTS_ROUTE)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(partial_envelope())
+        .create_async()
+        .await;
+
+    let client = test_client(&server.url());
+    let args = WaiveDigestsArgs {
+        repository: "oci-proxy".to_string(),
+        digests: vec![DIGEST.to_string()],
+        justification: "reviewed the bytes".to_string(),
+    };
+
+    let mut buf = Vec::new();
+    let exit = run_digests_with_output(client, args, OutputFormat::Table, &mut buf)
+        .await
+        .expect("a partial apply is an answer, not a transport failure");
+    m.assert_async().await;
+
+    assert_eq!(
+        code(&exit),
+        code(&ExitCode::from(WAIVE_PARTIAL_EXIT)),
+        "a batch that applied part of itself must not exit 0"
+    );
+    assert_ne!(
+        code(&exit),
+        code(&ExitCode::from(WAIVE_ABORTED_EXIT)),
+        "and must not read as the abort, which released nothing"
+    );
+    let out = String::from_utf8(buf).expect("utf8");
+    assert!(out.contains("FAILED (1)"), "the failed section: {out}");
+    assert!(
+        out.contains(ARTIFACT_B),
+        "naming the entry to re-issue: {out}"
+    );
+    assert!(
+        out.contains(ARTIFACT_ID),
+        "and the release that did land: {out}"
+    );
+}
+
+/// The asymmetry with `block`, pinned where a future tidy-up would
+/// remove it: the same per-entry failure list exits non-zero on a waive
+/// and `0` on a block.
+///
+/// `block`'s partial success is its documented contract — what landed is
+/// the restrictive direction and a retry costs the operator nothing —
+/// while a waive's is an irreversible release. The two verbs share the
+/// failure *rendering* (`render_failed_entries`) and nothing about the
+/// verdict, and the shared rendering is exactly why this needs a test
+/// rather than a comment.
+#[tokio::test]
+async fn a_partial_block_still_exits_zero_while_a_partial_waive_does_not() {
+    {
+        let _g = lock_env();
+        clear_env();
+    }
+
+    let mut server = Server::new_async().await;
+    let waive_mock = server
+        .mock("POST", DIGESTS_ROUTE)
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(partial_envelope())
+        .create_async()
+        .await;
+    let block_mock = server
+        .mock("POST", "/api/v1/admin/curation/block-digests")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(format!(
+            r#"{{
+                "correlation_id": "{CORRELATION_ID}",
+                "blocked_artifact_ids": ["{ARTIFACT_ID}"],
+                "already_rejected_ids": [],
+                "not_found_versions": [],
+                "not_found_digests": [],
+                "failed": [
+                    {{
+                        "artifact_id": "{ARTIFACT_B}",
+                        "error_kind": "conflict",
+                        "message": "event-store version conflict"
+                    }}
+                ]
+            }}"#
+        ))
+        .create_async()
+        .await;
+
+    let mut waive_buf = Vec::new();
+    let waive_exit = run_digests_with_output(
+        test_client(&server.url()),
+        WaiveDigestsArgs {
+            repository: "oci-proxy".to_string(),
+            digests: vec![DIGEST.to_string()],
+            justification: "reviewed the bytes".to_string(),
+        },
+        OutputFormat::Table,
+        &mut waive_buf,
+    )
+    .await
+    .expect("answered");
+
+    let mut block_buf = Vec::new();
+    hort_cli::curation::block::run_digests_with_output(
+        test_client(&server.url()),
+        hort_cli::curation::block::BlockDigestsArgs {
+            repository: "oci-proxy".to_string(),
+            digests: vec![DIGEST.to_string()],
+            justification: "CVE-2026-0001".to_string(),
+        },
+        OutputFormat::Table,
+        &mut block_buf,
+    )
+    .await
+    .expect("a partial block is a success — it returns no exit code at all");
+
+    waive_mock.assert_async().await;
+    block_mock.assert_async().await;
+
+    assert_eq!(
+        code(&waive_exit),
+        code(&ExitCode::from(WAIVE_PARTIAL_EXIT)),
+        "the waive's partial apply exits non-zero"
+    );
+    // Both printed the same shared FAILED section — the asymmetry is in
+    // the verdict, not in what the operator reads.
+    for out in [waive_buf, block_buf] {
+        let out = String::from_utf8(out).expect("utf8");
+        assert!(out.contains("FAILED (1)"), "{out}");
     }
 }
 

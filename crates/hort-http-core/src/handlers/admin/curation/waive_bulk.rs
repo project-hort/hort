@@ -17,31 +17,50 @@
 //!
 //! This is the fail-open half of curation and its contract is the
 //! inverse of `block-versions`'. One entry that is unresolvable,
-//! ambiguous, or in a state a bulk waive does not reach aborts the whole
-//! batch: **`409 Conflict` carrying the full per-entry report, and zero
-//! releases applied.** That is not a missing kindness — `ArtifactReleased`
-//! is history that cannot be retracted, so releasing the resolvable
-//! subset of a list the curator wrote wrongly is the defect this contract
-//! exists to prevent.
+//! ambiguous, in a state a bulk waive does not reach, or on a stream with
+//! no room for its release event aborts the whole batch: **`409 Conflict`
+//! carrying the full per-entry report, and zero releases applied.** That
+//! is not a missing kindness — `ArtifactReleased` is history that cannot
+//! be retracted, so releasing the resolvable subset of a list the curator
+//! wrote wrongly is the defect this contract exists to prevent.
 //!
 //! The report names **every** entry, the fine ones included, so a curator
 //! who asked for five releases and got none can see which entry stopped
 //! the batch without bisecting their list.
 //!
+//! ## Three answers, and the body says which one it is
+//!
+//! Every pre-validated apply precondition the batch can read in advance
+//! is read in advance, so what remains is an artifact that moved between
+//! the check and the append. That is irreducible — each release is its own
+//! aggregate transaction — so it gets its own answer rather than hiding
+//! inside the success one: `outcome` on the body is `"ok"`, `"partial"` or
+//! `"aborted"`, taken straight from `WaiveOutcome::wire_kind` so the wire
+//! and the server's audit log cannot disagree.
+//!
+//! **A partial apply is `200`, not `409`.** `409` means "nothing was
+//! released", and overloading it would destroy exactly the distinction
+//! this split exists to make; releases landed, so at the HTTP semantics
+//! level the call succeeded — the same stance `block-versions` takes for
+//! its own partial success.
+//!
 //! Status-code mapping:
-//! - `200 OK` with [`WaiveOutcomeDto`] — every entry pre-validated. The
-//!   body partitions the call into `released_artifact_ids`,
-//!   `already_released_ids` and `failed`; a non-empty `failed` is still
-//!   `200`, because those entries are per-artifact apply failures inside
-//!   an otherwise-valid batch and the envelope is how the operator learns
-//!   which
+//! - `200 OK` with [`WaiveOutcomeDto`] and `outcome: "ok"` — every entry
+//!   pre-validated and applied. The body partitions the call into
+//!   `released_artifact_ids` and `already_released_ids`, and `failed` is
+//!   empty
+//! - `200 OK` with [`WaiveOutcomeDto`] and `outcome: "partial"` — every
+//!   entry pre-validated, and at least one then lost its append inside
+//!   the validate→apply window. `failed` names those entries; the
+//!   releases that landed are in `released_artifact_ids` and are not
+//!   rolled back
 //! - `400 Bad Request` — empty / oversize justification; `versions` /
 //!   `digests` empty or over the 25-entry cap; a digest that is not a
 //!   bare 64-hex SHA-256 or a `sha256:`-prefixed one
 //! - `403 Forbidden` — principal lacks both Curate and Admin
 //! - `404 Not Found` — the `repository` key does not resolve
-//! - `409 Conflict` with [`WaiveAbortDto`] — pre-validation aborted the
-//!   batch (ADR 0025). Nothing was released
+//! - `409 Conflict` with [`WaiveAbortDto`] and `outcome: "aborted"` —
+//!   pre-validation aborted the batch (ADR 0025). Nothing was released
 //! - `500 Internal Server Error` — infrastructure failure
 
 use std::sync::Arc;
@@ -53,6 +72,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use hort_app::error::AppError;
 use hort_app::use_cases::curation_use_case::{
     WaiveApplied, WaiveEntryReport, WaiveEntryVerdict, WaiveOutcome, WaiveTarget,
 };
@@ -103,7 +123,8 @@ pub struct WaiveDigestsRequestDto {
     justification: String,
 }
 
-/// HTTP-layer mirror of [`WaiveApplied`] — the body of a `200`.
+/// HTTP-layer mirror of [`WaiveApplied`] — the body of a `200`, for both
+/// of the two `200` outcomes.
 ///
 /// `failed` reuses [`FailedBlockEntryDto`], which is the same
 /// `(artifact_id, AppError)` projection with the same sanitisation
@@ -112,6 +133,16 @@ pub struct WaiveDigestsRequestDto {
 /// second place for an un-sanitised variant to appear.
 #[derive(Debug, Serialize)]
 pub(crate) struct WaiveOutcomeDto {
+    /// `"ok"` when every entry applied, `"partial"` when at least one
+    /// did not — [`WaiveOutcome::wire_kind`] verbatim.
+    ///
+    /// On the body and not only in the status code, because both answers
+    /// are `200`: a client reading `failed.len()` to decide which it got
+    /// would be re-deriving the server's verdict from the server's data.
+    /// The `failed` list was already here before this field was — what
+    /// was missing is anything on the body that says the batch was
+    /// partial.
+    pub outcome: &'static str,
     /// Shared by every `ArtifactReleased` this call emitted.
     pub correlation_id: Uuid,
     /// Artifacts released on this call — one `ArtifactReleased` each.
@@ -122,17 +153,25 @@ pub(crate) struct WaiveOutcomeDto {
     /// happened.
     pub already_released_ids: Vec<Uuid>,
     /// Per-artifact apply failures inside an otherwise-valid batch.
+    /// Empty exactly when `outcome` is `"ok"`.
     pub failed: Vec<FailedBlockEntryDto>,
 }
 
 impl WaiveOutcomeDto {
-    fn from_domain(applied: WaiveApplied) -> Self {
+    /// One projection for both `200` outcomes: the two success lists are
+    /// the same two lists either way, and only the discriminator and the
+    /// (possibly empty) failure slice differ.
+    fn from_domain(
+        outcome: &'static str,
+        applied: WaiveApplied,
+        failed: &[(Uuid, AppError)],
+    ) -> Self {
         Self {
+            outcome,
             correlation_id: applied.correlation_id,
             released_artifact_ids: applied.released_artifact_ids,
             already_released_ids: applied.already_released_ids,
-            failed: applied
-                .failed
+            failed: failed
                 .iter()
                 .map(|(id, e)| FailedBlockEntryDto::from_app_error(*id, e))
                 .collect(),
@@ -148,8 +187,9 @@ impl WaiveOutcomeDto {
 /// bodies as one shape with some fields missing.
 #[derive(Debug, Serialize)]
 pub(crate) struct WaiveAbortDto {
-    /// Fixed discriminator, so a client can branch on the body as well as
-    /// on the status code.
+    /// Discriminator, so a client can branch on the body as well as on
+    /// the status code — [`WaiveOutcome::wire_kind`] verbatim, exactly as
+    /// the `200` body's is.
     pub outcome: &'static str,
     /// Every entry of the request, in the order it was written.
     pub entries: Vec<WaiveEntryReportDto>,
@@ -183,9 +223,14 @@ impl WaiveEntryReportDto {
         let (candidate_artifact_ids, status) = match entry.verdict {
             WaiveEntryVerdict::Ambiguous(ids) => (ids, None),
             WaiveEntryVerdict::StateNotReleasable(status) => (Vec::new(), Some(status.to_string())),
+            // `stream_full` carries no extra cell: the state is fine and
+            // the row is named — what the curator acts on is the verdict
+            // itself, which says the artifact's stream can take no
+            // further event.
             WaiveEntryVerdict::Releasable
             | WaiveEntryVerdict::AlreadyReleased
-            | WaiveEntryVerdict::Unresolvable => (Vec::new(), None),
+            | WaiveEntryVerdict::Unresolvable
+            | WaiveEntryVerdict::StreamFull => (Vec::new(), None),
         };
         Self {
             key: entry.key,
@@ -199,11 +244,31 @@ impl WaiveEntryReportDto {
 
 /// Map a [`WaiveOutcome`] onto the wire — the one place the
 /// all-or-nothing contract becomes a status code.
+///
+/// The discriminator the bodies carry is taken from the domain value
+/// rather than written per arm: three answers, one vocabulary, and a
+/// fourth answer added to [`WaiveOutcome`] is a compile error here.
 fn outcome_response(outcome: WaiveOutcome) -> Response {
+    let kind = outcome.wire_kind();
     match outcome {
-        WaiveOutcome::Applied(applied) => {
-            (StatusCode::OK, Json(WaiveOutcomeDto::from_domain(applied))).into_response()
-        }
+        WaiveOutcome::Applied(applied) => (
+            StatusCode::OK,
+            Json(WaiveOutcomeDto::from_domain(kind, applied, &[])),
+        )
+            .into_response(),
+        // Also `200`, deliberately: releases landed, so the call
+        // succeeded at the HTTP semantics level and the abort's `409`
+        // ("nothing was released") must stay the answer it is. The body's
+        // `outcome` is what tells the two `200`s apart.
+        WaiveOutcome::PartiallyApplied(partial) => (
+            StatusCode::OK,
+            Json(WaiveOutcomeDto::from_domain(
+                kind,
+                partial.applied,
+                &partial.failed,
+            )),
+        )
+            .into_response(),
         // ADR 0025 — a state precondition the caller can see and act on.
         // The report is the body, not a message: the curator needs the
         // per-entry verdicts and, for an ambiguous digest, the candidate
@@ -211,7 +276,7 @@ fn outcome_response(outcome: WaiveOutcome) -> Response {
         WaiveOutcome::Aborted { entries } => (
             StatusCode::CONFLICT,
             Json(WaiveAbortDto {
-                outcome: "aborted",
+                outcome: kind,
                 entries: entries
                     .into_iter()
                     .map(WaiveEntryReportDto::from_domain)
@@ -463,10 +528,223 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
 
         let v = body_json(resp).await;
+        assert_eq!(
+            v["outcome"], "ok",
+            "a fully applied batch says so on the body, not only by an empty `failed`"
+        );
         assert!(v["correlation_id"].is_string());
         assert_eq!(v["released_artifact_ids"][0], released.to_string());
         assert_eq!(v["already_released_ids"][0], converged.to_string());
         assert!(v["failed"].as_array().unwrap().is_empty());
+    }
+
+    /// A batch that released one entry and lost the other: **`200`, not
+    /// `409`** — releases landed — with `outcome: "partial"` telling it
+    /// apart from a full apply, and the failed entry named.
+    ///
+    /// Driven through the use case (the moved row is armed on the
+    /// resolver's own read) rather than by handing the handler a
+    /// constructed variant, so this test fails if the apply loop stops
+    /// producing the outcome.
+    #[tokio::test]
+    async fn waive_digests_partial_apply_is_200_with_its_own_discriminator() {
+        let (router, mocks) = harness();
+        let repo_id = seed_repo(&mocks);
+        let released = seed_digest(
+            &mocks,
+            repo_id,
+            DIGEST_A,
+            "blobs/a",
+            QuarantineStatus::Quarantined,
+        );
+        let moved = seed_digest(
+            &mocks,
+            repo_id,
+            DIGEST_B,
+            "blobs/b",
+            QuarantineStatus::Quarantined,
+        );
+        // The state changes between pre-validation's resolver read and
+        // the apply step's own load — the validate→apply race, which is
+        // the only way a partial apply is reachable.
+        mocks
+            .artifacts
+            .set_status_after_next_checksum_read(moved, QuarantineStatus::Rejected);
+
+        let body = format!(
+            r#"{{"repository":"{REPO_KEY}","digests":["{DIGEST_A}","{DIGEST_B}"],"justification":"reviewed"}}"#
+        );
+        let resp = router
+            .oneshot(post_json(
+                "/api/v1/admin/curation/waive-digests",
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "releases landed, so this is not the abort's 409"
+        );
+
+        let v = body_json(resp).await;
+        assert_eq!(v["outcome"], "partial");
+        assert_eq!(v["released_artifact_ids"][0], released.to_string());
+        let failed = v["failed"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["artifact_id"], moved.to_string());
+        assert_eq!(
+            mocks.lifecycle.committed_transitions().len(),
+            1,
+            "exactly the one entry that could be released was"
+        );
+    }
+
+    /// The three answers, on one axis: full apply, partial apply and
+    /// abort each carry their own status code and their own body
+    /// discriminator. The pair that shares a status code is the pair the
+    /// discriminator exists for.
+    #[tokio::test]
+    async fn the_three_outcomes_carry_three_discriminators_and_two_status_codes() {
+        // Full apply.
+        let (router, mocks) = harness();
+        let repo_id = seed_repo(&mocks);
+        seed_digest(
+            &mocks,
+            repo_id,
+            DIGEST_A,
+            "blobs/a",
+            QuarantineStatus::Quarantined,
+        );
+        let body = format!(
+            r#"{{"repository":"{REPO_KEY}","digests":["{DIGEST_A}"],"justification":"reviewed"}}"#
+        );
+        let resp = router
+            .oneshot(post_json(
+                "/api/v1/admin/curation/waive-digests",
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["outcome"], "ok");
+
+        // Partial apply — same status code, different discriminator.
+        let (router, mocks) = harness();
+        let repo_id = seed_repo(&mocks);
+        seed_digest(
+            &mocks,
+            repo_id,
+            DIGEST_A,
+            "blobs/a",
+            QuarantineStatus::Quarantined,
+        );
+        let moved = seed_digest(
+            &mocks,
+            repo_id,
+            DIGEST_B,
+            "blobs/b",
+            QuarantineStatus::Quarantined,
+        );
+        mocks
+            .artifacts
+            .set_status_after_next_checksum_read(moved, QuarantineStatus::Rejected);
+        let body = format!(
+            r#"{{"repository":"{REPO_KEY}","digests":["{DIGEST_A}","{DIGEST_B}"],"justification":"reviewed"}}"#
+        );
+        let resp = router
+            .oneshot(post_json(
+                "/api/v1/admin/curation/waive-digests",
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["outcome"], "partial");
+
+        // Abort — the only one that is not a 200.
+        let (router, mocks) = harness();
+        let repo_id = seed_repo(&mocks);
+        seed_digest(
+            &mocks,
+            repo_id,
+            DIGEST_A,
+            "blobs/a",
+            QuarantineStatus::Quarantined,
+        );
+        let body = format!(
+            r#"{{"repository":"{REPO_KEY}","digests":["{DIGEST_A}","{DIGEST_B}"],"justification":"reviewed"}}"#
+        );
+        let resp = router
+            .oneshot(post_json(
+                "/api/v1/admin/curation/waive-digests",
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(resp).await["outcome"], "aborted");
+    }
+
+    /// A stream with no room for its release event is refused at
+    /// pre-validation: `409`, the `stream_full` verdict naming the row,
+    /// and the releasable sibling stays unreleased.
+    #[tokio::test]
+    async fn waive_digests_refuses_a_full_stream_before_releasing_the_sibling() {
+        let (router, mocks) = harness();
+        let repo_id = seed_repo(&mocks);
+        seed_digest(
+            &mocks,
+            repo_id,
+            DIGEST_A,
+            "blobs/a",
+            QuarantineStatus::Quarantined,
+        );
+        let full = seed_digest(
+            &mocks,
+            repo_id,
+            DIGEST_B,
+            "blobs/b",
+            QuarantineStatus::Quarantined,
+        );
+        // Exactly on the cap: one more event would cross it.
+        let stream_id = StreamId::artifact(full);
+        mocks.events.set_stream(
+            &stream_id,
+            (0..1000)
+                .map(|p| {
+                    hort_app::use_cases::test_support::dummy_persisted_event(&stream_id, full, p)
+                })
+                .collect(),
+        );
+
+        let body = format!(
+            r#"{{"repository":"{REPO_KEY}","digests":["{DIGEST_A}","{DIGEST_B}"],"justification":"reviewed"}}"#
+        );
+        let resp = router
+            .oneshot(post_json(
+                "/api/v1/admin/curation/waive-digests",
+                &body,
+                Some(principal_with_claims(&["curate"])),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let v = body_json(resp).await;
+        assert_eq!(v["outcome"], "aborted");
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["verdict"], "releasable");
+        assert_eq!(entries[1]["verdict"], "stream_full");
+        assert_eq!(entries[1]["artifact_id"], full.to_string());
+        assert!(
+            mocks.lifecycle.committed_transitions().is_empty(),
+            "the releasable sibling was not released"
+        );
     }
 
     /// One bad entry: 409, the per-entry report, zero releases. Both
@@ -913,6 +1191,14 @@ mod tests {
                 },
                 "state_not_releasable",
             ),
+            (
+                WaiveEntryReport {
+                    key: "k".into(),
+                    artifact_id: Some(id),
+                    verdict: WaiveEntryVerdict::StreamFull,
+                },
+                "stream_full",
+            ),
         ];
         for (entry, expected) in cases {
             let dto = WaiveEntryReportDto::from_domain(entry);
@@ -941,15 +1227,18 @@ mod tests {
     /// reveals.
     #[test]
     fn an_apply_failure_renders_through_the_shared_sanitised_projection() {
-        let dto = WaiveOutcomeDto::from_domain(WaiveApplied {
-            correlation_id: Uuid::new_v4(),
-            released_artifact_ids: Vec::new(),
-            already_released_ids: Vec::new(),
-            failed: vec![(
+        let dto = WaiveOutcomeDto::from_domain(
+            "partial",
+            WaiveApplied {
+                correlation_id: Uuid::new_v4(),
+                released_artifact_ids: Vec::new(),
+                already_released_ids: Vec::new(),
+            },
+            &[(
                 Uuid::new_v4(),
-                hort_app::error::AppError::External("postgres://internal".into()),
+                AppError::External("postgres://internal".into()),
             )],
-        });
+        );
         assert_eq!(dto.failed[0].error_kind, "external");
         assert_eq!(dto.failed[0].message, "upstream unavailable");
     }

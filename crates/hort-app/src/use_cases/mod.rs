@@ -321,6 +321,12 @@ use crate::error::{AppError, AppResult};
 ///   `capped_stream_writes` structural guard enforces the choice: a new
 ///   append site carries the refusal, or states its once-only reason, or
 ///   fails the suite.
+///
+///   A caller that has to refuse a **batch of appends across several
+///   artifacts before the first one lands** asks the same question one
+///   step earlier, through [`observed_artifact_stream_len`] — which is a
+///   pre-flight and not a replacement: the refusal in the appending
+///   function still runs, because between the two the stream can grow.
 /// - **Read side.** [`read_artifact_stream`] reads `STREAM_EVENT_CAP + 1`
 ///   events: a read that comes back with at most `STREAM_EVENT_CAP` has
 ///   provably seen the entire stream, and one that comes back with more
@@ -393,6 +399,18 @@ const STREAM_EVENT_CAP: u64 = 1000;
 /// [`append_any_with_conflict_retry`] or hand-rolled conflict-retry
 /// loop, which would otherwise spend its whole budget waiting for a
 /// stream to get shorter.
+///
+/// # A pre-flight caller asks the same question through this function
+///
+/// A batch verb that must not apply part of itself establishes the cap
+/// precondition for every entry ahead of its loop, reading each length
+/// with [`observed_artifact_stream_len`] and asking **this** predicate
+/// about it. Re-deriving the comparison there would put a second
+/// definition of where the cap is next to a batch that refuses on it; the
+/// pre-flight and the appending function have to agree, so they call one
+/// function. The appending function's own refusal stays regardless — the
+/// stream can grow between the two reads, and the pre-flight is an
+/// earlier answer rather than a substitute.
 pub(crate) fn refuse_append_past_cap(
     stream_id: &StreamId,
     stream_len: u64,
@@ -442,6 +460,47 @@ pub(crate) fn refuse_append_past_cap_at_version(
         }
     };
     refuse_append_past_cap(stream_id, stream_len, appended)
+}
+
+/// An artifact stream's length as one capped read observes it — the
+/// left-hand side of [`refuse_append_past_cap`] for a caller asking the
+/// cap question **before** it appends anything.
+///
+/// # Why a length and deliberately nothing else
+///
+/// A batch verb that refuses the whole batch rather than applying part of
+/// it has to establish, per entry and ahead of its loop, that the entry's
+/// append has somewhere to go. The cap is the one such precondition that
+/// is readable in advance, so the batch's pre-validation reads it — and
+/// this function hands back **only** the length, which is the whole
+/// design:
+///
+/// - **Not the [`ExpectedVersion`].** The version an append carries is
+///   what turns a concurrent append into a conflict. A version taken at
+///   pre-validation time and carried into the apply step would describe a
+///   stream the apply step never looked at, converting a benign
+///   concurrent append into a failure — the opposite of what a
+///   pre-flight is for. The apply step takes its own pairing
+///   ([`ArtifactAtVersion`]), and this function cannot be mistaken for
+///   one.
+/// - **Not the events.** A pre-flight decides nothing from the stream's
+///   content; a caller that did would be deriving a decision from one
+///   read and protecting it with another, which is what
+///   [`ArtifactAtVersion`] exists to prevent.
+///
+/// The returned length is the read's own observation, exactly as
+/// [`ArtifactAtVersion::stream_len`] is: on a stream past the cap it is
+/// the read's budget (`STREAM_EVENT_CAP + 1`) rather than the true
+/// length, which is the value that tells [`refuse_append_past_cap`] the
+/// stream has already crossed rather than is about to. See that function
+/// for why those are different answers, and why only the second is a
+/// refusal.
+pub(crate) async fn observed_artifact_stream_len(
+    events: &dyn EventStore,
+    stream_id: &StreamId,
+) -> AppResult<u64> {
+    let read = capped_artifact_read(events, stream_id).await?;
+    Ok(read.events.len() as u64)
 }
 
 /// One capped `ReadFrom::Start` read of a bounded artifact stream, plus
@@ -1163,6 +1222,112 @@ mod refuse_append_past_cap_tests {
         assert!(
             err.to_string().contains("ExpectedVersion::Any"),
             "the error must name what it was asked of; got {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod observed_artifact_stream_len_tests {
+    use std::sync::Arc;
+
+    use hort_domain::events::StreamId;
+
+    use super::*;
+    use crate::use_cases::test_support::*;
+
+    fn seed(events: &Arc<MockEventStore>, artifact_id: Uuid, count: u64) -> StreamId {
+        let stream_id = StreamId::artifact(artifact_id);
+        let dummy: Vec<_> = (0..count)
+            .map(|i| dummy_persisted_event(&stream_id, artifact_id, i))
+            .collect();
+        events.set_stream(&stream_id, dummy);
+        stream_id
+    }
+
+    #[tokio::test]
+    async fn an_absent_stream_is_length_zero() {
+        let events = Arc::new(MockEventStore::new());
+        let stream_id = StreamId::artifact(Uuid::new_v4());
+        assert_eq!(
+            observed_artifact_stream_len(&*events, &stream_id)
+                .await
+                .expect("an absent stream is an answer, not a failure"),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_stream_reads_its_own_length() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+        let stream_id = seed(&events, artifact_id, 7);
+        assert_eq!(
+            observed_artifact_stream_len(&*events, &stream_id)
+                .await
+                .expect("readable"),
+            7
+        );
+    }
+
+    /// The pair of lengths the cap refusal has to tell apart: a stream
+    /// sitting exactly ON the cap reads as the cap (so one more event is
+    /// a crossing), and a stream past it reads as the read's budget (so
+    /// the refusal sees "already crossed" and, deliberately, does not
+    /// refuse).
+    #[tokio::test]
+    async fn the_cap_boundary_and_beyond_it_read_as_different_lengths() {
+        let events = Arc::new(MockEventStore::new());
+        let artifact_id = Uuid::new_v4();
+
+        let at_cap = seed(&events, artifact_id, STREAM_EVENT_CAP);
+        let len = observed_artifact_stream_len(&*events, &at_cap)
+            .await
+            .expect("readable");
+        assert_eq!(len, STREAM_EVENT_CAP);
+        refuse_append_past_cap(&at_cap, len, 1).expect_err("one more would cross");
+
+        let past_cap = seed(&events, artifact_id, STREAM_EVENT_CAP + 4);
+        let len = observed_artifact_stream_len(&*events, &past_cap)
+            .await
+            .expect("readable");
+        assert_eq!(
+            len,
+            STREAM_EVENT_CAP + 1,
+            "the read's budget, not the true length — which is all the refusal needs"
+        );
+        refuse_append_past_cap(&past_cap, len, 1).expect("already past is not crossing");
+    }
+
+    /// A read failure is the caller's to handle, not a length this
+    /// function invents: a pre-flight that could not establish the
+    /// precondition must not report that the precondition holds.
+    #[tokio::test]
+    async fn a_read_failure_propagates_rather_than_answering_zero() {
+        let events = Arc::new(MockEventStore::new());
+        let stream_id = StreamId::artifact(Uuid::new_v4());
+        events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+        let err = observed_artifact_stream_len(&*events, &stream_id)
+            .await
+            .expect_err("an unreadable stream has no observed length");
+        assert!(err.to_string().contains("event store down"), "got {err}");
+    }
+
+    /// Inherits [`capped_artifact_read`]'s category guard: a capped
+    /// forward scan states a length only for a stream the cap bounds.
+    #[tokio::test]
+    async fn rejects_non_artifact_stream_category() {
+        let events = Arc::new(MockEventStore::new());
+        let stream_id = StreamId::user(Uuid::new_v4());
+
+        let err = observed_artifact_stream_len(&*events, &stream_id)
+            .await
+            .expect_err("an unbounded stream has no capped length");
+        assert!(err.to_string().contains("non-artifact stream"), "got {err}");
+        assert_eq!(
+            events.read_stream_call_count(),
+            0,
+            "the category guard must fire before any read_stream I/O"
         );
     }
 }
