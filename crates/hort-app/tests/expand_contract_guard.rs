@@ -3052,10 +3052,9 @@ note = "n/a"
     }
 
     #[test]
-    fn the_deferred_quarantine_status_narrowing_is_enterable() {
-        // The acceptance criterion for closing the gap, expressed without
-        // touching the real manifest: the DROP + re-ADD shape the deferred
-        // `artifacts.quarantine_status` item announces must be BOTH
+    fn the_quarantine_status_narrowing_is_enterable() {
+        // The acceptance criterion for this CHECK replacement, expressed
+        // against a small independent fixture: its DROP + re-ADD shape must be BOTH
         // recognised (so check (a) demands a declaration) and declarable
         // (so the entry the policy asks for turns the guard green rather
         // than red). Before the CHECK shape was recognised it was neither:
@@ -3075,7 +3074,7 @@ note = "n/a"
         assert_eq!(
             ids_after(&[creates], narrows),
             vec![("artifacts.quarantine_status".to_string(), Reach::Narrowed)],
-            "the deferred shape must be recognised, or no entry for it can be correct"
+            "the narrowing must be recognised, or no entry for it can be correct"
         );
         let hits = violations(&tree(
             "0.15.0-dev",
@@ -3262,9 +3261,14 @@ note = "the deferred narrowing, landed"
             Reach::Narrowed,
             "ADD CONSTRAINT ... CHECK",
         );
-        // And the column universe itself: the deferred narrowing's column
-        // must still be in it, or that narrowing would read as a CHECK on
-        // storage its own migration created and go unreported.
+        found(
+            "044_artifacts_quarantine_status_storable_set.sql",
+            "artifacts.quarantine_status",
+            Reach::Narrowed,
+            "ADD CONSTRAINT ... CHECK",
+        );
+        // And the column universe itself: a replacement CHECK's column
+        // must remain visible as a pre-existing column.
         let mut known: BTreeSet<String> = BTreeSet::new();
         for (_, sql) in &inputs.migrations {
             known.extend(created_columns(&tokenize(&strip_comments(sql))));
@@ -3276,14 +3280,14 @@ note = "the deferred narrowing, landed"
     }
 
     #[test]
-    fn the_real_trees_check_narrowings_are_exactly_the_two_declared_ones() {
-        // The census, pinned. Nine statements in this tree carry the
+    fn the_real_trees_check_narrowings_are_exactly_the_three_declared_ones() {
+        // The census, pinned. Ten statements in this tree carry the
         // `ADD … CHECK` shape; seven of them replace an enum `CHECK` with
         // the same list plus one new literal and are therefore not
         // narrowings at all. If the widening comparison ever stopped
         // reaching one of those seven, the manifest would start demanding
         // an entry that fences a routine rolling upgrade; if it ever
-        // started reaching 031 or 039, a real narrowing would go
+        // started reaching 031, 039 or 044, a real narrowing would go
         // undeclared. Both directions are failures, so both are asserted.
         let inputs = real_tree_inputs();
         let by_migration = scan_in_apply_order(&inputs.migrations);
@@ -3306,6 +3310,10 @@ note = "the deferred narrowing, landed"
                 (
                     "039_policy_projections_quarantine_duration_nonnegative.sql".to_string(),
                     "policy_projections.quarantine_duration_secs".to_string(),
+                ),
+                (
+                    "044_artifacts_quarantine_status_storable_set.sql".to_string(),
+                    "artifacts.quarantine_status".to_string(),
                 ),
             ],
             "the real tree's CHECK narrowings changed"
@@ -3340,19 +3348,29 @@ note = "the deferred narrowing, landed"
         // text, and the real scan must report it. This is what proves the
         // green verdict is the entry's doing rather than the scanner's
         // silence.
-        let mut inputs = real_tree_inputs();
-        let migration = "039_policy_projections_quarantine_duration_nonnegative.sql";
-        inputs.manifest_toml = without_entry(&inputs.manifest_toml, migration);
-        let hits = violations(&inputs);
-        // Exactly one, so a splice that excised a neighbouring entry too
-        // cannot pass this off as the probe working.
-        assert_eq!(hits.len(), 1, "{hits:?}");
-        assert!(
-            hits[0].starts_with(migration)
-                && hits[0].contains("policy_projections.quarantine_duration_secs")
-                && hits[0].contains("no entry in migrations/"),
-            "stripping the entry must make the real scan report the narrowing: {hits:?}"
-        );
+        for (migration, identifier) in [
+            (
+                "039_policy_projections_quarantine_duration_nonnegative.sql",
+                "policy_projections.quarantine_duration_secs",
+            ),
+            (
+                "044_artifacts_quarantine_status_storable_set.sql",
+                "artifacts.quarantine_status",
+            ),
+        ] {
+            let mut inputs = real_tree_inputs();
+            inputs.manifest_toml = without_entry(&inputs.manifest_toml, migration);
+            let hits = violations(&inputs);
+            // Exactly one, so a splice that excised a neighbouring entry too
+            // cannot pass this off as the probe working.
+            assert_eq!(hits.len(), 1, "{hits:?}");
+            assert!(
+                hits[0].starts_with(migration)
+                    && hits[0].contains(identifier)
+                    && hits[0].contains("no entry in migrations/"),
+                "stripping the entry must make the real scan report the narrowing: {hits:?}"
+            );
+        }
     }
 
     #[test]

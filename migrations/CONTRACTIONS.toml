@@ -129,7 +129,7 @@ and prevented all of it.
 # not an escape — it exempts existing ROWS from the check, never a future
 # INSERT or UPDATE.
 #
-# Two statements in this tree carry the shape and are declared below. What is
+# Three statements in this tree carry the shape and are declared below. What is
 # NOT here is the commoner shape by far: a `DROP CONSTRAINT …_check` paired
 # with a re-`ADD` of the same name whose `IN` list is the old list plus one
 # new literal (migrations 018, 023, 024, 027, 036, 037, 041). An admitted set
@@ -211,6 +211,42 @@ anyone already on 0.17.3 or later. It is still open for an instance moving up
 from 0.17.2 today. Waiting one release would have cost nothing.
 """
 
+[[contraction]]
+migration = "044_artifacts_quarantine_status_storable_set.sql"
+identifiers = ["artifacts.quarantine_status"]
+reference_removed_in = "0.14.1"
+note = """
+The CHECK stops admitting the prototype scan states `unscanned`, `clean` and
+`flagged`. Migration 030 backfilled those rows to `'quarantined'` in the
+0.14.1 line, and `ADD CONSTRAINT` here validates existing rows, so any legacy
+value the backfill missed fails the migration rather than persisting under a
+schema that forbids it.
+
+`reference_removed_in` follows the policy's reference-removal arithmetic:
+`purge_gc::map_status` named all three literals up to and including 0.14.0,
+the mapper was folded onto the single `quarantine_status_sql` codec in the
+0.14.1 line, so 0.14.1 is the first release whose code does not name them.
+Not the release that ships this narrowing.
+
+**That value is deliberately conservative, and the reason is worth knowing
+before anyone edits it.** Measured at the v0.14.0 tag: no production statement
+assigns any of the three literals to this column. The only SQL occurrence is
+003's own CHECK — the admitted set, not a writer — and the Rust occurrences
+are a read-side match arm plus test fixtures. So no writer at 0.14.0 could
+emit a value this migration refuses, and read-only consumers are untouched by
+a narrowing. Under the field's own runtime meaning — the oldest binary version
+this migration tolerates — the honest value would therefore be older, the way
+031's 0.9.2 is.
+
+It stays 0.14.1 because lowering a declared floor loosens two
+operator-facing decisions at once: the fleet fence, which refuses a client
+below it, and the schema-compatibility register's recorded rollback floor.
+That is a decision with its own evidence, not a note edit. It costs nothing
+here: 039 already pins the reported floor at 0.17.3, which is strictly higher,
+and under the pre-1.0 wipe contract an upgrade carrying 0.14.0 data forward is
+not a supported path.
+"""
+
 # ---------------------------------------------------------------------------
 # Scheduled contractions — declared here in prose, not as `[[contraction]]`
 # entries, because the guard's checks are about migrations that EXIST.
@@ -226,63 +262,3 @@ from 0.17.2 today. Waiting one release would have cost nothing.
 # a deferred contraction becomes a forgotten one.
 # ---------------------------------------------------------------------------
 #
-# ## artifacts.quarantine_status — narrow the CHECK to the storable set
-#
-#   target release:  the first release after 0.14.1 — which is now **0.15.0**
-#                    (reference_removed_in = "0.14.1"; see the note below on
-#                    why the cycle opened at a minor rather than 0.14.2)
-#   shape:           ALTER TABLE public.artifacts
-#                        DROP CONSTRAINT artifacts_quarantine_status_check;
-#                    ALTER TABLE public.artifacts
-#                        ADD CONSTRAINT artifacts_quarantine_status_check CHECK (
-#                            quarantine_status IN ('quarantined', 'released',
-#                                                  'rejected', 'scan_indeterminate')
-#                        );
-#
-# The CHECK declared inline in `003_artifacts_cas.sql` admits three
-# prototype-era scan states — `unscanned`, `clean`, `flagged` — that
-# `QuarantineStatus` cannot parse and no writer in this tree produces (the
-# stored spelling of `QuarantineStatus::None` is SQL NULL, not a literal).
-# `030_artifacts_quarantine_status_legacy_backfill.sql` replaces them in the
-# data with the held state (`'quarantined'` plus a window anchor) in 0.14.1;
-# this narrowing stops the column from accepting them again.
-#
-# Why not 0.14.1 itself: `purge_gc::map_status` named all three literals up to
-# and including 0.14.0, so by the policy's own arithmetic the narrowing ships
-# one release later. That release was going to be 0.14.2; the cycle opened at
-# **0.15.0** instead, because the manual release lost an HTTP route and a CLI
-# command and `RELEASING.md` makes an observable-behaviour move a minor. The
-# arithmetic is unaffected — 0.15.0 is strictly after 0.14.1 — so this
-# narrowing is **eligible** in this cycle. Whether it rides in it is a
-# decision, not an automatism: the DROP + re-ADD below is destructive DDL.
-#
-# On that "up to and including 0.14.0": the mapper stopped naming the literals
-# when it was folded onto the single `quarantine_status_sql` codec, which ships
-# in 0.14.1 — so 0.14.1 is the release whose code no longer references them,
-# and 0.14.0 is the last one that did. `main` currently carries a
-# `version = "0.14.1"` whose `map_status` still names all three, but no
-# `v0.14.1` tag or artifact was ever cut from it, so it is not a release an
-# operator can upgrade between and not the reference point the arithmetic
-# wants. `v0.14.0` is the newest tag that names the identifiers, which is what
-# the reviewer step above should be run against.
-#
-# `003`'s inline CHECK cannot be edited in place —
-# `sqlx::migrate!` validates the checksum of every applied migration, so any
-# edit makes a migrated database refuse to boot (see
-# `018_jobs_kind_oci_edge_backfill.sql` for the same constraint and the same
-# DROP + re-ADD shape).
-#
-# Note for whoever lands it: `expand_contract_guard` now classifies the
-# `ADD CONSTRAINT … CHECK` half of that DROP + re-ADD as a narrowing of
-# `artifacts.quarantine_status` (the column pre-exists the migration), so the
-# migration WILL need an entry here naming exactly that identifier — the DROP
-# half still contributes nothing, and `no_sensitive_drops` still exempts a
-# same-name `_check` DROP + re-ADD. The expand-only exemption described above
-# does NOT reach it and must not be expected to: this narrowing REMOVES three
-# literals (`unscanned`, `clean`, `flagged`), so its admitted set is a strict
-# subset of 003's rather than a superset, which is the whole difference
-# between it and migrations 018 / 023 / 024 / 027 / 036 / 037 / 041. The
-# entry's `reference_removed_in` is "0.14.1" per the arithmetic above.
-# Landing it remains a decision rather than an automatism, which is why this
-# item stays prose: this file is where a reader looks for what is owed and
-# not yet done.

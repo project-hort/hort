@@ -12,7 +12,7 @@
 //! into that old fleet's face. This suite drives the fence that closes
 //! that operational-ordering gap against a real Postgres, using the
 //! workspace's *actual* migration set and the *actual* checked-in
-//! `migrations/CONTRACTIONS.toml` (versions 9, 14, 20, 31, 39 are declared
+//! `migrations/CONTRACTIONS.toml` (versions 9, 14, 20, 31, 39, 44 are declared
 //! contractions there) — no fixtures needed, since the manifest already
 //! gives us both a contraction and several expand-only migrations to test
 //! against.
@@ -29,9 +29,9 @@
 //! 3. `pending_contraction_with_no_older_fleet_does_not_block` — a
 //!    pending contraction but no other hort-shaped connection at all ⇒
 //!    not blocked; `migrate::run` then applies cleanly.
-//! 4. `expand_only_pending_set_is_never_fenced` — pending set has no
-//!    contraction, even with an older-version connection present ⇒ never
-//!    blocked; `migrate::run` applies cleanly.
+//! 4. `latest_pending_narrowing_tolerates_its_declared_floor` — only
+//!    migration 44 remains, and a client at its declared floor can stay
+//!    connected while `migrate::run` applies it.
 //! 5. `older_fleet_member_on_a_different_database_does_not_block` — an
 //!    older-version hort-shaped connection exists, but on a *different*
 //!    database in the same cluster ⇒ the fence must not treat it as an
@@ -156,14 +156,12 @@ async fn connect_with_application_name(db_name: &str, application_name: &str) ->
 
 /// A migration version, strictly below the lowest declared contraction
 /// (9), so `MIGRATOR.run_to(BEFORE_FIRST_CONTRACTION, ..)` leaves every
-/// declared contraction (9, 14, 20, 31, 39) pending.
+/// declared contraction (9, 14, 20, 31, 39, 44) pending.
 const BEFORE_FIRST_CONTRACTION: i64 = 8;
 
-/// The highest migration version below the workspace's current max —
-/// `MIGRATOR.run_to(EXPAND_ONLY_TARGET, ..)` leaves exactly the last
-/// migration pending. Computed from `MIGRATOR` itself (not hardcoded) so
-/// this stays correct as new expand-only migrations are appended.
-fn expand_only_target() -> i64 {
+/// The highest migration version below the workspace's current max.
+/// Leaves exactly the latest narrowing pending in this migration set.
+fn before_latest_narrowing() -> i64 {
     let max = MIGRATOR
         .iter()
         .map(|m| m.version)
@@ -419,41 +417,45 @@ async fn pending_contraction_with_no_older_fleet_does_not_block() {
 }
 
 // ---------------------------------------------------------------------------
-// 4 — expand-only pending set: never fenced, even with an older fleet.
+// 4 — the latest narrowing permits a fleet at its declared floor.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn expand_only_pending_set_is_never_fenced() {
+async fn latest_pending_narrowing_tolerates_its_declared_floor() {
     let Some(admin) = admin_pool().await else {
         eprintln!("DATABASE_URL unset; skipping");
         return;
     };
     let (db_name, pool) = create_temp_db(&admin).await;
 
-    let target = expand_only_target();
+    let target = before_latest_narrowing();
+    assert_eq!(target, 43, "the pending migration must be 44");
     MIGRATOR
         .run_to(target, &pool)
         .await
         .expect("partial migration run to just below the top succeeds");
 
-    // An older-version connection IS present — proves the pending set's
-    // shape (no contraction), not the absence of fleet members, is what
-    // holds this fence open.
-    let _older_conn = connect_with_application_name(&db_name, "hort-server/0.1.0").await;
+    let floor = contraction_minimum_binary_versions()
+        .get(&44)
+        .cloned()
+        .expect("migration 44 has a declared floor");
+    assert_eq!(floor, "0.14.1");
+    let _older_conn =
+        connect_with_application_name(&db_name, &format!("hort-server/{floor}")).await;
 
     let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
         .await
         .expect("fence evaluates");
     assert!(
         !fence.blocked,
-        "an expand-only pending set must never be fenced: {:?}",
+        "a client at migration 44's floor must be tolerated: {:?}",
         fence.offenders
     );
 
     migrate_run(&pool)
         .await
-        .expect("migrate::run applies the last expand-only migration cleanly");
+        .expect("migrate::run applies migration 44 cleanly");
 
     drop_temp_db(&admin, &db_name, pool).await;
 }

@@ -95,9 +95,9 @@ mod tests {
     /// changes this set, the intent is deliberate — update the
     /// assertion alongside the manifest edit.
     ///
-    /// Beyond the three drop/rename migrations the set carries two `CHECK`
+    /// Beyond the three drop/rename migrations the set carries three `CHECK`
     /// additions on a pre-existing column, which narrow that column's write
-    /// contract: 39, a real narrowing, and 31, which the guard reports
+    /// contract: 39 and 44, real narrowings, and 31, which the guard reports
     /// because it cannot read the statement as a replacement and fails
     /// closed. A `CHECK` replacement whose admitted set only GREW is not a
     /// narrowing and is deliberately absent — declaring one would fence a
@@ -108,7 +108,7 @@ mod tests {
         let versions = contraction_versions();
         assert_eq!(
             versions,
-            BTreeSet::from([9, 14, 20, 31, 39]),
+            BTreeSet::from([9, 14, 20, 31, 39, 44]),
             "migrations/CONTRACTIONS.toml contraction set changed — update this pin"
         );
     }
@@ -169,6 +169,7 @@ mod tests {
                 (20, "0.12.0".to_string()),
                 (31, "0.9.2".to_string()),
                 (39, "0.17.3".to_string()),
+                (44, "0.14.1".to_string()),
             ]),
             "migrations/CONTRACTIONS.toml reference_removed_in set changed — update this pin"
         );

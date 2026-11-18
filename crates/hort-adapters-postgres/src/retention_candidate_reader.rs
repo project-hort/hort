@@ -692,47 +692,32 @@ mod tests {
         assert!(ids.contains(&null_status));
     }
 
-    /// The legacy scan-state spellings migration `003`'s CHECK still
-    /// accepts (`unscanned` / `clean` / `flagged`) used to be *admitted*
-    /// here, because the row mapper collapsed them to
-    /// `QuarantineStatus::None`. They now fail the read instead: the
-    /// candidate SQL still selects the row (the filter is a `<> ALL`
-    /// over the protected names, and these are not protected names), and
-    /// `ArtifactRow -> Artifact` refuses to classify it.
-    ///
-    /// That is the fail-closed direction for a destructive sweep — a
-    /// blob whose hold state cannot be read is not offered for purge —
-    /// and it is why `030_artifacts_quarantine_status_legacy_backfill.sql`
-    /// replaces the spellings with the held state (`'quarantined'` plus a
-    /// window anchor): after that migration a database cannot reach this
-    /// state without a write behind the adapter's back.
+    /// A prototype scan state cannot be stored where retention could
+    /// mistake it for an unheld artifact.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    async fn list_candidates_fails_closed_on_a_legacy_scan_state_spelling() {
+    async fn list_candidates_cannot_receive_a_legacy_scan_state_spelling() {
         let Some(pool) = maybe_pool().await else {
             return;
         };
+        let repo_id = seed_repo(&pool).await;
+        let id = seed_artifact(&pool, repo_id, Some("released"), false).await;
         for raw in ["unscanned", "clean", "flagged"] {
-            let repo_id = seed_repo(&pool).await;
-            let id = seed_artifact(&pool, repo_id, Some(raw), false).await;
-
-            let err = PgRetentionCandidateReader::new(pool.clone())
-                .list_candidates(1000, None, Utc::now(), &[], None)
-                .await
-                .expect_err("an unclassifiable hold state must not be offered for purge");
-            assert!(
-                err.to_string().contains(raw),
-                "the error must name the offending value; got {err}"
-            );
-
-            // Clear before the next spelling: `list_candidates` reads
-            // the whole table, so a leftover row would make the next
-            // iteration's assertion name the previous spelling's value.
-            sqlx::query("DELETE FROM artifacts WHERE id = $1")
+            let err = sqlx::query("UPDATE artifacts SET quarantine_status = $1 WHERE id = $2")
+                .bind(raw)
                 .bind(id)
                 .execute(&pool)
                 .await
-                .expect("drop the fixture row");
+                .expect_err("legacy status must be refused before retention reads it");
+            let db = err
+                .as_database_error()
+                .expect("Postgres rejected the write");
+            assert_eq!(db.code().as_deref(), Some("23514"), "{raw}: {err}");
+            assert_eq!(
+                db.constraint(),
+                Some("artifacts_quarantine_status_check"),
+                "{raw}: {err}"
+            );
         }
     }
 
