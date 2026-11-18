@@ -2753,6 +2753,11 @@ pub struct MockEventStore {
     /// [`MockEventStore::fail_read_stream_at`]. Armed as
     /// `(0-based call index, error)`; consumed when that call fires.
     fail_read_stream_at: Mutex<Option<(usize, DomainError)>>,
+    /// Call-indexed one-shot stream replacement — see
+    /// [`MockEventStore::set_stream_after_read_at`]. Armed as
+    /// `(0-based call index, stream key, replacement)`; installed after
+    /// that call serves, and consumed then.
+    stream_after_read_at: Mutex<Option<(usize, String, Vec<PersistedEvent>)>>,
     /// Total `read_stream` invocations, including failed ones. Lets
     /// tests pin a "no read round-trip on this path anymore" claim
     /// (issue #87: `ExpectedVersion::Any` appends need no
@@ -2780,6 +2785,7 @@ impl MockEventStore {
             stream_after_next_read: Mutex::new(HashMap::new()),
             fail_next_read_stream: Mutex::new(None),
             fail_read_stream_at: Mutex::new(None),
+            stream_after_read_at: Mutex::new(None),
             read_stream_calls: AtomicUsize::new(0),
             deleted_streams: Mutex::new(Vec::new()),
             archived_streams: Mutex::new(Vec::new()),
@@ -2909,6 +2915,29 @@ impl MockEventStore {
             .lock()
             .unwrap()
             .insert(stream_id.to_string(), events);
+    }
+
+    /// Arm a one-shot stream replacement that fires after the
+    /// `read_stream` call at 0-based index `n` — the same counter
+    /// [`Self::read_stream_call_count`] reports.
+    ///
+    /// [`Self::set_stream_after_next_read`] can only ever reach the FIRST
+    /// read, exactly as [`Self::fail_next_read_stream`] can only reach
+    /// the first failure, and for the same reason this exists beside it: a
+    /// caller that reads one stream twice for two different questions —
+    /// a batch verb establishing a cap precondition ahead of its loop and
+    /// then pairing the artifact inside it — needs the concurrent append
+    /// to land between those two reads. That is the interleaving a lost
+    /// append actually has; arming the earlier read instead gives the
+    /// apply step a version that matches, and the append it was supposed
+    /// to lose succeeds.
+    pub fn set_stream_after_read_at(
+        &self,
+        n: usize,
+        stream_id: &StreamId,
+        events: Vec<PersistedEvent>,
+    ) {
+        *self.stream_after_read_at.lock().unwrap() = Some((n, stream_id.to_string(), events));
     }
 
     /// Seed the category feed that [`read_category`] serves. Events
@@ -3075,7 +3104,19 @@ impl EventStore for MockEventStore {
         // this read serves the current content; subsequent reads see
         // the armed replacement — a concurrent append between reads.
         if let Some(next) = self.stream_after_next_read.lock().unwrap().remove(&key) {
-            self.streams.lock().unwrap().insert(key, next);
+            self.streams.lock().unwrap().insert(key.clone(), next);
+        }
+        // The call-indexed form of the same one-shot, for a caller whose
+        // second read of this stream is the one the swap has to precede.
+        {
+            let mut armed = self.stream_after_read_at.lock().unwrap();
+            if armed
+                .as_ref()
+                .is_some_and(|(n, armed_key, _)| *n == call_index && *armed_key == key)
+            {
+                let (_, armed_key, next) = armed.take().expect("just checked it is armed");
+                self.streams.lock().unwrap().insert(armed_key, next);
+            }
         }
         let truncated: Vec<PersistedEvent> = events.into_iter().take(max_count as usize).collect();
         Box::pin(async move { Ok(truncated) })

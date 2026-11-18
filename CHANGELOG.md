@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A migration that adds a `CHECK` narrowing an existing column is now a
   declared contraction, so `hort-server migrate` refuses it while an older
   hort-shaped client is connected — override with `--allow-running-fleet` (#433).
+- A bulk waive that could not apply every entry no longer reports success: it
+  is refused before anything is released when the reason is visible in
+  advance, and reported as partial — `outcome: "partial"`, CLI exit 4 — when it
+  is not (#435).
 
 ## [0.17.5] - 2026-11-17
 
