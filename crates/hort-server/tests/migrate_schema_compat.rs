@@ -59,7 +59,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::time::Duration;
 
+use hort_config::pg_identity::parse_version_core;
 use hort_config::schema_compat::{register_from_rows, schema_rollback_floor, SchemaRollbackFloor};
+use hort_server::contractions::contraction_minimum_binary_versions;
 use hort_server::migrate::{assert_current, run as migrate_run, MIGRATOR};
 use serial_test::serial;
 use sqlx::{Executor, PgPool};
@@ -440,11 +442,51 @@ async fn an_upgrade_backfills_every_embedded_migration() {
     );
 
     let applied = applied_versions(&pool).await;
+    let floor = schema_rollback_floor(&applied, &register_from_rows(register));
+
+    // The floor is DERIVED from the manifest rather than written here as a
+    // literal: it is the strictest `reference_removed_in` among the declared
+    // contractions this binary applied, so declaring one more moves this
+    // expectation with the manifest instead of breaking a test that is about
+    // the backfill. The derivation is an independent expression of the same
+    // invariant — `schema_rollback_floor` reads the register rows the migrate
+    // run wrote, this reads the manifest those rows came from — so a value
+    // lost or mis-picked anywhere along that chain still fails here.
+    let declared: Vec<(i64, String)> = contraction_minimum_binary_versions()
+        .into_iter()
+        .filter(|(version, _)| applied.contains(version))
+        .collect();
+    let strictest = declared
+        .iter()
+        .max_by_key(|(_, minimum)| {
+            parse_version_core(minimum).expect("every declared floor parses as X.Y.Z")
+        })
+        .map(|(_, minimum)| minimum.clone())
+        .expect("the embedded migration set contains at least one declared contraction");
+
+    // Counter-assertion: the strictest floor is only meaningful as a maximum
+    // if the applied set declares more than one, with more than one value —
+    // otherwise this test would pass against an implementation that returns
+    // an arbitrary recorded minimum.
+    let lowest = declared
+        .iter()
+        .min_by_key(|(_, minimum)| {
+            parse_version_core(minimum).expect("every declared floor parses as X.Y.Z")
+        })
+        .map(|(_, minimum)| minimum.clone())
+        .expect("non-empty, checked above");
+    assert!(
+        parse_version_core(&strictest) > parse_version_core(&lowest),
+        "this assertion only pins a maximum while the applied set declares at least two \
+         distinct floors (strictest {strictest}, lowest {lowest})"
+    );
+
     assert_eq!(
-        schema_rollback_floor(&applied, &register_from_rows(register)),
-        SchemaRollbackFloor::Version("0.12.0".to_string()),
+        floor,
+        SchemaRollbackFloor::Version(strictest.clone()),
         "the backfill closes the inspection gap: an upgraded database reports a rollback \
-         floor instead of `indeterminate`"
+         floor instead of `indeterminate`, and it is the strictest floor the manifest \
+         declares for the migrations it applied"
     );
 
     drop_temp_db(&admin, &db_name, pool).await;
