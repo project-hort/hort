@@ -8,8 +8,19 @@
 //! 1. Capture `now`.
 //! 2. Call [`RescanCandidatesRepository::select_eligible`] to fetch up
 //!    to [`BATCH_SIZE`] artifacts whose policy-derived rescan interval
-//!    has elapsed, that are `quarantine_status='released'`, and that
-//!    have no in-flight `kind='scan'` job.
+//!    has elapsed, that have no in-flight `kind='scan'` job, and whose
+//!    `quarantine_status` is `'released'` **or** `NULL` — not
+//!    `'released'` alone. The adapter admits the permissive-default
+//!    `NULL` on purpose, and its reason is that such an artifact is a
+//!    live, downloadable terminal state: no operator policy at all, or a
+//!    policy with `quarantine_duration_secs = 0`. Excluding it would
+//!    leave every out-of-the-box deployment's artifacts un-rescanned.
+//!    `NULL` is also the state an artifact is left in when a decision
+//!    was never reached, so this arm is what keeps such a row reachable
+//!    — the tick enqueues a scan for it, and the transition table allows
+//!    `RejectFromScan` out of `None`. Reading this step as
+//!    `'released'`-only invites the opposite conclusion: that a
+//!    `NULL`-status row is never swept again.
 //! 3. Call [`RescanCandidatesRepository::select_stranded`] (issue #6) to
 //!    fetch up to [`BATCH_SIZE`] **stranded** artifacts: one of the two
 //!    holds with a last scan attempt that errored or was never made (see
