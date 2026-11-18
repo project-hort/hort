@@ -985,9 +985,15 @@ impl FormatHandler for PyPiFormatHandler {
             }));
         };
 
+        // The unparseable count is dropped here and consumed on the
+        // payload path (`declared_or_empty`), because this signature has
+        // nowhere to put it: `extract_sbom` answers `Option<Sbom>` with
+        // no resolution beside it, so it cannot say "read and not usable"
+        // at all. Nothing is lost — a format with a `PayloadSbom` is
+        // never routed here by the scan orchestrator, and pypi has one.
         Ok(Some(Sbom {
             subject: Some(subject),
-            components: pypi_components_from_requirements(&reqs, &licenses),
+            components: pypi_components_from_requirements(&reqs, &licenses).components,
         }))
     }
 
@@ -1186,18 +1192,105 @@ impl PayloadSbom for PyPiFormatHandler {
     }
 }
 
-/// Turn a read declaration into an extraction, keeping the three
-/// outcomes a component list can have apart.
+/// A way a dependency declaration that is **present** fails to yield
+/// the distribution's requirement list whole.
+///
+/// Each variant is a fact only its own reader can see; what every one
+/// of them is worth is decided in one place, by
+/// [`refuse_unread_declaration`].
+#[derive(Clone, Copy)]
+enum UnreadDeclaration {
+    /// `Requires-Dist` fields present with no value — folded onto a
+    /// continuation that carries nothing, or left empty on their own
+    /// line. Counted rather than flagged so an operator knows how much
+    /// of the document to go looking at.
+    FieldsWithNoValue(usize),
+    /// Requirement lines the PEP 508 reader could not parse, beside the
+    /// `readable` ones it could.
+    UnparseableRequirements { unparseable: usize, readable: usize },
+    /// An sdist whose `Metadata-Version` puts no completeness guarantee
+    /// behind its fields — below PEP 643's 2.2, or unreadable. Carries
+    /// the version for the diagnostic.
+    NoCompletenessGuarantee(Option<(u32, u32)>),
+}
+
+/// **A declaration that cannot be read in full is not a complete one —
+/// the criterion, stated here and consumed by every shape that fails
+/// it.**
+///
+/// A PyPI distribution's dependency declaration earns the complete
+/// verdict — [`PypiDeclaration::Stated`] from the header reader, and
+/// the [`SbomResolution::Declared`] the BOM builder derives from it —
+/// only when what the reader holds is the whole of what the document
+/// states. Anything less is an unread declaration:
+/// [`PypiDeclaration::NotCanonical`], and
+/// [`SbomResolution::UnusableLockfile`] at the port boundary, which the
+/// scan orchestrator spends as a gating absence rather than as a
+/// thinner BOM (ADR 0007).
+///
+/// **Why one criterion and not one per shape.** Every shape in
+/// [`UnreadDeclaration`] overstates in the same direction: a component
+/// list missing what the reader could not read presents itself as
+/// complete, and under a policy whose backend adjudicates that list an
+/// artifact whose dependencies were never established records a clean
+/// scan. Written per shape, the rule got stated once and applied to one
+/// of them — a `Requires-Dist` folded onto an empty continuation —
+/// while the *unfolded* empty field, the unparseable line beside a
+/// parseable one, and the sdist below metadata 2.2 each took the
+/// complete verdict instead. A fifth shape now has one home rather than
+/// three precedents to pick from.
+///
+/// Returns the operator-readable reason; the caller spends it on the
+/// arm its own layer has for an unread declaration.
+fn refuse_unread_declaration(shape: UnreadDeclaration) -> String {
+    match shape {
+        UnreadDeclaration::FieldsWithNoValue(fields) => format!(
+            "{fields} of the distribution's `Requires-Dist` fields are present and carry no \
+             value, so the requirement each one states cannot be read — Core Metadata requires \
+             every `Requires-Dist` entry to name a project, so an empty value is a statement \
+             that did not come out and not one that there is no dependency"
+        ),
+        UnreadDeclaration::UnparseableRequirements {
+            unparseable,
+            readable,
+        } => format!(
+            "{unparseable} of the distribution's {total} requirement lines are in a syntax this \
+             PEP 508 reader cannot parse, so the {readable} it did read are part of the \
+             declaration rather than the whole of it",
+            total = unparseable + readable
+        ),
+        UnreadDeclaration::NoCompletenessGuarantee(Some((major, minor))) => format!(
+            "the sdist's PKG-INFO is metadata {major}.{minor}, which predates PEP 643's \
+             `Dynamic` field (metadata 2.2) — the Core Metadata specification directs a reader \
+             to treat every field in such a document as if it were specified `Dynamic`, so what \
+             it says about `Requires-Dist` guarantees neither that the built distribution \
+             declares the same requirements nor that it declares none"
+        ),
+        UnreadDeclaration::NoCompletenessGuarantee(None) => {
+            "the sdist's PKG-INFO states no readable `Metadata-Version`, so nothing puts a \
+             completeness guarantee behind its fields (PEP 643 made that guarantee available \
+             from metadata 2.2) — what it says about `Requires-Dist` guarantees neither that \
+             the built distribution declares the same requirements nor that it declares none"
+                .to_string()
+        }
+    }
+}
+
+/// Turn a read declaration into an extraction, keeping the outcomes a
+/// component list can have apart.
 ///
 /// - No requirement lines at all → [`SbomResolution::NoLockfile`]: the
 ///   declaration was read and states there are none, which is as
 ///   truthful as an absent document and just as non-gating.
-/// - Lines that parsed → [`SbomResolution::Declared`].
-/// - Lines that **all** failed to parse → the declaration was read and
-///   could not be used, which is [`SbomResolution::UnusableLockfile`]
-///   and gates. Reporting `Declared` with an empty list here would say
-///   "this distribution declares nothing" about one that declares
-///   several things in a syntax this reader does not admit.
+/// - Every line parsed → [`SbomResolution::Declared`].
+/// - Any line that did not → the declaration was not read in full,
+///   which is [`SbomResolution::UnusableLockfile`] and gates, by
+///   [`refuse_unread_declaration`]'s criterion. One readable line
+///   beside one this reader cannot parse is the case that matters:
+///   `Declared` over the readable remainder says "these are the
+///   distribution's dependencies" about a list the document is longer
+///   than, and the line that fell out is as likely to be the one an
+///   advisory matches as any other.
 fn declared_or_empty(
     subject: SbomComponent,
     reqs: &[&str],
@@ -1206,14 +1299,23 @@ fn declared_or_empty(
     if reqs.is_empty() {
         return subject_only(subject, SbomResolution::NoLockfile);
     }
-    let components = pypi_components_from_requirements(reqs, licenses);
-    if components.is_empty() {
+    let read = pypi_components_from_requirements(reqs, licenses);
+    if read.unparseable > 0 {
+        tracing::warn!(
+            package = %subject.name,
+            reason = %refuse_unread_declaration(UnreadDeclaration::UnparseableRequirements {
+                unparseable: read.unparseable,
+                readable: read.components.len(),
+            }),
+            "pypi SBOM: the distribution's dependency declaration was not read in full — \
+             holding it as an unread declaration rather than as the part of it that parsed",
+        );
         return subject_only(subject, SbomResolution::UnusableLockfile);
     }
     PayloadSbomExtraction {
         sbom: Some(Sbom {
             subject: Some(subject),
-            components,
+            components: read.components,
         }),
         resolution: SbomResolution::Declared,
         // PyPI walks no closure, so there is no traversed-but-unemitted
@@ -1241,10 +1343,17 @@ fn declared_or_empty(
 /// advisory lookup and no download — and
 /// [`PyPiFormatHandler::payload_contains_components`] already denies
 /// every such finding authority over the artifact.
-fn pypi_components_from_requirements(reqs: &[&str], licenses: &[String]) -> Vec<SbomComponent> {
+///
+/// **The unparseable count comes back with the components** rather than
+/// being left for a caller to infer: whether the declaration was read
+/// in full is [`refuse_unread_declaration`]'s question, and only this
+/// function knows the answer.
+fn pypi_components_from_requirements(reqs: &[&str], licenses: &[String]) -> RequirementComponents {
     let mut components = Vec::new();
+    let mut unparseable = 0usize;
     for req_str in reqs {
         let Some((name, version)) = parse_pep_508_requirement(req_str) else {
+            unparseable += 1;
             continue;
         };
         let normalised_name = pep_503_normalize(&name);
@@ -1261,7 +1370,29 @@ fn pypi_components_from_requirements(reqs: &[&str], licenses: &[String]) -> Vec<
             direct_dependency: true,
         });
     }
-    components
+    RequirementComponents {
+        components,
+        unparseable,
+    }
+}
+
+/// What a set of requirement lines yielded: the BOM components, and how
+/// many of the lines produced none.
+///
+/// **The count is carried, not inferred.** `reqs.len() -
+/// components.len()` happens to equal it today only because every line
+/// yields exactly one component or none — the first rule that drops a
+/// *readable* line (a duplicate, or an extras-gated entry, which the
+/// cascade reader already drops and this one deliberately keeps) would
+/// silently turn that subtraction into an unread declaration and gate
+/// every distribution with such a line.
+struct RequirementComponents {
+    /// One component per line that parsed, in declaration order.
+    components: Vec<SbomComponent>,
+    /// Lines the PEP 508 reader could not parse. Non-zero is a
+    /// declaration that was not read in full — see
+    /// [`refuse_unread_declaration`].
+    unparseable: usize,
 }
 
 /// What a PyPI distribution's own dependency declaration turned out to
@@ -1280,11 +1411,14 @@ enum PypiDeclaration {
     /// `Requires-Dist` value in declaration order; **empty is a
     /// statement**, not an absence — this distribution declares none.
     Stated(Vec<String>),
-    /// The document was read and does not state them: it marks
+    /// The document was read and does not state them in full: it marks
     /// `Requires-Dist` dynamic (PEP 643), it is an sdist whose metadata
-    /// version makes silence about the field meaningless, or its RFC
-    /// 5322 header block folds an authority-bearing field into
-    /// something that cannot be read as that field's value.
+    /// version puts no completeness guarantee behind its fields, it
+    /// carries a `Requires-Dist` field with no readable value, or its
+    /// RFC 5322 header block folds an authority-bearing field into
+    /// something that cannot be read as that field's value. The
+    /// criterion the middle two share with the BOM builder's own
+    /// partial reading is [`refuse_unread_declaration`]'s.
     NotCanonical(String),
     /// No metadata document could be read out of the payload: the bytes
     /// are not one of the two containers, the archive is unreadable, the
@@ -1520,13 +1654,16 @@ fn is_sdist_pkg_info_path(name: &str) -> bool {
 /// - `Dynamic` — PEP 643's marker. `Dynamic: Requires-Dist` says the
 ///   field's value in **this** document is not canonical for what gets
 ///   built, so its absence is unknown rather than empty.
-/// - `Metadata-Version` — which decides whether silence about the field
-///   carries a guarantee at all.
+/// - `Metadata-Version` — which decides whether the document's fields
+///   carry a completeness guarantee at all, for a stated
+///   `Requires-Dist` as much as for an absent one.
 ///
-/// Header field names are matched case-insensitively (RFC 5322 §3.6.8).
-/// That is not tidiness: a case-sensitive match that missed a `dynamic:`
-/// spelling would read a non-canonical declaration as a canonical one,
-/// and the fail-open direction is the one that matters here.
+/// Header field names are matched case-insensitively (RFC 5322 §3.6.8),
+/// through the one definition both readers of this document share —
+/// [`core_metadata_field`]. That is not tidiness: a case-sensitive
+/// match that missed a `dynamic:` spelling would read a non-canonical
+/// declaration as a canonical one, and the fail-open direction is the
+/// one that matters here.
 ///
 /// For the same reason the document is **unfolded** before it is read
 /// (see [`unfold_rfc5322_block`]): a value folded onto a continuation
@@ -1542,8 +1679,14 @@ fn is_sdist_pkg_info_path(name: &str) -> bool {
 /// never an empty one. The empty arm grants release authority under a
 /// policy whose backend adjudicates the component list (ADR 0007), so
 /// it is reserved for a document that says there are no requirements.
+///
+/// Whether what came out of the document is the whole of what it states
+/// is not decided here: this function gathers the facts and
+/// [`refuse_unread_declaration`] holds the criterion, so the shapes
+/// that fail it cannot drift apart.
 fn classify_requires_dist(text: &str, container: PypiContainer) -> PypiDeclaration {
     let mut requires: Vec<String> = Vec::new();
+    let mut fields_with_no_value = 0usize;
     let mut requires_dist_is_dynamic = false;
     let mut metadata_version: Option<(u32, u32)> = None;
 
@@ -1557,27 +1700,26 @@ fn classify_requires_dist(text: &str, container: PypiContainer) -> PypiDeclarati
     };
 
     for header in &headers {
-        let Some((name, value)) = rfc5322_header(&header.line) else {
+        let Some((field, value)) = core_metadata_field(&header.line) else {
             continue;
         };
-        match name.as_str() {
-            "requires-dist" => {
-                // A field folded onto a continuation that carries
-                // nothing is a requirement this reader cannot recover,
-                // not one the distribution declined to state — and the
-                // difference is release authority, so say unreadable.
-                if header.folded && value.is_empty() {
-                    return PypiDeclaration::NotCanonical(
-                        "the distribution's `Requires-Dist` field is folded onto a continuation \
-                         line that carries no value, so the requirement it states cannot be read"
-                            .to_string(),
-                    );
-                }
-                if !value.is_empty() {
+        match field {
+            CoreMetadataField::RequiresDist => {
+                // A field present with no value states a requirement
+                // this reader cannot recover, not one the distribution
+                // declined to state — and the difference is release
+                // authority. Folding is not the test: a value folded
+                // onto a continuation that carries nothing and one left
+                // empty on its own line are the same unreadable state,
+                // and used to take opposite verdicts purely because one
+                // of them was reassembled.
+                if value.is_empty() {
+                    fields_with_no_value += 1;
+                } else {
                     requires.push(value.to_string());
                 }
             }
-            "dynamic" => {
+            CoreMetadataField::Dynamic => {
                 // Only a reassembled value is held to this: what the
                 // document states on one line is read as it stands, and
                 // what this reader joined back together must come out
@@ -1597,8 +1739,9 @@ fn classify_requires_dist(text: &str, container: PypiContainer) -> PypiDeclarati
                     requires_dist_is_dynamic = true;
                 }
             }
-            "metadata-version" => metadata_version = parse_metadata_version(value),
-            _ => {}
+            CoreMetadataField::MetadataVersion => {
+                metadata_version = parse_metadata_version(value);
+            }
         }
     }
 
@@ -1610,46 +1753,46 @@ fn classify_requires_dist(text: &str, container: PypiContainer) -> PypiDeclarati
         );
     }
 
-    if !requires.is_empty() {
-        // Lines are present. Their completeness relative to a future
-        // build is exactly what `Dynamic` is for, and it is not set, so
-        // what is written is what is declared — at any metadata version.
-        return PypiDeclaration::Stated(requires);
+    if fields_with_no_value > 0 {
+        return PypiDeclaration::NotCanonical(refuse_unread_declaration(
+            UnreadDeclaration::FieldsWithNoValue(fields_with_no_value),
+        ));
     }
 
-    // Nothing declared, and whether that is a statement depends on which
-    // document this is.
+    // What the document states is legible. Whether it is the whole of
+    // what the installed distribution will declare depends on which
+    // document this is — and that question is asked of the *document*,
+    // not of whether it happened to state any requirement, because the
+    // guarantee PEP 643 made available covers a present field and an
+    // absent one alike.
     match container {
         // A wheel is the **built** distribution: its METADATA describes
         // what was built, which is why PEP 643 permits `Dynamic` only in
         // a source distribution and why `pip` resolves a wheel's
         // dependencies from exactly this field. There is no later
-        // document for the answer to move to, so an absent
-        // `Requires-Dist` is the wheel declaring no runtime
-        // requirements — at every metadata version, 2.2 included.
-        PypiContainer::Wheel => PypiDeclaration::Stated(Vec::new()),
+        // document for the answer to move to, so what it states —
+        // including an absent `Requires-Dist` — is the wheel's own
+        // declaration, at every metadata version, 2.2 included.
+        PypiContainer::Wheel => PypiDeclaration::Stated(requires),
         // An sdist's PKG-INFO is a **pre-build** document whose fields
         // may be recomputed when a wheel is built from it, and before
         // metadata 2.2 it had no way to say which ones were settled.
-        // PEP 643 exists to close precisely that gap, so silence below
-        // 2.2 proves nothing — all the more so because an sdist's
-        // dependencies commonly live in `setup.py` / `pyproject.toml`,
-        // which no reader here executes. From 2.2 on, a field absent
-        // from `Dynamic` is declared static and its absence IS the
-        // statement.
+        // PEP 643 exists to close precisely that gap, and the Core
+        // Metadata specification draws the consequence in both
+        // directions: below 2.2 every field is to be read as if it were
+        // specified `Dynamic`, so silence proves nothing AND the
+        // requirement lines such a document *does* state are a lower
+        // bound on what a wheel built from it declares rather than that
+        // wheel's declaration —
+        // all the more so because an sdist's dependencies commonly live
+        // in `setup.py` / `pyproject.toml`, which no reader here
+        // executes. From 2.2 on, a field absent from `Dynamic` is
+        // declared static and the document stands as written.
         PypiContainer::Sdist => match metadata_version {
-            Some(version) if version >= (2, 2) => PypiDeclaration::Stated(Vec::new()),
-            Some((major, minor)) => PypiDeclaration::NotCanonical(format!(
-                "the sdist's PKG-INFO is metadata {major}.{minor}, which predates PEP 643's \
-                 `Dynamic` field (metadata 2.2) — an absent `Requires-Dist` carries no \
-                 guarantee that the built distribution declares none"
+            Some(version) if version >= (2, 2) => PypiDeclaration::Stated(requires),
+            below_2_2 => PypiDeclaration::NotCanonical(refuse_unread_declaration(
+                UnreadDeclaration::NoCompletenessGuarantee(below_2_2),
             )),
-            None => PypiDeclaration::NotCanonical(
-                "the sdist's PKG-INFO states no readable `Metadata-Version`, so an absent \
-                 `Requires-Dist` carries no guarantee (PEP 643 made that guarantee available \
-                 from metadata 2.2)"
-                    .to_string(),
-            ),
         },
     }
 }
@@ -1664,9 +1807,11 @@ struct UnfoldedHeader<'a> {
     line: Cow<'a, str>,
     /// Whether the value arrived across more than one physical line, so
     /// `line` is a reassembly this reader performed rather than text the
-    /// document states as it stands. The two authority-bearing fields
-    /// insist their reassembly is legible; see
-    /// [`classify_requires_dist`].
+    /// document states as it stands. `Dynamic` insists its reassembly
+    /// is legible; see [`classify_requires_dist`]. `Requires-Dist` does
+    /// not need to ask — a value that came out empty is unreadable
+    /// however it arrived, which is [`refuse_unread_declaration`]'s
+    /// criterion and not a fact about folding.
     folded: bool,
 }
 
@@ -1750,6 +1895,57 @@ fn rfc5322_header(line: &str) -> Option<(String, &str)> {
         return None;
     }
     Some((name.to_ascii_lowercase(), value.trim()))
+}
+
+/// A Core Metadata field one of this module's two readers of a metadata
+/// document has to recognise.
+///
+/// Both readers walk the same unfolded header block;
+/// [`core_metadata_field`] is the one definition of which field a line
+/// in it states.
+enum CoreMetadataField {
+    /// PEP 508 requirement lines — the dependency declaration itself.
+    /// The only field both readers consume.
+    RequiresDist,
+    /// PEP 643's marker: the named field's value in this document is
+    /// not canonical for the built distribution.
+    Dynamic,
+    /// Which Core Metadata version the document claims, which decides
+    /// whether its fields carry a completeness guarantee at all.
+    MetadataVersion,
+}
+
+/// Which Core Metadata field an unfolded header line states, and its
+/// trimmed value.
+///
+/// **One definition of what *is* a `Requires-Dist` field, consumed by
+/// both readers of the document** — the release-authority reader
+/// ([`classify_requires_dist`]) and the prefetch-cascade reader
+/// ([`parse_wheel_metadata_into_specs`]). RFC 5322 §3.6.8 makes field
+/// names case-insensitive, and the two readers disagreed about it: one
+/// matched the lowercased name this function produces while the other
+/// compared a `Requires-Dist:` prefix literally, so a wheel spelling
+/// the field `requires-dist:` declared a dependency to the BOM and
+/// declared nothing to the cascade — the same verified bytes, two
+/// contradictory statements about what the distribution depends on, and
+/// a package the cascade never warmed and advisory matching never asked
+/// about.
+///
+/// Unfolding is already shared ([`unfold_rfc5322_block`]); this is the
+/// other half of reading a field, and sharing one and not the other is
+/// exactly where the readers came apart.
+///
+/// `None` for every other field and for anything that is not a header
+/// line at all (see [`rfc5322_header`]).
+fn core_metadata_field(line: &str) -> Option<(CoreMetadataField, &str)> {
+    let (name, value) = rfc5322_header(line)?;
+    let field = match name.as_str() {
+        "requires-dist" => CoreMetadataField::RequiresDist,
+        "dynamic" => CoreMetadataField::Dynamic,
+        "metadata-version" => CoreMetadataField::MetadataVersion,
+        _ => return None,
+    };
+    Some((field, value))
 }
 
 /// Parse a `Metadata-Version` value into `(major, minor)` for ordered
@@ -2232,6 +2428,19 @@ struct WheelMetadataScan {
 /// so the dependency simply was not in the cascade and advisory matching
 /// never asked about it.
 ///
+/// **And the field name is matched through [`core_metadata_field`]**, the one
+/// definition the release-authority reader also consumes, so a `requires-dist:`
+/// spelling (field names are case-insensitive — RFC 5322 §3.6.8) cannot be a
+/// declared dependency to one reader and invisible to the other.
+///
+/// **Completeness is not this reader's question.** A line it cannot parse is
+/// one fewer package warmed, which costs a cache miss and grants no authority;
+/// the same line reaching the BOM makes a shorter component list look like the
+/// distribution's whole declaration, which is why
+/// [`refuse_unread_declaration`]'s criterion is applied there and nothing
+/// follows from it here. This signature has no way to say it in any case: an
+/// `Err` is a failed prefetch job, not an abstention.
+///
 /// Input must be valid UTF-8 (PEP 566 §3) — otherwise `Validation`. A header
 /// block that cannot be unfolded at all (its first line is a continuation) is
 /// an unparseable manifest, which the port contract puts on `Validation` too.
@@ -2257,10 +2466,10 @@ fn parse_wheel_metadata_into_specs(metadata: &[u8]) -> DomainResult<Vec<Dependen
     // `unfold_rfc5322_block` stops at the blank line, so the description
     // body below it — indented prose included — stays out.
     for header in unfold_rfc5322_block(text).map_err(DomainError::Validation)? {
-        let Some(value) = header.line.strip_prefix("Requires-Dist:") else {
+        let Some((CoreMetadataField::RequiresDist, value)) = core_metadata_field(&header.line)
+        else {
             continue;
         };
-        let value = value.trim();
         // Drop extras-gated deps: `; extra == 'test'` / `; extra == "dev"`.
         // pip's source (`pip._internal.req.constructors`) does an equivalent
         // check at install time. The cascade never asks for extras → drop.
@@ -4693,15 +4902,61 @@ mod tests {
         );
     }
 
-    /// A pre-2.2 sdist that *does* declare requirements has declared
-    /// them: `Dynamic` is what would have said otherwise and it is
-    /// absent. The pre-2.2 rule is about **absence** proving nothing.
+    /// A pre-2.2 sdist that *does* declare requirements has not
+    /// declared them completely. The Core Metadata specification is
+    /// literal about it — "if the sdist metadata version is older than
+    /// version 2.2, then all fields should be treated as if they were
+    /// specified with `Dynamic`" — so a wheel built from this sdist may
+    /// declare requirements this document does not, and the lines it
+    /// does carry are a lower bound rather than the list.
+    ///
+    /// This file used to draw the consequence from PEP 643's absence in
+    /// one direction only: an **absent** `Requires-Dist` below 2.2 was
+    /// correctly unreadable while a **present** one was taken as
+    /// canonical, both read out of the same document. The lines are
+    /// still read — the second half below is the same bytes at metadata
+    /// 2.2, where the guarantee exists and the declaration stands — they
+    /// just no longer confer completeness on their own.
     #[test]
-    fn a_pre_2_2_sdist_that_declares_requirements_is_read() {
-        let sdist = sdist_with_pkg_info(
-            "Metadata-Version: 2.1\nName: myapp\nRequires-Dist: urllib3 (==1.26.0)\n",
+    fn a_pre_2_2_sdist_that_declares_requirements_is_not_a_complete_declaration() {
+        let body = "Name: myapp\nRequires-Dist: urllib3 (==1.26.0)\n";
+
+        let pre_2_2 = format!("Metadata-Version: 2.1\n{body}");
+        assert!(
+            matches!(
+                classify_requires_dist(&pre_2_2, PypiContainer::Sdist),
+                PypiDeclaration::NotCanonical(_)
+            ),
+            "below 2.2 every field reads as `Dynamic`, present ones included"
         );
-        let extraction = extract_payload(&sdist, &proxied_metadata());
+        assert_eq!(
+            extract_payload(&sdist_with_pkg_info(&pre_2_2), &proxied_metadata()).resolution,
+            SbomResolution::UnusableLockfile,
+            "`Declared` here claims the distribution's dependencies from a document that \
+             guarantees nothing about them"
+        );
+
+        // The same requirement at 2.2, where PEP 643 put a guarantee
+        // behind a field absent from `Dynamic`: read, and complete.
+        let at_2_2 = format!("Metadata-Version: 2.2\n{body}");
+        let extraction = extract_payload(&sdist_with_pkg_info(&at_2_2), &proxied_metadata());
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/urllib3@1.26.0"]);
+    }
+
+    /// A **wheel** at the same metadata version is untouched by the rule
+    /// above: PEP 643 permits `Dynamic` only in a source distribution,
+    /// so there is no later document for a wheel's answer to move to and
+    /// its METADATA stands as written. Without this the fail-closed arm
+    /// would swallow every wheel built before metadata 2.2.
+    #[test]
+    fn a_pre_2_2_wheel_that_declares_requirements_is_still_complete() {
+        let extraction = extract_payload(
+            &wheel_with_metadata(
+                "Metadata-Version: 2.1\nName: myapp\nRequires-Dist: urllib3 (==1.26.0)\n",
+            ),
+            &proxied_metadata(),
+        );
 
         assert_eq!(extraction.resolution, SbomResolution::Declared);
         assert_eq!(purls(&extraction), vec!["pkg:pypi/urllib3@1.26.0"]);
@@ -4762,6 +5017,69 @@ mod tests {
 
         assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
         assert!(extraction.sbom.expect("subject-only").components.is_empty());
+    }
+
+    /// **One readable requirement line must not mask an unreadable one
+    /// beside it.** The readable remainder is a shorter list, and a
+    /// shorter list carrying `Declared` says "these are the
+    /// distribution's dependencies" about a declaration this reader only
+    /// partly read — the line that fell out is as likely to be the one
+    /// an advisory matches as any other, and an SBOM-only policy books
+    /// the result as a clean scan.
+    ///
+    /// A fixture whose lines *all* fail proves nothing about this: that
+    /// case was already gating. The mixed one is what crosses the
+    /// boundary.
+    #[test]
+    fn one_unparseable_requirement_beside_a_parseable_one_gates() {
+        // `vulnerable (>=1` never closes its specifier, so the PEP 508
+        // reader cannot parse it; `safe (==1.0)` parses.
+        let wheel = wheel_with_metadata(
+            "Metadata-Version: 2.3\nName: myapp\n\
+             Requires-Dist: safe (==1.0)\n\
+             Requires-Dist: vulnerable (>=1\n",
+        );
+        let extraction = extract_payload(&wheel, &proxied_metadata());
+
+        assert_eq!(
+            extraction.resolution,
+            SbomResolution::UnusableLockfile,
+            "a partial reading of the declaration is an unread one"
+        );
+        assert!(
+            extraction
+                .sbom
+                .expect("the subject-only shape")
+                .components
+                .is_empty(),
+            "no component may be claimed from a declaration that was not read in full"
+        );
+    }
+
+    /// And the count the verdict rests on is **carried** by the reader
+    /// that knows it, not inferred by the caller from a length
+    /// difference: the first rule that drops a *readable* line would
+    /// make that subtraction gate every distribution carrying one.
+    #[test]
+    fn the_component_builder_reports_the_lines_it_could_not_parse() {
+        let read = pypi_components_from_requirements(
+            &["safe (==1.0)", "vulnerable (>=1", "also-safe"],
+            &[],
+        );
+
+        assert_eq!(read.unparseable, 1);
+        assert_eq!(
+            read.components
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["safe", "also-safe"]
+        );
+        assert_eq!(
+            pypi_components_from_requirements(&["safe (==1.0)"], &[]).unparseable,
+            0,
+            "an all-readable declaration reports nothing unread"
+        );
     }
 
     /// The metadata document must be UTF-8 (PEP 566 §3); bytes that are
@@ -5476,6 +5794,117 @@ mod tests {
         assert_eq!(
             extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
             SbomResolution::UnusableLockfile
+        );
+    }
+
+    /// **And the unfolded shape of the same unreadable state takes the
+    /// same verdict.** `Requires-Dist:` with no value on its own line is
+    /// a field that is present and states no requirement — Core
+    /// Metadata requires every entry to name a project, so it is a
+    /// statement that did not come out and not a statement that there is
+    /// no dependency. It used to fall through the value-is-empty guard
+    /// and be skipped in silence, reaching `Stated([])` and
+    /// `NoLockfile`: the same document the folded case held, released on
+    /// the strength of having happened not to wrap.
+    #[test]
+    fn a_requires_dist_with_no_value_is_unreadable_folded_or_not() {
+        let unfolded = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Requires-Dist:\n",
+        );
+        let folded = concat!(
+            "Metadata-Version: 2.2\n",
+            "Name: myapp\n",
+            "Requires-Dist:\n",
+            "  \n",
+        );
+
+        for (shape, body) in [("unfolded", unfolded), ("folded", folded)] {
+            assert!(
+                matches!(
+                    classify_requires_dist(body, PypiContainer::Sdist),
+                    PypiDeclaration::NotCanonical(_)
+                ),
+                "the {shape} empty field is unreadable, not an empty declaration"
+            );
+            assert_eq!(
+                extract_payload(&sdist_with_pkg_info(body), &proxied_metadata()).resolution,
+                SbomResolution::UnusableLockfile,
+                "the {shape} empty field must gate"
+            );
+        }
+
+        // Nor does a readable line beside it make the document whole:
+        // the unreadable field is a requirement that is still missing.
+        assert!(matches!(
+            classify_requires_dist(
+                concat!(
+                    "Metadata-Version: 2.3\n",
+                    "Name: myapp\n",
+                    "Requires-Dist: safe (==1.0)\n",
+                    "Requires-Dist:\n",
+                ),
+                PypiContainer::Wheel
+            ),
+            PypiDeclaration::NotCanonical(_)
+        ));
+    }
+
+    /// **Field names are case-insensitive (RFC 5322 §3.6.8), and both
+    /// readers of the document have to agree about it.** The
+    /// release-authority reader matched the lowercased name; the
+    /// prefetch-cascade reader compared a literal `Requires-Dist:`
+    /// prefix — so a wheel spelling the field `requires-dist:` declared
+    /// a dependency to the BOM and declared nothing to the cascade. The
+    /// same verified bytes, two contradictory statements about what the
+    /// distribution depends on, and a package the cascade never warmed.
+    #[test]
+    fn a_lowercased_requires_dist_yields_the_same_dependency_set_to_both_readers() {
+        let body = concat!(
+            "metadata-version: 2.3\n",
+            "name: myapp\n",
+            "requires-dist: vulnerable (==1.0)\n",
+        );
+
+        // The release-authority reader (`classify_requires_dist`, via
+        // the payload SBOM path).
+        let extraction = extract_payload(&wheel_with_metadata(body), &proxied_metadata());
+        assert_eq!(extraction.resolution, SbomResolution::Declared);
+        assert_eq!(purls(&extraction), vec!["pkg:pypi/vulnerable@1.0"]);
+
+        // The prefetch-cascade reader
+        // (`parse_wheel_metadata_into_specs`).
+        let specs = parse_wheel_metadata_into_specs(body.as_bytes()).expect("specs");
+        assert_eq!(
+            specs
+                .iter()
+                .map(|s| (s.name.as_str(), s.range.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("vulnerable", "==1.0")],
+            "the cascade read nothing out of this wheel while the BOM declared a dependency"
+        );
+
+        // And the canonical spelling is unchanged for both.
+        let canonical = concat!(
+            "Metadata-Version: 2.3\n",
+            "Name: myapp\n",
+            "Requires-Dist: vulnerable (==1.0)\n",
+        );
+        assert_eq!(
+            purls(&extract_payload(
+                &wheel_with_metadata(canonical),
+                &proxied_metadata()
+            )),
+            vec!["pkg:pypi/vulnerable@1.0"]
+        );
+        assert_eq!(
+            parse_wheel_metadata_into_specs(canonical.as_bytes())
+                .expect("specs")
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["vulnerable"]
         );
     }
 
