@@ -450,9 +450,10 @@ token-aware source-scan of `migrations/` that rejects `DROP TABLE` /
 sensitive-table list: the authorization model, credential store, event store,
 repository config, and task queue), `expand_contract_guard` (ADR 0030 —
 enforces the expand/contract policy: destructive DDL (`DROP COLUMN` /
-`DROP TABLE` / table-or-column `RENAME` / column type change / `SET NOT NULL`)
-ships only in a release strictly after the last one whose code referenced the
-identifier. Cross-checks every migration's destructive DDL against the
+`DROP TABLE` / table-or-column `RENAME` / column type change / `SET NOT NULL` /
+a `CHECK` added to a column the migration did not create, less the
+superset-only widening exemption) ships only in a release strictly after the
+last one whose code referenced the identifier. Cross-checks every migration's destructive DDL against the
 checked-in manifest `migrations/CONTRACTIONS.toml`, requires the workspace
 version to exceed each entry's `reference_removed_in`, and rejects a
 still-referenced identifier in `crates/*/src`), `capped_stream_reads` (ADR 0007 —
