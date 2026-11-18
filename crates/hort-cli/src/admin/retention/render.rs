@@ -100,6 +100,31 @@ fn target_noun(n: u64) -> &'static str {
     }
 }
 
+/// The long form of what a floor left out, in the one place both
+/// sentences that state it read it from.
+///
+/// A count the document did not report reads as an unreported number,
+/// never as a digit and never as "none": both sentences put this phrase
+/// in series with the bound, and "nothing" there would say the bound is
+/// the total — the reading a floor exists to deny. Stating it once is
+/// what keeps the two sentences, and the cell form below, from each
+/// inventing their own words for the same absence.
+fn unresolved_targets_phrase(unresolved_targets: Option<u64>) -> String {
+    match unresolved_targets {
+        Some(n) => format!("{} reclaimable {}", count(n), target_noun(n)),
+        None => "an unreported number of reclaimable targets".to_string(),
+    }
+}
+
+/// The same fact in the width a delta-table cell has, parenthesised —
+/// the short form, stated once for the same reason.
+fn unresolved_targets_note(unresolved_targets: Option<u64>) -> String {
+    match unresolved_targets {
+        Some(n) => format!("({} unresolved)", count(n)),
+        None => "(unresolved count unreported)".to_string(),
+    }
+}
+
 /// One line's worth of byte accounting: a total, a floor, or an explicit
 /// statement that there is no figure.
 ///
@@ -114,11 +139,10 @@ fn bytes_phrase(freed: &FreedBytes) -> String {
             bytes,
             unresolved_targets,
         } => format!(
-            "at least {} — a floor: storage did not answer for {} reclaimable {}, \
+            "at least {} — a floor: storage did not answer for {}, \
              whose bytes are not counted here",
             measured_bytes(bytes),
-            count(unresolved_targets),
-            target_noun(unresolved_targets),
+            unresolved_targets_phrase(unresolved_targets),
         ),
         ByteFigure::Unmeasured { reason } => format!("NOT MEASURED — {reason}"),
     }
@@ -135,10 +159,10 @@ fn bytes_cell(freed: &FreedBytes) -> String {
             bytes,
             unresolved_targets,
         } => format!(
-            "at least {} {} ({} unresolved)",
+            "at least {} {} {}",
             count(bytes),
             byte_noun(bytes),
-            count(unresolved_targets),
+            unresolved_targets_note(unresolved_targets),
         ),
         ByteFigure::Unmeasured { .. } => "not measured".to_string(),
     }
@@ -603,10 +627,9 @@ pub fn render_delta(delta: &PreviewDelta, baseline_job: &str, fresh_job: &str) -
             unresolved_targets, ..
         } => out.push_str(&format!(
             "\n  The fresh preview measured a floor, not a total: storage did not answer\n\
-             \x20 for {} reclaimable {}, so the figure above is the least that would be\n\
+             \x20 for {}, so the figure above is the least that would be\n\
              \x20 freed and the change column has no difference to state.\n",
-            count(unresolved_targets),
-            target_noun(unresolved_targets),
+            unresolved_targets_phrase(unresolved_targets),
         )),
         ByteFigure::Unmeasured { reason } => out.push_str(&format!(
             "\n  The fresh preview did not measure a size: {reason}.\n\
@@ -996,7 +1019,7 @@ mod tests {
     fn a_partly_measured_size_renders_as_a_floor_with_its_count() {
         let rendered = bytes_phrase(&FreedBytes::AtLeast {
             bytes: 4_096,
-            unresolved_targets: 3,
+            unresolved_targets: Some(3),
         });
         assert!(
             rendered.starts_with("at least "),
@@ -1020,10 +1043,75 @@ mod tests {
     fn a_floor_missing_one_target_says_target_not_targets() {
         let rendered = bytes_phrase(&FreedBytes::AtLeast {
             bytes: 1,
-            unresolved_targets: 1,
+            unresolved_targets: Some(1),
         });
         assert!(rendered.contains("1 reclaimable target,"), "{rendered}");
         assert!(rendered.contains("at least 1 byte"), "{rendered}");
+    }
+
+    /// Words that mean "we do not know how many", in the three forms
+    /// that say the count at all. Each is checked on the rendered
+    /// string, and the count's own words are isolated out of it so the
+    /// two prohibitions can be asserted on exactly the segment they are
+    /// about: no digit, since a digit there is a claim about how much is
+    /// missing, and no word meaning "none", since that claim is the one
+    /// the `at_least` status contradicts.
+    #[test]
+    fn an_unreported_floor_count_is_stated_in_words_at_every_form() {
+        fn reads_as_an_unreported_number(segment: &str) {
+            assert!(
+                !segment.contains(|c: char| c.is_ascii_digit()),
+                "no digit may stand for a count nobody reported: {segment:?}"
+            );
+            let lowered = segment.to_lowercase();
+            for none_word in ["none", "zero", "nothing"] {
+                assert!(
+                    !lowered.contains(none_word),
+                    "an unreported count must not read as {none_word:?}: {segment:?}"
+                );
+            }
+        }
+
+        let countless = FreedBytes::AtLeast {
+            bytes: 4_096,
+            unresolved_targets: None,
+        };
+
+        let phrase = bytes_phrase(&countless);
+        assert_eq!(
+            phrase,
+            "at least 4.00 KiB (4,096 bytes, measured) — a floor: storage did not answer \
+             for an unreported number of reclaimable targets, whose bytes are not counted here",
+        );
+        let count_words = phrase
+            .split_once("did not answer for ")
+            .expect("the phrase names what was not answered for")
+            .1
+            .split_once(',')
+            .expect("and the sentence continues after it")
+            .0;
+        reads_as_an_unreported_number(count_words);
+
+        let cell = bytes_cell(&countless);
+        assert_eq!(cell, "at least 4,096 bytes (unresolved count unreported)");
+        let note = &cell[cell.find('(').expect("the parenthetical")..];
+        reads_as_an_unreported_number(note);
+
+        let before = summary(10, 8, FreedBytes::Exact { bytes: 99 }, "complete");
+        let after = summary(10, 8, countless, "complete");
+        let footnote = render_delta(&diff(&before, &after), "job-a", "job-b");
+        let footnote_words = footnote
+            .split_once("storage did not answer\n  for ")
+            .expect("the footnote names what was not answered for")
+            .1
+            .split_once(',')
+            .expect("and the sentence continues after it")
+            .0;
+        assert_eq!(
+            footnote_words,
+            "an unreported number of reclaimable targets"
+        );
+        reads_as_an_unreported_number(footnote_words);
     }
 
     /// The delta table is read column beside column, which is exactly
@@ -1032,7 +1120,7 @@ mod tests {
     fn a_floor_keeps_its_label_and_count_in_the_delta_table_cell() {
         let cell = bytes_cell(&FreedBytes::AtLeast {
             bytes: 12_345,
-            unresolved_targets: 2,
+            unresolved_targets: Some(2),
         });
         assert_eq!(cell, "at least 12,345 bytes (2 unresolved)");
         assert_eq!(
@@ -1051,11 +1139,11 @@ mod tests {
         let total = FreedBytes::Exact { bytes: 100 };
         let floor = FreedBytes::AtLeast {
             bytes: 90,
-            unresolved_targets: 1,
+            unresolved_targets: Some(1),
         };
         let other_floor = FreedBytes::AtLeast {
             bytes: 90,
-            unresolved_targets: 4,
+            unresolved_targets: Some(4),
         };
         for (before, after) in [
             (&total, &floor),
@@ -1137,7 +1225,7 @@ mod tests {
             10,
             FreedBytes::AtLeast {
                 bytes: 4_096,
-                unresolved_targets: 1,
+                unresolved_targets: Some(1),
             },
             "complete",
         );
@@ -1220,7 +1308,7 @@ mod tests {
             8,
             FreedBytes::AtLeast {
                 bytes: 90,
-                unresolved_targets: 2,
+                unresolved_targets: Some(2),
             },
             "complete",
         );

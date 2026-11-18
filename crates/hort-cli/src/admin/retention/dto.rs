@@ -35,7 +35,10 @@
 //! size it could not read. That is a floor, and a floor read as a total
 //! is the same class of mistake one step smaller — so the number is
 //! reachable only through [`ByteFigure::Floor`], which cannot be matched
-//! without also naming how many targets are missing from it.
+//! without also naming how many targets are missing from it. A count
+//! the document did not report is `None` there rather than `0`: a floor
+//! that says it left *zero* targets out is a total, which is the one
+//! reading the arm exists to deny.
 //!
 //! [`ProposalDigest`] carries the same posture on the same grounds. It
 //! is `Option`, and a digest missing either half counts as absent
@@ -161,8 +164,22 @@ pub enum FreedBytes {
     AtLeast {
         #[serde(default)]
         bytes: u64,
+        /// `None` from a document that did not report the count — an
+        /// unreported number, which every renderer states in words.
+        /// Absence is representable rather than folded to `0` for the
+        /// reason above: `0` says the figure left nothing out, i.e.
+        /// that it is the total, and the `at_least` status in the same
+        /// document says it is not. That is the stance an unrecognised
+        /// `status` already takes in degrading to
+        /// [`FreedBytes::Unrecognised`] instead of to zero.
+        ///
+        /// `#[serde(default)]` is kept even though an `Option` field
+        /// already yields `None` when the key is missing: the tolerance
+        /// this module promises should be stated at the field rather
+        /// than rest on that, so narrowing the type later cannot drop
+        /// it silently.
         #[serde(default)]
-        unresolved_targets: u64,
+        unresolved_targets: Option<u64>,
     },
     /// Deliberately not measured, with the server's reason.
     Omitted {
@@ -196,8 +213,14 @@ pub enum ByteFigure<'a> {
     /// Every reclaimable target resolved: the figure is the total.
     Total(u64),
     /// Some targets did not resolve: `bytes` is a lower bound and
-    /// `unresolved_targets` is how many are missing from it.
-    Floor { bytes: u64, unresolved_targets: u64 },
+    /// `unresolved_targets` is how many are missing from it, or `None`
+    /// when the document did not report how many. A renderer says that
+    /// absence in words — a `0` in its place would assert the bound is
+    /// the total.
+    Floor {
+        bytes: u64,
+        unresolved_targets: Option<u64>,
+    },
     /// No figure at all, with the reason to print in its place.
     Unmeasured { reason: &'a str },
 }
@@ -459,7 +482,7 @@ mod tests {
             partial,
             FreedBytes::AtLeast {
                 bytes: 4_096,
-                unresolved_targets: 7
+                unresolved_targets: Some(7)
             },
             "`at_least` is a status this client knows, not an unrecognised one",
         );
@@ -467,7 +490,7 @@ mod tests {
             partial.figure(),
             ByteFigure::Floor {
                 bytes: 4_096,
-                unresolved_targets: 7
+                unresolved_targets: Some(7)
             },
             "the count travels with the number, so no reader gets one without the other",
         );
@@ -482,19 +505,50 @@ mod tests {
         );
     }
 
-    /// `#[serde(default)]` on the count is the same tolerance every other
-    /// numeric field has, and it must not open a path to a total: a floor
-    /// that forgot to say how many targets it left out is still a floor.
+    /// A floor that forgot to say how many targets it left out is still
+    /// a floor — so the document parses, and the count it did not report
+    /// is representably absent. `0` would be the one value that reads as
+    /// "nothing is missing from this figure", which is `Exact` under
+    /// another status word, contradicting the `at_least` beside it.
     #[test]
     fn a_floor_without_its_count_is_still_a_floor() {
         let countless: FreedBytes =
             serde_json::from_value(serde_json::json!({ "status": "at_least", "bytes": 99 }))
                 .expect("parses");
         assert_eq!(
+            countless,
+            FreedBytes::AtLeast {
+                bytes: 99,
+                unresolved_targets: None
+            },
+            "a count the document never sent is absent, not zero",
+        );
+        assert_eq!(
             countless.figure(),
             ByteFigure::Floor {
                 bytes: 99,
-                unresolved_targets: 0
+                unresolved_targets: None
+            },
+            "and it reaches a renderer as a floor with no count to state",
+        );
+    }
+
+    /// The same document through the outer object every production read
+    /// actually goes through, since `freed_bytes` is a nested
+    /// internally-tagged enum and the tolerance has to survive both
+    /// layers rather than only a direct parse of the inner one.
+    #[test]
+    fn a_preview_body_whose_floor_omits_the_count_still_parses() {
+        let body: PreviewBody = serde_json::from_value(serde_json::json!({
+            "rows": 5,
+            "freed_bytes": { "status": "at_least", "bytes": 99 }
+        }))
+        .expect("a floor with no count is read, not refused");
+        assert_eq!(
+            body.freed_bytes.figure(),
+            ByteFigure::Floor {
+                bytes: 99,
+                unresolved_targets: None
             },
         );
     }

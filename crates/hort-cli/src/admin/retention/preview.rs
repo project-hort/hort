@@ -102,9 +102,15 @@ pub async fn run_with_output(
 /// covers every reclaimable target; a figure the server could measure
 /// only in part arrives as `bytes_at_least` beside
 /// `unresolved_targets`, so the key that means a total is never filled
-/// by a bound. The row counts are named `artifact_rows`
-/// rather than `rows` for the same reason the human output labels them —
-/// so a machine consumer cannot casually sum them as a size either.
+/// by a bound. That second key is present and JSON `null` when the
+/// summary being projected did not report the count — present rather
+/// than absent, so a consumer can tell "unreported" from a field it
+/// forgot to ask for, and `null` rather than `0`, because a consumer
+/// reading `0` there would conclude the bound left nothing out, which
+/// is `bytes` under another name. The row counts are named
+/// `artifact_rows` rather than `rows` for the same reason the human
+/// output labels them — so a machine consumer cannot casually sum them
+/// as a size either.
 pub fn preview_json(
     command: &str,
     facts: &JobFacts,
@@ -390,7 +396,7 @@ mod tests {
             &facts(),
             &summary(FreedBytes::AtLeast {
                 bytes: 4_096,
-                unresolved_targets: 3,
+                unresolved_targets: Some(3),
             }),
         );
         let freed = &doc["totals"]["freed_bytes"];
@@ -404,6 +410,43 @@ mod tests {
         assert_eq!(
             freed["unresolved_targets"], 3,
             "the count is what makes the figure readable: {freed}"
+        );
+    }
+
+    /// A floor whose count the summary never reported keeps the key and
+    /// fills it with `null`. Dropping the key would make "unreported"
+    /// indistinguishable from a field this projection does not emit, and
+    /// a `0` would say the bound left nothing out — which is the total,
+    /// the one claim the projection withholds from a floor.
+    #[test]
+    fn json_reports_an_unreported_floor_count_as_null_not_as_zero() {
+        let doc = preview_json(
+            "preview",
+            &facts(),
+            &summary(FreedBytes::AtLeast {
+                bytes: 99,
+                unresolved_targets: None,
+            }),
+        );
+        let freed = &doc["totals"]["freed_bytes"];
+        assert_eq!(freed["status"], "at_least");
+        assert_eq!(freed["measured"], false);
+        assert!(
+            freed
+                .as_object()
+                .expect("an object")
+                .contains_key("unresolved_targets"),
+            "the key stays, so absence is reported rather than omitted: {freed}"
+        );
+        assert_eq!(
+            freed["unresolved_targets"],
+            serde_json::Value::Null,
+            "and it is null, never a count: {freed}"
+        );
+        assert_eq!(freed["bytes_at_least"], 99);
+        assert!(
+            freed.as_object().expect("an object").get("bytes").is_none(),
+            "the key that means a total is absent from a floor: {freed}"
         );
     }
 
