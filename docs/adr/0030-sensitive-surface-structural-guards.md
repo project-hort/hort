@@ -308,25 +308,32 @@ which is a follow-on item on the same initiative and is specified separately;
 it is named here only so that this decision is not mistaken for full
 coverage.
 
-**The runtime fence (backlog 145).** Built as the follow-on item named above.
-Every hort Postgres connection now sets `application_name =
+**The runtime fleet fence.** Every hort Postgres connection sets `application_name =
 "hort-{server|worker}/<workspace-version>"` (one call site per binary —
 `hort_server::pg_identity::connect_options` / `hort_worker::pg_identity::connect_options`,
 both thin wrappers over the shared, zero-I/O
 `hort_config::pg_identity::pg_application_name`). Before applying, `hort-server
 migrate` computes the pending migration set and, only when at least one
 pending migration is a declared contraction (`migrations/CONTRACTIONS.toml`),
-queries `pg_stat_activity` for hort-shaped clients other than itself. Finding
-any whose stamped version is older than the current binary — or hort-shaped
-with no version segment at all, a client that predates this scheme,
-fail-closed — refuses the run and names the offending clients. An
-expand-only pending set is never fenced, so routine rolling upgrades stay
-hook-driven and unattended. The operator override is `--allow-running-fleet`
-(env `HORT_ALLOW_RUNNING_FLEET`, plumbed through the Helm migrate Job,
+queries `pg_stat_activity` for hort-shaped clients other than itself. It takes
+the maximum `reference_removed_in` among pending declared contractions: a
+client must tolerate every migration in the run, and equality with this floor
+is tolerated. A client whose stamped version is strictly below that floor, or
+whose hort-shaped name has no parseable version, refuses the run and is named.
+If any pending declared floor does not parse, the whole decision falls back to
+comparing clients with the migrating binary's own version; if that version does
+not parse, evaluation fails. The build-time guard requires every embedded
+floor to be strictly below the binary version, so the declared-floor comparison
+refuses strictly less often than the binary comparison and never more; the
+manifest value and its mandatory reviewer check against the release that
+removed the reference bound this decision. An expand-only pending set is never
+fenced, so routine rolling upgrades stay hook-driven and unattended. The
+operator override is `--allow-running-fleet` (env `HORT_ALLOW_RUNNING_FLEET`,
+plumbed through the Helm migrate Job,
 default off), loudly logged when used. This closes the runtime half of the
 gap: the build-time guard above stops a contraction from being *authored*
 too early, and this fence stops it from being *applied* into a fleet that is
-still running the old binary.
+still running a binary below the migration's declared floor.
 
 ## Consequences
 

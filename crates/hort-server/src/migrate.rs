@@ -4,7 +4,7 @@
 //! macro resolves the path relative to the crate's `Cargo.toml`, which is
 //! why the argument includes `../../migrations`.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Context;
 use sqlx::migrate::{Migrate, Migrator};
@@ -22,9 +22,9 @@ pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
 
 /// This binary's own version — the "how old am I" side of the schema
 /// compatibility register comparison, and the runtime fleet fence's
-/// "current" side. Both read the same workspace-inherited
-/// `CARGO_PKG_VERSION` that `hort_config::pg_identity` stamps into
-/// `application_name`, so the two answers cannot drift.
+/// fallback when a declared floor is invalid. Both read the same
+/// workspace-inherited `CARGO_PKG_VERSION` that `hort_config::pg_identity`
+/// stamps into `application_name`, so the two answers cannot drift.
 pub const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The versions [`MIGRATOR`] carries — the "embedded" side of
@@ -567,19 +567,35 @@ pub async fn assert_current(pool: &PgPool) -> anyhow::Result<()> {
 // `migrate` while a previous release's binaries are still connected can
 // still apply a legitimately-deferred contraction into that old fleet's
 // face. This fence closes that operational-ordering gap: before applying,
-// refuse when a pending migration is a declared contraction AND an older
-// (or unversioned, hence unknown) hort-shaped client is still connected.
+// refuse when a pending migration is a declared contraction AND a client
+// predates the strictest declared floor (or has an unknown version).
 // Expand-only pending sets are never fenced — routine rolling upgrades
 // stay hook-driven and unattended.
 
 /// The result of checking the pending migration set against the connected
 /// fleet. `blocked` is only ever `true` when the pending set contains a
-/// declared contraction AND an older/unversioned fleet member is present;
+/// declared contraction AND a client below the floor or with unknown version
+/// is present;
 /// `offenders` names them for the refusal message (empty when not blocked).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FleetFenceOutcome {
     pub blocked: bool,
     pub offenders: Vec<String>,
+    pub threshold: Option<FleetFenceThreshold>,
+}
+
+/// The comparison selected for a pending declared contraction set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FleetFenceThreshold {
+    Declared {
+        migration: i64,
+        floor: String,
+    },
+    BinaryFallback {
+        migration: i64,
+        invalid_floor: String,
+        binary_version: String,
+    },
 }
 
 /// Every migration version recorded in the `_sqlx_migrations` table.
@@ -615,12 +631,9 @@ pub async fn pending_migration_versions(pool: &PgPool) -> anyhow::Result<BTreeSe
         .collect())
 }
 
-/// Every hort-shaped `pg_stat_activity` client connected to the **current
-/// database**, other than this connection, whose version is older than
-/// `current_version` — fail-closed: a hort-shaped-but-unversioned
-/// `application_name` counts as older, and a version that fails to parse
-/// counts as older too. Non-hort `application_name`s never appear in the
-/// result (they are unrelated).
+/// Collect hort-shaped `pg_stat_activity` clients connected to the **current
+/// database**, other than this connection. Version classification belongs to
+/// [`decide_fleet_fence`], which can be tested without Postgres.
 ///
 /// Scoping invariant: `pg_stat_activity` is a cluster-wide view, but a
 /// pending contraction only changes the schema of the database being
@@ -628,15 +641,8 @@ pub async fn pending_migration_versions(pool: &PgPool) -> anyhow::Result<BTreeSe
 /// cluster (a second hort deployment, a co-hosted staging DB, a CI
 /// database) cannot be broken by it and must not count as offenders. The
 /// query is scoped with `datname = current_database()` accordingly.
-///
-/// Each entry is a human-readable `"<application_name> x<connection count>"`
-/// string, ready to drop into the refusal message.
-async fn older_fleet_members(pool: &PgPool, current_version: &str) -> anyhow::Result<Vec<String>> {
-    let current = parse_version_core(current_version).ok_or_else(|| {
-        anyhow::anyhow!("this binary's own version {current_version:?} failed to parse")
-    })?;
-
-    let rows: Vec<(String, i64)> = sqlx::query_as(
+async fn connected_fleet_members(pool: &PgPool) -> anyhow::Result<Vec<(String, i64)>> {
+    sqlx::query_as(
         "SELECT application_name, count(*) FROM pg_stat_activity \
          WHERE pid <> pg_backend_pid() AND application_name LIKE 'hort-%' \
          AND datname = current_database() \
@@ -645,15 +651,74 @@ async fn older_fleet_members(pool: &PgPool, current_version: &str) -> anyhow::Re
     )
     .fetch_all(pool)
     .await
-    .context("querying pg_stat_activity for connected hort fleet members")?;
+    .context("querying pg_stat_activity for connected hort fleet members")
+}
+
+/// Decide the fleet fence from pending declared floors and collected clients.
+/// `expand_contract_guard` requires the workspace version to be strictly
+/// greater than every embedded `reference_removed_in`, so a valid floor is
+/// below this binary's version. Comparing with that floor refuses strictly
+/// less often than comparing with this binary, never more. The manifest value
+/// and its mandatory reviewer check against the release that removed the
+/// reference are what bound this decision.
+fn decide_fleet_fence(
+    pending_contractions: &BTreeMap<i64, String>,
+    clients: &[(String, i64)],
+    binary_version: &str,
+) -> anyhow::Result<FleetFenceOutcome> {
+    if pending_contractions.is_empty() {
+        return Ok(FleetFenceOutcome {
+            blocked: false,
+            offenders: Vec::new(),
+            threshold: None,
+        });
+    }
+
+    let binary_core = parse_version_core(binary_version).ok_or_else(|| {
+        anyhow::anyhow!("this binary's own version {binary_version:?} failed to parse")
+    })?;
+    // One invalid floor makes the maximum unknowable: use the migrating binary
+    // comparison for the entire pending set, never skip the bad entry.
+    let (threshold, cutoff) = if let Some((migration, floor)) = pending_contractions
+        .iter()
+        .find(|(_, floor)| parse_version_core(floor).is_none())
+    {
+        (
+            FleetFenceThreshold::BinaryFallback {
+                migration: *migration,
+                invalid_floor: floor.clone(),
+                binary_version: binary_version.to_string(),
+            },
+            binary_core,
+        )
+    } else {
+        let (migration, floor, parsed) = pending_contractions
+            .iter()
+            .map(|(migration, floor)| {
+                (
+                    *migration,
+                    floor,
+                    parse_version_core(floor).expect("floors checked above"),
+                )
+            })
+            .max_by_key(|(migration, _, parsed)| (*parsed, *migration))
+            .expect("non-empty pending contraction set");
+        (
+            FleetFenceThreshold::Declared {
+                migration,
+                floor: floor.clone(),
+            },
+            parsed,
+        )
+    };
 
     let mut offenders = Vec::new();
-    for (application_name, count) in rows {
-        let Some(parsed) = parse_pg_application_name(&application_name) else {
+    for (application_name, count) in clients {
+        let Some(parsed) = parse_pg_application_name(application_name) else {
             continue;
         };
         let is_older = match parsed.version.as_deref().and_then(parse_version_core) {
-            Some(client_version) => client_version < current,
+            Some(client_version) => client_version < cutoff,
             // Hort-shaped but unversioned (predates this fence, or a
             // version string this binary cannot parse): fail-closed.
             None => true,
@@ -662,32 +727,30 @@ async fn older_fleet_members(pool: &PgPool, current_version: &str) -> anyhow::Re
             offenders.push(format!("{application_name} x{count}"));
         }
     }
-    Ok(offenders)
+    Ok(FleetFenceOutcome {
+        blocked: !offenders.is_empty(),
+        offenders,
+        threshold: Some(threshold),
+    })
 }
 
 /// The fence itself: block only when the pending set contains a declared
-/// contraction AND an older/unversioned fleet member is connected. An
-/// expand-only pending set (no contraction present) is never fenced,
-/// regardless of what else is connected.
+/// contraction AND a client below its floor or with unknown version is
+/// connected. An expand-only pending set (no contraction present) is never
+/// fenced, regardless of what else is connected.
 pub async fn evaluate_fleet_fence(
     pool: &PgPool,
     current_version: &str,
 ) -> anyhow::Result<FleetFenceOutcome> {
     let pending = pending_migration_versions(pool).await?;
-    let contractions = crate::contractions::contraction_versions();
-    let pending_contracts = pending.iter().any(|v| contractions.contains(v));
-    if !pending_contracts {
-        return Ok(FleetFenceOutcome {
-            blocked: false,
-            offenders: Vec::new(),
-        });
+    let mut contractions = crate::contractions::contraction_minimum_binary_versions();
+    contractions.retain(|version, _| pending.contains(version));
+    if contractions.is_empty() {
+        return decide_fleet_fence(&contractions, &[], current_version);
     }
 
-    let offenders = older_fleet_members(pool, current_version).await?;
-    Ok(FleetFenceOutcome {
-        blocked: !offenders.is_empty(),
-        offenders,
-    })
+    let clients = connected_fleet_members(pool).await?;
+    decide_fleet_fence(&contractions, &clients, current_version)
 }
 
 /// Pure decision: given a fence outcome and the operator's
@@ -702,10 +765,26 @@ pub fn gate_on_fleet_fence(
     if !outcome.blocked || allow_override {
         return Ok(());
     }
+    let reason = match outcome
+        .threshold
+        .as_ref()
+        .expect("blocked outcome has a threshold")
+    {
+        FleetFenceThreshold::Declared { migration, floor } => {
+            format!("migration {migration}: declared fleet floor {floor}")
+        }
+        FleetFenceThreshold::BinaryFallback {
+            migration,
+            invalid_floor,
+            binary_version,
+        } => format!(
+            "migration {migration}: declared fleet floor {invalid_floor:?} does not parse, \
+             so using this binary's version {binary_version}"
+        ),
+    };
     Err(format!(
-        "refusing to apply: a pending migration is a declared contraction \
-         (migrations/CONTRACTIONS.toml) and an older or unversioned hort-shaped client is \
-         still connected: {}. Wait for the old fleet to roll off, or pass \
+        "refusing to apply {reason}; connected hort-shaped clients below that version or \
+         without a parseable version: {}; wait for those clients to roll off or pass \
          --allow-running-fleet (HORT_ALLOW_RUNNING_FLEET=true) to override.",
         outcome.offenders.join(", ")
     ))
@@ -884,11 +963,128 @@ mod tests {
     // `--allow-running-fleet` override decision.
     // -----------------------------------------------------------------
 
+    fn fence_for(
+        floors: &[(i64, &str)],
+        clients: &[(&str, i64)],
+        binary_version: &str,
+    ) -> anyhow::Result<FleetFenceOutcome> {
+        let floors = floors
+            .iter()
+            .map(|(migration, floor)| (*migration, (*floor).to_string()))
+            .collect();
+        let clients = clients
+            .iter()
+            .map(|(name, count)| ((*name).to_string(), *count))
+            .collect::<Vec<_>>();
+        decide_fleet_fence(&floors, &clients, binary_version)
+    }
+
+    #[test]
+    fn expand_only_pending_set_is_unfenced_even_with_an_invalid_binary_version() {
+        let outcome = fence_for(&[], &[("hort-server/0.1.0", 1)], "invalid")
+            .expect("expand-only does not inspect versions");
+        assert!(!outcome.blocked);
+        assert_eq!(outcome.threshold, None);
+    }
+
+    #[test]
+    fn pending_contraction_with_no_clients_is_unblocked() {
+        let outcome = fence_for(&[(39, "0.17.3")], &[], "0.18.0-dev").expect("floor parses");
+        assert!(!outcome.blocked);
+        assert!(outcome.offenders.is_empty());
+        assert_eq!(
+            outcome.threshold,
+            Some(FleetFenceThreshold::Declared {
+                migration: 39,
+                floor: "0.17.3".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn clients_at_or_above_floor_are_tolerated_even_when_older_than_binary() {
+        let outcome = fence_for(
+            &[(39, "0.17.3")],
+            &[
+                ("hort-server/0.17.2", 1),
+                ("hort-server/0.17.3", 2),
+                ("hort-worker/0.17.4", 3),
+                ("hort-worker/0.19.0", 4),
+                ("unrelated/0.1.0", 5),
+            ],
+            "0.18.0-dev",
+        )
+        .expect("versions parse");
+        assert_eq!(outcome.offenders, vec!["hort-server/0.17.2 x1"]);
+    }
+
+    #[test]
+    fn maximum_pending_floor_and_its_migration_are_selected() {
+        let outcome = fence_for(
+            &[(31, "0.9.2"), (39, "0.17.3")],
+            &[("hort-server/0.17.2", 1)],
+            "0.18.0-dev",
+        )
+        .expect("versions parse");
+        assert!(outcome.blocked);
+        assert_eq!(
+            outcome.threshold,
+            Some(FleetFenceThreshold::Declared {
+                migration: 39,
+                floor: "0.17.3".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn unversioned_and_unparseable_hort_clients_fail_closed() {
+        let outcome = fence_for(
+            &[(39, "0.17.3")],
+            &[("hort-server", 1), ("hort-worker/unknown", 2)],
+            "0.18.0-dev",
+        )
+        .expect("floor parses");
+        assert_eq!(
+            outcome.offenders,
+            vec!["hort-server x1", "hort-worker/unknown x2"]
+        );
+    }
+
+    #[test]
+    fn invalid_pending_floor_uses_binary_version_for_the_entire_set() {
+        let outcome = fence_for(
+            &[(31, "invalid"), (39, "0.17.3")],
+            &[("hort-server/0.17.3", 1)],
+            "0.18.0-dev",
+        )
+        .expect("binary version parses");
+        assert!(outcome.blocked, "the invalid floor cannot weaken the fence");
+        assert_eq!(
+            outcome.threshold,
+            Some(FleetFenceThreshold::BinaryFallback {
+                migration: 31,
+                invalid_floor: "invalid".to_string(),
+                binary_version: "0.18.0-dev".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_binary_version_is_a_hard_error() {
+        let err = fence_for(&[(39, "0.17.3")], &[], "invalid")
+            .expect_err("invalid own version must fail");
+        assert_eq!(
+            err.to_string(),
+            "this binary's own version \"invalid\" failed to parse"
+        );
+    }
+
     #[test]
     fn not_blocked_is_always_ok() {
         let outcome = FleetFenceOutcome {
             blocked: false,
             offenders: Vec::new(),
+            threshold: None,
         };
         assert_eq!(gate_on_fleet_fence(&outcome, false), Ok(()));
         assert_eq!(gate_on_fleet_fence(&outcome, true), Ok(()));
@@ -899,10 +1095,38 @@ mod tests {
         let outcome = FleetFenceOutcome {
             blocked: true,
             offenders: vec!["hort-server/0.11.0 x2".to_string()],
+            threshold: Some(FleetFenceThreshold::Declared {
+                migration: 39,
+                floor: "0.17.3".to_string(),
+            }),
         };
         let err = gate_on_fleet_fence(&outcome, false).expect_err("must refuse");
-        assert!(err.contains("hort-server/0.11.0 x2"), "message: {err}");
-        assert!(err.contains("--allow-running-fleet"), "message: {err}");
+        assert_eq!(
+            err,
+            "refusing to apply migration 39: declared fleet floor 0.17.3; connected \
+             hort-shaped clients below that version or without a parseable version: \
+             hort-server/0.11.0 x2; wait for those clients to roll off or pass \
+             --allow-running-fleet (HORT_ALLOW_RUNNING_FLEET=true) to override."
+        );
+    }
+
+    #[test]
+    fn invalid_floor_refusal_names_binary_fallback() {
+        let outcome = fence_for(
+            &[(39, "invalid")],
+            &[("hort-server/0.17.3", 1)],
+            "0.18.0-dev",
+        )
+        .expect("binary version parses");
+        let err = gate_on_fleet_fence(&outcome, false).expect_err("must refuse");
+        assert_eq!(
+            err,
+            "refusing to apply migration 39: declared fleet floor \"invalid\" does not parse, \
+             so using this binary's version 0.18.0-dev; connected hort-shaped clients below \
+             that version or without a parseable version: hort-server/0.17.3 x1; wait for \
+             those clients to roll off or pass --allow-running-fleet (HORT_ALLOW_RUNNING_FLEET=true) \
+             to override."
+        );
     }
 
     #[test]
@@ -910,6 +1134,10 @@ mod tests {
         let outcome = FleetFenceOutcome {
             blocked: true,
             offenders: vec!["hort-server/0.11.0 x1".to_string()],
+            threshold: Some(FleetFenceThreshold::Declared {
+                migration: 39,
+                floor: "0.17.3".to_string(),
+            }),
         };
         assert_eq!(gate_on_fleet_fence(&outcome, true), Ok(()));
     }

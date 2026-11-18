@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `hort-server migrate` refuses a pending contraction only when a connected
+  release is older than that migration's own declared floor, and names the
+  floor it used (#433).
+
 ### Fixed
 
 - An upstream mapping whose host resolves to a private or loopback address —
@@ -24,9 +30,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer grows with every tick (#423).
 - A scheduled task that fails transiently and then succeeds on retry no longer
   ends as a permanently `Failed` Job (#449).
-- A migration that adds a `CHECK` narrowing an existing column is now a
-  declared contraction, so `hort-server migrate` refuses it while an older
-  hort-shaped client is connected — override with `--allow-running-fleet` (#433).
 - A bulk waive that could not apply every entry no longer reports success: it
   is refused before anything is released when the reason is visible in
   advance, and reported as partial — `outcome: "partial"`, CLI exit 4 — when it

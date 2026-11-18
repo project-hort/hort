@@ -39,15 +39,16 @@
 #                          TOLERATES. `crates/hort-server/src/contractions.rs`
 #                          reads this field at runtime for two
 #                          operator-facing behaviours: the fleet fence, which
-#                          refuses `hort-server migrate` while an older
-#                          hort-shaped client is connected and a pending
-#                          migration is declared here, and the
+#                          refuses `hort-server migrate` when a connected
+#                          hort-shaped client is below the strictest floor
+#                          among pending declared migrations, and the
 #                          schema-compatibility register, whose recorded
 #                          `min_binary_version` is the rollback floor a later
 #                          binary reads back. So an overstated value is not
 #                          harmless bookkeeping — it tells an operator in an
 #                          incident that a rollback their schema does
-#                          tolerate is unsafe. A migration that takes NOTHING
+#                          tolerate is unsafe, and makes the fence refuse a
+#                          compatible fleet. A migration that takes NOTHING
 #                          away from any writer tolerates every binary, and
 #                          its honest value is the oldest release in the
 #                          repository's history. A plain X.Y.Z (no
@@ -184,9 +185,9 @@ Fields above). Nothing was taken away from any writer, so that is the oldest
 release in the repository's history, 0.9.2, and not the release 031 shipped
 in: dating it to its shipping release would make the schema-compatibility
 register report a rollback floor the schema does not impose. The fleet fence
-reads only WHETHER a migration is declared, not the version, so it can still
-refuse a rolling upgrade across this migration; narrowing that is a change to
-the fence's own decision and needs a decision record, not a manifest edit.
+uses this same 0.9.2 floor: 031 alone cannot block a versioned client from any
+release in the repository's history. Another pending declared contraction
+with a higher floor may still require a newer client.
 """
 
 [[contraction]]

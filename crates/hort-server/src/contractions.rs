@@ -1,9 +1,10 @@
 //! Runtime reader for `migrations/CONTRACTIONS.toml` — the manifest
 //! behind two `hort-server migrate` behaviours: the fleet fence, which
-//! decides whether a pending migration set contains a contraction
-//! (ADR 0030 amendment (c)), and the schema compatibility register, which
-//! records each applied migration's `reference_removed_in` so a later
-//! binary can read back the oldest version that migration tolerates.
+//! compares connected clients with the strictest floor among pending
+//! declared contractions (ADR 0030 amendment (c)), and the schema
+//! compatibility register, which records each applied migration's
+//! `reference_removed_in` so a later binary can read back the oldest
+//! version that migration tolerates.
 //!
 //! This is a deliberately separate, minimal reader from
 //! `crates/hort-app/tests/expand_contract_guard.rs`'s manifest parser:
