@@ -12,8 +12,8 @@
 //! into that old fleet's face. This suite drives the fence that closes
 //! that operational-ordering gap against a real Postgres, using the
 //! workspace's *actual* migration set and the *actual* checked-in
-//! `migrations/CONTRACTIONS.toml` (versions 9, 14, 20, 31, 39, 44 are declared
-//! contractions there) — no fixtures needed, since the manifest already
+//! `migrations/CONTRACTIONS.toml` (versions 2, 9, 14, 17, 20, 31, 39, 44 are
+//! declared contractions there) — no fixtures needed, since the manifest already
 //! gives us both a contraction and several expand-only migrations to test
 //! against.
 //!
@@ -154,10 +154,20 @@ async fn connect_with_application_name(db_name: &str, application_name: &str) ->
         .expect("connect as simulated fleet member")
 }
 
-/// A migration version, strictly below the lowest declared contraction
-/// (9), so `MIGRATOR.run_to(BEFORE_FIRST_CONTRACTION, ..)` leaves every
-/// declared contraction (9, 14, 20, 31, 39, 44) pending.
-const BEFORE_FIRST_CONTRACTION: i64 = 8;
+/// A migration version that leaves every FENCE-RELEVANT declared
+/// contraction pending (9, 14, 17, 20, 31, 39, 44), and so leaves the
+/// strictest declared floor — 39's `0.17.3` — pending, which is the floor
+/// every assertion below is written against.
+///
+/// Deliberately not named for the *first* declared contraction: that is
+/// migration 2, and this value is after it.
+///
+/// Migration 2 is also a declared contraction and is deliberately BELOW
+/// this line: its declared floor is the oldest release in the repository's
+/// history, so whether it is pending or applied cannot change a fence
+/// verdict (no client can be below it). Running to 8 keeps the baseline
+/// schema whole, which the simulated fleet connections need.
+const BEFORE_FENCED_CONTRACTIONS: i64 = 8;
 
 /// The highest migration version below the workspace's current max.
 /// Leaves exactly the latest narrowing pending in this migration set.
@@ -307,7 +317,7 @@ async fn pending_contraction_with_older_fleet_blocks_and_names_offender() {
     let (db_name, pool) = create_temp_db(&admin).await;
 
     MIGRATOR
-        .run_to(BEFORE_FIRST_CONTRACTION, &pool)
+        .run_to(BEFORE_FENCED_CONTRACTIONS, &pool)
         .await
         .expect("partial migration run succeeds");
 
@@ -355,7 +365,7 @@ async fn pending_contraction_with_unversioned_hort_client_blocks_fail_closed() {
     let (db_name, pool) = create_temp_db(&admin).await;
 
     MIGRATOR
-        .run_to(BEFORE_FIRST_CONTRACTION, &pool)
+        .run_to(BEFORE_FENCED_CONTRACTIONS, &pool)
         .await
         .expect("partial migration run succeeds");
 
@@ -395,7 +405,7 @@ async fn pending_contraction_with_no_older_fleet_does_not_block() {
     let (db_name, pool) = create_temp_db(&admin).await;
 
     MIGRATOR
-        .run_to(BEFORE_FIRST_CONTRACTION, &pool)
+        .run_to(BEFORE_FENCED_CONTRACTIONS, &pool)
         .await
         .expect("partial migration run succeeds");
 
@@ -478,7 +488,7 @@ async fn older_fleet_member_on_a_different_database_does_not_block() {
     let (other_db_name, other_pool) = create_temp_db(&admin).await;
 
     MIGRATOR
-        .run_to(BEFORE_FIRST_CONTRACTION, &pool)
+        .run_to(BEFORE_FENCED_CONTRACTIONS, &pool)
         .await
         .expect("partial migration run succeeds");
 
