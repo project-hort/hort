@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer grows with every tick (#423).
 - A scheduled task that fails transiently and then succeeds on retry no longer
   ends as a permanently `Failed` Job (#449).
+- A migration that adds a `CHECK` narrowing an existing column is now a
+  declared contraction, so `hort-server migrate` refuses it while an older
+  hort-shaped client is connected — override with `--allow-running-fleet` (#433).
 
 ## [0.17.5] - 2026-11-17
 

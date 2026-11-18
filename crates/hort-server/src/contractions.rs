@@ -53,11 +53,16 @@ pub fn contraction_versions() -> BTreeSet<i64> {
 /// Every declared contraction's `reference_removed_in`, keyed by sqlx
 /// migration version.
 ///
-/// `reference_removed_in` is "the release whose code no longer references
-/// the identifiers this migration removes", which is exactly the oldest
-/// binary version the migration tolerates: the release before it is the
-/// last one that named them. A migration absent from this map removed
-/// nothing and every binary tolerates it.
+/// `reference_removed_in` is "the release whose code no longer produces
+/// what this migration takes away", which is exactly the oldest binary
+/// version the migration tolerates: the release before it is the last one
+/// that did. For a removal that is the release whose code stopped naming
+/// the identifier; for a narrowing — a type change, a `SET NOT NULL`, a
+/// new `CHECK` — the identifier stays and it is the release whose writers
+/// can no longer emit a value the migration refuses. A migration absent
+/// from this map took nothing away and every binary tolerates it; so does
+/// one whose entry names the oldest release, which is what a narrowing
+/// that only widened an admitted set honestly carries.
 pub fn contraction_minimum_binary_versions() -> BTreeMap<i64, String> {
     parse_manifest(MANIFEST_TOML)
 }
@@ -88,12 +93,21 @@ mod tests {
     /// currently declares destructive. If a future manifest edit
     /// changes this set, the intent is deliberate — update the
     /// assertion alongside the manifest edit.
+    ///
+    /// Beyond the three drop/rename migrations the set carries two `CHECK`
+    /// additions on a pre-existing column, which narrow that column's write
+    /// contract: 39, a real narrowing, and 31, which the guard reports
+    /// because it cannot read the statement as a replacement and fails
+    /// closed. A `CHECK` replacement whose admitted set only GREW is not a
+    /// narrowing and is deliberately absent — declaring one would fence a
+    /// rolling upgrade ADR 0030 exempts. See the manifest's own section
+    /// comment.
     #[test]
     fn reads_the_checked_in_manifest_versions() {
         let versions = contraction_versions();
         assert_eq!(
             versions,
-            BTreeSet::from([9, 14, 20]),
+            BTreeSet::from([9, 14, 20, 31, 39]),
             "migrations/CONTRACTIONS.toml contraction set changed — update this pin"
         );
     }
@@ -136,6 +150,14 @@ mod tests {
     /// The minimum-binary map is what the register write draws on, so the
     /// checked-in manifest's `reference_removed_in` values are pinned the
     /// same way the version set is.
+    ///
+    /// 31's `0.9.2` is not a placeholder: that migration's CHECK takes
+    /// nothing away from any writer (its own note carries why), so the
+    /// oldest binary it tolerates is the oldest binary there has ever been.
+    /// Dating it to the release it shipped in would make this map — and so
+    /// the register's recorded rollback floor — claim a floor the schema
+    /// does not impose, which is a false "you cannot roll back" in an
+    /// incident.
     #[test]
     fn reads_the_checked_in_minimum_binary_versions() {
         assert_eq!(
@@ -144,6 +166,8 @@ mod tests {
                 (9, "0.9.2".to_string()),
                 (14, "0.9.8".to_string()),
                 (20, "0.12.0".to_string()),
+                (31, "0.9.2".to_string()),
+                (39, "0.17.3".to_string()),
             ]),
             "migrations/CONTRACTIONS.toml reference_removed_in set changed — update this pin"
         );
