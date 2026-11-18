@@ -119,6 +119,98 @@ and prevented all of it.
 """
 
 # ---------------------------------------------------------------------------
+# Uniqueness and referential constraints on a pre-existing column.
+#
+# `ADD CONSTRAINT … UNIQUE`, `… PRIMARY KEY`, `… FOREIGN KEY`, `… EXCLUDE`
+# and `CREATE UNIQUE INDEX` on a column that existed before the migration
+# narrow the write contract of every column they name, exactly as a CHECK
+# does: a duplicate and a dangling reference are values the still-running
+# previous release can produce and PostgreSQL refuses from the instant the
+# migration hook commits. `ADD … NOT VALID` plus a later `VALIDATE`, and
+# `CREATE UNIQUE INDEX CONCURRENTLY`, are remedies for the LOCK the
+# statement takes — they shorten the outage during the migration and
+# discharge none of this obligation, because they exempt existing rows and
+# never a future INSERT. For a FOREIGN KEY the narrowed identifier is the
+# REFERENCING column: its admissible values shrink, the referenced column
+# loses nothing.
+#
+# Two escapes exist and no others, both syntactic. The column is created by
+# the same migration (as for a CHECK), or the same migration drops a
+# constraint or index whose replacement is provably no stricter: the
+# predecessor is findable in the migration set, sits on the same table, is
+# not itself partial, and its key columns are a subset of the new key's —
+# plus, for a new PRIMARY KEY, every key column is already NOT NULL, since
+# a primary key imposes NOT NULL as well as uniqueness. Both real shapes
+# are on disk: 013 widens the `content_references` primary key from three
+# columns to four (a wider key admits strictly more rows, and all four
+# columns were already NOT NULL in 003), and 021 replaces the full
+# `UNIQUE (repository_id, path)` with a partial unique index on the same
+# columns (duplicates among soft-deleted rows become admissible). Neither
+# is declared here, and neither should be.
+#
+# Everything else FAILS CLOSED, including "the old code never produced a
+# duplicate" — that is a semantic claim, and a harmless tightening pays the
+# one release of sequencing rather than buying an exemption.
+# ---------------------------------------------------------------------------
+
+[[contraction]]
+migration = "002_repositories.sql"
+identifiers = ["permission_grants.repository_id"]
+reference_removed_in = "0.9.2"
+note = """
+Declared because the guard reads one migration FILE at a time and this
+constraint spans two of them, so it fails closed — the same outcome, and the
+same right outcome, as 031 below. `permission_grants.repository_id` is
+created in 001 and this FK is declared in 002, because `repositories` does
+not exist yet in 001; 002's own section comment calls it the deferred FK
+from 001.
+
+Why it refuses no write any earlier binary could make: 001 and 002 are both
+part of the BASELINE migration set and have shipped as one unit in every
+release there has ever been (both files are present at the oldest tag in the
+repository). So no released binary ever served against a schema where 001
+had applied and 002 had not, and there is no mixed window in which a writer
+could emit a `repository_id` this FK now refuses. Establishing that needs
+the migration-to-release mapping, which a hermetic per-file scan does not
+have — it is exactly the reasoning the manifest exists to record.
+
+`reference_removed_in` therefore states what is true under the field's
+runtime meaning (the oldest binary version this migration tolerates):
+nothing was taken away from any writer, so it is the oldest release in the
+repository's history, 0.9.2, and not some later release. Dating it later
+would make the schema-compatibility register report a rollback floor the
+schema does not impose, and make the fleet fence refuse a compatible
+client.
+"""
+
+[[contraction]]
+migration = "017_scan_policy_scope_unique.sql"
+identifiers = ["policy_projections.scope"]
+reference_removed_in = "0.10.0"
+note = """
+A REAL narrowing, and a historical violation this entry records rather than
+blesses: a partial `CREATE UNIQUE INDEX` over
+`COALESCE(scope->>'Repository', 'Global')` on a column created back in 005,
+replacing no previous constraint at all. From the instant the migration
+commits, a second non-archived policy row in a scope that already has one is
+refused — a row the still-running previous release's projection write path
+could produce.
+
+The floor is measured, not estimated. The index and the apply-time rejection
+that stopped the gitops path producing duplicate-scope envelopes landed in
+ONE commit (bccbe4c8, 2026-08-06), first released in 0.10.0. So expand and
+contract shared a release here, which is precisely the shape this policy
+forbids; waiting one release would have cost nothing. 0.10.0 is therefore
+the release whose code can no longer emit a value this migration refuses,
+and the oldest binary version it tolerates.
+
+The migration repairs existing rows before building the index (it archives
+all but the earliest row per scope), so the index build itself cannot fail
+on legacy data — the exposure is entirely in the mixed-version write window,
+not in the apply.
+"""
+
+# ---------------------------------------------------------------------------
 # CHECK additions on a pre-existing column.
 #
 # `ALTER TABLE … ADD CONSTRAINT … CHECK` narrows the write contract of every

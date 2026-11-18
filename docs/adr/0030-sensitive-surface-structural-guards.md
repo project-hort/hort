@@ -204,7 +204,8 @@ identifiers compared as whole tokens, never substrings; the shared lexer both
 guards walk lives in `crates/hort-app/tests/sql_scan/mod.rs`. Recognised
 destructive shapes yield either a **removal** (`DROP TABLE`, `DROP COLUMN`,
 the source side of a `RENAME`) or a **narrowing** (`ALTER COLUMN … TYPE`,
-`SET NOT NULL`, and `ADD CONSTRAINT … CHECK` / `ADD CHECK` naming a column the
+`SET NOT NULL`, `ADD [CONSTRAINT …] CHECK` / `UNIQUE` / `PRIMARY KEY` /
+`FOREIGN KEY` / `EXCLUDE`, and `CREATE UNIQUE INDEX`, naming a column the
 migration did not create). Each is cross-checked against the checked-in manifest
 `migrations/CONTRACTIONS.toml`, whose entries carry the migration file name,
 the affected identifiers (`table` or `table.column`), a
@@ -334,6 +335,76 @@ default off), loudly logged when used. This closes the runtime half of the
 gap: the build-time guard above stops a contraction from being *authored*
 too early, and this fence stops it from being *applied* into a fleet that is
 still running a binary below the migration's declared floor.
+
+### Amendment 2026-11-18 — a constraint addition is a narrowing whatever the constraint
+
+*Authorised by the maintainer after the best-practice question was put and
+answered.*
+
+**The decision.** `ADD CONSTRAINT … UNIQUE`, `… PRIMARY KEY`,
+`… FOREIGN KEY`, `… EXCLUDE` and `CREATE UNIQUE INDEX` on a column that
+existed before the migration are narrowings, and carry the same obligation
+as the `CHECK` addition amendment (c) already names. A `CREATE INDEX`
+without `UNIQUE` constrains no write and is not one.
+
+**The reason, which is (c)'s reason unchanged.** A duplicate and a dangling
+reference are values the still-running previous release's write paths can
+produce, and PostgreSQL refuses them from the instant the migration hook
+commits — before a single new pod is Ready. That is the same window, the
+same fleet and the same failure as a `CHECK` that forbids a value the old
+writer still emits. `SET NOT NULL` — the special case
+`CHECK (c IS NOT NULL)` — has been recognised since this policy landed, so
+the omission of the rest of the class was an inconsistency rather than a
+judgement. It is also mainstream expand/contract doctrine rather than a
+local reading: the pattern's recipes state it as *"application code must
+write to the column before enforcement constraints are applied"*.
+
+**The lock-side remedies do not discharge it.** `strong_migrations` and
+`squawk` flag these same statements, predominantly for **lock duration**,
+and prescribe `ADD … NOT VALID` plus a later `VALIDATE`, or
+`CREATE UNIQUE INDEX CONCURRENTLY`. Those address availability *during* the
+migration, which is a separate question from release sequencing, and they
+discharge none of this obligation: `NOT VALID` exempts existing **rows**,
+never a future `INSERT` or `UPDATE`, exactly as amendment (c) already says
+for `CHECK`. A finding under this rule is never fixed by adding one of them;
+it is fixed by shipping the constraint one release later.
+
+**Two syntactic escapes, and no others.** A column the same migration
+creates is not narrowed by a constraint on it — no previous release ever
+wrote a value it forbids — and the guard derives that from the migration
+set. And a uniqueness key is exempt when the same migration drops one whose
+replacement is **provably no stricter**: the predecessor is findable in the
+migration set, sits on the same table, is not itself partial, and its key
+columns are a subset of the new key's; plus, for a new `PRIMARY KEY`, every
+key column is already `NOT NULL`, since a primary key imposes `NOT NULL`
+alongside uniqueness. A key over more columns admits strictly more rows (two
+rows agreeing on the wider tuple agree on the narrower one), and the same
+key over a subset of the rows admits strictly more rows. Both shapes are
+real: `013_content_references_multivalue_pk.sql` widens a primary key from
+three columns to four, and `021_artifacts_soft_delete.sql` replaces a full
+`UNIQUE (repository_id, path)` with a partial unique index on the same
+columns. A `FOREIGN KEY` and an `EXCLUDE` have no comparable predecessor
+shape and are therefore never exempt by replacement.
+
+Everything else **fails closed**, including *"the old code never produced a
+duplicate"* — a semantic claim, deliberately not an escape. A harmless
+tightening pays the one release of sequencing, and that is the accepted
+price. For a `FOREIGN KEY` the narrowed identifier is the **referencing**
+column, whose admissible values shrink; the referenced column loses nothing.
+
+**What the manifest gained.** Two retroactive entries, both recording what
+happened rather than blessing it. `017_scan_policy_scope_unique.sql` is a
+real narrowing whose partial unique index and the apply-time rejection that
+stopped the gitops path producing duplicate-scope envelopes shipped in one
+commit, first released in 0.10.0 — the same-release shape this policy
+forbids. `002_repositories.sql` declares the deferred foreign key on
+`permission_grants.repository_id`, a column created in `001`: the guard
+reads one migration file at a time and cannot see that 001 and 002 are both
+part of the baseline set and have shipped as one unit in every release there
+has ever been, so it fails closed and the entry carries that reasoning.
+Neither moves an operator-facing number — the fleet fence and the
+schema-compatibility register both key on the strictest declared floor, and
+`039`'s `0.17.3` remains it.
 
 ## Consequences
 

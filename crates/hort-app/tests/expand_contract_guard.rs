@@ -92,18 +92,20 @@
 //!     manifest; dropping a *sensitive* table that way remains an
 //!     unconditional failure in the sibling `no_sensitive_drops` guard, so
 //!     the two compose rather than overlap.
-//!   * **The one exception, and why it is still not an effects
-//!     analysis.** An enum `CHECK` replaced by the same `IN` list plus a
-//!     new literal is not reported (see [`only_widens`]). That verdict is
-//!     **set containment over two enumerated literal lists** — a
-//!     syntactic comparison of two statements, bounded to one shape — and
-//!     not a claim about what either predicate forbids. Everything the
-//!     comparison cannot make fails closed and is reported. It exists
-//!     because an admitted set that only grew tightens no write contract
-//!     at all, so declaring one would fence the routine rolling upgrade
-//!     ADR 0030 exempts in as many words: "an expand-only pending set is
-//!     never fenced, so routine rolling upgrades stay hook-driven and
-//!     unattended."
+//!   * **The two exceptions, and why neither is an effects analysis.**
+//!     An enum `CHECK` replaced by the same `IN` list plus a new literal
+//!     is not reported (see [`only_widens`]), and a uniqueness key
+//!     replaced by one that is provably no stricter is not reported (see
+//!     [`only_widens_key`]). Both verdicts are **containment over two
+//!     enumerated sets** — literal values in the first case, key columns
+//!     in the second — a syntactic comparison of two statements, bounded
+//!     to one shape, and not a claim about what either constraint forbids.
+//!     Everything the comparison cannot make fails closed and is reported.
+//!     They exist because a reach that only grew tightens no write
+//!     contract at all, so declaring one would fence the routine rolling
+//!     upgrade ADR 0030 exempts in as many words: "an expand-only pending
+//!     set is never fenced, so routine rolling upgrades stay hook-driven
+//!     and unattended."
 //!   * **A `CHECK` body is read as tokens, resolved against the columns the
 //!     migration set creates.** A reference the scanner cannot see as a
 //!     column — one assembled by a function the guard does not evaluate, or
@@ -114,7 +116,19 @@
 //!     comparison: the previous definition is harvested from the migration
 //!     set ([`CheckDefs`]) and nothing can be added anywhere to produce
 //!     one, so the only way past it is a statement that genuinely is the
-//!     same list plus more.
+//!     same list plus more. The uniqueness comparison is bounded the same
+//!     way: the predecessor is harvested from the migration set
+//!     ([`KeyDefs`]) and the nullability a `PRIMARY KEY` widening must
+//!     prove is harvested from it too ([`not_null_after`]), with nothing
+//!     to add anywhere to produce either.
+//!   * **The lock-duration remedies are not escapes.** `ADD … NOT VALID`
+//!     plus a later `VALIDATE`, and `CREATE UNIQUE INDEX CONCURRENTLY`,
+//!     are what `strong_migrations` and `squawk` prescribe for these same
+//!     statements — and they are about the LOCK the statement takes, which
+//!     is availability *during* the migration and a separate question from
+//!     release sequencing. Neither discharges this obligation: they exempt
+//!     existing ROWS, never a future `INSERT` from a binary that is still
+//!     running. A finding here is never fixed by adding one of them.
 //!
 //! ## Maintenance — weakening this is a blocking review finding
 //!
@@ -287,9 +301,10 @@ enum Reach {
     /// source side of a `RENAME`. Old code that names it errors.
     Removed,
     /// The identifier survives with a tighter contract: a `TYPE` change, a
-    /// `SET NOT NULL`, or a new `CHECK` on a pre-existing column. Old code
-    /// that *reads* it still works; old code that writes the old shape
-    /// errors.
+    /// `SET NOT NULL`, or a new `CHECK`, `UNIQUE`, `PRIMARY KEY`,
+    /// `FOREIGN KEY`, `EXCLUDE` or unique index on a pre-existing column.
+    /// Old code that *reads* it still works; old code that writes the old
+    /// shape errors.
     Narrowed,
 }
 
@@ -573,6 +588,223 @@ fn created_columns(tokens: &[Token]) -> BTreeSet<String> {
     out
 }
 
+/// Whether an `ALTER TABLE … ADD PRIMARY KEY` in THIS migration counts as
+/// evidence that its key columns are `NOT NULL`.
+///
+/// It does for the NEXT migration — PostgreSQL enforces `NOT NULL` on every
+/// primary-key column whether the column's own definition said so — and it
+/// must not for this one: the statement whose exemption
+/// [`only_widens_key`] is deciding cannot be its own evidence that it
+/// imposes no new `NOT NULL`. Without the distinction a key widening onto
+/// a nullable column reads as exempt because it made the column
+/// non-nullable itself, which is the narrowing rather than a reason to
+/// forgive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddedKeys {
+    Excluded,
+    Included,
+}
+
+/// The nullability the migration set has established by the time the
+/// migration whose tokens these are has run, given `before`.
+///
+/// Both directions, because membership is a proof obligation for
+/// [`only_widens_key`]: a column kept in the set after an
+/// `ALTER COLUMN … DROP NOT NULL` would exempt a `PRIMARY KEY` widening
+/// that silently re-imposes `NOT NULL` on it.
+///
+/// Three ways a column becomes `NOT NULL` in this tree, and one way it
+/// stops: a `NOT NULL` in its definition (`CREATE TABLE` body item or
+/// `ADD [COLUMN]` sub-action), an `ALTER COLUMN … SET NOT NULL`, and
+/// membership of a `PRIMARY KEY` — which PostgreSQL enforces as `NOT NULL`
+/// whether or not the column said so. A primary key declared inside a
+/// `CREATE TABLE` always counts: its columns are created by this migration
+/// and so are never the subject of an exemption decision here.
+fn not_null_after(
+    tokens: &[Token],
+    before: &BTreeSet<String>,
+    added: AddedKeys,
+) -> BTreeSet<String> {
+    let mut out = before.clone();
+    for (table, after_name) in create_tables(tokens) {
+        for item in body_items(tokens, after_name) {
+            match item_column(tokens, &item) {
+                Some(column) => {
+                    if declares_not_null(tokens, item.start, item.end) {
+                        out.insert(format!("{table}.{column}"));
+                    }
+                }
+                None => out.extend(primary_key_columns(tokens, &item, &table)),
+            }
+        }
+    }
+    for (table, after_name) in alter_tables(tokens) {
+        for action in alter_actions(tokens, after_name) {
+            apply_action_nullability(tokens, &action, &table, added, &mut out);
+        }
+    }
+    out
+}
+
+/// Does the token range declare `NOT NULL` (or an inline `PRIMARY KEY`) at
+/// its own paren depth?
+///
+/// Depth matters: a `CHECK (x IS NOT NULL)` on another column, and a
+/// `DEFAULT NULL`, both put the words inside the same item.
+fn declares_not_null(tokens: &[Token], start: usize, end: usize) -> bool {
+    let mut depth = 0usize;
+    for j in start..end.min(tokens.len()) {
+        if !plain(&tokens[j]) {
+            continue;
+        }
+        match tokens[j].text.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            "not" if depth == 0 && kw(tokens, j + 1, "null") => return true,
+            "primary" if depth == 0 && kw(tokens, j + 1, "key") => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The `table.column` set of a `PRIMARY KEY (…)` table constraint item,
+/// named or anonymous; empty for any other item.
+fn primary_key_columns(
+    tokens: &[Token],
+    item: &std::ops::Range<usize>,
+    table: &str,
+) -> BTreeSet<String> {
+    let mut at = item.start;
+    if kw(tokens, at, "constraint") {
+        match parse_table_name(tokens, at + 1) {
+            Some((_, after_name)) => at = after_name,
+            None => return BTreeSet::new(),
+        }
+    }
+    match key_keyword(tokens, at) {
+        Some((KeyKind::PrimaryKey, open)) if kw(tokens, open, "(") => {
+            plain_column_list(tokens, open, table).unwrap_or_default()
+        }
+        _ => BTreeSet::new(),
+    }
+}
+
+/// The comma-separated sub-action ranges of the `ALTER TABLE` clause body
+/// starting at `start`, stopping at the statement's `;`.
+///
+/// Sub-actions are comma-separated, but commas also appear inside
+/// parentheses (`CHECK (kind IN ('a','b'))`, a key column list), so only a
+/// depth-0 comma is a boundary — the same walk [`action_narrows`] makes,
+/// hoisted so the nullability harvest reads the same sub-action shape the
+/// matchers do.
+fn alter_actions(tokens: &[Token], start: usize) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut from = start;
+    let mut j = start;
+    while j < tokens.len() {
+        if plain(&tokens[j]) {
+            match tokens[j].text.as_str() {
+                "(" => depth += 1,
+                ")" => depth = depth.saturating_sub(1),
+                "," if depth == 0 => {
+                    if from < j {
+                        out.push(from..j);
+                    }
+                    from = j + 1;
+                }
+                ";" => {
+                    if from < j {
+                        out.push(from..j);
+                    }
+                    return out;
+                }
+                _ => {}
+            }
+        }
+        j += 1;
+    }
+    if from < tokens.len() {
+        out.push(from..tokens.len());
+    }
+    out
+}
+
+/// Apply one `ALTER TABLE` sub-action's effect on nullability to `out`.
+fn apply_action_nullability(
+    tokens: &[Token],
+    action: &std::ops::Range<usize>,
+    table: &str,
+    added: AddedKeys,
+    out: &mut BTreeSet<String>,
+) {
+    let at = action.start;
+    if kw(tokens, at, "add") {
+        if let Some(columns) = added_primary_key_columns(tokens, at, table) {
+            if added == AddedKeys::Included {
+                out.extend(columns);
+            }
+            return;
+        }
+        let cn = if kw(tokens, at + 1, "column") {
+            skip_if_not_exists(tokens, at + 2)
+        } else {
+            at + 1
+        };
+        if kw_in(tokens, cn, NON_COLUMN_ADD_ITEMS) {
+            return;
+        }
+        if let Some((column, after_column)) = parse_table_name(tokens, cn) {
+            if declares_not_null(tokens, after_column, action.end) {
+                out.insert(format!("{table}.{column}"));
+            }
+        }
+        return;
+    }
+    if !kw(tokens, at, "alter") {
+        return;
+    }
+    let cn = if kw(tokens, at + 1, "column") {
+        at + 2
+    } else {
+        at + 1
+    };
+    let Some((column, after_column)) = parse_table_name(tokens, cn) else {
+        return;
+    };
+    let identifier = format!("{table}.{column}");
+    for j in after_column..action.end.min(tokens.len()) {
+        if !kw(tokens, j + 1, "not") || !kw(tokens, j + 2, "null") {
+            continue;
+        }
+        if kw(tokens, j, "set") {
+            out.insert(identifier);
+            return;
+        }
+        if kw(tokens, j, "drop") {
+            out.remove(&identifier);
+            return;
+        }
+    }
+}
+
+/// The key columns of an `ADD [CONSTRAINT <n>] PRIMARY KEY (…)` sub-action
+/// at `at`, or `None` when the sub-action is not one.
+fn added_primary_key_columns(tokens: &[Token], at: usize, table: &str) -> Option<BTreeSet<String>> {
+    let mut after_add = at + 1;
+    if kw(tokens, after_add, "constraint") {
+        let (_, after_name) = parse_table_name(tokens, after_add + 1)?;
+        after_add = after_name;
+    }
+    match key_keyword(tokens, after_add)? {
+        (KeyKind::PrimaryKey, open) if kw(tokens, open, "(") => {
+            Some(plain_column_list(tokens, open, table).unwrap_or_default())
+        }
+        _ => None,
+    }
+}
+
 /// Every `ALTER TABLE [IF EXISTS] [ONLY] <t>` in the migration, as
 /// `(table, index just past the table name)` — the start of its clause
 /// body.
@@ -621,6 +853,17 @@ struct ColumnUniverse {
     /// That over-approximation is harmless: a `CHECK` cannot reference a
     /// column that no longer exists, because the migration would not apply.
     known: BTreeSet<String>,
+    /// `table.column` for every column this guard can see is `NOT NULL` by
+    /// the time this migration's statements run.
+    ///
+    /// Read by exactly one decision: a `PRIMARY KEY` makes every column of
+    /// its key `NOT NULL`, so a key widening that admits more rows can
+    /// still narrow a column's write contract through nullability alone.
+    /// Membership is therefore a *proof obligation*, and the set is
+    /// maintained in both directions — a `DROP NOT NULL` removes a column
+    /// again, because an over-approximation here would exempt a real
+    /// narrowing rather than report a harmless one.
+    not_null: BTreeSet<String>,
 }
 
 /// Does the `ALTER TABLE` sub-action starting at `idx` contain a `TYPE`
@@ -668,7 +911,17 @@ fn action_narrows(tokens: &[Token], idx: usize) -> Option<&'static str> {
 ///     anonymous `ALTER TABLE <t> … ADD CHECK (…)` → `Narrowed(t.c)` for
 ///     every column the CHECK body names that EXISTED BEFORE this
 ///     migration — unless the statement only WIDENS the constraint it
-///     replaces, which is [`only_widens`].
+///     replaces, which is [`only_widens`];
+///   * `ALTER TABLE <t> … ADD [CONSTRAINT <name>] UNIQUE (…)`,
+///     `… PRIMARY KEY (…)`, `… FOREIGN KEY (…) REFERENCES …`,
+///     `… EXCLUDE [USING <m>] (…)`, and
+///     `CREATE UNIQUE INDEX [CONCURRENTLY] [IF NOT EXISTS] [<name>] ON <t>
+///     …` → `Narrowed(t.c)` for every column the constraint's own column
+///     list names that EXISTED BEFORE this migration — unless the
+///     statement only WIDENS a key it replaces, which is
+///     [`only_widens_key`]. For a `FOREIGN KEY` that is the REFERENCING
+///     list and not the `REFERENCES` one; a `CREATE INDEX` without
+///     `UNIQUE` is not recognised at all, because it constrains no write.
 ///
 /// A constraint **drop** and a `CHECK` **addition** point opposite ways, and
 /// a reader who finds only one of the three statements below will draw the
@@ -694,16 +947,49 @@ fn action_narrows(tokens: &[Token], idx: usize) -> Option<&'static str> {
 ///     [`only_widens`] for the four conditions, and for why the comparison
 ///     is syntactic rather than the effects analysis the bullet above
 ///     refuses.
+///   * Adding a `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` or `EXCLUDE`
+///     constraint, or a `UNIQUE` index, to a pre-existing column NARROWS
+///     it, for the identical reason and in the identical window: a
+///     duplicate and a dangling reference are values the still-running
+///     previous release's write paths can produce and PostgreSQL refuses
+///     from the instant the hook commits. This is mainstream
+///     expand/contract doctrine rather than a local reading — the
+///     pattern's own recipes put it as "application code must write to the
+///     column before enforcement constraints are applied" — and
+///     `SET NOT NULL`, the special case `CHECK (c IS NOT NULL)`, has been
+///     recognised here all along. The lock-duration remedies named in the
+///     module header do not discharge it.
+///   * Replacing a uniqueness key with one that is provably no stricter —
+///     a key over MORE columns, or the same key over a SUBSET of the rows
+///     — narrows nothing, for the same reason the `CHECK` widening does.
+///     `013_content_references_multivalue_pk.sql` and
+///     `021_artifacts_soft_delete.sql` are the two shapes on disk; see
+///     [`only_widens_key`] for the four conditions.
 ///
 /// So a `DROP CONSTRAINT c` paired with an `ADD CONSTRAINT c CHECK (…)` in
 /// one migration is never a removal plus an addition: the drop contributes
 /// nothing, and the addition is either one narrowing or — when the
 /// comparison can be made and the set only grew — nothing at all.
 ///
-/// Deliberately NOT recognised, because no application query names them and
-/// no binary breaks when they change: `DROP INDEX`, `DROP CONSTRAINT`,
-/// `RENAME CONSTRAINT`. Constraint drops on a security-critical table are
-/// covered unconditionally by the sibling `no_sensitive_drops` guard.
+/// Two blind spots in the constraint class, stated so a green run is not
+/// mistaken for a proof. `ADD CONSTRAINT <n> PRIMARY KEY USING INDEX <idx>`
+/// carries no parenthesised column list and is not recognised — the
+/// `CREATE UNIQUE INDEX` it promotes is, so the uniqueness half is caught
+/// where it is declared and only the primary key's implicit `NOT NULL`
+/// escapes. And an inline column constraint on an `ADD COLUMN`
+/// (`ADD COLUMN c integer UNIQUE`, `… REFERENCES other (id)`) is not
+/// recognised either; that one costs nothing, because the column it
+/// constrains is created by the same migration and so is exempt anyway.
+///
+/// Deliberately NOT recognised, because every item on this list WIDENS the
+/// write contract or leaves it alone, and no application query names any of
+/// them: `DROP INDEX`, `DROP CONSTRAINT`, `RENAME CONSTRAINT`, and
+/// `CREATE INDEX` without `UNIQUE`. That the list holds only widenings is
+/// the property to preserve when adding to it — a constraint ADDITION is
+/// never on it, however harmless it looks, because "the old code never
+/// produced a duplicate" is a semantic claim and this guard trades it for
+/// one release of sequencing. Constraint drops on a security-critical table
+/// are covered unconditionally by the sibling `no_sensitive_drops` guard.
 /// `DROP TABLE [IF EXISTS] <t>` at `i`, unless `t` was created earlier in the
 /// same migration (create-then-drop is not a contraction of prior releases).
 fn scan_drop_table(
@@ -1085,6 +1371,102 @@ fn record_item_checks(
     }
 }
 
+/// The uniqueness keys every `CREATE TABLE` in this migration declares
+/// inline, recorded into `defs`.
+///
+/// Both forms, for [`created_checks`]' reason: a table constraint
+/// (`CONSTRAINT content_references_pkey PRIMARY KEY (…)`) and a column
+/// constraint (`id uuid PRIMARY KEY`, which PostgreSQL auto-names
+/// `<table>_pkey` — the name a later re-key drops).
+fn created_keys(tokens: &[Token], defs: &mut KeyDefs) {
+    for (table, after_name) in create_tables(tokens) {
+        for item in body_items(tokens, after_name) {
+            record_item_keys(
+                tokens,
+                &item,
+                &table,
+                item_column(tokens, &item).as_deref(),
+                defs,
+            );
+        }
+    }
+}
+
+/// The uniqueness key one `CREATE TABLE` body item declares, recorded into
+/// `defs`. `column` is the column the item defines, or `None` for a table
+/// constraint.
+fn record_item_keys(
+    tokens: &[Token],
+    item: &std::ops::Range<usize>,
+    table: &str,
+    column: Option<&str>,
+    defs: &mut KeyDefs,
+) {
+    let mut at = item.start;
+    let mut named = None;
+    if kw(tokens, at, "constraint") {
+        match parse_table_name(tokens, at + 1) {
+            Some((name, after_name)) => {
+                named = Some(name);
+                at = after_name;
+            }
+            None => return,
+        }
+    }
+    // A table constraint carries its own column list.
+    if let Some((kind, open)) = key_keyword(tokens, at) {
+        if kw(tokens, open, "(") {
+            let columns = plain_column_list(tokens, open, table);
+            let name = named.unwrap_or_else(|| auto_key_name(table, kind, columns.as_ref()));
+            record_key(
+                defs,
+                name,
+                Some(KeyDef {
+                    table: table.to_string(),
+                    kind,
+                    columns,
+                    partial: false,
+                }),
+            );
+        }
+        return;
+    }
+    // A column constraint has none: the key is the column it sits on.
+    let Some(column) = column else {
+        return;
+    };
+    let qualified: BTreeSet<String> = [format!("{table}.{column}")].into_iter().collect();
+    let mut depth = 0usize;
+    for j in item.start..item.end.min(tokens.len()) {
+        if !plain(&tokens[j]) {
+            continue;
+        }
+        match tokens[j].text.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                if let Some((kind, after)) = key_keyword(tokens, j) {
+                    if kw(tokens, after, "(") {
+                        continue;
+                    }
+                    record_key(
+                        defs,
+                        auto_key_name(table, kind, Some(&qualified)),
+                        Some(KeyDef {
+                            table: table.to_string(),
+                            kind,
+                            columns: Some(qualified.clone()),
+                            partial: false,
+                        }),
+                    );
+                    return;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The name PostgreSQL gives an unnamed `CHECK` constraint.
 fn auto_check_name(table: &str, column: Option<&str>) -> String {
     match column {
@@ -1119,6 +1501,216 @@ fn dropped_constraints(tokens: &[Token]) -> BTreeSet<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Uniqueness keys: the non-`CHECK` constraint shapes, and the one of them
+// whose reach can be compared.
+// ---------------------------------------------------------------------------
+
+/// Which uniqueness constraint a statement declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyKind {
+    /// `UNIQUE (…)`, or a `CREATE UNIQUE INDEX`.
+    Unique,
+    /// `PRIMARY KEY (…)`, which additionally makes every key column
+    /// `NOT NULL` — a second narrowing riding along with the first, and the
+    /// reason [`only_widens_key`] asks about nullability at all.
+    PrimaryKey,
+}
+
+/// The uniqueness key one constraint or unique index enforces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyDef {
+    /// Unqualified, lower-cased table the key is on. A replacement is only
+    /// comparable against a predecessor on the SAME table.
+    table: String,
+    kind: KeyKind,
+    /// `table.column` for every key element, when every element is a plain
+    /// column reference. `None` when any element is an expression this
+    /// guard does not read as a column list, which makes two keys
+    /// incomparable and so fails closed.
+    columns: Option<BTreeSet<String>>,
+    /// `true` when the key constrains a SUBSET of the rows — a partial
+    /// unique index's `WHERE`. A partial predecessor is one this guard
+    /// cannot compare against: deciding that one row-subset contains
+    /// another is predicate implication, which is the analysis the scanner
+    /// refuses everywhere else.
+    partial: bool,
+}
+
+/// What uniqueness key each constraint-or-index NAME carries.
+///
+/// Keyed by the bare name rather than `<table>.<name>`, because that is
+/// exactly what a `DROP CONSTRAINT` and a `DROP INDEX` hand over — an index
+/// name is schema-scoped and carries no table. The table lives inside the
+/// value and every comparison checks it, so two tables that genuinely share
+/// a name collapse to `None` through [`record_key`] and fail closed rather
+/// than comparing two unrelated keys.
+///
+/// `None` means what it means in [`CheckDefs`]: there is a definition under
+/// this name and this guard cannot read its key.
+type KeyDefs = BTreeMap<String, Option<KeyDef>>;
+
+/// Record one key definition under `name`, collapsing a name defined twice
+/// in one migration to `None` for [`record_check`]'s reason.
+fn record_key(defs: &mut KeyDefs, name: String, def: Option<KeyDef>) {
+    match defs.entry(name) {
+        std::collections::btree_map::Entry::Vacant(slot) => {
+            slot.insert(def);
+        }
+        std::collections::btree_map::Entry::Occupied(mut slot) => {
+            slot.insert(None);
+        }
+    }
+}
+
+/// `UNIQUE` | `PRIMARY KEY` at `idx`, plus the index just past the keyword.
+fn key_keyword(tokens: &[Token], idx: usize) -> Option<(KeyKind, usize)> {
+    if kw(tokens, idx, "unique") {
+        Some((KeyKind::Unique, idx + 1))
+    } else if kw(tokens, idx, "primary") && kw(tokens, idx + 1, "key") {
+        Some((KeyKind::PrimaryKey, idx + 2))
+    } else {
+        None
+    }
+}
+
+/// Read the parenthesised key list whose `(` sits at `open` as a plain
+/// column list, resolved to the manifest's `table.column` spelling.
+///
+/// `None` when any depth-1 item is anything other than exactly one dotted
+/// identifier chain — an expression, a collation, an operator class, the
+/// `WITH <operator>` element of an `EXCLUDE`. The strictness is the point,
+/// for [`in_list_check`]'s reason: a reader that kept the part it
+/// understood would compare two key lists that are not the lists.
+fn plain_column_list(tokens: &[Token], open: usize, table: &str) -> Option<BTreeSet<String>> {
+    let items = body_items(tokens, open);
+    if items.is_empty() {
+        return None;
+    }
+    let mut out = BTreeSet::new();
+    for item in items {
+        let (column, next) = column_chain(tokens, item.start, item.end, table);
+        if next != item.end {
+            return None;
+        }
+        out.insert(column?);
+    }
+    Some(out)
+}
+
+/// The name PostgreSQL gives an unnamed uniqueness constraint: `<t>_pkey`
+/// for a primary key, `<t>_<col>…_key` for a unique one.
+///
+/// PostgreSQL joins a unique constraint's columns in DECLARATION order and
+/// this guess joins them sorted, so a multi-column anonymous `UNIQUE` can
+/// be guessed wrong. Like [`auto_check_name`], a wrong guess only means a
+/// later replacement finds no previous definition to compare against,
+/// which is the fail-closed direction.
+fn auto_key_name(table: &str, kind: KeyKind, columns: Option<&BTreeSet<String>>) -> String {
+    match kind {
+        KeyKind::PrimaryKey => format!("{table}_pkey"),
+        KeyKind::Unique => {
+            let mut name = table.to_string();
+            for column in columns.into_iter().flatten() {
+                name.push('_');
+                name.push_str(column.rsplit('.').next().unwrap_or(column));
+            }
+            name.push_str("_key");
+            name
+        }
+    }
+}
+
+/// Bare names of every constraint and index this migration drops.
+///
+/// Both, under one set, because both are how the uniqueness a replacement
+/// supersedes was spelled: `003_artifacts_cas.sql` declares path uniqueness
+/// as a table CONSTRAINT and `021_artifacts_soft_delete.sql` replaces it
+/// with an INDEX, so a scan that only read one of the two spellings would
+/// find no predecessor for the commonest real widening in this tree.
+fn dropped_key_names(tokens: &[Token]) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for (_, after_name) in alter_tables(tokens) {
+        let mut k = after_name;
+        while k < tokens.len() && !kw(tokens, k, ";") {
+            if kw(tokens, k, "drop") && kw(tokens, k + 1, "constraint") {
+                let cn = skip_if_exists(tokens, k + 2);
+                if let Some((name, _)) = parse_table_name(tokens, cn) {
+                    out.insert(name);
+                }
+            }
+            k += 1;
+        }
+    }
+    for i in 0..tokens.len() {
+        if !(kw(tokens, i, "drop") && kw(tokens, i + 1, "index")) {
+            continue;
+        }
+        let mut j = i + 2;
+        if kw(tokens, j, "concurrently") {
+            j += 1;
+        }
+        j = skip_if_exists(tokens, j);
+        if let Some((name, _)) = parse_table_name(tokens, j) {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// What one `ALTER TABLE … ADD` sub-action declares, when it declares a
+/// non-`CHECK` constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddedConstraint {
+    /// `UNIQUE (…)` | `PRIMARY KEY (…)` — a uniqueness key, the one shape
+    /// a replacement can be compared over.
+    Key(KeyKind),
+    /// `FOREIGN KEY (…) REFERENCES …`. The narrowed identifier is the
+    /// REFERENCING column, whose admissible values shrink to the referenced
+    /// column's current contents; the referenced column loses nothing.
+    ForeignKey,
+    /// `EXCLUDE [USING <method>] (…)`.
+    Exclude,
+}
+
+/// The constraint class an `ALTER TABLE … ADD [CONSTRAINT <n>]` declares at
+/// `at`, plus the index of its parenthesised column list.
+fn added_constraint(tokens: &[Token], at: usize) -> Option<(AddedConstraint, usize)> {
+    if let Some((kind, open)) = key_keyword(tokens, at) {
+        return Some((AddedConstraint::Key(kind), open));
+    }
+    if kw(tokens, at, "foreign") && kw(tokens, at + 1, "key") {
+        return Some((AddedConstraint::ForeignKey, at + 2));
+    }
+    if kw(tokens, at, "exclude") {
+        let mut open = at + 1;
+        if kw(tokens, open, "using") {
+            open += 2;
+        }
+        return Some((AddedConstraint::Exclude, open));
+    }
+    None
+}
+
+/// The recognised statement shape, for the failure message an author acts
+/// on.
+fn add_constraint_shape(named: bool, class: AddedConstraint) -> &'static str {
+    match (named, class) {
+        (true, AddedConstraint::Key(KeyKind::Unique)) => {
+            "ALTER TABLE ... ADD CONSTRAINT ... UNIQUE"
+        }
+        (false, AddedConstraint::Key(KeyKind::Unique)) => "ALTER TABLE ... ADD UNIQUE",
+        (true, AddedConstraint::Key(KeyKind::PrimaryKey)) => {
+            "ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY"
+        }
+        (false, AddedConstraint::Key(KeyKind::PrimaryKey)) => "ALTER TABLE ... ADD PRIMARY KEY",
+        (true, AddedConstraint::ForeignKey) => "ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY",
+        (false, AddedConstraint::ForeignKey) => "ALTER TABLE ... ADD FOREIGN KEY",
+        (true, AddedConstraint::Exclude) => "ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE",
+        (false, AddedConstraint::Exclude) => "ALTER TABLE ... ADD EXCLUDE",
+    }
+}
+
 /// What one migration's statements are resolved against, beyond the token
 /// stream itself.
 struct MigrationContext<'a> {
@@ -1131,6 +1723,11 @@ struct MigrationContext<'a> {
     /// The definition each `<table>.<constraint name>` carried BEFORE this
     /// migration.
     in_force: &'a CheckDefs,
+    /// Bare names of every constraint AND index this migration drops — the
+    /// candidate predecessors a uniqueness key can be compared against.
+    dropped_keys: &'a BTreeSet<String>,
+    /// The uniqueness key each name carried BEFORE this migration.
+    keys_in_force: &'a KeyDefs,
 }
 
 /// The same, narrowed to one `ALTER TABLE`'s own table. The table is the
@@ -1189,6 +1786,215 @@ fn only_widens(ctx: &TableContext<'_>, key: &str, new: Option<&InListCheck>) -> 
         return false;
     };
     old.column == new.column && old.literals.is_subset(&new.literals)
+}
+
+/// Does this uniqueness key only *widen* the one it replaces?
+///
+/// The same posture as [`only_widens`], over the other comparable shape.
+/// A uniqueness key forbids a ROW given its neighbours rather than a value
+/// given itself, so "no stricter" is a containment question about two key
+/// column sets, and it is decidable syntactically in one direction only:
+///
+///   * **a key over MORE columns admits strictly more rows.** Two rows that
+///     agree on the wider tuple agree on the narrower one, so the narrower
+///     key already forbade them. `NULL` does not disturb that — a `UNIQUE`
+///     exempts any row with a `NULL` in the key, and a wider tuple can only
+///     contain more `NULL`s.
+///   * **a key over a SUBSET of the rows admits strictly more rows** than
+///     the same key over all of them.
+///
+/// So all four conditions hold, or the statement is a narrowing:
+///
+///   * this migration drops a constraint or index whose previous definition
+///     is findable in the migration set and sits on the same table — the
+///     replacement shape, the only one with a predecessor to compare
+///     against;
+///   * that predecessor is NOT partial. A partial predecessor would make
+///     the comparison "does this row-subset contain that one", which is
+///     predicate implication;
+///   * both key column lists are readable as plain column lists
+///     ([`plain_column_list`]), and the predecessor's is a subset of this
+///     one. Equality counts: re-stating the same key takes nothing away;
+///   * if the new key is a `PRIMARY KEY`, every one of its columns is
+///     already `NOT NULL`. Otherwise the statement smuggles in a
+///     `SET NOT NULL` that the row-admission argument above says nothing
+///     about.
+///
+/// Every other case **fails closed** and is reported, including the one the
+/// ecosystem's lock-duration advice would "fix": `ADD … NOT VALID` plus a
+/// later `VALIDATE`, and `CREATE UNIQUE INDEX CONCURRENTLY`, shorten the
+/// lock and do not discharge this obligation at all — they exempt existing
+/// rows, never a future `INSERT` from a binary that is still running.
+fn only_widens_key(table: &str, mig: &MigrationContext<'_>, new: &KeyDef) -> bool {
+    let Some(new_columns) = new.columns.as_ref() else {
+        return false;
+    };
+    if new.kind == KeyKind::PrimaryKey
+        && !new_columns
+            .iter()
+            .all(|column| mig.universe.not_null.contains(column))
+    {
+        return false;
+    }
+    mig.dropped_keys.iter().any(|name| {
+        matches!(
+            mig.keys_in_force.get(name),
+            Some(Some(old))
+                if old.table == table
+                    && !old.partial
+                    && old
+                        .columns
+                        .as_ref()
+                        .is_some_and(|old_columns| old_columns.is_subset(new_columns))
+        )
+    })
+}
+
+/// `ADD [CONSTRAINT <name>] UNIQUE | PRIMARY KEY | FOREIGN KEY | EXCLUDE`
+/// inside an `ALTER TABLE` body at `k`. Returns the index to resume
+/// scanning from when this shape matched — just past the constraint's own
+/// column list, which for a `FOREIGN KEY` is the REFERENCING list and
+/// deliberately not the `REFERENCES` one.
+///
+/// Records the uniqueness key it adds into `defs` whatever the verdict,
+/// because a later migration's replacement is compared against it.
+fn scan_add_constraint(
+    tokens: &[Token],
+    k: usize,
+    ctx: &TableContext<'_>,
+    out: &mut Vec<Contraction>,
+    defs: &mut KeyDefs,
+) -> Option<usize> {
+    if !kw(tokens, k, "add") {
+        return None;
+    }
+    let (named, at) = if kw(tokens, k + 1, "constraint") {
+        let (name, after_name) = parse_table_name(tokens, k + 2)?;
+        (Some(name), after_name)
+    } else {
+        (None, k + 1)
+    };
+    let (class, open) = added_constraint(tokens, at)?;
+    if !kw(tokens, open, "(") {
+        return None;
+    }
+    let shape = add_constraint_shape(named.is_some(), class);
+    let (body, resume) = parenthesised(tokens, open);
+    if let AddedConstraint::Key(kind) = class {
+        let def = KeyDef {
+            table: ctx.table.to_string(),
+            kind,
+            columns: plain_column_list(tokens, open, ctx.table),
+            partial: false,
+        };
+        let name = named.unwrap_or_else(|| auto_key_name(ctx.table, kind, def.columns.as_ref()));
+        record_key(defs, name, Some(def.clone()));
+        if only_widens_key(ctx.table, ctx.mig, &def) {
+            return Some(resume);
+        }
+    }
+    for identifier in referenced_columns(tokens, body, ctx.table, ctx.mig.universe) {
+        out.push(Contraction {
+            identifier,
+            reach: Reach::Narrowed,
+            shape,
+            line: line_of(ctx.mig.stripped, tokens[k].offset),
+        });
+    }
+    Some(resume)
+}
+
+/// `CREATE UNIQUE INDEX [CONCURRENTLY] [IF NOT EXISTS] [<name>] ON <t>
+/// [USING <method>] ( … )` starting at `i`. Returns the index to resume
+/// scanning from when this shape matched.
+///
+/// The `UNIQUE` form only: a non-unique index constrains no write at all,
+/// so it is additive DDL whatever it covers. The reported columns come from
+/// the KEY list and not from an `INCLUDE` payload or a partial `WHERE` — a
+/// payload column is not constrained, and a predicate selects WHICH rows
+/// the uniqueness covers rather than forbidding a value in the predicate's
+/// own columns.
+fn scan_create_unique_index(
+    tokens: &[Token],
+    i: usize,
+    mig: &MigrationContext<'_>,
+    out: &mut Vec<Contraction>,
+    defs: &mut KeyDefs,
+) -> Option<usize> {
+    if !(kw(tokens, i, "create") && kw(tokens, i + 1, "unique") && kw(tokens, i + 2, "index")) {
+        return None;
+    }
+    let mut j = i + 3;
+    if kw(tokens, j, "concurrently") {
+        j += 1;
+    }
+    j = skip_if_not_exists(tokens, j);
+    // PostgreSQL lets the index name be omitted, in which case `ON` follows
+    // immediately and there is no name to record a definition under.
+    let named = if kw(tokens, j, "on") {
+        None
+    } else {
+        let (name, after_name) = parse_table_name(tokens, j)?;
+        j = after_name;
+        Some(name)
+    };
+    if !kw(tokens, j, "on") {
+        return None;
+    }
+    j += 1;
+    if kw(tokens, j, "only") {
+        j += 1;
+    }
+    let (table, after_table) = parse_table_name(tokens, j)?;
+    let mut open = after_table;
+    if kw(tokens, open, "using") {
+        open += 2;
+    }
+    if !kw(tokens, open, "(") {
+        return None;
+    }
+    let (body, resume) = parenthesised(tokens, open);
+    let def = KeyDef {
+        table: table.clone(),
+        kind: KeyKind::Unique,
+        columns: plain_column_list(tokens, open, &table),
+        partial: statement_has_where(tokens, resume),
+    };
+    if let Some(name) = named {
+        record_key(defs, name, Some(def.clone()));
+    }
+    if !only_widens_key(&table, mig, &def) {
+        for identifier in referenced_columns(tokens, body, &table, mig.universe) {
+            out.push(Contraction {
+                identifier,
+                reach: Reach::Narrowed,
+                shape: "CREATE UNIQUE INDEX",
+                line: line_of(mig.stripped, tokens[i].offset),
+            });
+        }
+    }
+    Some(resume)
+}
+
+/// Does the statement that continues at `from` carry a top-level `WHERE`?
+///
+/// For a `CREATE INDEX` that is the partial-index predicate, which is what
+/// makes the index constrain a subset of the rows.
+fn statement_has_where(tokens: &[Token], from: usize) -> bool {
+    let mut depth = 0usize;
+    for token in tokens.iter().skip(from) {
+        if !plain(token) {
+            continue;
+        }
+        match token.text.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            ";" => return false,
+            "where" if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `ADD CONSTRAINT <name> CHECK ( … )` | `ADD CHECK ( … )` inside an
@@ -1277,6 +2083,10 @@ fn scan_alter_table_body(
             k = next;
             continue;
         }
+        if let Some(next) = scan_add_constraint(tokens, k, ctx, out, &mut sink.keys) {
+            k = next;
+            continue;
+        }
         k += 1;
     }
 }
@@ -1307,6 +2117,8 @@ struct MigrationSink {
     /// The `CHECK` definitions this migration establishes — what the NEXT
     /// migration's replacements are compared against.
     checks: CheckDefs,
+    /// The uniqueness keys this migration establishes, for the same reason.
+    keys: KeyDefs,
 }
 
 /// One migration's scan result: what it contracts, and what it adds to the
@@ -1316,6 +2128,11 @@ struct MigrationScan {
     contractions: Vec<Contraction>,
     created_columns: BTreeSet<String>,
     checks: CheckDefs,
+    keys: KeyDefs,
+    /// Nullability as it stands AFTER this migration — carried forward
+    /// whole rather than as a delta, because a `DROP NOT NULL` removes a
+    /// column and a delta the caller unions in could not express that.
+    not_null: BTreeSet<String>,
 }
 
 /// Scan one migration, resolving its `CHECK` bodies against the columns that
@@ -1328,30 +2145,31 @@ struct MigrationScan {
 /// and the other view blanks them. Every keyword and punctuation test here
 /// goes through [`plain`] / [`kw`], which reject a string-literal token, so
 /// a literal still cannot be read as syntax.
-fn scan_migration(
-    sql: &str,
-    known_before: &BTreeSet<String>,
-    in_force: &CheckDefs,
-) -> MigrationScan {
+fn scan_migration(sql: &str, before: &SchemaBefore<'_>) -> MigrationScan {
     let stripped = strip_comments(sql);
     let tokens = tokenize(&stripped);
     let created = created_tables(&tokens);
     let created_here = created_columns(&tokens);
-    let mut known = known_before.clone();
+    let mut known = before.columns.clone();
     known.extend(created_here.iter().cloned());
     let universe = ColumnUniverse {
         created_here: created_here.clone(),
         known,
+        not_null: not_null_after(&tokens, before.not_null, AddedKeys::Excluded),
     };
     let dropped = dropped_constraints(&tokens);
+    let dropped_keys = dropped_key_names(&tokens);
     let mig = MigrationContext {
         stripped: &stripped,
         universe: &universe,
         dropped: &dropped,
-        in_force,
+        in_force: before.checks,
+        dropped_keys: &dropped_keys,
+        keys_in_force: before.keys,
     };
     let mut sink = MigrationSink::default();
     created_checks(&tokens, &mut sink.checks);
+    created_keys(&tokens, &mut sink.keys);
     let n = tokens.len();
 
     let mut i = 0;
@@ -1359,10 +2177,31 @@ fn scan_migration(
         if let Some(c) = scan_drop_table(&tokens, i, &created, &stripped) {
             sink.contractions.push(c);
         }
+        if let Some(next) =
+            scan_create_unique_index(&tokens, i, &mig, &mut sink.contractions, &mut sink.keys)
+        {
+            i = next;
+            continue;
+        }
         if kw(&tokens, i, "alter") && kw(&tokens, i + 1, "table") {
             scan_alter_table_statement(&tokens, i, n, &mig, &mut sink);
         }
         i += 1;
+    }
+
+    // A key this migration dropped and did not re-add stops being a
+    // comparable predecessor. `CheckDefs` leaves a dropped name standing on
+    // the grounds that a `DROP CONSTRAINT` against a constraint the database
+    // does not have fails the migration — but `DROP INDEX IF EXISTS`
+    // succeeds against nothing, so a later migration could otherwise be
+    // compared against a key that was not in force. In the gap the columns
+    // accepted anything, so a writer in the gap could have produced a row the
+    // replacement refuses, and being wider than the old key says nothing
+    // about that. `None` is "not comparable", which reports.
+    for name in &dropped_keys {
+        if !sink.keys.contains_key(name) {
+            record_key(&mut sink.keys, name.clone(), None);
+        }
     }
 
     sink.contractions.sort();
@@ -1371,7 +2210,28 @@ fn scan_migration(
         contractions: sink.contractions,
         created_columns: created_here,
         checks: sink.checks,
+        keys: sink.keys,
+        not_null: not_null_after(&tokens, before.not_null, AddedKeys::Included),
     }
+}
+
+/// The schema as it stands BEFORE one migration's statements run — what
+/// every "did this exist already?" question in the scan is resolved
+/// against.
+///
+/// One struct rather than four parameters, because the four move together:
+/// each is the accumulation of the migrations in front of this one, and a
+/// caller that threaded three of them would ask the scan to decide the
+/// fourth on its own authority.
+struct SchemaBefore<'a> {
+    /// `table.column` for every column created at or before this point.
+    columns: &'a BTreeSet<String>,
+    /// `table.column` for every column known to be `NOT NULL`.
+    not_null: &'a BTreeSet<String>,
+    /// The `CHECK` definition each `<table>.<constraint name>` carries.
+    checks: &'a CheckDefs,
+    /// The uniqueness key each constraint-or-index name carries.
+    keys: &'a KeyDefs,
 }
 
 // ---------------------------------------------------------------------------
@@ -1660,12 +2520,24 @@ fn scan_in_apply_order(migrations: &[(String, String)]) -> BTreeMap<&str, Vec<Co
         .collect();
     in_order.sort_by_key(|(name, _)| *name);
     let mut known_columns: BTreeSet<String> = BTreeSet::new();
+    let mut not_null: BTreeSet<String> = BTreeSet::new();
     let mut checks_in_force: CheckDefs = BTreeMap::new();
+    let mut keys_in_force: KeyDefs = BTreeMap::new();
     let mut scanned = BTreeMap::new();
     for (name, sql) in in_order {
-        let scan = scan_migration(sql, &known_columns, &checks_in_force);
+        let scan = scan_migration(
+            sql,
+            &SchemaBefore {
+                columns: &known_columns,
+                not_null: &not_null,
+                checks: &checks_in_force,
+                keys: &keys_in_force,
+            },
+        );
         known_columns.extend(scan.created_columns);
+        not_null = scan.not_null;
         checks_in_force.extend(scan.checks);
+        keys_in_force.extend(scan.keys);
         scanned.insert(name, scan.contractions);
     }
     scanned
@@ -2115,15 +2987,28 @@ note = "n/a"
 
     #[test]
     fn green_on_an_expand_only_migration() {
-        // Additive DDL needs no entry at all: the old binary never names the
-        // new identifier, so there is nothing to sequence.
+        // Additive DDL needs no entry at all, and the reason is specific to
+        // what "additive" means: the old binary never NAMES the new
+        // identifier, so no query it issues can break on the name's
+        // account. `ADD COLUMN` and a non-unique index are additive in
+        // exactly that sense — neither forbids a write either.
+        //
+        // This fixture used to carry 021's statement pair, with that same
+        // sentence as the justification. The sentence is true of the index
+        // NAME and says nothing about the constraint the index imposes, so
+        // it justified the wrong half: a unique index on pre-existing
+        // columns narrows a write contract whatever its name. 021's pair
+        // stays green, but on the widening exemption and not on this
+        // claim — see
+        // [`a_full_unique_constraint_replaced_by_a_partial_index_only_widens`],
+        // which asserts it with the reason that is actually load-bearing.
         let hits = violations(&tree(
             "0.12.2-dev",
             &[(
-                "021_artifacts_soft_delete.sql",
-                "ALTER TABLE public.artifacts ADD COLUMN deleted_at timestamptz;\n\
-                 CREATE UNIQUE INDEX artifacts_live_key ON public.artifacts (repository_id, path)\n\
-                 WHERE (deleted_at IS NULL);",
+                "022_artifacts_release_attempt_at.sql",
+                "ALTER TABLE public.artifacts ADD COLUMN release_attempt_at timestamptz;\n\
+                 CREATE INDEX idx_artifacts_release_attempt_at\n\
+                     ON public.artifacts (release_attempt_at);",
             )],
             "",
             &[],
@@ -2408,13 +3293,32 @@ note = "n/a"
     /// way a real migration set does.
     fn scan(earlier: &[&str], sql: &str) -> MigrationScan {
         let mut known = BTreeSet::new();
-        let mut in_force = CheckDefs::new();
+        let mut not_null = BTreeSet::new();
+        let mut checks = CheckDefs::new();
+        let mut keys = KeyDefs::new();
+        let before = |known: &BTreeSet<String>,
+                      not_null: &BTreeSet<String>,
+                      checks: &CheckDefs,
+                      keys: &KeyDefs,
+                      sql: &str| {
+            scan_migration(
+                sql,
+                &SchemaBefore {
+                    columns: known,
+                    not_null,
+                    checks,
+                    keys,
+                },
+            )
+        };
         for prior in earlier {
-            let scan = scan_migration(prior, &known, &in_force);
+            let scan = before(&known, &not_null, &checks, &keys, prior);
             known.extend(scan.created_columns);
-            in_force.extend(scan.checks);
+            not_null = scan.not_null;
+            checks.extend(scan.checks);
+            keys.extend(scan.keys);
         }
-        scan_migration(sql, &known, &in_force)
+        before(&known, &not_null, &checks, &keys, sql)
     }
 
     #[test]
@@ -3193,6 +4097,576 @@ note = "the deferred narrowing, landed"
         .is_empty());
     }
 
+    // ---- Uniqueness and referential constraints. -------------------------
+
+    /// A migration that creates `t` with two pre-existing, nullable
+    /// columns plus a `NOT NULL` one — the state every case below reads a
+    /// later migration's constraint against.
+    const CREATES_T_KEYS: &str = "CREATE TABLE public.t (\n\
+                                      id uuid PRIMARY KEY,\n\
+                                      a integer,\n\
+                                      b integer,\n\
+                                      c integer NOT NULL\n\
+                                  );";
+
+    #[test]
+    fn every_uniqueness_constraint_spelling_on_a_pre_existing_column_is_a_narrowing() {
+        // One class, eight spellings, one verdict. A duplicate and a
+        // dangling reference are values the still-running previous release
+        // can produce and PostgreSQL refuses from the instant the hook
+        // commits — the same reach a `CHECK` has, reached a different way.
+        for (statement, shape) in [
+            (
+                "ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE (a);",
+                "ALTER TABLE ... ADD CONSTRAINT ... UNIQUE",
+            ),
+            (
+                "ALTER TABLE public.t ADD UNIQUE (a);",
+                "ALTER TABLE ... ADD UNIQUE",
+            ),
+            (
+                "ALTER TABLE public.t ADD CONSTRAINT t_a_pk PRIMARY KEY (a);",
+                "ALTER TABLE ... ADD CONSTRAINT ... PRIMARY KEY",
+            ),
+            (
+                "ALTER TABLE public.t ADD PRIMARY KEY (a);",
+                "ALTER TABLE ... ADD PRIMARY KEY",
+            ),
+            (
+                "ALTER TABLE public.t ADD CONSTRAINT t_a_fk FOREIGN KEY (a) \
+                 REFERENCES public.other (id);",
+                "ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY",
+            ),
+            (
+                "ALTER TABLE public.t ADD FOREIGN KEY (a) REFERENCES public.other (id);",
+                "ALTER TABLE ... ADD FOREIGN KEY",
+            ),
+            (
+                "ALTER TABLE public.t ADD CONSTRAINT t_a_excl EXCLUDE USING gist (a WITH =);",
+                "ALTER TABLE ... ADD CONSTRAINT ... EXCLUDE",
+            ),
+            (
+                "ALTER TABLE public.t ADD EXCLUDE (a WITH =);",
+                "ALTER TABLE ... ADD EXCLUDE",
+            ),
+            (
+                "CREATE UNIQUE INDEX t_a_uq ON public.t (a);",
+                "CREATE UNIQUE INDEX",
+            ),
+            (
+                "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS t_a_uq \
+                 ON public.t USING btree (a);",
+                "CREATE UNIQUE INDEX",
+            ),
+        ] {
+            let scanned = scan(&[CREATES_T_KEYS], statement);
+            assert_eq!(
+                scanned.contractions.len(),
+                1,
+                "{statement}: {:?}",
+                scanned.contractions
+            );
+            let found = &scanned.contractions[0];
+            assert_eq!(found.identifier, "t.a", "{statement}");
+            assert_eq!(found.reach, Reach::Narrowed, "{statement}");
+            assert_eq!(found.shape, shape, "{statement}");
+            // The failure message is what an author acts on.
+            let message = describe(&scanned.contractions);
+            assert!(message.contains("t.a"), "{statement}: {message}");
+            assert!(message.contains(shape), "{statement}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_key_on_a_column_created_in_the_same_migration_is_not_a_narrowing() {
+        // The same mechanism the `CHECK` case uses, and deliberately not a
+        // second statement of it: a column no previous release could write
+        // to cannot lose a value a previous release wrote.
+        //
+        // (a) the column arrives by `ADD COLUMN` in this very migration.
+        assert!(ids_after(
+            &[CREATES_T_KEYS],
+            "ALTER TABLE public.t ADD COLUMN fresh integer;\n\
+             ALTER TABLE public.t ADD CONSTRAINT t_fresh_key UNIQUE (fresh);\n\
+             CREATE UNIQUE INDEX t_fresh_uq ON public.t (fresh);",
+        )
+        .is_empty());
+        // (b) the whole table arrives in this migration, inline and bolted
+        // on afterwards.
+        assert!(ids("CREATE TABLE public.u (id uuid PRIMARY KEY, x integer UNIQUE);").is_empty());
+        assert!(ids("CREATE TABLE public.u (id uuid, x integer);\n\
+             ALTER TABLE public.u ADD CONSTRAINT u_pkey PRIMARY KEY (id);\n\
+             ALTER TABLE public.u ADD CONSTRAINT u_x_fk FOREIGN KEY (x) \
+                 REFERENCES public.other (id);\n\
+             CREATE UNIQUE INDEX u_x_uq ON public.u (x);")
+        .is_empty());
+    }
+
+    #[test]
+    fn a_non_unique_index_constrains_nothing_and_is_not_reported() {
+        // An index without `UNIQUE` forbids no write at all, however many
+        // pre-existing columns it covers, and whatever shape it takes.
+        for statement in [
+            "CREATE INDEX t_a_idx ON public.t (a);",
+            "CREATE INDEX t_a_idx ON public.t USING btree (a, b) WHERE (c > 0);",
+            "CREATE INDEX CONCURRENTLY IF NOT EXISTS t_a_idx ON public.t (a) INCLUDE (b);",
+            "CREATE INDEX ON public.t (a);",
+        ] {
+            assert!(
+                ids_after(&[CREATES_T_KEYS], statement).is_empty(),
+                "{statement}"
+            );
+        }
+        // The same index with `UNIQUE` is the narrowing — so the verdict
+        // turns on the keyword and not on anything else about the shape.
+        assert_eq!(
+            ids_after(
+                &[CREATES_T_KEYS],
+                "CREATE UNIQUE INDEX t_a_idx ON public.t (a);"
+            ),
+            vec![("t.a".to_string(), Reach::Narrowed)]
+        );
+    }
+
+    #[test]
+    fn a_foreign_keys_narrowed_column_is_the_referencing_one() {
+        // The referencing column's admissible values shrink to whatever the
+        // referenced column currently holds; the referenced column loses
+        // nothing and must not be reported — an entry naming it would send
+        // an operator looking at the wrong table.
+        let creates = "CREATE TABLE public.parent (id uuid PRIMARY KEY);\n\
+                       CREATE TABLE public.child (id uuid PRIMARY KEY, parent_id uuid);";
+        assert_eq!(
+            ids_after(
+                &[creates],
+                "ALTER TABLE ONLY public.child ADD CONSTRAINT child_parent_fk\n\
+                     FOREIGN KEY (parent_id) REFERENCES public.parent (id) ON DELETE CASCADE;",
+            ),
+            vec![("child.parent_id".to_string(), Reach::Narrowed)],
+            "the REFERENCES list is not a narrowing and must stay out of the report"
+        );
+        // A composite foreign key reports each referencing column.
+        let composite = "CREATE TABLE public.parent (a uuid, b uuid);\n\
+                         CREATE TABLE public.child (x uuid, y uuid);";
+        assert_eq!(
+            ids_after(
+                &[composite],
+                "ALTER TABLE public.child ADD CONSTRAINT child_fk\n\
+                     FOREIGN KEY (x, y) REFERENCES public.parent (a, b);",
+            ),
+            vec![
+                ("child.x".to_string(), Reach::Narrowed),
+                ("child.y".to_string(), Reach::Narrowed),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_partial_unique_index_that_replaces_nothing_is_reported() {
+        // `017_scan_policy_scope_unique.sql`'s shape, as an independent
+        // fixture: a partial unique index over an expression on a
+        // pre-existing column, with no predecessor constraint anywhere.
+        // Partial is not a widening on its own — there has to be something
+        // it is wider THAN.
+        let creates = "CREATE TABLE public.policy_projections (\n\
+                           policy_id uuid PRIMARY KEY,\n\
+                           scope jsonb NOT NULL,\n\
+                           archived boolean DEFAULT false NOT NULL\n\
+                       );";
+        let narrows = "CREATE UNIQUE INDEX idx_policy_projections_active_scope\n\
+                           ON public.policy_projections USING btree (\n\
+                               (COALESCE(scope->>'Repository', 'Global'))\n\
+                           )\n\
+                           WHERE (archived = false);";
+        assert_eq!(
+            ids_after(&[creates], narrows),
+            vec![("policy_projections.scope".to_string(), Reach::Narrowed)],
+            "the narrowing must be recognised, or no entry for it can be correct"
+        );
+        // And it is declarable: the entry the policy asks for turns the
+        // guard green rather than red, which is the other half of the
+        // acceptance criterion.
+        let hits = violations(&tree(
+            "0.18.0-dev",
+            &[
+                ("005_policy.sql", creates),
+                ("017_scan_policy_scope_unique.sql", narrows),
+            ],
+            r#"
+[[contraction]]
+migration = "017_scan_policy_scope_unique.sql"
+identifiers = ["policy_projections.scope"]
+reference_removed_in = "0.10.0"
+note = "the historical narrowing, declared"
+"#,
+            &[],
+        ));
+        assert!(hits.is_empty(), "{hits:?}");
+    }
+
+    #[test]
+    fn a_wider_primary_key_replacing_a_narrower_one_only_widens() {
+        // `013_content_references_multivalue_pk.sql`'s shape. Two rows that
+        // agree on the four-column key agree on the three-column one, so
+        // the old key already forbade them: the wider key admits strictly
+        // more rows. Every column of the new key was already `NOT NULL`, so
+        // no implicit `NOT NULL` rides along either.
+        let creates = "CREATE TABLE public.cr (\n\
+                           repository_id uuid NOT NULL,\n\
+                           source_artifact_id uuid NOT NULL,\n\
+                           target_content_hash text NOT NULL,\n\
+                           kind text NOT NULL\n\
+                       );\n\
+                       ALTER TABLE ONLY public.cr ADD CONSTRAINT cr_pkey\n\
+                           PRIMARY KEY (repository_id, source_artifact_id, kind);";
+        let widens = "ALTER TABLE ONLY public.cr DROP CONSTRAINT cr_pkey;\n\
+                      ALTER TABLE ONLY public.cr ADD CONSTRAINT cr_pkey\n\
+                          PRIMARY KEY (repository_id, source_artifact_id,\n\
+                                       target_content_hash, kind);";
+        assert!(
+            ids_after(&[creates], widens).is_empty(),
+            "a key over more columns admits strictly more rows"
+        );
+        // Restating the identical key takes nothing away either.
+        assert!(ids_after(
+            &[creates],
+            "ALTER TABLE public.cr DROP CONSTRAINT cr_pkey;\n\
+             ALTER TABLE public.cr ADD CONSTRAINT cr_pkey\n\
+                 PRIMARY KEY (repository_id, source_artifact_id, kind);",
+        )
+        .is_empty());
+        // The other direction is a narrowing: a key over FEWER columns
+        // forbids pairs the old one admitted.
+        assert_eq!(
+            ids_after(
+                &[creates],
+                "ALTER TABLE public.cr DROP CONSTRAINT cr_pkey;\n\
+                 ALTER TABLE public.cr ADD CONSTRAINT cr_pkey\n\
+                     PRIMARY KEY (repository_id, source_artifact_id);",
+            ),
+            vec![
+                ("cr.repository_id".to_string(), Reach::Narrowed),
+                ("cr.source_artifact_id".to_string(), Reach::Narrowed),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_primary_key_widening_onto_a_nullable_column_is_still_a_narrowing() {
+        // A `PRIMARY KEY` imposes `NOT NULL` as well as uniqueness, so a
+        // wider key whose new column is nullable smuggles in the
+        // `SET NOT NULL` this guard has recognised all along. The
+        // row-admission argument says nothing about it, so the exemption
+        // must not reach it.
+        let creates = "CREATE TABLE public.t (a uuid NOT NULL, b uuid);\n\
+                       ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);";
+        let widens = "ALTER TABLE public.t DROP CONSTRAINT t_pkey;\n\
+                      ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a, b);";
+        assert_eq!(
+            ids_after(&[creates], widens),
+            vec![
+                ("t.a".to_string(), Reach::Narrowed),
+                ("t.b".to_string(), Reach::Narrowed),
+            ],
+            "a nullable column joining a primary key loses NULL as a value"
+        );
+        // The same widening over a `NOT NULL` column is exempt — so the
+        // verdict turns on the nullability and on nothing else.
+        let not_null = "CREATE TABLE public.t (a uuid NOT NULL, b uuid NOT NULL);\n\
+                        ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);";
+        assert!(ids_after(&[not_null], widens).is_empty());
+        // A `UNIQUE` key imposes no `NOT NULL`, so the same widening over
+        // the same nullable column is exempt in that spelling.
+        let unique_before = "CREATE TABLE public.t (a uuid, b uuid);\n\
+                             ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE (a);";
+        assert!(ids_after(
+            &[unique_before],
+            "ALTER TABLE public.t DROP CONSTRAINT t_a_key;\n\
+             ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE (a, b);",
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn a_nullability_that_was_dropped_does_not_exempt_a_primary_key_widening() {
+        // The nullability set is maintained in BOTH directions, which is
+        // the difference between a proof and an assumption: a column that
+        // was `NOT NULL` and has since been made nullable is one a
+        // `PRIMARY KEY` would re-constrain.
+        let creates = "CREATE TABLE public.t (a uuid NOT NULL, b uuid NOT NULL);\n\
+                       ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a);";
+        let relaxes = "ALTER TABLE public.t ALTER COLUMN b DROP NOT NULL;";
+        let widens = "ALTER TABLE public.t DROP CONSTRAINT t_pkey;\n\
+                      ALTER TABLE public.t ADD CONSTRAINT t_pkey PRIMARY KEY (a, b);";
+        assert!(
+            ids_after(&[creates], widens).is_empty(),
+            "without the relaxation the widening is exempt"
+        );
+        assert_eq!(
+            ids_after(&[creates, relaxes], widens),
+            vec![
+                ("t.a".to_string(), Reach::Narrowed),
+                ("t.b".to_string(), Reach::Narrowed),
+            ],
+            "a column made nullable again cannot carry a primary key's implicit NOT NULL"
+        );
+        // And a `SET NOT NULL` puts it back — the set tracks the statements
+        // rather than remembering only the declaration.
+        let restores = "ALTER TABLE public.t ALTER COLUMN b SET NOT NULL;";
+        assert!(ids_after(&[creates, relaxes, restores], widens).is_empty());
+    }
+
+    #[test]
+    fn a_full_unique_constraint_replaced_by_a_partial_index_only_widens() {
+        // `021_artifacts_soft_delete.sql`'s shape, and the claim the old
+        // green test did not make: the same key over a SUBSET of the rows
+        // admits strictly more rows, because every pair the partial index
+        // leaves alone was already forbidden by the full constraint.
+        // Duplicates among soft-deleted rows become admissible — nothing
+        // becomes inadmissible.
+        let creates = "CREATE TABLE public.artifacts (\n\
+                           id uuid PRIMARY KEY,\n\
+                           repository_id uuid NOT NULL,\n\
+                           path text NOT NULL\n\
+                       );\n\
+                       ALTER TABLE ONLY public.artifacts\n\
+                           ADD CONSTRAINT artifacts_repository_id_path_key\n\
+                           UNIQUE (repository_id, path);";
+        let widens = "ALTER TABLE public.artifacts ADD COLUMN deleted_at timestamptz;\n\
+                      ALTER TABLE public.artifacts\n\
+                          DROP CONSTRAINT artifacts_repository_id_path_key;\n\
+                      CREATE UNIQUE INDEX artifacts_repository_id_path_live_key\n\
+                          ON public.artifacts USING btree (repository_id, path)\n\
+                          WHERE (deleted_at IS NULL);";
+        assert!(
+            ids_after(&[creates], widens).is_empty(),
+            "a full uniqueness constraint becoming partial takes nothing away"
+        );
+        // The pairing is what earns it. Without the `DROP CONSTRAINT` the
+        // index replaces nothing and is reported — which is also what
+        // happens when the replacement lands one migration LATER than the
+        // drop, because in between the column pair accepted anything.
+        let index_only = "ALTER TABLE public.artifacts ADD COLUMN deleted_at timestamptz;\n\
+                          CREATE UNIQUE INDEX artifacts_repository_id_path_live_key\n\
+                              ON public.artifacts USING btree (repository_id, path)\n\
+                              WHERE (deleted_at IS NULL);";
+        assert_eq!(
+            ids_after(&[creates], index_only),
+            vec![
+                ("artifacts.path".to_string(), Reach::Narrowed),
+                ("artifacts.repository_id".to_string(), Reach::Narrowed),
+            ]
+        );
+        let drop_only = "ALTER TABLE public.artifacts\n\
+                             DROP CONSTRAINT artifacts_repository_id_path_key;";
+        assert!(
+            ids_after(&[creates], drop_only).is_empty(),
+            "a lone constraint DROP widens and is invisible to this scanner"
+        );
+        assert_eq!(
+            ids_after(&[creates, drop_only], index_only).len(),
+            2,
+            "a replacement one migration after the drop is not a replacement"
+        );
+    }
+
+    #[test]
+    fn a_dropped_index_is_as_good_a_predecessor_as_a_dropped_constraint() {
+        // Uniqueness is spelled both ways in this tree — `003` declares
+        // path uniqueness as a table CONSTRAINT and `021` replaces it with
+        // an INDEX — so a scan that only read one spelling would find no
+        // predecessor for the commonest real widening here. The symmetric
+        // case has to work too.
+        let creates = "CREATE TABLE public.t (a uuid NOT NULL, b uuid NOT NULL);\n\
+                       CREATE UNIQUE INDEX t_a_uq ON public.t (a);";
+        assert!(ids_after(
+            &[creates],
+            "DROP INDEX public.t_a_uq;\n\
+             CREATE UNIQUE INDEX t_a_b_uq ON public.t (a, b);",
+        )
+        .is_empty());
+        // A partial predecessor is NOT comparable: deciding one row-subset
+        // contains another is predicate implication.
+        let partial_before = "CREATE TABLE public.t (a uuid NOT NULL, b uuid);\n\
+                              CREATE UNIQUE INDEX t_a_uq ON public.t (a) WHERE (b IS NULL);";
+        assert_eq!(
+            ids_after(
+                &[partial_before],
+                "DROP INDEX public.t_a_uq;\n\
+                 CREATE UNIQUE INDEX t_a_uq ON public.t (a) WHERE (b IS NOT NULL);",
+            ),
+            vec![("t.a".to_string(), Reach::Narrowed)]
+        );
+    }
+
+    #[test]
+    fn a_key_dropped_in_an_earlier_migration_is_not_a_predecessor() {
+        // The uniqueness counterpart of
+        // [`a_re_add_in_a_later_migration_than_the_drop_is_not_a_replacement`],
+        // and the reason the key side tombstones a dropped name where the
+        // `CHECK` side can leave one standing: `DROP CONSTRAINT` against a
+        // constraint the database does not have fails the migration, but
+        // `DROP INDEX IF EXISTS` succeeds against nothing. Without the
+        // tombstone a vacuous re-drop would resurrect a key that had not
+        // been in force since an earlier release — and in that gap the
+        // columns accepted anything, so a writer could have produced a row
+        // the replacement now refuses.
+        let creates = "CREATE TABLE public.t (a uuid NOT NULL, b uuid NOT NULL);\n\
+                       CREATE UNIQUE INDEX t_a_uq ON public.t (a);";
+        let drop_only = "DROP INDEX public.t_a_uq;";
+        let wider = "DROP INDEX IF EXISTS public.t_a_uq;\n\
+                     CREATE UNIQUE INDEX t_a_b_uq ON public.t (a, b);";
+        assert!(
+            ids_after(&[creates], wider).is_empty(),
+            "with the key still in force the wider one is exempt"
+        );
+        assert_eq!(
+            ids_after(&[creates, drop_only], wider),
+            vec![
+                ("t.a".to_string(), Reach::Narrowed),
+                ("t.b".to_string(), Reach::Narrowed),
+            ],
+            "a key dropped one migration earlier was not in force in between"
+        );
+    }
+
+    #[test]
+    fn a_key_the_scan_cannot_read_as_a_column_list_is_not_comparable() {
+        // An expression key has no column set to contain or be contained
+        // by, in either position, so neither side of the comparison can be
+        // made and both fail closed.
+        let expression_before = "CREATE TABLE public.t (a text NOT NULL, b text NOT NULL);\n\
+             CREATE UNIQUE INDEX t_expr_uq ON public.t (lower(a));";
+        // Old side an expression, new side a plain list.
+        assert_eq!(
+            ids_after(
+                &[expression_before],
+                "DROP INDEX public.t_expr_uq;\n\
+                 CREATE UNIQUE INDEX t_a_uq ON public.t (a, b);",
+            ),
+            vec![
+                ("t.a".to_string(), Reach::Narrowed),
+                ("t.b".to_string(), Reach::Narrowed),
+            ]
+        );
+        // New side an expression, old side a plain list.
+        let plain_before = "CREATE TABLE public.t (a text NOT NULL, b text NOT NULL);\n\
+                            CREATE UNIQUE INDEX t_a_uq ON public.t (a);";
+        assert_eq!(
+            ids_after(
+                &[plain_before],
+                "DROP INDEX public.t_a_uq;\n\
+                 CREATE UNIQUE INDEX t_expr_uq ON public.t (lower(a));",
+            ),
+            vec![("t.a".to_string(), Reach::Narrowed)]
+        );
+    }
+
+    #[test]
+    fn a_predecessor_on_another_table_is_not_a_predecessor() {
+        // The comparison would otherwise pair two unrelated keys that
+        // happen to be dropped and added in one migration.
+        let creates = "CREATE TABLE public.t (a uuid NOT NULL);\n\
+                       CREATE TABLE public.u (a uuid NOT NULL, b uuid NOT NULL);\n\
+                       ALTER TABLE public.t ADD CONSTRAINT t_a_key UNIQUE (a);";
+        assert_eq!(
+            ids_after(
+                &[creates],
+                "ALTER TABLE public.t DROP CONSTRAINT t_a_key;\n\
+                 ALTER TABLE public.u ADD CONSTRAINT u_key UNIQUE (a, b);",
+            ),
+            vec![
+                ("u.a".to_string(), Reach::Narrowed),
+                ("u.b".to_string(), Reach::Narrowed),
+            ]
+        );
+        // And a disjoint key on the same table is not a widening either.
+        assert_eq!(
+            ids_after(
+                &[creates],
+                "ALTER TABLE public.t DROP CONSTRAINT t_a_key;\n\
+                 CREATE TABLE public.v (id uuid PRIMARY KEY);\n\
+                 ALTER TABLE public.t ADD CONSTRAINT t_other_key UNIQUE (missing);",
+            )
+            .len(),
+            0,
+            "`missing` is not a column this migration set creates, so it is not reported — \
+             the column universe bounds this extraction exactly as it bounds a CHECK's"
+        );
+    }
+
+    #[test]
+    fn the_reported_columns_come_from_the_key_and_not_from_the_payload() {
+        // An `INCLUDE` payload is stored in the leaf and constrained by
+        // nothing; a partial `WHERE` selects WHICH rows the uniqueness
+        // covers rather than forbidding a value in its own columns.
+        // Reporting either would send an author to declare a column whose
+        // write contract did not change.
+        assert_eq!(
+            ids_after(
+                &[CREATES_T_KEYS],
+                "CREATE UNIQUE INDEX t_uq ON public.t USING btree (a)\n\
+                     INCLUDE (b)\n\
+                     WHERE (c > 0);",
+            ),
+            vec![("t.a".to_string(), Reach::Narrowed)]
+        );
+    }
+
+    #[test]
+    fn not_valid_and_concurrently_do_not_change_a_key_verdict() {
+        // The ecosystem's advice on these statements is predominantly about
+        // LOCK duration, and its remedies are `ADD … NOT VALID` plus a
+        // later `VALIDATE` and `CREATE UNIQUE INDEX CONCURRENTLY`. Both
+        // shorten the outage DURING the migration and discharge none of
+        // this obligation: they exempt existing rows, never a future INSERT
+        // from a binary that is still running. If either read as an escape,
+        // a future finding would get "fixed" with it and believed.
+        let plain = ids_after(
+            &[CREATES_T_KEYS],
+            "ALTER TABLE public.t ADD CONSTRAINT t_a_fk FOREIGN KEY (a) \
+             REFERENCES public.other (id);",
+        );
+        let not_valid = ids_after(
+            &[CREATES_T_KEYS],
+            "ALTER TABLE public.t ADD CONSTRAINT t_a_fk FOREIGN KEY (a) \
+             REFERENCES public.other (id) NOT VALID;",
+        );
+        assert_eq!(plain, not_valid);
+        assert_eq!(plain, vec![("t.a".to_string(), Reach::Narrowed)]);
+
+        let index = ids_after(
+            &[CREATES_T_KEYS],
+            "CREATE UNIQUE INDEX t_uq ON public.t (a);",
+        );
+        let concurrently = ids_after(
+            &[CREATES_T_KEYS],
+            "CREATE UNIQUE INDEX CONCURRENTLY t_uq ON public.t (a);",
+        );
+        assert_eq!(index, concurrently);
+        assert_eq!(index, vec![("t.a".to_string(), Reach::Narrowed)]);
+    }
+
+    #[test]
+    fn red_when_a_key_narrowing_has_no_manifest_entry() {
+        let hits = violations(&tree(
+            "0.18.0-dev",
+            &[
+                ("003_create.sql", CREATES_T_KEYS),
+                (
+                    "045_narrow.sql",
+                    "CREATE UNIQUE INDEX t_a_uq ON public.t (a);",
+                ),
+            ],
+            "",
+            &[],
+        ));
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].contains("no entry in migrations/"), "{hits:?}");
+        assert!(hits[0].contains("t.a"), "{hits:?}");
+        assert!(hits[0].contains("CREATE UNIQUE INDEX"), "{hits:?}");
+    }
+
     // ---- Mutation probes against the real on-disk tree. ------------------
 
     /// The real manifest text with one entry excised, for the probes that
@@ -3266,6 +4740,18 @@ note = "the deferred narrowing, landed"
             "artifacts.quarantine_status",
             Reach::Narrowed,
             "ADD CONSTRAINT ... CHECK",
+        );
+        found(
+            "002_repositories.sql",
+            "permission_grants.repository_id",
+            Reach::Narrowed,
+            "ADD CONSTRAINT ... FOREIGN KEY",
+        );
+        found(
+            "017_scan_policy_scope_unique.sql",
+            "policy_projections.scope",
+            Reach::Narrowed,
+            "CREATE UNIQUE INDEX",
         );
         // And the column universe itself: a replacement CHECK's column
         // must remain visible as a pre-existing column.
@@ -3389,6 +4875,287 @@ note = "the deferred narrowing, landed"
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert!(hits[0].starts_with("999_undeclared_check.sql"), "{hits:?}");
         assert!(hits[0].contains("artifacts.path"), "{hits:?}");
+    }
+
+    /// Replace `from` with `to` throughout one named migration of `inputs`.
+    ///
+    /// Asserts the text was there and that the replacement changed
+    /// something: a mutation probe that mutates nothing proves nothing, and
+    /// is the way a renamed identifier turns one of these into a test that
+    /// passes by accident.
+    fn mutate_migration(inputs: &mut Inputs, migration: &str, from: &str, to: &str) {
+        let slot = inputs
+            .migrations
+            .iter_mut()
+            .find(|(name, _)| name == migration)
+            .unwrap_or_else(|| panic!("{migration} is not in the real tree"));
+        let mutated = slot.1.replace(from, to);
+        assert_ne!(
+            mutated, slot.1,
+            "{migration} no longer contains {from:?} — this probe mutates nothing"
+        );
+        slot.1 = mutated;
+    }
+
+    #[test]
+    fn the_real_trees_key_narrowings_are_exactly_the_two_declared_ones() {
+        // The census for the non-`CHECK` constraint class, pinned in both
+        // directions like its `CHECK` sibling. Four migrations in this tree
+        // add a uniqueness or referential constraint to a column that
+        // existed before them. Two are narrowings and are declared; two are
+        // widenings and must never be, because the runtime fence keys on
+        // whether a pending migration is declared and declaring a widening
+        // would fence a routine rolling upgrade ADR 0030 exempts.
+        let inputs = real_tree_inputs();
+        let by_migration = scan_in_apply_order(&inputs.migrations);
+        let census: Vec<(String, String, &'static str)> = by_migration
+            .iter()
+            .flat_map(|(migration, found)| {
+                found
+                    .iter()
+                    .filter(|c| !c.shape.contains("CHECK") && c.reach == Reach::Narrowed)
+                    .filter(|c| {
+                        c.shape.contains("UNIQUE")
+                            || c.shape.contains("KEY")
+                            || c.shape.contains("EXCLUDE")
+                    })
+                    .map(move |c| ((*migration).to_string(), c.identifier.clone(), c.shape))
+            })
+            .collect();
+        assert_eq!(
+            census,
+            vec![
+                (
+                    "002_repositories.sql".to_string(),
+                    "permission_grants.repository_id".to_string(),
+                    "ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY",
+                ),
+                (
+                    "017_scan_policy_scope_unique.sql".to_string(),
+                    "policy_projections.scope".to_string(),
+                    "CREATE UNIQUE INDEX",
+                ),
+            ],
+            "the real tree's uniqueness / referential narrowings changed"
+        );
+        // The two widenings, named: 013 widens a primary key from three
+        // columns to four, 021 replaces a full unique constraint with a
+        // partial index on the same columns. Neither takes anything away.
+        for migration in [
+            "013_content_references_multivalue_pk.sql",
+            "021_artifacts_soft_delete.sql",
+        ] {
+            let found = by_migration
+                .get(migration)
+                .unwrap_or_else(|| panic!("{migration} is not in the scanned tree"));
+            assert!(
+                found.is_empty(),
+                "{migration} only widens a uniqueness key and must not be reported: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_real_trees_nullability_harvest_reads_the_tree_it_scans() {
+        // The nullability set is the evidence 013's exemption rests on, and
+        // an over-broad one would exempt a real narrowing — so the
+        // non-membership half is the load-bearing assertion here, not the
+        // membership half. An empty or absent set only makes the guard
+        // report 013, which is the safe direction.
+        let inputs = real_tree_inputs();
+        let mut in_order: Vec<(&str, &String)> = inputs
+            .migrations
+            .iter()
+            .map(|(name, sql)| (name.as_str(), sql))
+            .collect();
+        in_order.sort_by_key(|(name, _)| *name);
+        let mut columns = BTreeSet::new();
+        let mut not_null = BTreeSet::new();
+        let mut checks = CheckDefs::new();
+        let mut keys = KeyDefs::new();
+        for (_, sql) in in_order {
+            let scan = scan_migration(
+                sql,
+                &SchemaBefore {
+                    columns: &columns,
+                    not_null: &not_null,
+                    checks: &checks,
+                    keys: &keys,
+                },
+            );
+            columns.extend(scan.created_columns);
+            not_null = scan.not_null;
+            checks.extend(scan.checks);
+            keys.extend(scan.keys);
+        }
+        for declared in [
+            "content_references.target_content_hash",
+            "content_references.kind",
+            "artifacts.repository_id",
+            "artifacts.path",
+        ] {
+            assert!(
+                not_null.contains(declared),
+                "the harvest lost {declared}, which the tree declares NOT NULL"
+            );
+        }
+        for nullable in [
+            "artifacts.deleted_at",
+            "policy_projections.last_evaluated_at",
+        ] {
+            assert!(
+                !not_null.contains(nullable),
+                "the harvest claims {nullable} is NOT NULL, which the tree never says — an \
+                 over-broad nullability set exempts a primary-key widening that really does \
+                 impose NOT NULL"
+            );
+        }
+    }
+
+    #[test]
+    fn real_tree_goes_red_when_a_key_narrowings_entry_is_removed() {
+        // The same probe the `CHECK` narrowings carry, for the two
+        // uniqueness / referential entries: strip the declaration out of
+        // the real manifest text and the real scan must report it. This is
+        // what proves each entry is load-bearing rather than decorative —
+        // the green run above would look identical if the scanner had
+        // simply gone quiet.
+        for (migration, identifier) in [
+            ("002_repositories.sql", "permission_grants.repository_id"),
+            (
+                "017_scan_policy_scope_unique.sql",
+                "policy_projections.scope",
+            ),
+        ] {
+            let mut inputs = real_tree_inputs();
+            inputs.manifest_toml = without_entry(&inputs.manifest_toml, migration);
+            let hits = violations(&inputs);
+            assert_eq!(hits.len(), 1, "{hits:?}");
+            assert!(
+                hits[0].starts_with(migration)
+                    && hits[0].contains(identifier)
+                    && hits[0].contains("no entry in migrations/"),
+                "stripping the entry must make the real scan report the narrowing: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn real_tree_goes_red_when_a_widening_loses_what_makes_it_one() {
+        // The mutation counter-assertion for the exemption, run over REAL
+        // on-disk migration SQL rather than a fixture: over a clean tree
+        // the exemption and a scanner that never saw these statements agree
+        // on the verdict and differ only in what they read, so nothing else
+        // here can tell them apart. Each mutation removes exactly one of
+        // the exemption's conditions and the statement must report.
+        let clean = violations(&real_tree_inputs());
+        assert!(
+            clean.is_empty(),
+            "the real tree must be green before it is mutated: {clean:?}"
+        );
+
+        // (a) 013's pairing: without the `DROP CONSTRAINT` of the same
+        // name, the wider primary key has no predecessor to be wider than.
+        let mut inputs = real_tree_inputs();
+        mutate_migration(
+            &mut inputs,
+            "013_content_references_multivalue_pk.sql",
+            "DROP CONSTRAINT content_references_pkey;",
+            "DROP CONSTRAINT content_references_some_other_name;",
+        );
+        let hits = violations(&inputs);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].starts_with("013_content_references_multivalue_pk.sql"),
+            "{hits:?}"
+        );
+        for column in [
+            "content_references.repository_id",
+            "content_references.source_artifact_id",
+            "content_references.target_content_hash",
+            "content_references.kind",
+        ] {
+            assert!(hits[0].contains(column), "{column} missing from {hits:?}");
+        }
+
+        // (b) 013's nullability: with `target_content_hash` nullable, the
+        // same widening imposes a NOT NULL the row-admission argument says
+        // nothing about.
+        let mut inputs = real_tree_inputs();
+        mutate_migration(
+            &mut inputs,
+            "003_artifacts_cas.sql",
+            "target_content_hash text NOT NULL",
+            "target_content_hash text",
+        );
+        let hits = violations(&inputs);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].starts_with("013_content_references_multivalue_pk.sql")
+                && hits[0].contains("content_references.target_content_hash"),
+            "{hits:?}"
+        );
+
+        // (c) 021's pairing: without the `DROP CONSTRAINT`, the partial
+        // unique index replaces nothing — which is 017's shape, and the
+        // property a tree holding only 021 does not pin.
+        let mut inputs = real_tree_inputs();
+        mutate_migration(
+            &mut inputs,
+            "021_artifacts_soft_delete.sql",
+            "DROP CONSTRAINT artifacts_repository_id_path_key;",
+            "DROP CONSTRAINT artifacts_some_other_name;",
+        );
+        let hits = violations(&inputs);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(
+            hits[0].starts_with("021_artifacts_soft_delete.sql")
+                && hits[0].contains("artifacts.repository_id")
+                && hits[0].contains("artifacts.path"),
+            "{hits:?}"
+        );
+
+        // (d) and the keyword the index verdict turns on: without `UNIQUE`
+        // the same statement constrains nothing, so it must go quiet even
+        // with the pairing gone.
+        let mut inputs = real_tree_inputs();
+        mutate_migration(
+            &mut inputs,
+            "021_artifacts_soft_delete.sql",
+            "DROP CONSTRAINT artifacts_repository_id_path_key;",
+            "DROP CONSTRAINT artifacts_some_other_name;",
+        );
+        mutate_migration(
+            &mut inputs,
+            "021_artifacts_soft_delete.sql",
+            "CREATE UNIQUE INDEX artifacts_repository_id_path_live_key",
+            "CREATE INDEX artifacts_repository_id_path_live_key",
+        );
+        assert!(
+            violations(&inputs).is_empty(),
+            "a non-unique index constrains nothing: {:?}",
+            violations(&inputs)
+        );
+    }
+
+    #[test]
+    fn the_017_entry_is_what_keeps_the_real_tree_green() {
+        // Stated as its own test because it is the acceptance criterion for
+        // this unit, and the two halves have to be asserted together: the
+        // real corpus is green WITH the entry and red WITHOUT it. Either
+        // half alone is satisfied by a guard that reports nothing.
+        let inputs = real_tree_inputs();
+        assert!(
+            inputs
+                .manifest_toml
+                .contains("017_scan_policy_scope_unique.sql"),
+            "the manifest must declare 017 for this test to mean anything"
+        );
+        assert!(violations(&inputs).is_empty());
+        let mut stripped = real_tree_inputs();
+        stripped.manifest_toml =
+            without_entry(&stripped.manifest_toml, "017_scan_policy_scope_unique.sql");
+        assert_eq!(violations(&stripped).len(), 1);
     }
 
     // ---- Rust string-literal extraction. ---------------------------------
