@@ -83,6 +83,13 @@
       "matchPackageNames": ["alpine/helm"],
       "matchUpdateTypes": ["major"],
       "enabled": false
+    },
+    {
+      "description": "The three release/compose Dockerfiles pin ONE rust builder image, and scripts/ci/base-image-refs.sh asserts the pinned set is exactly three unique repo@digest refs, so a digest bump that reaches only some of them is red by construction: quality:base-image-preflight-test emits four refs and fails on the count. The tag strings differ - rust:1.100-slim-trixie in deploy/compose/Dockerfile, rust:${RUST_VERSION}-slim in docker/Dockerfile.hort-server and docker/Dockerfile.worker - which is why the digest arrives as two separate updates that are each unmergeable alone and green only together. Grouping makes the one coupled bump one MR. Scoped to digest updates: a rust *version* move is groomed work with MSRV and lint fallout and stays its own proposal. Unpark condition: the group stops being needed if those Dockerfiles stop sharing a builder image.",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["rust"],
+      "matchUpdateTypes": ["digest", "pinDigest"],
+      "groupName": "rust builder image digest"
     }
   ]
 }
