@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Migration notice
+
+- **`artifacts.quarantine_status` is narrowed to the four storable states**
+  (migration `044_artifacts_quarantine_status_storable_set.sql`). Minimum
+  tolerating binary version: **0.14.1**. Upgrade from 0.14.1 or newer; take a
+  maintenance window or suspend automated remediation if old pods cannot
+  error during rollout. See the [upgrade how-to](docs/architecture/how-to/deploy/upgrade.md).
+  This adds no rollback restriction beyond the existing 0.17.3 floor.
+
 ### Changed
 
 - `hort-server migrate` refuses a pending contraction only when a connected

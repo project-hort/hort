@@ -1,40 +1,7 @@
-//! Integration test — an `artifacts` row whose stored
-//! `quarantine_status` the domain cannot classify is neither
-//! downloadable nor advertised by an index, driven through the real
-//! Postgres adapter and the real axum router.
-//!
-//! # Why this test cannot be written with a fixture
-//!
-//! The defect lived in the *decode*. Every mock artifact repository in
-//! the workspace stores a typed
-//! [`QuarantineStatus`](hort_domain::entities::artifact::QuarantineStatus),
-//! so a test built on one can only ever ask what the system does with a
-//! status that already parsed — and the question here is what it does
-//! with one that cannot. The three spellings below
-//! (`unscanned` / `clean` / `flagged`) are prototype-era scan states
-//! that migration `003`'s CHECK still accepts and `QuarantineStatus`
-//! cannot parse; before the fix, the row mapper discarded the parse
-//! error and substituted `QuarantineStatus::None` — the most permissive
-//! state in the system — so such a row was advertised by the index and
-//! served on download with no release authority behind it and no
-//! `ArtifactReleased` in its stream.
-//!
-//! So: a real row, written as raw SQL (no writer in the tree produces
-//! these values), read through
-//! [`PgArtifactRepository`](hort_adapters_postgres::artifact_repo::PgArtifactRepository),
-//! and driven through the production npm handler stack by
-//! `tower::oneshot`.
-//!
-//! # What each test pins, and why the control case matters
-//!
-//! Every assertion is made twice over the same fixture: once for the
-//! legacy spelling and once for `'released'`. Without the second half,
-//! a fixture that was simply broken (wrong path, missing repository,
-//! absent content) would produce the same "not served" verdict and the
-//! test would pass while proving nothing. The control is what makes the
-//! legacy case attributable to the decode — and, in the migration test,
-//! what keeps "not advertised" from being satisfied by a 404 over an
-//! empty package.
+//! Real-DB checks for the quarantine-status storage boundary and the legacy
+//! backfill. The current schema refuses prototype scan states on write; the
+//! backfill test starts before that constraint and checks that older rows
+//! become held before a download or index read.
 //!
 //! # The hybrid context
 //!
@@ -91,16 +58,11 @@ use hort_http_core::context::AppContext;
 use hort_http_core::test_support::{build_mock_ctx, with_artifacts, MockPorts};
 use hort_server::migrate::MIGRATOR;
 
-/// The spellings migration `003`'s CHECK accepts and the domain cannot
-/// parse. `030_artifacts_quarantine_status_legacy_backfill.sql` replaces
-/// them with the held state; this test is about what happens if one is
-/// in front of a read anyway.
+/// Prototype scan-state spellings the current schema must refuse.
 const UNCLASSIFIABLE_SPELLINGS: [&str; 3] = ["unscanned", "clean", "flagged"];
 
 const REPO_KEY: &str = "npm-legacy-status";
 const PACKAGE: &str = "legacy-pkg";
-const VERSION: &str = "1.0.0";
-const FILENAME: &str = "legacy-pkg-1.0.0.tgz";
 const TARBALL: &[u8] = b"legacy-tarball-bytes";
 
 /// The control version in the post-migration fixture — a `'released'`
@@ -184,10 +146,9 @@ async fn pre_backfill_pool() -> Option<(PgPool, PgPool, String)> {
     Some((pool, admin, db_name))
 }
 
-/// Apply the backfill migration — and only it — to a pool standing one
-/// version below it. `MIGRATOR::run` applies every pending migration,
-/// which at this waterline is exactly the backfill.
-async fn run_backfill_migration(pool: &PgPool) {
+/// Apply the backfill and all later migrations to a pool standing one
+/// version below it. This also proves later constraints accept its output.
+async fn run_remaining_migrations(pool: &PgPool) {
     MIGRATOR
         .run(pool)
         .await
@@ -250,27 +211,14 @@ async fn seed_repository_row(pool: &PgPool, id: Uuid) {
     .expect("seed repositories row");
 }
 
-/// Write the artifact row with `raw` in `quarantine_status`, as raw SQL.
-///
-/// Raw SQL is not a shortcut here, it is the only way: the adapter's
-/// encoder cannot produce any of these spellings (that is the point of
-/// having one encoder), so a row carrying one can only be written
-/// behind it — which is also exactly how a migrated database would come
-/// to hold one.
-async fn seed_artifact_row(pool: &PgPool, repository_id: Uuid, raw: &str) -> Uuid {
-    seed_artifact_version_row(pool, repository_id, raw, VERSION).await
-}
-
-/// [`seed_artifact_row`] for an arbitrary version, so one fixture can
-/// carry several versions of the same package side by side — the shape
-/// the post-migration index assertion needs (held versions next to a
-/// served one, in one packument).
-async fn seed_artifact_version_row(
+/// Attempt a raw artifact write. The post-migration test inspects the
+/// constraint error; the pre-backfill test uses the successful wrapper.
+async fn try_seed_artifact_version_row(
     pool: &PgPool,
     repository_id: Uuid,
-    raw: &str,
+    raw: Option<&str>,
     version: &str,
-) -> Uuid {
+) -> Result<Uuid, sqlx::Error> {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"INSERT INTO public.artifacts (
@@ -293,9 +241,19 @@ async fn seed_artifact_version_row(
     .bind("0".repeat(40))
     .bind(raw)
     .execute(pool)
-    .await
-    .expect("seed artifacts row");
-    id
+    .await?;
+    Ok(id)
+}
+
+async fn seed_artifact_version_row(
+    pool: &PgPool,
+    repository_id: Uuid,
+    raw: &str,
+    version: &str,
+) -> Uuid {
+    try_seed_artifact_version_row(pool, repository_id, Some(raw), version)
+        .await
+        .expect("seed artifacts row")
 }
 
 /// The npm tarball filename for `version` — `{basename}-{version}.tgz`,
@@ -365,19 +323,6 @@ async fn get(ctx: &Arc<AppContext>, uri: &str) -> (StatusCode, String) {
     (status, String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Drop the artifact rows so the next spelling starts from a clean
-/// fixture within the same throwaway database.
-async fn clear_artifacts(pool: &PgPool) {
-    sqlx::query("DELETE FROM public.artifacts")
-        .execute(pool)
-        .await
-        .expect("clear artifacts");
-}
-
-fn download_uri() -> String {
-    format!("/npm/{REPO_KEY}/{PACKAGE}/-/{FILENAME}")
-}
-
 fn download_uri_for(version: &str) -> String {
     format!("/npm/{REPO_KEY}/{PACKAGE}/-/{}", tarball_filename(version))
 }
@@ -386,142 +331,49 @@ fn packument_uri() -> String {
     format!("/npm/{REPO_KEY}/{PACKAGE}")
 }
 
-/// A real download of a row carrying an unclassifiable status does not
-/// serve the bytes — and the identical fixture at `'released'` does, so
-/// the refusal is attributable to the status and not to the fixture.
+/// The column refuses each prototype spelling before a read can see it.
+/// Valid stored states, including SQL NULL, prove the fixture can write.
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn an_unclassifiable_status_row_is_not_downloadable() {
+async fn legacy_status_spellings_cannot_enter_the_column() {
     let Some(pool) = isolated_pool().await else {
         return;
     };
     let repository_id = Uuid::new_v4();
     seed_repository_row(&pool, repository_id).await;
-    let (ctx, _mocks) = harness(&pool, repository_id).await;
-
-    // Control first: the fixture is sound and the download works.
-    seed_artifact_row(&pool, repository_id, "released").await;
-    let (status, body) = get(&ctx, &download_uri()).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "control: a released row must download — otherwise the legacy \
-         verdict below proves nothing about the status. Body: {body}"
-    );
-    assert_eq!(
-        body.as_bytes(),
-        TARBALL,
-        "control: the download must serve the seeded content"
-    );
-
-    for raw in UNCLASSIFIABLE_SPELLINGS {
-        clear_artifacts(&pool).await;
-        seed_artifact_row(&pool, repository_id, raw).await;
-
-        let (status, body) = get(&ctx, &download_uri()).await;
-        assert_ne!(
-            status,
-            StatusCode::OK,
-            "a row carrying {raw:?} must not download"
-        );
-        assert_ne!(
-            body.as_bytes(),
-            TARBALL,
-            "a row carrying {raw:?} must not serve its content"
-        );
-    }
-}
-
-/// A real hosted-index serve does not advertise the version of a row
-/// carrying an unclassifiable status. Same control/legacy pairing.
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn an_unclassifiable_status_row_is_not_served_by_the_index() {
-    let Some(pool) = isolated_pool().await else {
-        return;
-    };
-    let repository_id = Uuid::new_v4();
-    seed_repository_row(&pool, repository_id).await;
-    let (ctx, _mocks) = harness(&pool, repository_id).await;
-
-    // Control: the released row IS advertised, so "absent" below is a
-    // verdict about the status rather than about an empty repository.
-    seed_artifact_row(&pool, repository_id, "released").await;
-    let (status, body) = get(&ctx, &packument_uri()).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "control: a released row must be advertised. Body: {body}"
-    );
-    assert!(
-        body.contains(VERSION),
-        "control: the packument must advertise {VERSION}; got {body}"
-    );
-
-    for raw in UNCLASSIFIABLE_SPELLINGS {
-        clear_artifacts(&pool).await;
-        seed_artifact_row(&pool, repository_id, raw).await;
-
-        let (status, body) = get(&ctx, &packument_uri()).await;
-        assert_ne!(
-            status,
-            StatusCode::OK,
-            "an index serve that cannot classify a row must not answer 200 \
-             for {raw:?}"
-        );
-        assert!(
-            !body.contains(FILENAME),
-            "the index must not advertise a tarball for {raw:?}; got {body}"
-        );
-    }
-}
-
-/// The per-version status read every format's index-serve filter
-/// consumes — `ArtifactUseCase::package_version_status`, the feed for
-/// the npm / PyPI / cargo proxy sources and for
-/// `filter_served_versions` — fails rather than report an
-/// unclassifiable row as servable.
-///
-/// Driven at the use-case seam on purpose: this one read is shared by
-/// every format, so pinning it here covers the proxy sources of all of
-/// them without four router fixtures. The per-format propagation (that
-/// none of them substitutes an empty status map) is pinned in each
-/// format crate's own tests.
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn the_shared_per_version_status_read_fails_closed() {
-    let Some(pool) = isolated_pool().await else {
-        return;
-    };
-    let repository_id = Uuid::new_v4();
-    seed_repository_row(&pool, repository_id).await;
-    let (ctx, _mocks) = harness(&pool, repository_id).await;
-
-    seed_artifact_row(&pool, repository_id, "released").await;
-    let servable = ctx
-        .artifact_use_case
-        .package_version_status(repository_id, PACKAGE)
+    for (index, raw) in UNCLASSIFIABLE_SPELLINGS.iter().enumerate() {
+        let err = try_seed_artifact_version_row(
+            &pool,
+            repository_id,
+            Some(raw),
+            &format!("legacy-{index}"),
+        )
         .await
-        .expect("control: a released row reads back");
-    assert_eq!(
-        servable,
-        vec![(VERSION.to_string(), QuarantineStatus::Released)],
-        "control: the read must report the released version"
-    );
-
-    for raw in UNCLASSIFIABLE_SPELLINGS {
-        clear_artifacts(&pool).await;
-        seed_artifact_row(&pool, repository_id, raw).await;
-
-        let err = ctx
-            .artifact_use_case
-            .package_version_status(repository_id, PACKAGE)
-            .await
-            .expect_err("an unclassifiable row must not read back as a status");
-        assert!(
-            err.to_string().contains(raw),
-            "the error must name the offending value; got {err}"
+        .expect_err("legacy status must be refused by the column CHECK");
+        let db = err
+            .as_database_error()
+            .expect("Postgres rejected the write");
+        assert_eq!(db.code().as_deref(), Some("23514"), "{raw}: {err}");
+        assert_eq!(
+            db.constraint(),
+            Some("artifacts_quarantine_status_check"),
+            "{raw}: {err}"
         );
+    }
+
+    for (index, status) in [
+        Some("quarantined"),
+        Some("released"),
+        Some("rejected"),
+        Some("scan_indeterminate"),
+        None,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        try_seed_artifact_version_row(&pool, repository_id, status, &format!("valid-{index}"))
+            .await
+            .expect("a domain-storable status must be admitted");
     }
 }
 
@@ -588,7 +440,7 @@ async fn a_legacy_row_written_before_the_backfill_is_held_by_it() {
         );
     }
 
-    run_backfill_migration(&pool).await;
+    run_remaining_migrations(&pool).await;
 
     // --- the column ---------------------------------------------------
     for (raw, version) in &legacy {

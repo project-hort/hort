@@ -323,20 +323,11 @@ async fn the_singular_read_picks_where_the_plural_read_enumerates() {
     );
 }
 
-/// A status the column's CHECK still admits but the codec cannot
-/// classify fails the read instead of answering with a state.
-///
-/// Migration `003`'s CHECK accepts three spellings no code writes any
-/// more (`unscanned`, `clean`, `flagged`), so the row is schema-legal
-/// and only the codec stands between it and a serving decision. This
-/// read decides a curator release, and the permissive
-/// `QuarantineStatus::None` is both the value a substituted decode
-/// lands on and the state the bulk waive's own guard would read as
-/// "nothing to release" — so a discarded decode error here would not
-/// degrade the resolution, it would invert it.
+/// A stored scan-indeterminate hold stays attached to the exact row the
+/// curation resolver reads, rather than becoming a permissive `None`.
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn an_unclassifiable_status_fails_the_read_rather_than_answering() {
+async fn a_scan_indeterminate_status_travels_with_the_row() {
     let Some(pool) = maybe_pool().await else {
         return;
     };
@@ -345,25 +336,19 @@ async fn an_unclassifiable_status_fails_the_read_rather_than_answering() {
         &pool,
         repo,
         DIGEST_SINGLE,
-        "blobs/legacy",
-        Some("unscanned"),
+        "blobs/indeterminate",
+        Some("scan_indeterminate"),
         false,
     )
     .await;
 
     let port = repo_port(&pool).await;
-    let err = port
+    let rows = port
         .find_live_rows_by_repo_and_checksums(repo, &[hash(DIGEST_SINGLE)])
         .await
-        .expect_err("an unclassifiable status must not resolve to a state");
-    let message = err.to_string();
-    assert!(
-        message.contains("unclassifiable quarantine_status"),
-        "the refusal must say what it could not read: {message}"
-    );
-    assert!(
-        message.contains("find_live_rows_by_repo_and_checksums")
-            && message.contains(&id.to_string()),
-        "the refusal must name the read and the row, so the bad row is findable: {message}"
+        .expect("a storable status reads back");
+    assert_eq!(
+        rows,
+        vec![(hash(DIGEST_SINGLE), id, QuarantineStatus::ScanIndeterminate)]
     );
 }
