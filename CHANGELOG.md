@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tolerating binary version: **0.14.1**. Upgrade from 0.14.1 or newer; take a
   maintenance window or suspend automated remediation if old pods cannot
   error during rollout. See the [upgrade how-to](docs/architecture/how-to/deploy/upgrade.md).
-  This adds no rollback restriction beyond the existing 0.17.3 floor.
+  After the migration, the schema-compatibility register reports **0.14.1** as
+  the oldest tolerated binary; it reported 0.12.0 before.
 
 ### Changed
 
