@@ -61,12 +61,17 @@ Do not assume either; read each site.
 ### 2. What the expand/contract guard actually reaches
 
 The issue says adding a `CHECK` is schema-narrowing and therefore falls under
-ADR 0030. **Check that against the guard rather than against the sentence.**
-`crates/hort-app/tests/expand_contract_guard.rs` enumerates the destructive DDL
-it rejects — `DROP COLUMN`, `DROP TABLE`, table-or-column `RENAME`, a column
-type change, `SET NOT NULL`. If an added `CHECK` is not in that set, then
-**no `migrations/CONTRACTIONS.toml` entry is required and no release split is
-mechanically forced** — state that finding with the line you read it at.
+ADR 0030. **Check that against the guard rather than against the sentence** —
+and the guard has since changed, so read it rather than this paragraph.
+`crates/hort-app/tests/expand_contract_guard.rs` now classifies
+`ALTER TABLE … ADD CONSTRAINT … CHECK` as a narrowing for every referenced
+column that existed before the migration, alongside `DROP COLUMN`,
+`DROP TABLE`, table-or-column `RENAME`, a column type change and
+`SET NOT NULL`. So an added `CHECK` on a pre-existing column **does** require a
+`migrations/CONTRACTIONS.toml` entry and **is** mechanically release-split; the
+exception is a replacement whose admitted value set only grew, which takes
+nothing away from any writer. State which of the two the change is, with the
+line you read it at.
 
 The guard is the authority on its own rule. What it does *not* answer is the
 next point, which is the real risk and survives whatever the guard says.

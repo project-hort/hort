@@ -22,12 +22,39 @@
 #    migration             file name under migrations/
 #    identifiers           `table` or `table.column`, unqualified and
 #                          lower-cased; exactly the set the SQL affects
-#    reference_removed_in  the release whose code no longer references these
-#                          identifiers — so the release before it is the last
-#                          that did. A plain X.Y.Z (no pre-release suffix):
-#                          the policy is stated in terms of releases
-#                          operators upgrade between. The guard requires the
-#                          workspace version to be strictly greater than this.
+#    reference_removed_in  the release whose code no longer produces what
+#                          this migration takes away — so the release before
+#                          it is the last that did. For a REMOVED identifier
+#                          (a drop, a rename) that is the release whose code
+#                          stopped naming it. For a NARROWED one the
+#                          identifier stays and the forbidden VALUES are what
+#                          the code stopped producing: a type change, a
+#                          SET NOT NULL or a new CHECK leaves every query
+#                          that reads the column working and breaks the write
+#                          paths that still emit the old shape. So read it as
+#                          "the release whose writers can no longer emit a
+#                          value this migration refuses" — equivalently, and
+#                          this is the reading a production consumer relies
+#                          on, THE OLDEST BINARY VERSION THIS MIGRATION
+#                          TOLERATES. `crates/hort-server/src/contractions.rs`
+#                          reads this field at runtime for two
+#                          operator-facing behaviours: the fleet fence, which
+#                          refuses `hort-server migrate` while an older
+#                          hort-shaped client is connected and a pending
+#                          migration is declared here, and the
+#                          schema-compatibility register, whose recorded
+#                          `min_binary_version` is the rollback floor a later
+#                          binary reads back. So an overstated value is not
+#                          harmless bookkeeping — it tells an operator in an
+#                          incident that a rollback their schema does
+#                          tolerate is unsafe. A migration that takes NOTHING
+#                          away from any writer tolerates every binary, and
+#                          its honest value is the oldest release in the
+#                          repository's history. A plain X.Y.Z (no
+#                          pre-release suffix): the policy is stated in terms
+#                          of releases operators upgrade between. The guard
+#                          requires the workspace version to be strictly
+#                          greater than this.
 #    note                  why this contraction was safe — or, for a
 #                          historical entry, what actually happened. Required
 #                          and non-empty.
@@ -91,6 +118,99 @@ and prevented all of it.
 """
 
 # ---------------------------------------------------------------------------
+# CHECK additions on a pre-existing column.
+#
+# `ALTER TABLE … ADD CONSTRAINT … CHECK` narrows the write contract of every
+# column the CHECK body names: from the instant the migration hook commits,
+# the still-running previous release can produce a value PostgreSQL now
+# refuses. `SET NOT NULL` is the special case `CHECK (c IS NOT NULL)`; these
+# are the general form, and they carry the same obligation. `NOT VALID` is
+# not an escape — it exempts existing ROWS from the check, never a future
+# INSERT or UPDATE.
+#
+# Two statements in this tree carry the shape and are declared below. What is
+# NOT here is the commoner shape by far: a `DROP CONSTRAINT …_check` paired
+# with a re-`ADD` of the same name whose `IN` list is the old list plus one
+# new literal (migrations 018, 023, 024, 027, 036, 037, 041). An admitted set
+# that only grew tightens nothing — no writer that has ever existed loses a
+# value it could produce — so such a statement is not a narrowing and the
+# guard does not report it. Declaring one would also fence a routine rolling
+# upgrade: the runtime fleet fence keys on whether a pending migration is
+# declared here, and ADR 0030 says in as many words that "an expand-only
+# pending set is never fenced, so routine rolling upgrades stay hook-driven
+# and unattended".
+#
+# That exemption is a syntactic comparison of two enumerated literal lists,
+# not an effects analysis: the guard requires the same migration to drop the
+# same constraint name, the previous definition of that name to be findable
+# in the migration set, both definitions to be `<col> IN (<literal>, …)` over
+# the same single column, and the new set to be a superset of the old. Every
+# other case FAILS CLOSED and is reported — an unfindable previous
+# definition, either side not the `IN` form, a set that is neither superset
+# nor comparable. A guard that goes quiet when it cannot decide is worse than
+# one that asks for an entry it did not need, which is why 031 below is
+# declared even though its CHECK is harmless.
+#
+# A CHECK on a column the SAME migration creates needs no entry and gets
+# none either: no previous release ever wrote a value it forbids. The guard
+# derives that from the migration set rather than from a list here.
+# ---------------------------------------------------------------------------
+
+[[contraction]]
+migration = "031_upstream_mappings_allowed_realm_hosts.sql"
+identifiers = ["repository_upstream_mappings.upstream_auth_type"]
+reference_removed_in = "0.9.2"
+note = """
+Declared because the guard fails closed here, and that is the right outcome
+for a shape-based guard even though the statement is in effect harmless. The
+CHECK is `allowed_realm_hosts = '{}' OR upstream_auth_type =
+'bearer_challenge'` — a NEW cross-column rule, not a replacement of an
+existing constraint, so there is no previous definition to compare an
+admitted set against and the expand-only exemption above does not reach it.
+It names `upstream_auth_type`, created back in migration 007.
+
+Why it refuses no write any earlier binary could make: the only way to
+violate it is a non-`'{}'` `allowed_realm_hosts`, and that column is created
+by THIS migration with a `'{}'` default — so every existing row and every
+write from a binary that does not know the column satisfies the left
+disjunct whatever its `upstream_auth_type`, and the first writer that can set
+a host list ships with the column. Establishing that needs reasoning about
+what the predicate SATISFIES, across a disjunction and a column default,
+which is the effects analysis the guard deliberately does not do.
+
+`reference_removed_in` therefore states what is true under the field's
+runtime meaning — the oldest binary version this migration tolerates (see
+Fields above). Nothing was taken away from any writer, so that is the oldest
+release in the repository's history, 0.9.2, and not the release 031 shipped
+in: dating it to its shipping release would make the schema-compatibility
+register report a rollback floor the schema does not impose. The fleet fence
+reads only WHETHER a migration is declared, not the version, so it can still
+refuse a rolling upgrade across this migration; narrowing that is a change to
+the fence's own decision and needs a decision record, not a manifest edit.
+"""
+
+[[contraction]]
+migration = "039_policy_projections_quarantine_duration_nonnegative.sql"
+identifiers = ["policy_projections.quarantine_duration_secs"]
+reference_removed_in = "0.17.3"
+note = """
+A REAL narrowing, and the one that motivated recognising this shape: a fresh
+`CHECK (quarantine_duration_secs >= 0) NOT VALID` on a column that had no
+constraint before. It shipped in 0.17.3 — the same release as the
+application-side refusal that stopped the write paths producing a negative
+duration — which is the same-release shape this policy forbids, and it went
+undeclared because the scanner did not yet recognise a CHECK addition.
+`NOT VALID` narrowed nothing about the exposure: it exempts existing rows,
+while every INSERT and UPDATE is constrained from the hook onward. So in the
+0.17.2 -> 0.17.3 mixed window a still-running 0.17.2 pod could accept a
+negative duration through the policy write path and have PostgreSQL reject
+it. The failure is loud — a rejected write, with no silent corruption and no
+effect on reads or on any other policy field — and the window is closed for
+anyone already on 0.17.3 or later. It is still open for an instance moving up
+from 0.17.2 today. Waiting one release would have cost nothing.
+"""
+
+# ---------------------------------------------------------------------------
 # Scheduled contractions — declared here in prose, not as `[[contraction]]`
 # entries, because the guard's checks are about migrations that EXIST.
 #
@@ -151,9 +271,17 @@ and prevented all of it.
 # `018_jobs_kind_oci_edge_backfill.sql` for the same constraint and the same
 # DROP + re-ADD shape).
 #
-# Note for whoever lands it: `expand_contract_guard`'s scanner does NOT treat
-# `DROP CONSTRAINT` as destructive DDL (deliberately — a constraint is not an
-# identifier old code names), and `no_sensitive_drops` exempts a same-name
-# `_check` DROP + re-ADD, so neither guard will ask for a manifest entry. That
-# is why this note exists: the guard cannot be the reminder, and this file is
-# where a reader looks.
+# Note for whoever lands it: `expand_contract_guard` now classifies the
+# `ADD CONSTRAINT … CHECK` half of that DROP + re-ADD as a narrowing of
+# `artifacts.quarantine_status` (the column pre-exists the migration), so the
+# migration WILL need an entry here naming exactly that identifier — the DROP
+# half still contributes nothing, and `no_sensitive_drops` still exempts a
+# same-name `_check` DROP + re-ADD. The expand-only exemption described above
+# does NOT reach it and must not be expected to: this narrowing REMOVES three
+# literals (`unscanned`, `clean`, `flagged`), so its admitted set is a strict
+# subset of 003's rather than a superset, which is the whole difference
+# between it and migrations 018 / 023 / 024 / 027 / 036 / 037 / 041. The
+# entry's `reference_removed_in` is "0.14.1" per the arithmetic above.
+# Landing it remains a decision rather than an automatism, which is why this
+# item stays prose: this file is where a reader looks for what is owed and
+# not yet done.
