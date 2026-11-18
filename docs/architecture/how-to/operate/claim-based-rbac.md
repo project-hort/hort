@@ -221,6 +221,38 @@ widen an SA's authority does nothing — the SA bearer never resolves
 claims. To change what a ServiceAccount can do, add or remove its
 `PermissionGrant`s.
 
+**A new grant does not reach a token that already exists.** A
+service-account token carries its permission cap **frozen at
+issuance**: the federation exchange and the fallback-rotation mint both
+snapshot the effective grants into the cap
+([ADR 0044](../../../adr/0044-service-accounts-identity-only.md)), and
+authorization intersects that cap with the live grants
+([ADR 0036](../../../adr/0036-oci-auth-capability-token.md)). Effective
+authority is `grants ∩ claims ∩ cap`, and only the grants leg
+re-resolves per call. So a `PermissionGrant` added after the SA's token
+was minted applies to every *future* token and to no existing one — the
+apply succeeds, the grant is in the database and in the evaluator
+snapshot, and the bearer still gets `403`. The server's denial response
+says so at point (c), but only once someone has already tried and
+failed.
+
+Whether it bites depends on the cap's **shape**, not on the grant's
+existence: a cap with no repository restriction already admits a grant
+for a *new repository* as long as the permission it needs is in the
+frozen set. What the freeze blocks is a permission the cap does not
+carry, or a repository outside an explicitly enumerated cap.
+
+The freeze is deliberate — a leaked token must not gain authority
+because an operator widened the subject later — so the remedy is to
+**rotate the token**, not to relax the cap: see
+[`../rotating-service-account-tokens.md`](../rotating-service-account-tokens.md).
+Note that the chart's bootstrap job is idempotent and reports
+"nothing to do" for an SA that already has a token, so nothing rotates
+on its own. Verify the result with
+`GET /api/v1/auth/whoami` — its `effective_grants` is cap-intersected,
+so it answers what *this* token can do, and `permissions` is the frozen
+set itself.
+
 ### 3.1 Prefer a durable `User`-subject Admin grant for `HORT_TOKEN_ALLOW_ADMIN` deployments
 
 `is_admin` is recomputed from the IdP `groups` claim and **persisted**
