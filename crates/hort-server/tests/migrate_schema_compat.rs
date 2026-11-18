@@ -28,9 +28,9 @@
 //!    `re_running_migrate_leaves_the_register_unchanged` /
 //!    `an_upgrade_backfills_every_embedded_migration` — the register write:
 //!    one row per migration the binary embeds, carrying the oldest binary
-//!    version it tolerates, written once and never rewritten, and
-//!    backfilled for whatever an older, pre-register binary already
-//!    applied.
+//!    version it tolerates, and backfilled for whatever an older,
+//!    pre-register binary already applied. A later declaration fills a
+//!    previously recorded NULL without overwriting a recorded floor.
 //! 6. `a_newer_contraction_refuses_the_migrate_gate_too` /
 //!    `an_unregistered_newer_migration_refuses_the_migrate_gate` — a
 //!    structurally-newer schema is not enough: a migration ahead that
@@ -60,11 +60,14 @@ use std::env;
 use std::time::Duration;
 
 use hort_config::pg_identity::parse_version_core;
-use hort_config::schema_compat::{register_from_rows, schema_rollback_floor, SchemaRollbackFloor};
+use hort_config::schema_compat::{
+    register_from_rows, schema_rollback_floor, MigrationTolerance, SchemaRollbackFloor,
+};
 use hort_server::contractions::contraction_minimum_binary_versions;
 use hort_server::migrate::{assert_current, run as migrate_run, MIGRATOR};
 use serial_test::serial;
 use sqlx::{Executor, PgPool};
+use tracing_test::traced_test;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -195,6 +198,30 @@ async fn register_rows(pool: &PgPool) -> BTreeMap<i64, Option<String>> {
     .expect("read schema_compat_register")
     .into_iter()
     .collect()
+}
+
+fn strictest_declared_floor(applied: &BTreeSet<i64>) -> (i64, String) {
+    let declared: Vec<(i64, String)> = contraction_minimum_binary_versions()
+        .into_iter()
+        .filter(|(version, _)| applied.contains(version))
+        .collect();
+    let strictest = declared
+        .iter()
+        .max_by_key(|(_, minimum)| {
+            parse_version_core(minimum).expect("every declared floor parses as X.Y.Z")
+        })
+        .expect("the applied set contains a declared contraction");
+    let lowest = declared
+        .iter()
+        .min_by_key(|(_, minimum)| {
+            parse_version_core(minimum).expect("every declared floor parses as X.Y.Z")
+        })
+        .expect("the applied set contains a declared contraction");
+    assert!(
+        parse_version_core(&strictest.1) > parse_version_core(&lowest.1),
+        "the applied set must declare at least two distinct floors"
+    );
+    strictest.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -368,17 +395,19 @@ async fn migrating_a_fresh_database_registers_every_applied_migration() {
         "every migration this run applied owes the register a row"
     );
 
-    // The contraction the manifest declares carries its
-    // `reference_removed_in`; everything else removed nothing and
-    // records NULL. `020_drop_artifacts_is_deleted.sql` is the incident
-    // exemplar the expand/contract policy exists for.
+    let declared = contraction_minimum_binary_versions();
+    let (contraction, minimum) = strictest_declared_floor(&embedded_versions());
+    let expansion = embedded_versions()
+        .into_iter()
+        .find(|version| !declared.contains_key(version))
+        .expect("the embedded set contains an expansion");
     assert_eq!(
-        register.get(&20),
-        Some(&Some("0.12.0".to_string())),
+        register.get(&contraction),
+        Some(&Some(minimum)),
         "a declared contraction records the oldest binary version it tolerates"
     );
     assert_eq!(
-        register.get(&21),
+        register.get(&expansion),
         Some(&None),
         "a migration the manifest does not name removed nothing"
     );
@@ -387,8 +416,7 @@ async fn migrating_a_fresh_database_registers_every_applied_migration() {
 }
 
 /// Re-running `migrate` against an up-to-date database applies nothing and
-/// writes nothing — the rows are already there and an applied migration's
-/// contraction status is frozen (ADR 0022), so there is nothing to update.
+/// writes nothing when its recorded floors already match the manifest.
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn re_running_migrate_leaves_the_register_unchanged() {
@@ -403,6 +431,125 @@ async fn re_running_migrate_leaves_the_register_unchanged() {
 
     assert_eq!(register_rows(&pool).await, first);
 
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn a_later_declaration_fills_a_null_register_row() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR.run(&pool).await.expect("apply migrations");
+    let (version, minimum) = strictest_declared_floor(&applied_versions(&pool).await);
+    insert_register_row(&pool, version, None).await;
+
+    migrate_run(&pool).await.expect("backfill declared floor");
+
+    assert_eq!(
+        register_rows(&pool).await.get(&version),
+        Some(&Some(minimum))
+    );
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+#[traced_test]
+async fn a_recorded_floor_is_never_overwritten_or_misreported() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR.run(&pool).await.expect("apply migrations");
+    let (version, declared) = strictest_declared_floor(&applied_versions(&pool).await);
+    let core = parse_version_core(&declared).expect("declared floor parses");
+    let recorded = format!("{}.{}.{}", core.major, core.minor, core.patch + 1);
+    assert_ne!(recorded, declared);
+    insert_register_row(&pool, version, Some(&recorded)).await;
+
+    migrate_run(&pool).await.expect("preserve recorded floor");
+
+    assert_eq!(
+        register_rows(&pool).await.get(&version),
+        Some(&Some(recorded.clone()))
+    );
+    assert!(
+        logs_contain(&format!("tolerates_binaries_from={recorded}")),
+        "migrate must report the floor stored in the register"
+    );
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn a_genuine_expansion_stays_null_without_an_update() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR.run(&pool).await.expect("apply migrations");
+    let declared = contraction_minimum_binary_versions();
+    let version = embedded_versions()
+        .into_iter()
+        .find(|version| !declared.contains_key(version))
+        .expect("the embedded set contains an expansion");
+    insert_register_row(&pool, version, None).await;
+    let before: String =
+        sqlx::query_scalar("SELECT xmin::text FROM schema_compat_register WHERE version = $1")
+            .bind(version)
+            .fetch_one(&pool)
+            .await
+            .expect("read row identity before backfill");
+
+    migrate_run(&pool).await.expect("leave expansion alone");
+
+    let after: String =
+        sqlx::query_scalar("SELECT xmin::text FROM schema_compat_register WHERE version = $1")
+            .bind(version)
+            .fetch_one(&pool)
+            .await
+            .expect("read row identity after backfill");
+    assert_eq!(
+        after, before,
+        "an expansion must not receive a NULL-to-NULL update"
+    );
+    let register = register_rows(&pool).await;
+    assert_eq!(register.get(&version), Some(&None));
+    assert_eq!(
+        register_from_rows(register).get(&version),
+        Some(&MigrationTolerance::Expansion)
+    );
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+#[traced_test]
+async fn a_filled_row_is_included_in_the_reported_maximum() {
+    let Some(admin) = admin_pool().await else {
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR.run(&pool).await.expect("apply migrations");
+    let applied = applied_versions(&pool).await;
+    let (version, strictest) = strictest_declared_floor(&applied);
+    insert_register_row(&pool, version, None).await;
+
+    migrate_run(&pool)
+        .await
+        .expect("fill and report declared floor");
+
+    let register = register_from_rows(register_rows(&pool).await);
+    assert_eq!(
+        schema_rollback_floor(&applied, &register),
+        SchemaRollbackFloor::Version(strictest.clone())
+    );
+    assert!(
+        logs_contain(&format!("tolerates_binaries_from={strictest}")),
+        "migrate must report the maximum declared floor after filling the row"
+    );
     drop_temp_db(&admin, &db_name, pool).await;
 }
 
@@ -452,34 +599,9 @@ async fn an_upgrade_backfills_every_embedded_migration() {
     // invariant — `schema_rollback_floor` reads the register rows the migrate
     // run wrote, this reads the manifest those rows came from — so a value
     // lost or mis-picked anywhere along that chain still fails here.
-    let declared: Vec<(i64, String)> = contraction_minimum_binary_versions()
-        .into_iter()
-        .filter(|(version, _)| applied.contains(version))
-        .collect();
-    let strictest = declared
-        .iter()
-        .max_by_key(|(_, minimum)| {
-            parse_version_core(minimum).expect("every declared floor parses as X.Y.Z")
-        })
-        .map(|(_, minimum)| minimum.clone())
-        .expect("the embedded migration set contains at least one declared contraction");
-
-    // Counter-assertion: the strictest floor is only meaningful as a maximum
-    // if the applied set declares more than one, with more than one value —
-    // otherwise this test would pass against an implementation that returns
-    // an arbitrary recorded minimum.
-    let lowest = declared
-        .iter()
-        .min_by_key(|(_, minimum)| {
-            parse_version_core(minimum).expect("every declared floor parses as X.Y.Z")
-        })
-        .map(|(_, minimum)| minimum.clone())
-        .expect("non-empty, checked above");
-    assert!(
-        parse_version_core(&strictest) > parse_version_core(&lowest),
-        "this assertion only pins a maximum while the applied set declares at least two \
-         distinct floors (strictest {strictest}, lowest {lowest})"
-    );
+    // The helper requires at least two distinct declared floors, so this
+    // checks a maximum rather than an arbitrary recorded minimum.
+    let (_, strictest) = strictest_declared_floor(&applied);
 
     assert_eq!(
         floor,
