@@ -4,6 +4,13 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 dockerfiles=(docker/Dockerfile.hort-server docker/Dockerfile.worker deploy/compose/Dockerfile)
+# Pinned, deliberately OUTSIDE the release set. The release set exists to
+# pre-warm and scan the bases that ship inside a product artifact; a harness
+# image's bases ship in nothing. Pulling them into the release set would make
+# every harness digest bump wait out a cold-digest quarantine window for no
+# product benefit — so they are pinned here and listed here, and the reason
+# lives at the list rather than in a separate exemption file.
+harness_dockerfiles=(scripts/native-tests/Dockerfile.client)
 
 for file in "${dockerfiles[@]}"; do
     if [[ ! -f "${file}" ]]; then
@@ -15,8 +22,9 @@ done
 while IFS= read -r file; do
     file="${file#./}"
     [[ " $(printf '%s ' "${dockerfiles[@]}") " == *" ${file} "* ]] && continue
+    [[ " $(printf '%s ' "${harness_dockerfiles[@]}") " == *" ${file} "* ]] && continue
     if grep -E '^[[:space:]]*FROM[[:space:]].*@sha256:' "${file}" >/dev/null; then
-        echo "error: ${file} pins a base-image digest but is absent from the release set; add it to scripts/ci/base-image-refs.sh or its base images stay cold until a build requests them" >&2
+        echo "error: ${file} pins a base-image digest but is in neither set in scripts/ci/base-image-refs.sh; add it to the release set if its bases ship inside a product artifact (they are then pre-warmed and scanned), or to the harness-only set if they do not" >&2
         exit 1
     fi
 done < <(find . -type f -name 'Dockerfile*' -not -path './target/*' | sort)

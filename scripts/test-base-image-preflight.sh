@@ -57,6 +57,18 @@ chmod +x "${tmp}/date"
 refs="$(bash "${root}/scripts/ci/base-image-refs.sh")"
 [[ "$(printf '%s\n' "${refs}" | wc -l)" -eq 3 ]]
 [[ "${refs}" =~ debian@sha256:[0-9a-f]{64} ]]
+(
+  fixture="$(mktemp "${root}/Dockerfile.unlisted-release-base.XXXXXX")"
+  trap 'rm -f -- "${fixture}"' EXIT
+  printf 'FROM alpine:3.22@sha256:%064d\n' 0 > "${fixture}"
+  rc=0
+  bash "${root}/scripts/ci/base-image-refs.sh" > "${tmp}/unlisted-out" 2>&1 || rc=$?
+  [[ "${rc}" -eq 1 ]]
+  # Pin the identifying half only — the file and the rejection class. The
+  # remedy half of the sentence names which list to add it to and is meant to
+  # be improved without this assertion having to follow it.
+  grep -Fq "error: ${fixture#"${root}/"} pins a base-image digest" "${tmp}/unlisted-out"
+)
 while IFS= read -r ref; do
   case "${ref}" in
     rust@*) rust_ref="${ref}" ;;
