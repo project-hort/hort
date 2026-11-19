@@ -1025,9 +1025,9 @@ fn has_traversal_segment(name: &str) -> bool {
 /// `.jar`/`.war` payload and extract its declared dependencies.
 ///
 /// The named POM's decompressed bytes are bounded by
-/// [`crate::archive_bounds::BoundsConfig::default_for_metadata_extraction`]
-/// (10 MiB / 10x compression-ratio). The archive's other entries are not
-/// read. Degrades to [`subject_only`] rather than erroring on every non-fatal outcome: no
+/// [`crate::archive_bounds::MAX_NAMED_ZIP_OUTPUT_BYTES`] (512 KiB).
+/// The archive's other entries are not read. Degrades to [`subject_only`]
+/// rather than erroring on every non-fatal outcome: no
 /// embedded POM (the common case — most Maven jars don't embed one),
 /// a corrupt/non-ZIP jar, or an embedded POM that isn't well-formed XML.
 /// A decompression bound trip is treated as hostile input and also degrades softly, logged
@@ -1090,7 +1090,7 @@ fn jar_embedded_pom_sbom_from_zip<R: Read + Seek>(
 
     let pom_bytes = match crate::archive_bounds::read_zip_entry_by_name(
         zip,
-        crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
+        crate::archive_bounds::MAX_NAMED_ZIP_OUTPUT_BYTES,
         &expected_path,
     ) {
         Ok(bytes) => bytes,
@@ -2600,6 +2600,76 @@ mod tests {
         );
         let subject = sbom.subject.expect("subject present");
         assert_eq!(subject.purl, "pkg:maven/com.example/app@1.2.3");
+    }
+
+    #[test]
+    fn extract_sbom_jar_accepts_embedded_pom_above_ten_times_compressed_size() {
+        let dependency = r#"<dependency>
+            <groupId>com.example</groupId><artifactId>compile-lib</artifactId>
+            <version>1.1</version>
+        </dependency>"#;
+        let xml = pom_wrapped(&format!(
+            "<dependencies>{}</dependencies>",
+            dependency.repeat(120)
+        ));
+        let entry_path = "META-INF/maven/com.example/app/pom.xml";
+        let jar_bytes = crate::test_support::build_wheel_zip(&[(entry_path, xml.as_bytes())]);
+        {
+            let mut archive =
+                zip::ZipArchive::new(Cursor::new(&jar_bytes)).expect("fixture zip opens");
+            let entry = archive.by_name(entry_path).expect("fixture POM exists");
+            assert_eq!(entry.size(), xml.len() as u64);
+            assert!(
+                entry.size()
+                    > entry.compressed_size() * crate::archive_bounds::COMPRESSION_RATIO_LIMIT,
+                "fixture must compress beyond the walk's ratio limit"
+            );
+        }
+
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(&jar_bytes),
+            )
+            .expect("jar zip opens");
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        assert!(!extraction.sbom.expect("sbom present").components.is_empty());
+    }
+
+    #[test]
+    fn extract_sbom_jar_refuses_embedded_pom_above_named_ceiling() {
+        let xml = pom_wrapped(&format!(
+            "<description>{}</description>",
+            "x".repeat(crate::archive_bounds::MAX_NAMED_ZIP_OUTPUT_BYTES as usize)
+        ));
+        assert!(xml.len() as u64 > crate::archive_bounds::MAX_NAMED_ZIP_OUTPUT_BYTES);
+        assert!(pom::parse_pom_dependencies(&mut Cursor::new(xml.as_bytes())).is_ok());
+        let entry_path = "META-INF/maven/com.example/app/pom.xml";
+        let jar_bytes = crate::test_support::build_wheel_zip(&[(entry_path, xml.as_bytes())]);
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(&jar_bytes),
+            )
+            .expect("oversized POM degrades softly");
+        assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
+        assert!(extraction
+            .sbom
+            .expect("subject-only fallback")
+            .components
+            .is_empty());
     }
 
     #[test]

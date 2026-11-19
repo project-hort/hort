@@ -6,6 +6,8 @@
 //! a named ZIP lookup opens one entry through the central directory and
 //! must not charge the entries it never reads. Otherwise an archive is
 //! refused for its member count instead of the content the caller uses.
+//! A walk bounds each entry's expansion because it may read many entries;
+//! a named lookup reads one entry and bounds its output absolutely.
 //!
 //! Scope: this module reads archive metadata and never touches a
 //! filesystem path. It deliberately offers no extract-to-disk
@@ -20,7 +22,7 @@
 //!
 //! ## Invariants the helper enforces
 //!
-//! 1. **Bounded decompressed output.** Wrap the decompressor in
+//! 1. **Bounded decompressed output.** For walks, wrap the decompressor in
 //!    [`BoundedReader::new`] with `output_cap = min(10 × compressed_size,
 //!    [`MAX_OUTPUT_BYTES`])`. Reads past the cap return
 //!    [`BoundsError::OutputCapExceeded`] before the underlying reader can
@@ -110,6 +112,16 @@ use std::io::{self, Read, Seek};
 /// 10 MiB sits well above any legitimate metadata file and well below
 /// "we OOM'd extracting metadata".
 pub const MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Absolute decompressed-byte ceiling for one named ZIP metadata entry.
+///
+/// 512 KiB leaves over six times the 81,493-byte embedded POM measured in
+/// `com.google.cloud:google-cloud-bigquery:2.56.0` on Maven Central (3,837
+/// compressed bytes). It also covers the 101,858-byte standalone AWS SDK BOM
+/// POM sampled as a dependency-management-heavy comparison. A single named
+/// read cannot accumulate output across entries; 512 KiB is twenty times
+/// smaller than the general metadata walk's 10 MiB absolute ceiling.
+pub const MAX_NAMED_ZIP_OUTPUT_BYTES: u64 = 512 * 1024;
 
 /// Compression-ratio multiplier on the compressed input size.
 ///
@@ -255,8 +267,7 @@ impl BoundsConfig {
 /// pathologically large.
 #[derive(Debug, thiserror::Error)]
 pub enum BoundsError {
-    /// Decompressed output exceeded the cap derived from
-    /// [`BoundsConfig::output_cap_for`]. The reader stops yielding bytes
+    /// Decompressed output exceeded the caller's cap. The reader stops yielding bytes
     /// at the cap; this error is returned on the very next `read()`
     /// call.
     #[error("decompressed output cap exceeded ({cap} bytes)")]
@@ -567,12 +578,12 @@ pub enum ZipNamedError {
 /// name. The caller must reject any path it does not intend to read.
 ///
 /// Only the selected entry is decompressed, through [`BoundedReader`] with
-/// [`BoundsConfig::output_cap_for`] applied to its compressed size. The
-/// entry-count cap applies to walks, not this lookup. Nested archive detection
-/// remains the caller's responsibility.
+/// the supplied absolute output ceiling. Entry-count and compression-ratio
+/// caps apply to walks, not this lookup. Nested archive detection remains
+/// the caller's responsibility.
 pub fn read_zip_entry_by_name<R: Read + Seek>(
     reader: R,
-    config: BoundsConfig,
+    max_output_bytes: u64,
     name: &str,
 ) -> Result<Option<Vec<u8>>, ZipNamedError> {
     let mut archive = zip::ZipArchive::new(reader).map_err(ZipNamedError::Open)?;
@@ -584,8 +595,7 @@ pub fn read_zip_entry_by_name<R: Read + Seek>(
     if !entry.is_file() {
         return Ok(None);
     }
-    let cap = config.output_cap_for(entry.compressed_size());
-    let mut bounded = BoundedReader::new(&mut entry, cap);
+    let mut bounded = BoundedReader::new(&mut entry, max_output_bytes);
     let mut bytes = Vec::new();
     bounded
         .read_to_end(&mut bytes)
@@ -1234,12 +1244,8 @@ mod tests {
     #[test]
     fn read_zip_entry_by_name_reads_only_the_requested_file() {
         let zip = make_zip(&[("other.txt", b"other"), ("pom.xml", b"pom")]);
-        let bytes = read_zip_entry_by_name(
-            zip,
-            BoundsConfig::default_for_metadata_extraction(),
-            "pom.xml",
-        )
-        .expect("named lookup succeeds");
+        let bytes = read_zip_entry_by_name(zip, MAX_NAMED_ZIP_OUTPUT_BYTES, "pom.xml")
+            .expect("named lookup succeeds");
         assert_eq!(bytes, Some(b"pom".to_vec()));
     }
 
@@ -1254,24 +1260,34 @@ mod tests {
                 .expect("directory entry");
             writer.finish().expect("finish");
         }
-        let config = BoundsConfig::default_for_metadata_extraction();
         assert_eq!(
-            read_zip_entry_by_name(Cursor::new(&bytes), config, "missing.xml")
-                .expect("missing entry is ordinary"),
+            read_zip_entry_by_name(
+                Cursor::new(&bytes),
+                MAX_NAMED_ZIP_OUTPUT_BYTES,
+                "missing.xml"
+            )
+            .expect("missing entry is ordinary"),
             None
         );
         assert_eq!(
-            read_zip_entry_by_name(Cursor::new(&bytes), config, "directory/")
-                .expect("directory is not a file"),
+            read_zip_entry_by_name(
+                Cursor::new(&bytes),
+                MAX_NAMED_ZIP_OUTPUT_BYTES,
+                "directory/"
+            )
+            .expect("directory is not a file"),
             None
         );
     }
 
     #[test]
     fn read_zip_entry_by_name_reports_open_entry_and_output_failures() {
-        let config = BoundsConfig::default_for_metadata_extraction();
         assert!(matches!(
-            read_zip_entry_by_name(Cursor::new(b"not a zip"), config, "pom.xml"),
+            read_zip_entry_by_name(
+                Cursor::new(b"not a zip"),
+                MAX_NAMED_ZIP_OUTPUT_BYTES,
+                "pom.xml"
+            ),
             Err(ZipNamedError::Open(_))
         ));
 
@@ -1279,19 +1295,32 @@ mod tests {
         let mut corrupt = zip.into_inner();
         corrupt[0] = b'X';
         assert!(matches!(
-            read_zip_entry_by_name(Cursor::new(corrupt), config, "pom.xml"),
+            read_zip_entry_by_name(Cursor::new(corrupt), MAX_NAMED_ZIP_OUTPUT_BYTES, "pom.xml"),
             Err(ZipNamedError::Entry(_))
         ));
 
         let payload = vec![b'x'; 200];
         let zip = make_zip(&[("pom.xml", &payload)]);
-        let tight = BoundsConfig {
-            max_output_bytes: 10,
-            ..config
-        };
         assert!(matches!(
-            read_zip_entry_by_name(zip, tight, "pom.xml"),
+            read_zip_entry_by_name(zip, 10, "pom.xml"),
             Err(ZipNamedError::Read(_))
+        ));
+    }
+
+    #[test]
+    fn read_zip_entry_by_name_refuses_entry_above_named_ceiling() {
+        let payload = vec![b'x'; MAX_NAMED_ZIP_OUTPUT_BYTES as usize + 1];
+        let zip = make_zip(&[("pom.xml", &payload)]);
+        let error = read_zip_entry_by_name(zip, MAX_NAMED_ZIP_OUTPUT_BYTES, "pom.xml")
+            .expect_err("entry above the ceiling must be refused");
+        assert!(matches!(
+            error,
+            ZipNamedError::Read(source)
+                if matches!(
+                    source.get_ref().and_then(|error| error.downcast_ref::<BoundsError>()),
+                    Some(BoundsError::OutputCapExceeded { cap })
+                        if *cap == MAX_NAMED_ZIP_OUTPUT_BYTES
+                )
         ));
     }
 

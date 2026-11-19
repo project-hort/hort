@@ -25,8 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Maven `.jar`/`.war` dependencies with many entries no longer return 403 as
-  scan-indeterminate when their embedded dependency declaration is readable (#454).
+- Maven `.jar`/`.war` artifacts are no longer withheld as scan-indeterminate for
+  an unreadable embedded dependency declaration — a dependency that resolved
+  before no longer starts answering 403 (#454).
 - A 401 now offers Bearer and Basic in separate `WWW-Authenticate` fields, so
   `mvn deploy` and `gradle publish` can authenticate to HTTPS URLs without an explicit port (#453).
 - The Maven read path now answers 404 for maven-resolver's `.meta/prefixes.txt`
