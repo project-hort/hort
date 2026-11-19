@@ -2640,16 +2640,6 @@ impl hort_domain::ports::api_token_repository::ApiTokenRepository for MockApiTok
         Box::pin(async move { Ok(Page { items, total }) })
     }
 
-    fn update_last_used(
-        &self,
-        _token_id: Uuid,
-        _at: DateTime<Utc>,
-        _client_ip: Option<&str>,
-        _user_agent: Option<&str>,
-    ) -> BoxFut<'_, DomainResult<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn revoke(&self, token_id: Uuid) -> BoxFut<'_, DomainResult<()>> {
         self.revokes.lock().unwrap().push(token_id);
         Box::pin(async { Ok(()) })
@@ -10904,9 +10894,6 @@ mod tests {
             repository_ids: None,
             expires_at: None,
             revoked_at: None,
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: Uuid::new_v4(),
             created_at: Utc::now(),
             issued_via: IssuedVia::HttpMint,

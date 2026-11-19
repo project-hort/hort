@@ -504,15 +504,11 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // do what. `api_tokens` had no horizon at all before this kind —
     // nothing in the tree deleted one — while a row accrues per issued
     // credential and the federation branch of `/auth/token-exchange`
-    // writes one per workload exchange. Destructive at the *credential*
-    // level in the sense that the 90-day window is also the decision that
-    // `last_used_at` / `last_used_ip` / `last_used_user_agent` are not
-    // worth keeping past it (they live nowhere else — the event store
-    // keeps `ApiTokenIssued` / `ApiTokenRevoked` / `ApiTokenUsed`, not
-    // those three fields), but it releases no authority and forecloses no
-    // decision: the row it deletes could not authenticate anybody for 90
-    // days before it went, and `PatCache` re-checks both marks on every
-    // cache hit so no cached entry can outlive its row's eligibility.
+    // writes one per workload exchange. It releases no authority and
+    // forecloses no decision: the row it deletes could not authenticate
+    // anybody for 90 days before it went, and `PatCache` re-checks both
+    // marks on every cache hit so no cached entry can outlive its row's
+    // eligibility.
     "api-token-retention-sweep",
     // PEP 658 wheel-metadata backfill — consumed by
     // `WheelMetadataBackfillHandler` in the worker. The ingest

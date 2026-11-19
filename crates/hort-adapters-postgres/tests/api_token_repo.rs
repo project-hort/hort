@@ -9,40 +9,27 @@
 //!    constant-time invariant lives in the use case, not the adapter.
 //! 3. `list_for_user_orders_by_created_at_desc` — list paginates with
 //!    descending `created_at`, total count matches.
-//! 4. `update_last_used_buckets_ipv4_to_24` — write `203.0.113.42`,
-//!    read back `203.0.113.0/24`. (Acceptance bullet 4 sub-bullet a.)
-//! 5. `update_last_used_buckets_ipv6_to_48` — IPv6 input round-trips
-//!    through `client_ip_bucket` exactly (the helper's wire form is
-//!    the spec, not a hand-rolled string). (Sub-bullet b.)
-//! 6. `update_last_used_truncates_user_agent_to_256_bytes` — 4 KB UA
-//!    surfaces as 256 chars on read. (Sub-bullet c.)
-//! 7. `update_last_used_respects_utf8_boundary_on_truncation` —
-//!    multi-byte char straddling the 256-byte boundary does NOT crash
-//!    the adapter; the persisted string is valid UTF-8. (Sub-bullet c
-//!    second clause.)
-//! 8. `update_last_used_passes_through_malformed_ip` — a non-parseable
-//!    IP is stored verbatim, NOT crashed. (Sub-bullet d.)
-//! 9. `revoke_sets_revoked_at_idempotently` — first revoke flips the
+//! 4. `revoke_sets_revoked_at_idempotently` — first revoke flips the
 //!    column; double-revoke is a no-op (no error).
-//! 10. `insert_round_trips_every_issued_via_value` — the provenance
-//!     column survives the INSERT bind and the SELECT decode, which are
-//!     two separate statements in the adapter.
-//! 11. `operator_authority_query_separates_identities_from_exchange_rows`
-//!     — the query the column exists for, over rows that `kind`,
-//!     `revoked_at` and `created_by_user_id` cannot separate.
-//! 12. The credential-store retention sweep's predicate, **one test per
-//!     NULL case** rather than one sweep over a mixed fixture:
-//!     `retention_sweep_deletes_a_row_expired_past_the_horizon`,
-//!     `…_keeps_a_row_expired_inside_the_horizon`,
-//!     `…_deletes_a_row_revoked_past_the_horizon`,
-//!     `…_keeps_a_row_revoked_inside_the_horizon`,
-//!     `…_keeps_a_row_with_both_marks_null`, and
-//!     `…_keeps_a_row_whose_only_old_mark_is_a_future_expiry`. The
-//!     both-NULL case is the one that matters most and is deliberately
-//!     its own test rather than a corollary of another: that row is a
-//!     durable identity that never expires, and a `COALESCE`-flattened
-//!     or negated predicate reaches it. A mixed fixture asserting one
-//!     deleted count would pass with the branches swapped.
+//! 5. `insert_round_trips_every_issued_via_value` — the provenance
+//!    column survives the INSERT bind and the SELECT decode, which are
+//!    two separate statements in the adapter.
+//! 6. `operator_authority_query_separates_identities_from_exchange_rows`
+//!    — the query the column exists for, over rows that `kind`,
+//!    `revoked_at` and `created_by_user_id` cannot separate.
+//! 7. The credential-store retention sweep's predicate, **one test per
+//!    NULL case** rather than one sweep over a mixed fixture:
+//!    `retention_sweep_deletes_a_row_expired_past_the_horizon`,
+//!    `…_keeps_a_row_expired_inside_the_horizon`,
+//!    `…_deletes_a_row_revoked_past_the_horizon`,
+//!    `…_keeps_a_row_revoked_inside_the_horizon`,
+//!    `…_keeps_a_row_with_both_marks_null`, and
+//!    `…_keeps_a_row_whose_only_old_mark_is_a_future_expiry`. The
+//!    both-NULL case is the one that matters most and is deliberately
+//!    its own test rather than a corollary of another: that row is a
+//!    durable identity that never expires, and a `COALESCE`-flattened
+//!    or negated predicate reaches it. A mixed fixture asserting one
+//!    deleted count would pass with the branches swapped.
 //!
 //! These tests follow the project convention (mirrored from
 //! `api_tokens_migration.rs`): require `DATABASE_URL` to be set;
@@ -107,9 +94,6 @@ fn sample_token(user_id: Uuid, prefix: &str) -> ApiToken {
         repository_ids: None,
         expires_at: Some(Utc::now() + Duration::days(90)),
         revoked_at: None,
-        last_used_at: None,
-        last_used_ip: None,
-        last_used_user_agent: None,
         created_by_user_id: user_id,
         created_at: Utc::now(),
         issued_via: IssuedVia::HttpMint,
@@ -218,157 +202,6 @@ async fn list_for_user_orders_by_created_at_desc() {
     assert_eq!(page.items[0].id, t3.id);
     assert_eq!(page.items[1].id, t2.id);
     assert_eq!(page.items[2].id, t1.id);
-}
-
-// ---------------------------------------------------------------------------
-// Acceptance bullet 4 — update_last_used buckets IPv4 to /24.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn update_last_used_buckets_ipv4_to_24() {
-    let Some(pool) = admin_pool().await else {
-        return;
-    };
-    let user_id = create_test_user(&pool).await;
-    let repo = PgApiTokenRepository::new(pool);
-    let token = sample_token(user_id, "ip4bucke");
-    repo.insert(&token).await.expect("insert");
-
-    let when = Utc::now();
-    repo.update_last_used(token.id, when, Some("203.0.113.42"), Some("curl/8.4"))
-        .await
-        .expect("update_last_used succeeds");
-
-    let fetched = repo.find_by_id(token.id).await.expect("find_by_id");
-    assert_eq!(fetched.last_used_ip.as_deref(), Some("203.0.113.0/24"));
-    assert_eq!(fetched.last_used_user_agent.as_deref(), Some("curl/8.4"));
-    assert!(fetched.last_used_at.is_some());
-}
-
-// ---------------------------------------------------------------------------
-// Acceptance bullet 4 sub-bullet b — update_last_used buckets IPv6 to /48.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn update_last_used_buckets_ipv6_to_48() {
-    let Some(pool) = admin_pool().await else {
-        return;
-    };
-    let user_id = create_test_user(&pool).await;
-    let repo = PgApiTokenRepository::new(pool);
-    let token = sample_token(user_id, "ip6bucke");
-    repo.insert(&token).await.expect("insert");
-
-    // Use the same input form the brute-force lockout consumer would
-    // hand the adapter — verify against what `client_ip_bucket`
-    // produces, NOT a hand-rolled expectation, so the test cannot
-    // drift from the helper.
-    let raw = "2001:db8:abcd:0012:0000:0000:0000:0001";
-    let parsed: std::net::IpAddr = raw.parse().expect("test input parses");
-    let expected = hort_app::metrics::client_ip_bucket(parsed);
-
-    repo.update_last_used(token.id, Utc::now(), Some(raw), None)
-        .await
-        .expect("update_last_used succeeds");
-
-    let fetched = repo.find_by_id(token.id).await.expect("find_by_id");
-    assert_eq!(fetched.last_used_ip.as_deref(), Some(expected.as_str()));
-    // Sanity — the helper emits the /48 form.
-    assert!(expected.ends_with("/48"));
-}
-
-// ---------------------------------------------------------------------------
-// Acceptance bullet 4 sub-bullet c — UA truncation to 256 bytes.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn update_last_used_truncates_user_agent_to_256_bytes() {
-    let Some(pool) = admin_pool().await else {
-        return;
-    };
-    let user_id = create_test_user(&pool).await;
-    let repo = PgApiTokenRepository::new(pool);
-    let token = sample_token(user_id, "uatrunc8");
-    repo.insert(&token).await.expect("insert");
-
-    let huge_ua = "x".repeat(4096);
-    repo.update_last_used(token.id, Utc::now(), None, Some(&huge_ua))
-        .await
-        .expect("update_last_used succeeds with huge UA");
-
-    let fetched = repo.find_by_id(token.id).await.expect("find_by_id");
-    let stored = fetched.last_used_user_agent.expect("UA persisted");
-    assert_eq!(stored.len(), 256, "UA must be truncated to 256 bytes");
-    assert!(stored.chars().all(|c| c == 'x'));
-}
-
-// ---------------------------------------------------------------------------
-// Acceptance bullet 4 sub-bullet c (UTF-8 boundary clause).
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn update_last_used_respects_utf8_boundary_on_truncation() {
-    let Some(pool) = admin_pool().await else {
-        return;
-    };
-    let user_id = create_test_user(&pool).await;
-    let repo = PgApiTokenRepository::new(pool);
-    let token = sample_token(user_id, "utf8boun");
-    repo.insert(&token).await.expect("insert");
-
-    // 254 bytes ASCII + a 3-byte EURO SIGN at bytes 254..257 + filler.
-    // Naive byte truncation at 256 lands inside the multi-byte
-    // sequence and would panic via `String::truncate`. The
-    // boundary-aware truncator drops the EURO SIGN wholly.
-    let mut ua = "x".repeat(254);
-    ua.push('\u{20AC}');
-    ua.extend(std::iter::repeat_n('y', 100));
-    assert!(ua.len() > 256);
-
-    repo.update_last_used(token.id, Utc::now(), None, Some(&ua))
-        .await
-        .expect("update_last_used must not panic on multi-byte boundary");
-
-    let fetched = repo.find_by_id(token.id).await.expect("find_by_id");
-    let stored = fetched.last_used_user_agent.expect("UA persisted");
-    // String::from_utf8 round-trip via as_bytes — torn UTF-8 would
-    // fail this check.
-    assert!(std::str::from_utf8(stored.as_bytes()).is_ok());
-    // The 3-byte char straddled bytes 254..256; the adapter walked
-    // back to 254, dropping it wholly.
-    assert_eq!(stored.len(), 254);
-    assert!(stored.chars().all(|c| c == 'x'));
-}
-
-// ---------------------------------------------------------------------------
-// Acceptance bullet 4 sub-bullet d — malformed IP stored verbatim.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-#[serial(hort_pg_db)]
-async fn update_last_used_passes_through_malformed_ip() {
-    let Some(pool) = admin_pool().await else {
-        return;
-    };
-    let user_id = create_test_user(&pool).await;
-    let repo = PgApiTokenRepository::new(pool);
-    let token = sample_token(user_id, "malforip");
-    repo.insert(&token).await.expect("insert");
-
-    // The validation layer filters bad IP strings; the adapter MUST
-    // NOT crash on one. The garbage round-trips verbatim — operators
-    // can grep for it as a debug signal.
-    let garbage = "not-an-ip-string";
-    repo.update_last_used(token.id, Utc::now(), Some(garbage), None)
-        .await
-        .expect("update_last_used must not crash on a bad IP string");
-
-    let fetched = repo.find_by_id(token.id).await.expect("find_by_id");
-    assert_eq!(fetched.last_used_ip.as_deref(), Some(garbage));
 }
 
 // ---------------------------------------------------------------------------
@@ -667,8 +500,8 @@ async fn retention_sweep_deletes_a_row_expired_past_the_horizon() {
 }
 
 /// A row whose `expires_at` is inside the horizon survives. The
-/// credential is already dead; what the window is still holding is its
-/// last-use trail.
+/// credential is already dead; what the window is still holding is the
+/// record that it existed.
 #[tokio::test]
 #[serial(hort_pg_db)]
 async fn retention_sweep_keeps_a_row_expired_inside_the_horizon() {

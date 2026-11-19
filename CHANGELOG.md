@@ -49,6 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advance, and reported as partial — `outcome: "partial"`, CLI exit 4 — when it
   is not (#435).
 
+### Removed
+
+- The token-list response (`GET /api/v1/users/me/tokens`) no longer carries
+  `last_used_at`, which always read `null`; when a token was last used is
+  answered by `GET /api/v1/events?category=token_use` (#436).
+
 ## [0.17.5] - 2026-11-17
 
 ### Security

@@ -18,9 +18,11 @@ artifact/repository/user/RBAC domain plus the append-only event store.
   `EventStore`, `ApiTokenRepository`, `ArtifactLifecyclePort`,
   `RefLifecyclePort`, `PurgeGcPort`, `JobsRepository`,
   `SubscriptionRepository`, and ~30 more.
-- **Consumes:** `hort_app::metrics::client_ip_bucket` (IP bucketing before
-  writing `last_used_ip`) — otherwise a leaf adapter with respect to the
-  application layer.
+- **Consumes:** `hort_app::use_cases::held_set_use_case::MAX_HELD_PAGE_LIMIT`
+  (`held_set_reader.rs` clamps its candidate page size against the same
+  single-sourced constant the use case refuses an oversize limit with, so a
+  caller that bypasses the use case is still bounded) — otherwise a leaf
+  adapter with respect to the application layer.
 
 ## Key types
 

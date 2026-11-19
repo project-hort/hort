@@ -143,16 +143,6 @@ impl ApiTokenRepository for InMemoryApiTokenRepo {
         })
     }
 
-    fn update_last_used(
-        &self,
-        _token_id: Uuid,
-        _at: chrono::DateTime<Utc>,
-        _client_ip: Option<&str>,
-        _user_agent: Option<&str>,
-    ) -> BoxFuture<'_, DomainResult<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn revoke(&self, _token_id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
         Box::pin(async { Ok(()) })
     }
@@ -257,9 +247,6 @@ fn build_harness_with_lockout(lockout: PatLockoutConfig) -> Harness {
         repository_ids: None,
         expires_at: None,
         revoked_at: None,
-        last_used_at: None,
-        last_used_ip: None,
-        last_used_user_agent: None,
         created_by_user_id: user_id,
         created_at: now,
         issued_via: IssuedVia::HttpMint,

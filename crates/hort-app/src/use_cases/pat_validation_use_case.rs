@@ -57,9 +57,14 @@
 //!
 //! - Plaintext-PAT-over-HTTP refusal — that is a middleware concern.
 //! - PgListener wiring of `ApiTokenCacheInvalidator`.
-//! - `last_used_at` debounced bookkeeping — the fire-and-forget update
-//!   spawn lives at the middleware boundary so the validator stays free
-//!   of `tokio::spawn` and side effects beyond the cache write.
+//! - Any per-token "last used" row bookkeeping. There is none anywhere in
+//!   the system: when a token was last exercised is answered by
+//!   `maybe_emit_token_use`'s throttled [`ApiTokenUsed`] append on the
+//!   token's own
+//!   [`StreamCategory::TokenUse`](hort_domain::events::StreamCategory::TokenUse)
+//!   stream, which an operator reads at
+//!   `GET /api/v1/events?category=token_use`. An `UPDATE` on the credential
+//!   row per authenticated request is what that append exists instead of.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -1073,15 +1078,6 @@ mod tests {
         ) -> BoxFuture<'_, DomainResult<Page<ApiToken>>> {
             unreachable!("validator does not list")
         }
-        fn update_last_used(
-            &self,
-            _token_id: Uuid,
-            _at: DateTime<Utc>,
-            _client_ip: Option<&str>,
-            _user_agent: Option<&str>,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            unreachable!("update_last_used is the middleware's job")
-        }
         fn revoke(&self, _token_id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
             unreachable!("validator does not revoke")
         }
@@ -1274,9 +1270,6 @@ mod tests {
             repository_ids: None,
             expires_at: None,
             revoked_at: None,
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: t0(),
             issued_via: IssuedVia::HttpMint,

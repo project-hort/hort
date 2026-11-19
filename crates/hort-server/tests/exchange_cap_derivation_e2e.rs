@@ -566,16 +566,6 @@ mod federation_sa {
             })
         }
 
-        fn update_last_used(
-            &self,
-            _token_id: Uuid,
-            _at: chrono::DateTime<Utc>,
-            _client_ip: Option<&str>,
-            _user_agent: Option<&str>,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
-
         fn revoke(&self, _token_id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }

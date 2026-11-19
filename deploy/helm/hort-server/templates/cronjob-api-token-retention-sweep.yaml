@@ -23,18 +23,17 @@ DELETE lands on the table that decides who may do what, so "the
 predicate cannot reach a live credential" is its acceptance criterion
 rather than a nicety.
 
-What the 90 days are actually buying: the deleted row carries
-`last_used_at`, `last_used_ip` and `last_used_user_agent`, which exist
-nowhere else in hort — the event store keeps `ApiTokenIssued`,
-`ApiTokenRevoked` and `ApiTokenUsed`, not those three fields. The
-credential itself has been dead since the moment its mark was set, so the
-window is not protecting the credential; it is keeping the last-use trail
-available to an investigation opened within the quarter. Shortening the
-window shortens that trail and nothing else.
+Why there is a horizon at all: `api_tokens` had none before this CronJob
+— nothing in hort deleted a row — while a row accrues per issued
+credential and the federation branch of `/auth/token-exchange` writes one
+per workload exchange. The deletion releases no authority and forecloses
+no decision: the row it reaches could not authenticate anybody for 90
+days before it went, and the credential itself has been dead since the
+moment its mark was set.
 
 Why the horizon is longer than the three `jobs`-row sweeps' 7 days: those
-age out operational accounting. This one ages out audit material, and the
-two are answering different questions.
+age out operational accounting, and this one ages out the record that a
+credential existed in the table that decides who may do what.
 
 Design rationale (delivery path): a default-enabled CronJob going through
 the `hort-cli` HTTP admin-task path would drag the whole

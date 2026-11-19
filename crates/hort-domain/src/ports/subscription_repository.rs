@@ -10,8 +10,14 @@
 //!   with an arbitrary `secret_hash` from external input is the threat
 //!   model; the wire boundary is the only place wire-shaped JSON is parsed.
 //! - `update_last_delivered` is called by the dispatcher on a debounced
-//!   schedule (5-minute floor, same pattern as the API-token
-//!   `last_used_at` debounce).
+//!   schedule — a 5-minute floor (`PROGRESS_DEBOUNCE` in
+//!   `hort_app::dispatcher`) on the **success** write, because the cursor
+//!   advances once per delivered event and an un-amortised write would put
+//!   one `UPDATE` on the hot path of every notify. A delivery **failure**
+//!   persists immediately and is not debounced. The cost of the floor is
+//!   bounded re-delivery, never a gap: the persisted position is the seed a
+//!   restart resumes *from*, so it may lag the task's in-memory cursor by up
+//!   to the floor and the window in between is re-read.
 //!   Implementations MUST NOT block the dispatcher on a slow write — the
 //!   notifier is best-effort and the dispatcher is single-task per
 //!   subscription (a load-bearing invariant).

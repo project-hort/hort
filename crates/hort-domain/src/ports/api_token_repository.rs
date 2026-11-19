@@ -5,12 +5,6 @@
 //!
 //! # Adapter-side discipline (not enforced here)
 //!
-//! - `update_last_used` MUST persist a **bucketed** IP (`/24` IPv4, `/48`
-//!   IPv6 — `hort_app::metrics::client_ip_bucket`) and MUST truncate the
-//!   user-agent to **256 chars** at write — both are GDPR Art 5(1)(c) data
-//!   minimisation requirements. A malformed input IP that fails to parse as
-//!   `std::net::IpAddr` is stored verbatim — the validator is the upstream
-//!   layer that filters those, and the adapter MUST NOT crash on a bad string.
 //! - `revoke` is the natural transactional home for the
 //!   `NOTIFY api_token_revocation, '<token_id>'` emission for
 //!   multi-replica revocation invalidation. The LISTEN side lives in
@@ -63,22 +57,6 @@ pub trait ApiTokenRepository: Send + Sync {
         page: PageRequest,
     ) -> BoxFuture<'_, DomainResult<Page<ApiToken>>>;
 
-    /// Update the debounced `last_used_*` columns.
-    ///
-    /// Adapter buckets `client_ip` via `hort_app::metrics::client_ip_bucket`
-    /// (`/24` IPv4, `/48` IPv6) and truncates `user_agent` to 256 chars
-    /// before writing. Implementations MUST NOT log the raw IP or UA.
-    /// Inputs that fail to parse as `std::net::IpAddr` are written
-    /// verbatim — the validator is the layer that rejects malformed
-    /// strings; the adapter is best-effort and MUST NOT crash.
-    fn update_last_used(
-        &self,
-        token_id: Uuid,
-        at: chrono::DateTime<chrono::Utc>,
-        client_ip: Option<&str>,
-        user_agent: Option<&str>,
-    ) -> BoxFuture<'_, DomainResult<()>>;
-
     /// Soft-revoke: set `revoked_at = NOW()` if not already set.
     ///
     /// Idempotent: returns `Ok(())` when the token is already revoked
@@ -114,12 +92,13 @@ pub trait ApiTokenRepository: Send + Sync {
     /// written anyway so the NULL reasoning is visible in the statement
     /// rather than being a property a reader has to recall.
     ///
-    /// The horizon exists because the row carries `last_used_at`,
-    /// `last_used_ip` and `last_used_user_agent`, which exist nowhere
-    /// else in the system: the event store keeps `ApiTokenIssued`,
-    /// `ApiTokenRevoked` and `ApiTokenUsed`, not those three fields. So
-    /// the window is the decision that they are not worth keeping past
-    /// it, which is why this is a horizon and not an immediate delete.
+    /// The horizon exists because `api_tokens` had none at all before —
+    /// nothing in the tree deleted a row — while a row accrues per
+    /// issued credential and the federation branch of
+    /// `/auth/token-exchange` writes one per workload exchange. It
+    /// releases no authority and forecloses no decision: the row it
+    /// deletes could not authenticate anybody for the length of the
+    /// horizon before it went.
     ///
     /// **It deletes by state, never by provenance.** The statement must
     /// not consult `issued_via`: that column records which issuance path
@@ -158,7 +137,7 @@ pub trait ApiTokenRepository: Send + Sync {
 mod tests {
     use super::*;
 
-    /// The narrowest possible implementor: it supplies only the six
+    /// The narrowest possible implementor: it supplies only the five
     /// required methods, so every defaulted method on the trait is
     /// reached through it.
     struct Bare;
@@ -189,15 +168,6 @@ mod tests {
                     total: 0,
                 })
             })
-        }
-        fn update_last_used(
-            &self,
-            _token_id: Uuid,
-            _at: chrono::DateTime<chrono::Utc>,
-            _client_ip: Option<&str>,
-            _user_agent: Option<&str>,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
         }
         fn revoke(&self, _token_id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })
