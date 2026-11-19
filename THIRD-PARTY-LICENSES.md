@@ -194,7 +194,7 @@ the result instead.
 | digest | 0.11.3 | MIT | https://github.com/RustCrypto/traits |
 | blake2 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
 | aes | 0.8.4 | MIT | https://github.com/RustCrypto/block-ciphers |
-| bytes | 1.12.1 | MIT | https://github.com/tokio-rs/bytes |
+| bytes | 1.12.2 | MIT | https://github.com/tokio-rs/bytes |
 | rand_xoshiro | 0.7.0 | MIT | https://github.com/rust-random/rngs |
 | smallvec | 1.15.1 | MIT | https://github.com/servo/rust-smallvec |
 | ahash | 0.8.12 | MIT | https://github.com/tkaitchuck/ahash |
@@ -9331,7 +9331,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### bytes 1.12.1 — MIT
+### bytes 1.12.2 — MIT
 
 Repository: https://github.com/tokio-rs/bytes
 
