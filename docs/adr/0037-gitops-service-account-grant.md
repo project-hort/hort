@@ -79,7 +79,8 @@ apply pipeline resolves to the domain `GrantSubject::User(backing_user_id)`.**
   the audited apply path. This is what lets the reset's cron and maintainer SAs
   drop `is_admin` entirely (ADR 0038): `cronjob-tasks` gets a standalone
   `admin_task_invoke` grant, `maintainer-curator` a `curate` grant,
-  `maintainer-dev` a global `read` grant — none of them admin.
+  `maintainer-dev` global `read`, `prefetch` and `write` grants — none of them
+  admin.
 - The domain stays minimal: one apply-boundary resolution, no new domain variant,
   no migration to a third `GrantSubject` arm, no change to the RBAC evaluator
   (which still sees `User`-subject grants).
