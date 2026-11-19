@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Concurrent attempts to enqueue the same scan job now resolve as an ordinary
+  conflict without a database error or aborted transaction (#452).
 - The expiry backstop's in-flight `provenance-verify` lookup is now index-backed
   instead of scanning the whole `jobs` table on every call (#451).
 - An upstream mapping whose host resolves to a private or loopback address —

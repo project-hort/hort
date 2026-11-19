@@ -806,11 +806,6 @@ impl PgJobsRepository {
 /// `running`. See `docs/metrics-catalog.md`.
 const METRIC_CLAIM_UNMAPPABLE: &str = "hort_admin_tasks_claim_unmappable_total";
 
-/// PostgreSQL `unique_violation` SQLSTATE — surfaced when the partial
-/// unique on `(artifact_id) WHERE kind='scan'` rejects a duplicate
-/// `enqueue_scan`.
-const SQLSTATE_UNIQUE_VIOLATION: &str = "23505";
-
 /// Convert a `Duration` to a `PgInterval` for `now() + $::interval`
 /// arithmetic. The intermediate cast is bounded — clamping to `i64::MAX`
 /// microseconds (~292,000 years) is safer than `unwrap`-ing on overflow.
@@ -1306,11 +1301,12 @@ impl JobsRepository for PgJobsRepository {
                 %trigger_source,
                 "enqueue_scan",
             );
-            let result: Result<Uuid, sqlx::Error> = sqlx::query_scalar(
+            let id: Option<Uuid> = sqlx::query_scalar(
                 "INSERT INTO public.jobs\n\
                      (kind, artifact_id, repository_id, content_hash, format,\n\
                       priority, trigger_source, status)\n\
                  VALUES ('scan', $1, $2, $3, $4, $5, $6, 'pending')\n\
+                 ON CONFLICT DO NOTHING\n\
                  RETURNING id",
             )
             .bind(artifact_id)
@@ -1319,17 +1315,13 @@ impl JobsRepository for PgJobsRepository {
             .bind(&format)
             .bind(priority)
             .bind(&trigger_source)
-            .fetch_one(&self.pool)
-            .await;
-            result.map_err(|e| {
-                if let Some(db_err) = e.as_database_error() {
-                    if db_err.code().as_deref() == Some(SQLSTATE_UNIQUE_VIOLATION) {
-                        return DomainError::Conflict(format!(
-                            "scan job already exists for artifact {artifact_id}"
-                        ));
-                    }
-                }
-                map_sqlx_error(&e, "ScanJob", &artifact_id.to_string())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| map_sqlx_error(&e, "ScanJob", &artifact_id.to_string()))?;
+            id.ok_or_else(|| {
+                DomainError::Conflict(format!(
+                    "scan job already exists for artifact {artifact_id}"
+                ))
             })
         })
     }

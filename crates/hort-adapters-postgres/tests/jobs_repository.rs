@@ -487,6 +487,30 @@ async fn enqueue_scan_rejects_duplicate_artifact() {
     );
 }
 
+#[test]
+fn enqueue_scan_plans_duplicate_conflict() {
+    let source = include_str!("../src/jobs_repository.rs");
+    let pool_enqueue = source
+        .split_once("fn enqueue_scan<'a>(")
+        .expect("pool enqueue_scan implementation")
+        .1
+        .split_once("fn enqueue_task<'a>(")
+        .expect("next repository method")
+        .0;
+    let insert = pool_enqueue
+        .split_once("sqlx::query_scalar(")
+        .expect("pool scan insert")
+        .1
+        .split_once("RETURNING id")
+        .expect("scan insert returns its id")
+        .0;
+
+    assert!(
+        insert.contains("ON CONFLICT DO NOTHING"),
+        "pool scan insert must plan duplicate conflicts before PostgreSQL raises an error"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Partial unique index status filter + `find_active_scan_for_artifact`
 // semantics
