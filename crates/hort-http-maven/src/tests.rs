@@ -1560,6 +1560,25 @@ async fn metadata_sidecar_unknown_artifact_is_404() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn resolver_prefixes_probe_is_404_for_visible_and_missing_repos() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let router = router(ctx);
+
+    let (visible_status, visible_body) = get(&router, "/maven/mvn/.meta/prefixes.txt").await;
+    let (missing_status, missing_body) = get(&router, "/maven/missing/.meta/prefixes.txt").await;
+    assert_eq!(visible_status, StatusCode::NOT_FOUND);
+    assert_eq!(missing_status, StatusCode::NOT_FOUND);
+    assert_eq!(visible_body, missing_body);
+    let body: serde_json::Value = serde_json::from_slice(&visible_body).unwrap();
+    assert!(body["error"].as_str().unwrap().contains("Artifact"));
+
+    let (other_status, other_body) = get(&router, "/maven/mvn/.meta/other.txt").await;
+    assert_eq!(other_status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&other_body).contains("maven.coordinate"));
+}
+
+#[tokio::test]
 async fn traversal_coordinate_get_is_400_maven_coordinate() {
     let (ctx, mocks) = build_mock_ctx(handle());
     insert_repo(&mocks, "mvn", RepositoryFormat::Maven);

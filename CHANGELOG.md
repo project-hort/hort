@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A 401 now offers Bearer and Basic in separate `WWW-Authenticate` fields, so
+  `mvn deploy` and `gradle publish` can authenticate to HTTPS URLs without an explicit port (#453).
+- The Maven read path now answers 404 for maven-resolver's `.meta/prefixes.txt`
+  probe instead of a coordinate-validation 400 (#453).
 - Concurrent attempts to enqueue the same scan job now resolve as an ordinary
   conflict without a database error or aborted transaction (#452).
 - The expiry backstop's in-flight `provenance-verify` lookup is now index-backed

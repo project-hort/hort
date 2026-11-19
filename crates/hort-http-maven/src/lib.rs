@@ -177,6 +177,16 @@ async fn download(
     // inject neither slot) → anonymous.
     principal: Option<Extension<Option<AuthenticatedPrincipal>>>,
 ) -> Result<Response, ApiError> {
+    // The resolver probes this optional convention file before deploying.
+    // Answer before repo resolution so its absence reveals no repo visibility.
+    if artifact_path == ".meta/prefixes.txt" {
+        return Err(hort_domain::error::DomainError::NotFound {
+            entity: "Artifact",
+            id: artifact_path,
+        }
+        .into());
+    }
+
     let actor = principal
         .as_deref()
         .and_then(|opt| opt.as_ref())
