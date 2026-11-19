@@ -152,6 +152,12 @@ Produce a short spec document before writing implementation code. The spec must 
 - Key behavioral invariants, including error shapes copied from the existing handler
 - For format modules: which capability groups the format implements (see taxonomy below)
 - Migration/compatibility notes if replacing existing behavior
+- **Every behaviour of a foreign system the spec relies on, with the source it
+  was read from** — the document URL, or the artifact that was fetched and the
+  field that was read off it. A scanner's coverage matrix, a registry's auth
+  requirement, an upstream metadata field's semantics: outside this repository
+  nothing in the build can contradict a wrong assumption, and a test written
+  from the same assumption as the code is green and worthless.
 
 Post the spec and wait for review before proceeding to implementation.
 
@@ -189,6 +195,20 @@ zero code/`Cargo.lock` changes. Never report the audit gate as satisfied from a
 "no dependency change" inference — run it and read its output. Prefer upgrading
 the flagged crate over an ignore (an ignore needs `.cargo/audit.toml` +
 `deny.toml` parity). See CLAUDE.md → Pre-push Quality Checklist.
+
+**A skipped test has proven nothing, and a suite that reports it as `ok` is not
+evidence of it.** libtest has no dynamic-ignore verdict, so a test that returns
+early for a missing precondition — no `DATABASE_URL`, no scanner binary, no
+network — counts as passed, and the summary line cannot tell a run from a
+return. So judge a gate by what it *reached*: a report lists every skipped and
+ignored test with the precondition it lacked, and no acceptance criterion is
+met by a test that did not execute in the run being reported. The scanner
+evidence suites are the live exemplar —
+`hort-adapters-scanner-trivy/tests/materialisation_evidence.rs` self-skips
+without `TRIVY_BIN` and `hort-adapters-scanner-osv/tests/sbom_evidence.rs`
+without `OSV_SCANNER_BIN`, and no CI job on either forge sets either variable,
+so both have reported green in every automated run without scanning a byte.
+The defects they exist to catch reached a human on the harness instead.
 
 Pre-existing tests must continue to pass. New behavior must be covered by new tests. Note that passing tests are necessary but not sufficient for protocol correctness — the tests were also AI-generated and may not cover all protocol-mandated edge cases. Where the spec review in Step 1 identified divergences, add targeted tests for the correct behavior even if the old tests did not cover it.
 
@@ -808,6 +828,14 @@ When reviewing a spec (Step 2 output):
 - [ ] Upstream checksum verification is addressed if the spec handles proxy fetch
 - [ ] No architectural layer violations (domain calling adapters, handler containing SQL)
 - [ ] The spec is narrow — it does not gold-plate or add features beyond what was asked
+- [ ] **Every foreign-system behaviour the spec asserts names its source** — a
+      document URL, or the artifact that was fetched and what was read off it.
+      Unsourced is a send-back, not a review comment: `scan_argv` pinned "a JAR
+      is scanned with `trivy fs`" and the crate-version-in-index preflight read an
+      anonymous `404` as "absent", both from assumption, and both carried green
+      unit tests built on that same assumption. What settled each sat in Trivy's
+      coverage matrix and in cargo's registry-auth documentation — outside the
+      repository, where no test reaches.
 
 ## Initiative Plan Review Checklist
 
@@ -830,6 +858,11 @@ When reviewing an implementation (Step 5):
 - [ ] Other crates (`hort-adapters-*`, `hort-http-core`, `hort-http-<format>`, `hort-formats`, `hort-server`) meet >= 85% coverage on new code
 - [ ] **DB-backed test parallel-safety:** any new `hort-adapters-postgres` test that acquires a real connection (calls `maybe_pool()` / touches the shared DB) carries the crate-wide `#[serial(hort_pg_db)]` key (or an equivalent per-test isolation mechanism). The suite runs in parallel against one shared DB with no isolation and production is single-flight by design; a DB-gated test without the key silently reintroduces the identity-shifting flake fixed in `ed79360a`. Coverage % passing is **not** sufficient. There is no compile-time/lint enforcement — this is a mandatory manual check. (See CLAUDE.md → Test Coverage Tiers → DB-backed test isolation.)
 - [ ] Pre-existing tests still pass (`cargo test --workspace --lib`)
+- [ ] **No acceptance criterion rests on a test that did not run.** For each
+      criterion, name the test that proves it and confirm that test executed in
+      the reported run — that its gate had the database, the binary or the
+      network it needs. A self-skipped test reports `ok`, so "the suite is
+      green" does not answer this. See Step 4.
 - [ ] **`cargo audit --deny warnings` was actually run and is clean** — unconditionally, regardless of whether the change touched `Cargo.toml`/`Cargo.lock` (live RustSec DB → the blocking CI security gate can be red with no dep change). A "no dependency change, audit not required" inference is a hard block — the gate's pass must come from the command's output, not a heuristic. See CLAUDE.md → Pre-push Quality Checklist.
 - [ ] **Third-party attribution regenerated if the dependency graph changed** — any `Cargo.lock` delta adding/removing/re-versioning a **non-workspace** crate (a bump, `cargo update`, add/remove dep or feature) is accompanied by a `THIRD-PARTY-LICENSES.{md,json}` regeneration (`scripts/regenerate-attribution.sh`) in the **same** change. `security:attribution-sync` is release-scoped (#30) and will NOT catch this per-MR — it is the release backstop, so the authoring/review check is the first line. A release workspace-version-only bump is exempt. Hard block. (see ADR 0049)
 - [ ] E2E smoke tests pass (`./scripts/native-tests/run.sh --hort=compose`) if the component is on a tested path
