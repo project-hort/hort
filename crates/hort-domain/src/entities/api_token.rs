@@ -248,13 +248,6 @@ pub struct TokenCap {
 /// - `repository_ids = None` ⇒ inherit user grants. `Some(vec![])`
 ///   structurally allowed (see [`TokenCap`]); rejected at issuance for
 ///   `Pat` / `ServiceAccount`.
-/// - `last_used_ip` is **already bucketed** at adapter write — `/24` for
-///   IPv4, `/48` for IPv6 — to satisfy GDPR Art 5(1)(c) data
-///   minimisation. The domain entity carries the bucketed string; raw
-///   IPs never reach this struct.
-/// - `last_used_user_agent` is **truncated to 256 chars** at adapter
-///   write. UA strings longer than that are common fingerprinting
-///   signals and are not security-useful.
 /// - `created_by_user_id` is the actor who minted the token; for
 ///   self-mint PATs this equals `user_id`, for admin-mint
 ///   service-account tokens it is the issuing admin.
@@ -277,9 +270,6 @@ pub struct ApiToken {
     pub repository_ids: Option<Vec<Uuid>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
-    pub last_used_ip: Option<String>,
-    pub last_used_user_agent: Option<String>,
     pub created_by_user_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub issued_via: IssuedVia,
@@ -873,9 +863,6 @@ mod tests {
             repository_ids: Some(vec![repo_a()]),
             expires_at: Some(Utc::now()),
             revoked_at: None,
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: Uuid::from_u128(1),
             created_at: Utc::now(),
             issued_via: IssuedVia::HttpMint,

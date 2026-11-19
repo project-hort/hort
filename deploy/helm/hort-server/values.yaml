@@ -1935,13 +1935,13 @@ scheduledTasks:
   # lands on the table that decides who may do what, so that is its
   # acceptance criterion rather than a nicety.
   #
-  # What the 90 days buy: the deleted row carries `last_used_at`,
-  # `last_used_ip` and `last_used_user_agent`, which exist nowhere else
-  # in hort. The credential has been dead since its mark was set, so the
-  # window is not protecting the credential — it keeps the last-use trail
-  # available to an investigation opened within the quarter. Longer than
-  # the three `jobs`-row sweeps' 7 days because those age out operational
-  # accounting and this ages out audit material.
+  # Why a horizon at all: `api_tokens` had none before this CronJob —
+  # nothing in hort deleted a row — while a row accrues per issued
+  # credential and the federation branch of `/auth/token-exchange` writes
+  # one per workload exchange. The deletion releases no authority and
+  # forecloses no decision: the row it reaches could not authenticate
+  # anybody for 90 days before it went. Longer than the three `jobs`-row
+  # sweeps' 7 days, which age out operational accounting.
   #
   # DSN-only delivery contract — no svc-token, no `adminTasksEnabled`
   # umbrella — and no HTTP invoke route: `hort-http-admin-tasks`

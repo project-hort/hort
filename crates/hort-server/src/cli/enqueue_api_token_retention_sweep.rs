@@ -22,9 +22,10 @@
 //!
 //! Unlike its three siblings, the `DELETE` behind this subcommand lands
 //! outside the task queue, on the table that decides who may do what.
-//! The 90-day window is also the decision that the deleted row's
-//! `last_used_at` / `last_used_ip` / `last_used_user_agent` are not worth
-//! keeping past it — those three live nowhere else in the system.
+//! `api_tokens` had no horizon at all before it — nothing in the tree
+//! deleted a row — while a row accrues per issued credential and the
+//! federation branch of `/auth/token-exchange` writes one per workload
+//! exchange.
 //!
 //! ## Why a DB-only subcommand instead of `hort-cli admin task invoke`
 //!
