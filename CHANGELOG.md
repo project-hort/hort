@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The expiry backstop's in-flight `provenance-verify` lookup is now index-backed
+  instead of scanning the whole `jobs` table on every call (#451).
 - An upstream mapping whose host resolves to a private or loopback address —
   an internal registry or in-cluster mirror — is no longer refused at connect;
   a download URL taken from upstream metadata still is (#422).

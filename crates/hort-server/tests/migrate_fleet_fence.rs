@@ -169,15 +169,23 @@ async fn connect_with_application_name(db_name: &str, application_name: &str) ->
 /// schema whole, which the simulated fleet connections need.
 const BEFORE_FENCED_CONTRACTIONS: i64 = 8;
 
-/// The highest migration version below the workspace's current max.
-/// Leaves exactly the latest narrowing pending in this migration set.
+/// The highest migration version below the latest **declared narrowing**, so
+/// a run to it leaves that narrowing pending.
+///
+/// Derived from the checked-in `migrations/CONTRACTIONS.toml` and deliberately
+/// not from `MIGRATOR.max()`. The two agree only while the newest migration in
+/// the set happens to be a contraction, which is a property of the corpus and
+/// not of the suite: the first additive migration authored after one moves
+/// `max()` past it, and `max() - 1` then names a version at which the latest
+/// narrowing is already applied — leaving this suite asserting a fence verdict
+/// over nothing pending. An expand-only migration must not be able to change
+/// what these tests are about.
 fn before_latest_narrowing() -> i64 {
-    let max = MIGRATOR
-        .iter()
-        .map(|m| m.version)
-        .max()
-        .expect("migration set is non-empty at compile time");
-    max - 1
+    let latest = *contraction_minimum_binary_versions()
+        .keys()
+        .next_back()
+        .expect("the checked-in contraction manifest declares at least one narrowing");
+    latest - 1
 }
 
 // ---------------------------------------------------------------------------
@@ -440,7 +448,7 @@ async fn latest_pending_narrowing_tolerates_its_declared_floor() {
     let (db_name, pool) = create_temp_db(&admin).await;
 
     let target = before_latest_narrowing();
-    assert_eq!(target, 43, "the pending migration must be 44");
+    assert_eq!(target, 43, "the pending narrowing must be 44");
     MIGRATOR
         .run_to(target, &pool)
         .await
