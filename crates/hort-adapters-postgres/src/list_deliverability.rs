@@ -106,11 +106,15 @@
 //! of LLVM compilation per execution. From the sixth execution the
 //! statement flips to a generic plan whose estimate sits below the
 //! threshold, JIT stops firing, and the steady state above is what a
-//! long-lived pool sees on that smaller corpus — and the corpus is
-//! load-bearing: on the production-shaped seed below, the generic plan
-//! still crossed `jit_above_cost` and generated 62 functions from the
-//! sixth execution on, so this paragraph describes that corpus and not
-//! a property of the statement. Note the direction: here the
+//! long-lived pool sees on that corpus — and the corpus is
+//! load-bearing: whether the flip still clears the threshold on a much
+//! larger edge set is open, and neither measurement in this comment
+//! answers it. The sweep below ran with `jit = off`, deliberately, so
+//! that compilation could not confound the block counts; and a plain
+//! `EXPLAIN` is always a custom plan, so it cannot show a generic one at
+//! all. Settling it needs a `PREPARE` executed at least six times, which
+//! is the only shape that produces the plan in question. Note the
+//! direction: here the
 //! custom→generic flip is a 50× **improvement**, the opposite of the `= ANY` cliff
 //! above — which is why the two must not be confused when reading a
 //! latency graph after a restart.
