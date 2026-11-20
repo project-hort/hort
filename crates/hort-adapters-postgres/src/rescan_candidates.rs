@@ -268,9 +268,14 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // recovery case — item1 of #115 stops NEW artifacts from
             // stranding job-less, but artifacts already quarantined
             // job-less in deployed environments before that fix need
-            // this widened sweep to recover; there is no manual
-            // per-artifact rescan surface, so this IS the remediation for
-            // them, not an alternative to one.
+            // this widened sweep to recover. A per-artifact rescan
+            // surface does exist
+            // (`hort-http-admin-security`'s artifact rescan route), but it
+            // needs an operator to invoke it per artifact and
+            // `Permission::Write` on the parent repository — so for a
+            // job-less quarantined artifact this sweep is the remediation
+            // that arrives unattended, which is the property that matters
+            // when nobody is watching.
             //
             // It also selects that job's `created_at`, which is what the
             // absent-verdict arm compares against. See the third
@@ -309,9 +314,11 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // blocking one condemns it, so a rescan has somewhere to
             // land. A state nothing re-picks is terminal in practice
             // whatever the transition table says, which is why the two
-            // halves are one decision — this query IS the mechanism that
-            // delivers the healing, since there is no per-artifact
-            // operator rescan surface that bypasses it. Soft-deleted
+            // halves are one decision — this query is the mechanism
+            // that delivers the healing **unattended**. An operator can
+            // reach the same path per artifact through the admin rescan
+            // route, but nothing re-picks such a state on its own except
+            // this query. Soft-deleted
             // rows stay excluded for both statuses (`a.deleted_at IS
             // NULL`, which `live_reads_exclude_deleted` governs).
             //
