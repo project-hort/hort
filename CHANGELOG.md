@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The register reports the strictest declared floor across applied migrations.
   A migration applied before its declaration may now raise it; check the boot log before rollback.
 
+### Added
+
+- Refused Cargo, npm, PyPI and Maven content reads now leave a log line with the
+  artifact, repository, path, response status and withholding reason (#454).
+
 ### Changed
 
 - `hort-server migrate` refuses a pending contraction only when a connected

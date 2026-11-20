@@ -85,6 +85,7 @@ use axum::response::Response;
 
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::types::ContentHash;
+use hort_http_core::artifact_gate::ArtifactRefusal;
 
 /// Which hosted read route refused.
 ///
@@ -171,32 +172,40 @@ pub(crate) enum RefusalReason {
 impl RefusalReason {
     /// Which hold a `Quarantined` refusal is.
     ///
-    /// The flag read here decides, in
+    /// Delegated to [`ArtifactRefusal::hold`], the one definition of that
+    /// split — and infallible there, so this stays the total function it
+    /// has always been rather than inventing a failure for an artifact a
+    /// caller already knows is held.
+    ///
+    /// The flag read there decides, in
     /// `hort_http_core::artifact_gate::quarantine_retry_after_seconds` and
     /// only there, whether the refusal advertises a `Retry-After`; this
     /// read only names the hold. So the token and the header cannot
     /// disagree about the response — they are the same fact reported once
     /// each.
     pub(crate) fn hold(artifact: &Artifact) -> Self {
-        if artifact.provenance_hold_indefinite {
-            Self::ProvenanceHold
-        } else {
-            Self::Quarantined
+        ArtifactRefusal::hold(artifact).into()
+    }
+
+    fn artifact_refusal(&self) -> Option<ArtifactRefusal> {
+        match self {
+            Self::Quarantined => Some(ArtifactRefusal::Quarantined),
+            Self::ProvenanceHold => Some(ArtifactRefusal::ProvenanceHold),
+            Self::Rejected => Some(ArtifactRefusal::Rejected),
+            Self::ScanIndeterminate => Some(ArtifactRefusal::ScanIndeterminate),
+            Self::TerminalConstituent => None,
         }
     }
 
     fn token(&self) -> &'static str {
-        match self {
-            Self::Quarantined => "quarantined",
-            Self::ProvenanceHold => "provenance_hold",
-            Self::Rejected => "rejected",
-            Self::ScanIndeterminate => "scan_indeterminate",
-            Self::TerminalConstituent => "terminal_constituent",
+        match self.artifact_refusal() {
+            Some(reason) => reason.token(),
+            None => "terminal_constituent",
         }
     }
 
-    /// Whether waiting resolves this refusal — the whole of the level
-    /// decision stated in the module doc.
+    /// Whether waiting resolves this refusal. Artifact-state reasons use
+    /// the shared HTTP taxonomy's one level criterion.
     ///
     /// The constituent refusal is decided by this same criterion and not
     /// beside it: `ConstituentStatusReader` can only name a status
@@ -206,12 +215,32 @@ impl RefusalReason {
     /// envelope the manifest's own arms for those states answer in, and
     /// the refusal ends only when an operator acts on the constituent.
     fn self_resolving(&self) -> bool {
-        match self {
-            Self::Quarantined => true,
-            Self::ProvenanceHold
-            | Self::Rejected
-            | Self::ScanIndeterminate
-            | Self::TerminalConstituent => false,
+        match self.artifact_refusal() {
+            Some(reason) => reason.self_resolving(),
+            None => false,
+        }
+    }
+}
+
+/// Each artifact-state refusal the shared gate can name has exactly one
+/// counterpart here — the inverse of the `artifact_refusal` mapping that
+/// `token` and `self_resolving` delegate through.
+///
+/// Total, rather than restricted to the two hold variants `RefusalReason::hold`
+/// actually asks for: restricting it would need either a second two-variant
+/// type or a panic on arms the caller knows cannot occur, and a panic on a
+/// request-serving path is a worse trade than naming the remaining two arms'
+/// own counterparts. A fifth [`ArtifactRefusal`] is then a compile error here,
+/// which is where that decision belongs — this crate carries one refusal the
+/// shared gate cannot produce (`TerminalConstituent`), so it cannot inherit an
+/// answer it has not made.
+impl From<ArtifactRefusal> for RefusalReason {
+    fn from(refusal: ArtifactRefusal) -> Self {
+        match refusal {
+            ArtifactRefusal::Quarantined => Self::Quarantined,
+            ArtifactRefusal::ProvenanceHold => Self::ProvenanceHold,
+            ArtifactRefusal::Rejected => Self::Rejected,
+            ArtifactRefusal::ScanIndeterminate => Self::ScanIndeterminate,
         }
     }
 }
