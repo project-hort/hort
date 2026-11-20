@@ -55,6 +55,105 @@ use chrono::Utc;
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::events::RejectionReason;
 
+/// Why an artifact's own state prevents a content route from serving it.
+///
+/// The split between the two holds is the same fact that decides whether
+/// [`quarantine_retry_after_seconds`] advertises a deadline, so the token
+/// an operator greps for and the header the client was handed report one
+/// fact rather than two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArtifactRefusal {
+    /// A hold with a deadline — the artifact's own scan verdict is
+    /// outstanding and does arrive.
+    Quarantined,
+    /// A hold waiting on an external event: a signature that has not
+    /// arrived under `provenance_mode: Required`.
+    ProvenanceHold,
+    /// A terminal verdict against the artifact.
+    Rejected,
+    /// A scan that reached no verdict — terminal too, and fail-closed.
+    ScanIndeterminate,
+}
+
+impl ArtifactRefusal {
+    /// Which of the two holds a `Quarantined` artifact is under — the one
+    /// definition of that split, for this gate and for the OCI refusal
+    /// envelope that names the same two states.
+    ///
+    /// Infallible, and that is the point: the question is a boolean field
+    /// read, and a caller that already knows the artifact is held must not
+    /// have to answer for a failure that cannot occur in order to ask it.
+    pub fn hold(artifact: &Artifact) -> Self {
+        if artifact.provenance_hold_indefinite {
+            Self::ProvenanceHold
+        } else {
+            Self::Quarantined
+        }
+    }
+
+    /// Name the artifact-state refusal, or [`None`] when the artifact is
+    /// servable — exactly the statuses on which
+    /// [`non_servable_response`] answers [`Some`] and [`None`].
+    ///
+    /// The `match` is exhaustive with **no wildcard arm**, so a future
+    /// [`QuarantineStatus`] variant is a compile error here rather than a
+    /// fall-through that serves withheld bytes. This function is where
+    /// that property lives for the whole gate:
+    /// [`non_servable_response`] matches on the refusal named here, so no
+    /// status reaches a response envelope until it has been classified
+    /// into a refusal first.
+    pub fn from_artifact(artifact: &Artifact) -> Option<Self> {
+        match artifact.quarantine_status {
+            QuarantineStatus::Quarantined => Some(Self::hold(artifact)),
+            QuarantineStatus::Rejected => Some(Self::Rejected),
+            QuarantineStatus::ScanIndeterminate => Some(Self::ScanIndeterminate),
+            QuarantineStatus::None | QuarantineStatus::Released => None,
+        }
+    }
+
+    /// Stable operator-facing token for the withheld state.
+    ///
+    /// These four strings are what a log filter keys on, so changing one
+    /// changes what an operator's saved query matches — the same contract
+    /// the OCI refusal line has carried since it was written, which is why
+    /// that line reads its four artifact-state tokens from here.
+    pub fn token(&self) -> &'static str {
+        match self {
+            Self::Quarantined => "quarantined",
+            Self::ProvenanceHold => "provenance_hold",
+            Self::Rejected => "rejected",
+            Self::ScanIndeterminate => "scan_indeterminate",
+        }
+    }
+
+    /// Whether waiting resolves this refusal — the **one** definition of
+    /// the level criterion, shared by this gate's refusal line and the OCI
+    /// one.
+    ///
+    /// A hold with a deadline is the registry working as designed: every
+    /// cold read of a freshly-ingested artifact answers one while the scan
+    /// runs, the response carries a `Retry-After`, and a well-behaved
+    /// client comes back and succeeds. Recorded at `warn` that would make
+    /// the warn stream routinely non-empty, which makes it a stream nobody
+    /// reads. A rejection, an indeterminate verdict and a hold waiting on
+    /// a signature have no deadline to advertise and end only when an
+    /// operator waives, re-scans, signs or replaces the artifact.
+    ///
+    /// The criterion is therefore visible on the wire — a refusal that
+    /// advertises a `Retry-After` is exactly one that resolves itself —
+    /// which is what lets a test hold the level against the response
+    /// rather than against a restated table.
+    ///
+    /// Exhaustive rather than a `matches!`: a fifth refusal has to state
+    /// its answer here instead of silently inheriting `false`.
+    pub fn self_resolving(&self) -> bool {
+        match self {
+            Self::Quarantined => true,
+            Self::ProvenanceHold | Self::Rejected | Self::ScanIndeterminate => false,
+        }
+    }
+}
+
 /// `Retry-After` for a `Quarantined` artifact whose computed
 /// `quarantine_deadline` is absent — 1 hour, the value every one of the
 /// four routes open-coded before this module existed.
@@ -189,21 +288,40 @@ fn rejected_response(artifact: &Artifact) -> Response {
 /// Surface the per-artifact status gate as the HTTP response a content
 /// route owes a caller, or [`None`] when the artifact is servable.
 ///
-/// - `Quarantined` → `503` plus `Retry-After`, except for a hold with no
-///   self-resolving deadline (see [`quarantine_retry_after_seconds`]).
-///   The body is identical either way: which of the two holds this is
-///   stays opaque to the client, and the absence of the header is the
-///   only difference on the wire.
-/// - `Rejected` → `403` naming the rejection axis (see
-///   [`rejected_response`]).
-/// - `ScanIndeterminate` → `403`. The scanner could not decide, so this
-///   is fail-closed and terminal like `Rejected` rather than a timed
-///   hold: no window applies and therefore no `Retry-After`.
-/// - `None` / `Released` → [`None`]; the caller serves the bytes.
+/// [`ArtifactRefusal::from_artifact`] is the discriminant, not
+/// `quarantine_status` directly, so there is **one** table here rather
+/// than two that have to agree: a refusal cannot be named without a
+/// response, nor answered without being named, and the
+/// exhaustive-with-no-wildcard property — a future
+/// [`QuarantineStatus`] variant is a compile error rather than a
+/// fall-through that serves withheld bytes — lives in `from_artifact`,
+/// which every answer below is reached through.
 ///
-/// The `match` is exhaustive with **no wildcard arm**, so a future
-/// [`QuarantineStatus`] variant is a compile error here rather than a
-/// fall-through that serves withheld bytes.
+/// - [`ArtifactRefusal::Quarantined`] / [`ArtifactRefusal::ProvenanceHold`]
+///   → `503`, one envelope and one body for both: which of the two holds
+///   this is stays opaque to the client, and whether a `Retry-After` is
+///   advertised (see [`quarantine_retry_after_seconds`], which reads the
+///   same flag the two refusals are split on) is the only difference on
+///   the wire.
+/// - [`ArtifactRefusal::Rejected`] → `403` naming the rejection axis (see
+///   [`rejected_response`]).
+/// - [`ArtifactRefusal::ScanIndeterminate`] → `403`. The scanner could not
+///   decide, so this is fail-closed and terminal like `Rejected` rather
+///   than a timed hold: no window applies and therefore no `Retry-After`.
+/// - a servable artifact (`None` / `Released`) → [`None`]; the caller
+///   serves the bytes.
+///
+/// ## The refusal leaves a record
+///
+/// Every answer other than [`None`] emits exactly one log line, here and
+/// at no call site: the served read is durably audited by
+/// `ArtifactUseCase::download` on the happy path, and until this line
+/// existed the refusal — the case an operator is asked to explain — left
+/// nothing behind on the cargo / npm / PyPI / Maven routes at all. It is a
+/// log line and not a `DomainEvent` for the two reasons
+/// `hort_http_oci::refusal` sets out: the volume is set by whoever is
+/// retrying rather than by how many artifacts exist, and a refused read
+/// changes no artifact state. A caller does not add its own line.
 ///
 /// `retry_after_floor_secs` is the operator-configured floor
 /// (`AppContext::quarantine_retry_after_floor_secs`,
@@ -217,31 +335,71 @@ pub fn non_servable_response(
     artifact: &Artifact,
     retry_after_floor_secs: NonZeroU32,
 ) -> Option<Response> {
-    match artifact.quarantine_status {
-        QuarantineStatus::Quarantined => {
+    let refusal = ArtifactRefusal::from_artifact(artifact)?;
+    let response = match refusal {
+        ArtifactRefusal::Quarantined | ArtifactRefusal::ProvenanceHold => {
             let mut builder = Response::builder().status(StatusCode::SERVICE_UNAVAILABLE);
             if let Some(secs) = quarantine_retry_after_seconds(artifact, retry_after_floor_secs) {
                 builder = builder.header("Retry-After", secs.to_string());
             }
-            Some(
-                builder
-                    .body(Body::from(
-                        serde_json::json!({"error": "artifact is quarantined"}).to_string(),
-                    ))
-                    .expect("static-shape quarantined response always builds"),
-            )
-        }
-        QuarantineStatus::Rejected => Some(rejected_response(artifact)),
-        QuarantineStatus::ScanIndeterminate => Some(
-            Response::builder()
-                .status(StatusCode::FORBIDDEN)
+            builder
                 .body(Body::from(
-                    serde_json::json!({"error": "artifact scan is indeterminate"}).to_string(),
+                    serde_json::json!({"error": "artifact is quarantined"}).to_string(),
                 ))
-                .expect("static-shape scan-indeterminate response always builds"),
-        ),
-        QuarantineStatus::None | QuarantineStatus::Released => None,
+                .expect("static-shape quarantined response always builds")
+        }
+        ArtifactRefusal::Rejected => rejected_response(artifact),
+        ArtifactRefusal::ScanIndeterminate => Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .body(Body::from(
+                serde_json::json!({"error": "artifact scan is indeterminate"}).to_string(),
+            ))
+            .expect("static-shape scan-indeterminate response always builds"),
+    };
+    // The status is read off the response just built and is **never** a
+    // parameter: the refusal → response mapping above is the one thing that
+    // decides it, and a line carrying its own copy could report a status the
+    // client never received.
+    let status = response.status().as_u16();
+    // Three field decisions, made here:
+    //
+    // - No repository key. A key is a request label; this function holds the
+    //   artifact, and `repository_id` is what joins to everything else.
+    //   Threading a key through the six call sites would also let one pass a
+    //   key that disagrees with the artifact's actual repository — the same
+    //   hazard as passing the status in. An adapter that has the key and
+    //   wants to name it already can, and the OCI line does.
+    // - No format field. This function cannot see the format without a new
+    //   parameter, and a repository has exactly one format, so
+    //   `repository_id` carries it.
+    // - The path is the stored artifact's own, validated at ingest — not raw
+    //   client input. That is why this line echoes it, where the OCI
+    //   parse-failure paths deliberately refuse to echo the bytes they could
+    //   not parse.
+    //
+    // Two macro calls and not one, because `tracing` bakes the level into
+    // static callsite metadata so it cannot be a runtime value. The level is
+    // still decided once, by `self_resolving`.
+    if refusal.self_resolving() {
+        tracing::info!(
+            artifact_id = %artifact.id,
+            repository_id = %artifact.repository_id,
+            path = %artifact.path,
+            status,
+            reason = %refusal.token(),
+            "artifact read refused"
+        );
+    } else {
+        tracing::warn!(
+            artifact_id = %artifact.id,
+            repository_id = %artifact.repository_id,
+            path = %artifact.path,
+            status,
+            reason = %refusal.token(),
+            "artifact read refused"
+        );
     }
+    Some(response)
 }
 
 #[cfg(test)]
@@ -252,6 +410,7 @@ mod tests {
     use chrono::Duration;
     use hort_app::use_cases::test_support::sample_artifact;
     use tracing_test::traced_test;
+    use uuid::Uuid;
 
     /// Drain a gate response into `(status, retry_after, parsed body)`.
     fn parts(response: Response) -> (StatusCode, Option<String>, serde_json::Value) {
@@ -279,6 +438,174 @@ mod tests {
         let mut artifact = sample_artifact(QuarantineStatus::Rejected);
         artifact.rejection_reason = axis;
         artifact
+    }
+
+    /// The four refusals, each on an artifact whose id, repository id and
+    /// path are distinguishable — so a capture holding all four can be
+    /// attributed line-to-artifact rather than by position.
+    ///
+    /// The timed quarantine gets a real deadline, which is what makes its
+    /// response carry the `Retry-After` that makes it the one `info` case;
+    /// the indefinite hold differs from it by the flag alone.
+    fn refusal_cases() -> [(Artifact, &'static str); 4] {
+        let mut timed = sample_artifact(QuarantineStatus::Quarantined);
+        timed.quarantine_deadline = Some(Utc::now() + Duration::minutes(10));
+        let mut indefinite = sample_artifact(QuarantineStatus::Quarantined);
+        indefinite.provenance_hold_indefinite = true;
+        let rejected = sample_artifact(QuarantineStatus::Rejected);
+        let indeterminate = sample_artifact(QuarantineStatus::ScanIndeterminate);
+        let mut cases = [
+            (timed, "quarantined"),
+            (indefinite, "provenance_hold"),
+            (rejected, "rejected"),
+            (indeterminate, "scan_indeterminate"),
+        ];
+        for (index, (artifact, token)) in cases.iter_mut().enumerate() {
+            artifact.id = Uuid::from_u128(index as u128 + 1);
+            artifact.repository_id = Uuid::from_u128(index as u128 + 11);
+            artifact.path = format!("stored/{token}");
+        }
+        cases
+    }
+
+    /// One line per refusal, and exactly one, carrying the artifact's own
+    /// id, repository id and path plus the status its response actually
+    /// carries.
+    ///
+    /// Exactly one, because two lines for one refusal is the noise this
+    /// record exists not to produce and zero is the regression it exists
+    /// to catch. All four reasons go through one capture, so a line
+    /// emitted from the wrong arm surfaces as a second line against
+    /// another artifact's id instead of passing unnoticed.
+    #[traced_test]
+    #[test]
+    fn every_refusal_records_exactly_one_line_with_the_artifacts_own_fields() {
+        let cases = refusal_cases();
+        let responses: Vec<_> = cases
+            .iter()
+            .map(|(artifact, _)| non_servable_response(artifact, TEST_FLOOR).unwrap())
+            .collect();
+
+        logs_assert(|lines: &[&str]| {
+            let refusals: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains("artifact read refused"))
+                .collect();
+            assert_eq!(refusals.len(), cases.len(), "{refusals:?}");
+            for ((artifact, token), response) in cases.iter().zip(&responses) {
+                let matching: Vec<_> = refusals
+                    .iter()
+                    .filter(|line| line.contains(&artifact.id.to_string()))
+                    .collect();
+                assert_eq!(matching.len(), 1, "{refusals:?}");
+                let line = matching[0];
+                for field in [
+                    format!("artifact_id={}", artifact.id),
+                    format!("repository_id={}", artifact.repository_id),
+                    format!("path={}", artifact.path),
+                    format!("status={}", response.status().as_u16()),
+                    format!("reason={token}"),
+                ] {
+                    assert!(line.contains(&field), "missing `{field}` in {line}");
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// The level criterion held against the wire: `INFO` exactly when the
+    /// refusal advertises a `Retry-After`, `WARN` when it does not.
+    ///
+    /// Asserted against the response the same call produced and never
+    /// against a table restated here — this is the one place that builds
+    /// both halves, which is what makes the assertion worth anything. The
+    /// indefinite hold is the case that earns it: its status (`503`) and
+    /// its level (`WARN`) disagree, so a level quietly derived from the
+    /// status could not pass.
+    #[traced_test]
+    #[test]
+    fn refusal_level_agrees_with_the_response_retry_after_header() {
+        let cases = refusal_cases();
+        let responses: Vec<_> = cases
+            .iter()
+            .map(|(artifact, _)| non_servable_response(artifact, TEST_FLOOR).unwrap())
+            .collect();
+
+        logs_assert(|lines: &[&str]| {
+            for ((artifact, _), response) in cases.iter().zip(&responses) {
+                let line = lines
+                    .iter()
+                    .find(|line| {
+                        line.contains("artifact read refused")
+                            && line.contains(&artifact.id.to_string())
+                    })
+                    .expect("each refused read has a line");
+                let expected_level = if response.headers().contains_key("Retry-After") {
+                    "INFO"
+                } else {
+                    "WARN"
+                };
+                assert!(line.contains(expected_level), "{line}");
+            }
+            Ok(())
+        });
+    }
+
+    /// The converse of every assertion above: nothing was withheld, so
+    /// nothing may be recorded as withheld. Without it, a line emitted
+    /// unconditionally would satisfy all of them.
+    #[traced_test]
+    #[test]
+    fn servable_artifacts_leave_no_refusal_line() {
+        for status in [QuarantineStatus::None, QuarantineStatus::Released] {
+            assert!(non_servable_response(&sample_artifact(status), TEST_FLOOR).is_none());
+        }
+        logs_assert(|lines: &[&str]| {
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("artifact read refused")),
+                "{lines:?}"
+            );
+            Ok(())
+        });
+    }
+
+    /// Which status each refusal answers with.
+    ///
+    /// This test used to hold [`ArtifactRefusal::from_artifact`] and
+    /// [`non_servable_response`] to the same [`Some`]/[`None`] verdict.
+    /// That agreement is now true by construction — the response is built
+    /// by matching on the refusal `from_artifact` named, so there is no
+    /// second table left for it to drift from — and what remains a free
+    /// choice, and so still worth pinning, is the **status code** per
+    /// refusal: the single `503` envelope the two holds share, and the
+    /// `403` that separates a terminal verdict from a hold. Enumerated
+    /// over every [`QuarantineStatus`] and both values of the hold flag,
+    /// so neither a new status nor a new refusal can reach the wire
+    /// without stating its answer here.
+    #[test]
+    fn refusal_taxonomy_and_response_agree_on_every_status() {
+        for status in QuarantineStatus::ALL {
+            for indefinite in [false, true] {
+                let mut artifact = sample_artifact(status);
+                artifact.provenance_hold_indefinite = indefinite;
+                let expected = match ArtifactRefusal::from_artifact(&artifact) {
+                    Some(ArtifactRefusal::Quarantined | ArtifactRefusal::ProvenanceHold) => {
+                        Some(StatusCode::SERVICE_UNAVAILABLE)
+                    }
+                    Some(ArtifactRefusal::Rejected | ArtifactRefusal::ScanIndeterminate) => {
+                        Some(StatusCode::FORBIDDEN)
+                    }
+                    None => None,
+                };
+                assert_eq!(
+                    non_servable_response(&artifact, TEST_FLOOR).map(|r| r.status()),
+                    expected,
+                    "{status:?}, provenance_hold_indefinite={indefinite}"
+                );
+            }
+        }
     }
 
     // -- Quarantined: the Retry-After rule --------------------------------
