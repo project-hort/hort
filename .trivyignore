@@ -46,3 +46,26 @@
 #     release so stale acceptances do not accumulate.
 #
 # (Empty by default — no CVEs are currently accepted.)
+
+# CVE-2026-99362 — linux-libc-dev, out-of-bounds write in the kernel's nfsd.
+#
+# Accepted because the package cannot carry the vulnerability where we have
+# it: linux-libc-dev ships kernel HEADER files, not kernel code, and the bug
+# is in the in-kernel NFS server, which a container does not run. It enters
+# only through the digest-pinned `rust` BUILDER stage; the runtime images are
+# distroless and do not contain the package.
+#
+# That last clause is the condition this acceptance rests on, and it was
+# measured rather than assumed: in the same pipeline that reported this CVE
+# against the base image, both `build-images:hort-server` and
+# `build-images:hort-worker` scanned the image they had just built and
+# reported no fixable CRITICAL. Trivy flags it as fixable because Debian has
+# published linux-libc-dev 6.12.117-1; nothing in this repository can install
+# it, since the fix arrives when upstream rebuilds the `rust` image.
+#
+# Retire this entry when the pinned `rust` digest next moves — the acceptance
+# is about one builder stage, and a shared suppression list means this ID is
+# also silent in the two gates that DO block. If this CVE is ever reported
+# against an image hort builds, the reason above has lapsed and the entry must
+# go rather than be widened.
+CVE-2026-99362
