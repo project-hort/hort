@@ -76,7 +76,11 @@ the result instead.
 | dotenvy | 0.15.7 | MIT | https://github.com/allan2/dotenvy |
 | quanta | 0.12.6 | MIT | https://github.com/metrics-rs/quanta |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
-| sqlx | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-core | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-macros-core | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-macros | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-postgres | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
 | sha1 | 0.10.6 | MIT | https://github.com/RustCrypto/hashes |
 | sha2 | 0.10.9 | MIT | https://github.com/RustCrypto/hashes |
 | lazy_static | 1.5.0 | MIT | https://github.com/rust-lang-nursery/lazy-static.rs |
@@ -108,9 +112,9 @@ the result instead.
 | num-integer | 0.1.46 | MIT | https://github.com/rust-num/num-integer |
 | num-iter | 0.1.45 | MIT | https://github.com/rust-num/num-iter |
 | num-traits | 0.2.19 | MIT | https://github.com/rust-num/num-traits |
-| regex-automata | 0.4.16 | MIT | https://github.com/rust-lang/regex |
-| regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
-| regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
+| regex-automata | 0.4.19 | MIT | https://github.com/rust-lang/regex |
+| regex-syntax | 0.8.12 | MIT | https://github.com/rust-lang/regex |
+| regex | 1.13.2 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
 | uuid | 1.29.2 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
@@ -383,12 +387,9 @@ the result instead.
 | objc2-core-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-encode | 4.1.0 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
+| objc2-system-configuration | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
 | object_store | 0.14.2 | MIT | https://github.com/apache/arrow-rs-object-store |
-| sqlx-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-macros-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-macros | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-postgres | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
 | typed-path | 0.9.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | whoami | 2.1.2 | MIT | https://github.com/ardaku/whoami |
 | winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT | https://github.com/retep998/winapi-rs |
@@ -5503,7 +5504,143 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### sqlx 0.9.0 — MIT
+### sqlx-core 0.9.1 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-macros-core 0.9.1 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-macros 0.9.1 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-postgres 0.9.1 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx 0.9.1 — MIT
 
 Repository: https://github.com/launchbadge/sqlx
 
@@ -6551,7 +6688,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex-automata 0.4.16 — MIT
+### regex-automata 0.4.19 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -6584,7 +6721,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex-syntax 0.8.11 — MIT
+### regex-syntax 0.8.12 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -6617,7 +6754,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex 1.13.1 — MIT
+### regex 1.13.2 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -15111,6 +15248,32 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
+### objc2-system-configuration 0.3.2 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
 ### objc2 0.6.4 — MIT
 
 Repository: https://github.com/madsmtm/objc2
@@ -15140,110 +15303,6 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 ### object_store 0.14.2 — MIT
 
 Repository: https://github.com/apache/arrow-rs-object-store
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-core 0.9.0 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-macros-core 0.9.0 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-macros 0.9.0 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-postgres 0.9.0 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
 
 ```text
 MIT License
