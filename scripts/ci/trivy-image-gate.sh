@@ -64,11 +64,16 @@
 # over third-party base-image contents that no change here can act on either;
 # the publish gate still runs it over the images hort itself ships.
 #
-# `.trivyignore` (repo root) is honoured — one suppression list, maintainer-
-# owned, shared with the publish gate, so an accepted CVE does not mean one
-# gate green and the other permanently red. Its active entries are printed
-# below before any scan runs: a suppressed finding is a visible decision here,
-# never a silent one.
+# The repo-root `.trivyignore` is project-wide, including the ghcr publish
+# gate. The --pull warning scan also honours `.trivyignore.base-images.yaml`:
+# a finding in a base image we only pin can await an upstream rebuild, while
+# a finding in an image we built blocks. The warning scan assembles both lists
+# into one temporary YAML file, without copying accepted IDs between sources.
+# The old objection to per-gate lists concerned publish-only acceptance: that
+# leaves development pushes permanently coloured for a ruled-on finding. A
+# base-image-only acceptance reaches the warning gate whose policy already
+# treats upstream fixes differently. Print each active class before scanning;
+# a suppressed finding is a visible decision in the job log, never a silent one.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -104,7 +109,51 @@ export TRIVY_CACHE_DIR="${TRIVY_CACHE_DIR:-/tmp/hort-trivy-cache}"
 # destructive command on a variable path is what hangs a headless runner on an
 # un-bypassable confirmation.
 archive="/tmp/hort-image-scan.tar"
-trap 'rm -f -- "/tmp/hort-image-scan.tar"' EXIT
+ignore_dir=""
+cleanup() {
+    rm -f -- "/tmp/hort-image-scan.tar"
+    if [[ -n "${ignore_dir}" ]]; then
+        (cd "${ignore_dir}" && rm -f ./effective.yaml)
+        rmdir -- "${ignore_dir}"
+    fi
+}
+trap cleanup EXIT
+
+base_ignore=".trivyignore.base-images.yaml"
+ignorefile=".trivyignore"
+if ((pull)); then
+    if [[ ! -r "${base_ignore}" ]] || [[ "$(sed -n '1p' "${base_ignore}")" != 'vulnerabilities:' ]]; then
+        echo "INDETERMINATE — ${base_ignore} is missing or has no vulnerabilities root." >&2
+        exit "${EXIT_SCAN_DID_NOT_RUN}"
+    fi
+    ignore_dir="$(mktemp -d)"
+    ignorefile="${ignore_dir}/effective.yaml"
+    printf 'vulnerabilities:\n' > "${ignorefile}"
+    if [[ -r .trivyignore ]]; then
+        while IFS= read -r accepted || [[ -n "${accepted}" ]]; do
+            accepted="${accepted%%#*}"
+            # Trim the ends only. Stripping whitespace everywhere would fold two
+            # identifiers written on one line into a single one that matches no
+            # advisory, so a mistake would suppress nothing and say nothing; the
+            # refusal below is what turns it into a message instead.
+            accepted="$(printf '%s' "${accepted}" | tr -d '\r' \
+                | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [[ -n "${accepted}" ]] || continue
+            # Trivy accepts every advisory namespace it knows here — CVE-, GHSA-,
+            # RUSTSEC-, DLA-, DSA- — so the test is deliberately NOT the CVE format.
+            # What has to hold is that the value is safe to embed as a YAML scalar:
+            # refusing whitespace, a colon or a quote is what keeps a junk line from
+            # becoming a junk ignore rule, while a legitimate GHSA acceptance in the
+            # project-wide list does not turn this scan's exit 1 into a red pipeline.
+            if [[ ! "${accepted}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+                echo "INDETERMINATE — .trivyignore line is not a single advisory identifier: ${accepted}" >&2
+                exit "${EXIT_SCAN_DID_NOT_RUN}"
+            fi
+            printf '  - id: %s\n' "${accepted}" >> "${ignorefile}"
+        done < .trivyignore
+    fi
+    sed '1d' "${base_ignore}" >> "${ignorefile}"
+fi
 
 if ! bash "${root}/scripts/ci/install-trivy.sh"; then
     echo ""
@@ -126,13 +175,17 @@ echo "  cache dir:  ${TRIVY_CACHE_DIR}"
 if [[ -r .trivyignore ]]; then
     accepted="$(sed -e 's/#.*//' -e '/^[[:space:]]*$/d' .trivyignore)"
     if [[ -n "${accepted}" ]]; then
-        echo "  accepted CVEs (.trivyignore) — these are suppressed by maintainer decision:"
+        echo "  project-wide accepted CVEs (.trivyignore):"
         printf '%s\n' "${accepted}" | sed 's/^/    /'
     else
-        echo "  accepted CVEs (.trivyignore): none"
+        echo "  project-wide accepted CVEs (.trivyignore): none"
     fi
 else
-    echo "  accepted CVEs: no .trivyignore present"
+    echo "  project-wide accepted CVEs: no .trivyignore present"
+fi
+if ((pull)); then
+    echo "  base-image-only accepted CVEs (${base_ignore}):"
+    sed 's/^/    /' "${base_ignore}"
 fi
 echo "==================="
 
@@ -238,6 +291,7 @@ for ref in "$@"; do
         --skip-version-check \
         --format table \
         --exit-code 1 \
+        --ignorefile "${ignorefile}" \
         > "${scan_log}" 2>&1 || scan_rc=$?
 
     if [[ "${scan_rc}" -eq 0 ]]; then
@@ -260,6 +314,7 @@ for ref in "$@"; do
         --skip-version-check \
         --format table \
         --exit-code 0 \
+        --ignorefile "${ignorefile}" \
         > "${probe_log}" 2>&1 || probe_rc=$?
     rm -f -- "${archive}"
 
@@ -290,8 +345,8 @@ if ((critical)); then
     echo "  fixable ${severity} in:"
     for ref in "${critical_refs[@]}"; do echo "    ${ref}"; done
     echo "  Cleared by moving the pin forward to a base image that carries the fix,"
-    echo "  or by upgrading the affected layer. Suppressing it in .trivyignore is a"
-    echo "  maintainer decision with a written reason, never the routine answer."
+    echo "  or by upgrading the affected layer. Any suppression is a maintainer"
+    echo "  decision with a written reason, never the routine answer."
     echo ""
     echo "  This verdict leaves with exit ${EXIT_CVE_FINDING}. Whether that stops the pipeline is the"
     echo "  calling job's \`allow_failure:\`, not this script's, and it differs by what the"
