@@ -37,6 +37,10 @@
 #          Those are images hort produces: a fixable CRITICAL is ours to fix
 #          and must not reach the registry or receive a cosign signature.
 #
+#   4. The root .trivyignore applies to both scans; base-image-only YAML
+#      acceptances apply only to --pull. A finding in a built image must not
+#      disappear because its ID was accepted for a pinned builder base.
+#
 # The corpus is DERIVED, not listed: a job is an image build because its
 # script runs `buildah bud`, and the pinned-base scan is the job that calls
 # the gate with `--pull`. A new one joins the corpus by existing. There is no
@@ -51,7 +55,7 @@
 # the CRITICAL/fixable-only policy, both exit-code constants and both verdict
 # `exit`s, the enumeration script must still exist, and the Trivy version pin
 # `install-trivy.sh` reads out of `docker/Dockerfile.worker` must still be
-# there under the names it reads. Then four mutation checks, each one a
+# there under the names it reads. Then five mutation checks, each one a
 # specific way this could silently come apart: the gate calls stripped out of
 # `.gitlab-ci.yml`; the base-image job's allowed list widened to cover a scan
 # that did not run; the two exit-code constants set to the same number; and
@@ -68,7 +72,7 @@
 #   - `.gitlab-ci.yml`   (quality:image-scan-gate-guard)
 #   - locally before pushing, via scripts/run-shell-guards.sh
 #
-# Implementation: pure bash, no database, sub-second. No awk: the CI job runs
+# Implementation: pure bash, no database. No awk: the CI job runs
 # this on alpine, where awk is busybox's.
 
 set -euo pipefail
@@ -80,6 +84,7 @@ gate_script="scripts/ci/trivy-image-gate.sh"
 refs_script="scripts/ci/base-image-refs.sh"
 install_script="scripts/ci/install-trivy.sh"
 worker_dockerfile="docker/Dockerfile.worker"
+base_ignore=".trivyignore.base-images.yaml"
 
 # A top-level key in .gitlab-ci.yml: a job, or a `.`-prefixed template/anchor.
 # Templates are blocks of their own precisely so an `extends:` target can be
@@ -483,8 +488,108 @@ rm -f -- "${mutant_codes}"
 
 rm -f -- "${scratch}" "${mutant_out}"
 
+# ---- executable scope check: exercise the actual gate with stub scan tools
+# The stub records the ignore file handed to Trivy. This checks the assembled
+# file itself, not only the shell spelling of the branch that selects it.
+scope_root="$(mktemp -d)"
+mkdir -p "${scope_root}/scripts/ci" "${scope_root}/docker" "${scope_root}/bin"
+cp "${gate_script}" "${install_script}" "${scope_root}/scripts/ci/"
+cp "${worker_dockerfile}" "${scope_root}/docker/"
+cp .trivyignore "${scope_root}/.trivyignore"
+if [[ ! -f "${base_ignore}" ]]; then
+    fail "counter-assertion: ${base_ignore} is missing"
+fi
+# Synthetic entries keep the scope test useful after the currently accepted
+# CVE expires and is removed from the real list.
+cat > "${scope_root}/${base_ignore}" <<'BASE_IGNORE_FIXTURE'
+vulnerabilities:
+  - id: CVE-2024-88888
+    expired_at: 2099-01-01
+    statement: Base-image scope fixture.
+BASE_IGNORE_FIXTURE
+cat > "${scope_root}/bin/trivy" <<'STUB_TRIVY'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == "--version" ]]; then
+    echo 'Version: 0.70.0'
+    exit 0
+fi
+if [[ "${1:-}" == image && "${2:-}" == --download-db-only ]]; then exit 0; fi
+if [[ "${1:-}" != image ]]; then exit 1; fi
+shift
+ignorefile=""
+while (($#)); do
+    if [[ "$1" == --ignorefile ]]; then
+        ignorefile="${2:-}"
+        break
+    fi
+    shift
+done
+[[ -n "${ignorefile}" && -r "${ignorefile}" ]] || exit 1
+printf '%s\n' "${ignorefile}" > "${MOCK_IGNORE_PATH}"
+cp "${ignorefile}" "${MOCK_IGNORE_CONTENT}"
+STUB_TRIVY
+cat > "${scope_root}/bin/buildah" <<'STUB_BUILDAH'
+#!/usr/bin/env bash
+case "${1:-}" in pull|inspect|push) exit 0 ;; *) exit 1 ;; esac
+STUB_BUILDAH
+chmod +x "${scope_root}/bin/trivy" "${scope_root}/bin/buildah"
+
+check_ignore_scope() {
+    local script="$1" label="$2" mode="$3"
+    local -a args=(image-for-scope-test)
+    if [[ "${mode}" == base ]]; then args=(--pull "${args[@]}"); fi
+    if ! (cd "${scope_root}" &&
+        PATH="${scope_root}/bin:${PATH}" \
+        MOCK_IGNORE_PATH="${scope_root}/ignore-path" \
+        MOCK_IGNORE_CONTENT="${scope_root}/ignore-content" \
+        bash "${script}" "${args[@]}") > "${scope_root}/gate-log" 2>&1; then
+        fail "${label}: ${mode} scan did not complete with stub tools"
+        return
+    fi
+    if [[ ! -s "${scope_root}/ignore-path" || ! -s "${scope_root}/ignore-content" ]]; then
+        fail "${label}: ${mode} scan did not hand an ignore file to Trivy"
+        return
+    fi
+    if [[ "${mode}" == base ]]; then
+        if ! grep -qF 'CVE-2024-99999' "${scope_root}/ignore-content" ||
+            ! grep -qF 'CVE-2024-88888' "${scope_root}/ignore-content"; then
+            fail "${label}: --pull must assemble project-wide and base-only acceptances into one Trivy ignore file"
+        fi
+        if ! grep -qF 'base-image-only' "${scope_root}/gate-log" ||
+            ! grep -qF 'project-wide' "${scope_root}/gate-log"; then
+            fail "${label}: --pull log must label both acceptance classes"
+        fi
+    else
+        if grep -qF 'CVE-2024-88888' "${scope_root}/ignore-content" ||
+            grep -qF 'base-image-only' "${scope_root}/gate-log"; then
+            fail "${label}: post-build scan must neither honour nor print the base-image-only acceptance"
+        fi
+        if ! grep -qF 'CVE-2024-99999' "${scope_root}/ignore-content"; then
+            fail "${label}: post-build scan lost the project-wide acceptance"
+        fi
+    fi
+}
+
+# Use synthetic IDs so the test proves the split regardless of which
+# acceptances happen to be active in the repository.
+printf '\nCVE-2024-99999\n' >> "${scope_root}/.trivyignore"
+check_ignore_scope "${scope_root}/${gate_script}" "${gate_script}" base
+check_ignore_scope "${scope_root}/${gate_script}" "${gate_script}" build
+
+# Mutation: force the base-only assembly branch on for both modes. The built
+# image scan must turn red when it starts seeing that acceptance.
+sed 's/^if ((pull)); then$/if ((1)); then/' "${gate_script}" > "${scope_root}/${gate_script}.mutant"
+if cmp -s "${gate_script}" "${scope_root}/${gate_script}.mutant"; then
+    fail "counter-assertion: the base-only branch was not found for the mutation check"
+fi
+expect_red "letting the post-build scan honour base-image acceptances" \
+    check_ignore_scope "${scope_root}/${gate_script}.mutant" 'MUTANT' build
+find "${scope_root}" -depth -delete
+rm -f -- "${mutant_out}"
+
 if ((failures)); then
     echo "image scan gate: ${failures} violation(s)" >&2
     exit 1
 fi
-echo 'image scan gate: the gate is called in every image build before its push, the pinned-base scan reads the one enumeration on every code-changing push, and the two verdicts still cost what they are meant to — the builds allow neither, the pinned-base scan allows the CVE code alone'
+echo 'image scan gate: every image build is scanned before push, the pinned-base scan runs on code changes, the two verdicts retain distinct costs, and base-only acceptances reach only --pull'

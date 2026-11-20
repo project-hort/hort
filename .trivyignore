@@ -1,71 +1,19 @@
-# .trivyignore — reviewed and accepted CVE allowlist
+# .trivyignore — project-wide reviewed CVE acceptances
 #
-# This file is the suppression list for every Trivy gate in the project. All
-# three run the SAME policy — a fixable CRITICAL is a finding
-# (`severity: CRITICAL`, `ignore-unfixed: true`) — and differ only in what a
-# finding COSTS:
+# This plain, repo-root file is read implicitly by the blocking ghcr publish
+# gate and by the GitLab post-build scans. The GitLab pinned-base scan also
+# includes these entries when it assembles its effective ignore file.
 #
-#   - .github/workflows/docker-publish.yml, the "Trivy gate" step of the
-#     `scan-containers` job. BLOCKING. It runs once per published image and
-#     architecture, and `merge` depends on it, so a hit here is what stands
-#     between a CRITICAL and a held ghcr publish.
-#   - .gitlab-ci.yml `build-images:hort-server` / `build-images:hort-worker`,
-#     which scan the image they just built BEFORE its first push. BLOCKING:
-#     the image is one hort produces, the finding is ours to fix, and it must
-#     not reach the registry or receive a cosign signature.
-#   - .gitlab-ci.yml `security:base-image-scan`, which scans the digest-pinned
-#     base images on every code-changing push. WARNING for a CVE finding
-#     (`allow_failure: exit_codes: [2]`): a base image's CRITICAL is cleared
-#     by an upstream rebuild, which no change in this repository can produce.
-#     It still FAILS HARD when the scan did not run — a refused pull, a
-#     database that would not download, a scanner error — because that is this
-#     pipeline breaking rather than an upstream CVE.
+# A base image this repository only pins has a separate, expiring YAML list
+# in .trivyignore.base-images.yaml. It is read only by the --pull warning gate.
+# The objection to per-gate lists was to a publish-only acceptance that would
+# leave development pushes permanently coloured for a finding already ruled
+# on. A base-image-only acceptance is the reverse: it reaches only the warning
+# gate, whose allow_failure policy already recognises that an upstream rebuild
+# is outside this repository's control. It must never silence a built image.
 #
-# So an entry here is not how a base-image finding stops blocking: it does not
-# block. It is for the two gates that do, and for silencing a base-image
-# warning the maintainer has decided to stop being told about.
+# List one CVE ID per line. Every addition needs review: a CVE silenced here
+# is a CVE we ship. Prefer upgrading the affected layer or dependency; keep
+# the reason beside the ID and reassess on each release.
 #
-# The last two reach trivy through scripts/ci/trivy-image-gate.sh, which
-# prints this file's active entries before it scans anything: a suppressed
-# finding is a visible decision in the job log, never a silent one.
-#
-# ONE list, deliberately, rather than a per-gate list: an accepted CVE that
-# reached only the publish gate would leave every development push red — or
-# permanently yellow — for a finding the maintainer has already ruled on, and
-# a gate that is always the same colour is a gate people learn to ignore.
-#
-# List one CVE ID per line (e.g. `CVE-2024-12345`). A line here means the CVE
-# has been reviewed and consciously accepted — typically an unfixable
-# base-image CVE Trivy still flags as fixable, or a CVE in a code path the
-# image does not exercise.
-#
-# Discipline:
-#   - Every addition MUST be reviewed (a CVE silenced here is a CVE we ship).
-#   - Prefer upgrading the affected layer/dependency over adding an entry.
-#   - Keep a short justification comment above each ID and reassess on each
-#     release so stale acceptances do not accumulate.
-#
-# (Empty by default — no CVEs are currently accepted.)
-
-# CVE-2026-99362 — linux-libc-dev, out-of-bounds write in the kernel's nfsd.
-#
-# Accepted because the package cannot carry the vulnerability where we have
-# it: linux-libc-dev ships kernel HEADER files, not kernel code, and the bug
-# is in the in-kernel NFS server, which a container does not run. It enters
-# only through the digest-pinned `rust` BUILDER stage; the runtime images are
-# distroless and do not contain the package.
-#
-# That last clause is the condition this acceptance rests on, and it was
-# measured rather than assumed: in the same pipeline that reported this CVE
-# against the base image, both `build-images:hort-server` and
-# `build-images:hort-worker` scanned the image they had just built and
-# reported no fixable CRITICAL. Trivy flags it as fixable because Debian has
-# published linux-libc-dev 6.12.117-1; nothing in this repository can install
-# it, since the fix arrives when upstream rebuilds the `rust` image.
-#
-# Retire this entry when the pinned `rust` digest next moves — the acceptance
-# is about one builder stage, and a shared suppression list means this ID is
-# also silent in the two gates that DO block. If this CVE is ever reported
-# against an image hort builds, the reason above has lapsed and the entry must
-# go rather than be widened.
-CVE-2026-99362
+# No project-wide CVEs are currently accepted.

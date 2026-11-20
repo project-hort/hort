@@ -158,10 +158,11 @@ workflow:
   - "about/**/*"
   - "THIRD-PARTY-LICENSES.md"
   - "THIRD-PARTY-LICENSES.json"
-  # The accepted-CVE list the image CVE gates honour (one list, shared with
-  # the ghcr publish gate). An edit to it changes a gate verdict, so it must
-  # re-run the gate that reads it.
+  # The repo-root project-wide list reaches the GitLab scans and ghcr publish;
+  # the base-image YAML list reaches only GitLab's --pull warning scan. Changes
+  # to either list must re-run the gate whose verdict they can alter.
   - ".trivyignore"
+  - ".trivyignore.base-images.yaml"
 
 # Shared rule template for jobs with no other rules: `!reference`'d as
 # `<<: [*other-anchor, *rules-code-changed]` (YAML merge; GitLab supports
