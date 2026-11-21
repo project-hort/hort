@@ -1604,13 +1604,15 @@ async fn set_tag_ref(
 ///
 /// **Two of these keys are a cache; one is not, and the difference decides
 /// what a missing key means.** `config_media_type` and `annotations` are
-/// derivable from the manifest bytes, so CAS stays their source of truth and
-/// their absence means *not cached* — a reader that needs them and finds them
-/// missing reads through to the payload. `name` is not derivable from any
+/// derivable from the manifest bytes, so CAS stays their source of truth.
+/// `projection_version: 1` declares that their absence is known: an index has
+/// no config descriptor, or the object has no annotations. Without that marker,
+/// absence is a cache miss and the reader must read through to the payload.
+/// `name` is not derivable from any
 /// payload: the bytes do not record which OCI name they were pushed under, so
 /// it is recorded here or it is lost, and its absence means *unknown*, never
-/// *none*. Treating either absence as a declaration would invert the spec's
-/// `artifactType` fallback, which turns on empty-or-missing versus present.
+/// *none*. Treating an unmarked absence as a declaration would invert the
+/// spec's `artifactType` fallback.
 fn subject_content_reference_claim(
     subject_digest_parsed: &Option<ContentHash>,
     media_type: &str,
@@ -1624,6 +1626,7 @@ fn subject_content_reference_claim(
             "artifact_type": artifact_type_opt,
             "media_type": media_type,
             "name": name,
+            "projection_version": 1,
         });
         let config_media_type = if is_index {
             None
@@ -3667,6 +3670,7 @@ mod tests {
         );
         assert_eq!(claim.metadata["annotations"], image["annotations"]);
         assert!(claim.metadata["artifact_type"].is_null());
+        assert_eq!(claim.metadata["projection_version"], 1);
     }
 
     #[test]
@@ -3686,6 +3690,7 @@ mod tests {
         .unwrap();
         assert!(claim.metadata.get("config_media_type").is_none());
         assert!(claim.metadata.get("annotations").is_none());
+        assert_eq!(claim.metadata["projection_version"], 1);
         assert_eq!(
             claim.metadata["artifact_type"],
             "application/vnd.example.index"

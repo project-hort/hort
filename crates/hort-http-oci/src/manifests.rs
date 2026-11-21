@@ -106,7 +106,7 @@ const DEFAULT_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 /// ceiling does not get an unbounded buffer: the read is refused and
 /// the claims are logged as skipped, the same fail-safe posture the rest
 /// of the derivation takes.
-const MANIFEST_PROJECTION_READ_CAP_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MANIFEST_PROJECTION_READ_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Serve an OCI manifest by `(repo_key, name, reference)`.
 ///
