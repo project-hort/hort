@@ -88,10 +88,10 @@ the result instead.
 | core-foundation | 0.10.1 | MIT | https://github.com/servo/core-foundation-rs |
 | core-foundation | 0.9.4 | MIT | https://github.com/servo/core-foundation-rs |
 | hex | 0.4.3 | MIT | https://github.com/KokaKiwi/rust-hex |
-| form_urlencoded | 1.2.2 | MIT | https://github.com/servo/rust-url |
+| form_urlencoded | 1.2.3 | MIT | https://github.com/servo/rust-url |
 | idna | 1.1.0 | MIT | https://github.com/servo/rust-url/ |
 | percent-encoding | 2.3.2 | MIT | https://github.com/servo/rust-url/ |
-| url | 2.5.8 | MIT | https://github.com/servo/rust-url |
+| url | 2.5.9 | MIT | https://github.com/servo/rust-url |
 | cfg-if | 1.0.4 | MIT | https://github.com/rust-lang/cfg-if |
 | filetime | 0.2.29 | MIT | https://github.com/alexcrichton/filetime |
 | futures-timer | 3.0.3 | MIT | https://github.com/async-rs/futures-timer |
@@ -318,10 +318,10 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.8 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.9 | MIT | https://github.com/clap-rs/clap |
 | clap_builder | 4.6.7 | MIT | https://github.com/clap-rs/clap |
 | clap_complete | 4.6.12 | MIT | https://github.com/clap-rs/clap |
-| clap_derive | 4.6.8 | MIT | https://github.com/clap-rs/clap |
+| clap_derive | 4.6.9 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
@@ -5904,7 +5904,7 @@ SOFTWARE.
 
 ```
 
-### form_urlencoded 1.2.2 — MIT
+### form_urlencoded 1.2.3 — MIT
 
 Repository: https://github.com/servo/rust-url
 
@@ -6003,7 +6003,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### url 2.5.8 — MIT
+### url 2.5.9 — MIT
 
 Repository: https://github.com/servo/rust-url
 
@@ -13327,7 +13327,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.8 — MIT
+### clap 4.6.9 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -13408,7 +13408,7 @@ SOFTWARE.
 
 ```
 
-### clap_derive 4.6.8 — MIT
+### clap_derive 4.6.9 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
