@@ -123,27 +123,95 @@ and neither is a defect here:
 
 ---
 
-## Nachtrag nach dem Peer-Review — diese Einheit ist blockiert, und zwar begründet
+## Nachtrag — die Entscheidung unter dieser Einheit ist beantwortet
 
-Der Review hat eine Tatsache widerlegt, die ich oben als „vom Implementierer zu klären" offengelassen hatte. Ich habe sie selbst nachgeprüft:
+Der Peer-Review hatte eine Tatsache widerlegt, die ich oben als "vom
+Implementierer zu klären" offengelassen hatte: die Daten, die die Spec
+verlangt, lagen nicht in der Projektion. Das ist entschieden und umgesetzt.
 
-**Die Daten, die die Spec verlangt, liegen nicht in der Projektion.** `subject_content_reference_claim` (`manifests_write.rs:1596-1611`) schreibt in die `oci_subject`-Kante genau
+**Die Entscheidung (Maintainer, 2026-11-21):** alle Daten, die wir brauchen,
+werden gespeichert, möglichst in ursprünglicher Granularität; abgeleitete Werte
+werden zur Laufzeit berechnet. Also **die Projektion erweitern** — und weil ein
+CAS-Read auf dieser Leseroute absehbar nicht ausreichend performt, ist die
+Speicherung dieser Werte ein **Cache** und wird auch so deklariert.
 
-```rust
-metadata: serde_json::json!({
-    "artifact_type": artifact_type_opt,
-    "media_type": media_type,
-}),
-```
+**Umgesetzt in Einheit 430** (gemergt): `subject_content_reference_claim`
+(`crates/hort-http-oci/src/manifests_write.rs:1614-1647`) schreibt auf die
+`oci_subject`-Kante `artifact_type`, `media_type`, `name`, dazu
+`config_media_type` (nur Nicht-Index, nur wenn vorhanden) und `annotations`
+(nur wenn vorhanden). Die Cache-Semantik steht im Doc-Kommentar derselben
+Funktion:
 
-Also **keine Annotations** — `annotations` kommt in `manifests_write.rs` und `referrers.rs` überhaupt nicht vor — und **nicht die `mediaType` des Config-Descriptors**; die `media_type` hier ist der Typ des referenzierenden Manifests selbst. Beides ist nur aus den Manifest-Bytes zu holen.
+- `config_media_type` und `annotations` sind **aus den Manifest-Bytes
+  ableitbar**. CAS bleibt ihre Wahrheit, ein fehlender Key heißt *nicht
+  gecacht*, und der Leser liest durch.
+- `name` ist aus **keinem** Payload ableitbar — bei Schreiben erfasst oder
+  verloren. Sein Fehlen heißt *unbekannt*, niemals *keiner*.
 
-**Damit ist die Einheit keine Implementierung mehr, sondern hängt an einer Entscheidung:**
+### Was dadurch offen bleibt, und wie es hier entschieden wird
 
-1. **Ein begrenzter CAS-Read plus Parse pro Descriptor** (`ArtifactUseCase::read_content_for_projection`). Erfüllt die Spec für Alt- und Neubestand gleich, ändert aber das Kostenmodell der Liste von „eine Projektionsabfrage" auf „ein Objekt-Read je Zeile" — und ADR 0062 benutzt für die Listen-Schließung bewusst Projektionsdaten.
-2. **Die Projektion erweitern** (Write- **und** Proxy-Pfad) und für bestehende Zeilen einen Weg nennen. Billig im Betrieb, aber jede vor der Änderung gepushte Zeile bleibt unvollständig, bis etwas sie nachzieht.
+Ein Cache-Eintrag, der ein Sack optionaler Keys ist, kann **"Eintrag da, Feld
+leer" nicht von "kein Eintrag" unterscheiden** — und genau diese Unterscheidung
+ist das, was "ein fehlender Key heißt nicht gecacht" braucht, um
+implementierbar zu sein. Gemessen an 430s Schreibpfad:
 
-Das ist eine Kosten-gegen-Vollständigkeit-Abwägung über eine heiße Leseroute und keine Implementierungsdetailfrage. **Nicht anfangen, bevor sie beantwortet ist.**
+- Ein Manifest **ohne** Annotations schreibt keinen `annotations`-Key. Das ist
+  der häufige Fall.
+- Ein **Index** schreibt nie `config_media_type` — korrekt, ein Index hat
+  keinen Config-Descriptor.
+
+Beide sehen für den Leser genauso aus wie eine Altzeile. Ohne weiteres würde
+die Referrers-Liste also für jeden annotationsfreien Referrer und für jeden
+Index-Referrer **dauerhaft** einen begrenzten CAS-Read bezahlen — für ein
+Ergebnis, das der Schreiber schon kannte. Das ist kein Cache mehr, das ist ein
+Cache, der immer misst.
+
+**Entscheidung dieser Einheit:** die Kante trägt einen ausdrücklichen
+**Vollständigkeitsmarker** — ein Key, den der Projektor immer schreibt. Der
+Leser traut einer Abwesenheit **nur**, wenn der Marker da ist; fehlt er, ist
+die Zeile Altbestand und wird durchgelesen. Damit ist jede Abwesenheit unter
+einem Marker eine *Aussage* (dieses Manifest hat keine Annotations; dieser
+Index hat keinen Config-Descriptor) und jede Abwesenheit ohne Marker ein
+*Miss*.
+
+Ausdrücklich **nicht** auf die Anwesenheit von `name` gestützt, obwohl die sich
+heute genauso verhält: `name` kann mit #459 wieder verschwinden, und ein
+Marker, der an einem Feld hängt, das eine andere Entscheidung entfernen darf,
+ist kein Marker.
+
+**Der Marker ist eine Zahl, kein Bool:** `projection_version: 1` (Integer). Der
+Leser traut der Abwesenheit eines Feldes nur, wenn die Version mindestens die
+ist, in der dieses Feld eingeführt wurde — für alle hier betroffenen Felder
+also `>= 1`. Ein Bool wäre heute gleichwertig und würde die nächste
+Felderweiterung in genau diese Ambiguität zurückwerfen: Zeilen, die unter dem
+alten Feldsatz als "vollständig" markiert wurden, sind für das neue Feld
+Altbestand. Die Zahl beantwortet das mechanisch, der Bool nicht. Ein anderer
+Name oder eine andere Form braucht einen *objectively better*-Fall nach der
+Deviation-Disziplin des Repos, nicht nur eine Vorliebe.
+
+**Höchstens ein Read pro Zeile.** Fehlt der Marker, werden die Bytes des
+referenzierenden Manifests **einmal** gelesen und **einmal** geparst, und beide
+fehlenden Felder kommen aus diesem einen Parse. Nie ein Read pro Feld. Vorhandene Route und Deckel dafür:
+`ctx.artifact_use_case.read_content_for_projection(&hash, cap)` mit
+`MANIFEST_PROJECTION_READ_CAP_BYTES` (`manifests.rs:109`, 16 MiB) — beides in
+diesem Crate schon in Benutzung (`manifests.rs:2233`,
+`manifests_write.rs:777`).
+
+**Der `mediaType`-Default ist Verteidigung, kein Defekt — und bleibt eine.**
+`referrers.rs:396-400` setzt bei fehlendem `media_type` `DEFAULT_DESCRIPTOR_MEDIA_TYPE`,
+also die Annahme "Image-Manifest". Nachgesehen: `media_type` liegt auf der Kante
+seit ihrer Einführung, und `subject_content_reference_claim` ist der einzige
+Schreiber — es gibt also keine Zeile ohne diesen Key, und der Zweig ist heute
+unerreichbar. Der Peer-Review hat ihn als Fehlbeschriftung alter Index-Zeilen
+gelesen; das stimmt in der Konsequenz, aber nicht in der Voraussetzung. **Nicht
+als Bug behandeln.** Was zählt: ein Miss darf nicht mit einem geratenen Wert
+beantwortet werden, also gehört dieser Zweig, wenn er angefasst wird, an denselben
+Durchleseweg und nicht an einen zweiten Default.
+
+Daraus folgt auch, was ein Durchlese-Read tatsächlich bedient: **nicht drei
+Felder, sondern zwei** — die Config-`mediaType` für den `artifactType`-Fallback
+und die Annotations. Der `mediaType` des Descriptors kommt aus der Zeile, bei
+Alt- wie Neubestand.
 
 ### Zwei weitere Korrekturen aus dem Review, selbst nachgelesen
 
@@ -155,4 +223,28 @@ Das ist eine Kosten-gegen-Vollständigkeit-Abwägung über eine heiße Leseroute
 
 Die beiden geparkten MUSTs halten, und beim 404 ist die Lage besser als von mir behauptet: die **Endpoint-Tabelle der Spec selbst** führt für `end-12a`/`end-12b` `404`/`400` als Fehlercodes (`spec.md:860-861`). Mein „vertretbar" war zu schwach — die Tabelle deckt es. Beim `Link`-Header hat der Review die Kette unter dem Handler mitgelesen, was ich nicht getan hatte: `content_reference.rs:97-112` gibt den Vektor unverändert weiter, der Adapter benutzt `fetch_all` ohne `LIMIT` oder Offset. Die Pflicht ist damit wirklich leer erfüllt — und das unbegrenzte Fan-out bleibt ein Kostenrisiko, das kein MUST auslöst.
 
-**Abhängigkeit:** diese Einheit konsumiert die Projektion aus `backlog/430-project-what-the-referrers-list-needs.md` und beginnt erst, wenn 430 gemergt ist. Vor 430 existieren die Daten nicht, die die Spec hier verlangt.
+**Abhängigkeit:** erfüllt — diese Einheit konsumiert die Projektion aus `backlog/430-project-what-the-referrers-list-needs.md`, und 430 ist gemergt. Unabhängig von #459: die beiden Cache-Keys bleiben, wie die Reichweitenfrage dort auch ausgeht; nur der `name`-Key hängt daran, und den liest diese Einheit nicht.
+
+### Akzeptanz, zusätzlich zur Liste oben
+
+- Eine Zeile **mit** Marker und ohne `annotations` liefert einen Descriptor ohne
+  `annotations`-Feld **und löst keinen CAS-Read aus** — asserted über die
+  Storage-Aufrufzahl, nicht über das Ergebnis allein. Das ist die Zusicherung,
+  die den Cache zu einem Cache macht; ohne diesen Test ist sie nicht da.
+- Eine Zeile **ohne** Marker löst genau **einen** Read aus und bedient daraus
+  beide Felder, die nur dort stehen: die Config-`mediaType` für den
+  `artifactType`-Fallback und die Annotations.
+- Eine Index-Zeile mit Marker und ohne `config_media_type` lässt `artifactType`
+  weg (Spec-Regel für Index) und liest nicht durch.
+- Der Filter läuft auf dem **effektiven** `artifactType` — also nach dem
+  Fallback —, und `OCI-Filters-Applied` wird nur gesetzt, wenn gefiltert wurde.
+  Ein Manifest ohne deklarierten `artifactType`, dessen Config-`mediaType` dem
+  Filterwert entspricht, **ist** in der gefilterten Antwort: asserted.
+- Der leere String zählt als fehlend (`"empty or missing"`), für beide Arten
+  getestet.
+- Fehlschlägt der Durchlese-Read (Bytes weg, Deckel überschritten), wird die
+  Zeile **nicht** stillschweigend mit einem geratenen `artifactType` ausgeliefert.
+  Welche der beiden Antworten richtig ist — Zeile auslassen oder Anfrage mit 500
+  beenden — entscheidet derselbe Maßstab, den Schritt 5 des Handlers schon
+  anlegt (`referrers.rs:283-296`: Tombstone fällt still, transienter Fehler
+  bricht ab); begründe die Wahl im Report an dieser Stelle.

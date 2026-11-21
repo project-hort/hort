@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OCI referrers descriptors now include source annotations and the spec-defined
+  `artifactType` fallback; filtered lists disclose the applied filter (#456).
 - Maven `.jar`/`.war` artifacts are no longer withheld as scan-indeterminate for
   an unreadable embedded dependency declaration — a dependency that resolved
   before no longer starts answering 403. An artifact already withheld clears on
