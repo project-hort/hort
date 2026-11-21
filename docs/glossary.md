@@ -284,6 +284,19 @@ disproved signature. It cannot reach a **corruption** tombstone: there the
 stored bytes do not match the content hash naming them, so no external
 attestation confirms anything and `VerifyingReader` fails the read regardless.
 
+### OCI `<name>` (namespace)
+
+The second half of an OCI wire path — `/v2/<repo_key>/<name>/…` — and the
+**namespace for artifact identity**. The OCI Distribution Specification uses
+"repository" and `<name>` synonymously, so what a client calls one repository
+is `repo_key` plus `name` here, and a hort
+[`Repository`](#repository-hort-vs-repository-oci) is a container of many such
+namespaces. Not a hort concept invented for OCI: `MutableRef` is keyed
+`(repository_id, namespace, ref_name)` across formats, binding `namespace` to
+the image name for OCI, the package name for npm and `<group>:<artifact>` for
+Maven. See
+[OCI namespace and identity](architecture/reference/oci-namespace-and-identity.md).
+
 ### Ready-for-staging
 
 A resting state for an issue whose fix has merged to `develop` and is
@@ -300,6 +313,18 @@ staging. See [ADR 0048](adr/0048-release-branch-staging-strategy.md) D3, D5.
 suffix. A single promotion can batch-close many issues that had been
 resting in `ready-for-staging` / `in-uat`. See
 [ADR 0048](adr/0048-release-branch-staging-strategy.md) D1, D5.
+
+### Repository (hort) vs. repository (OCI)
+
+Two different things wearing one word, and the distinction is load-bearing on
+the OCI surface. A **hort repository** is the configured aggregate selected by
+`repo_key`: it carries the upstream mapping, the policies and the visibility
+rules. An **OCI repository** is what the specification also calls `<name>`, and
+in a hort URL it is the path *after* `repo_key`. One hort repository therefore
+holds many OCI repositories, and a boundary the specification draws around "the
+repository" is a boundary around the [name](#oci-name-namespace), not around
+the hort aggregate. See
+[OCI namespace and identity](architecture/reference/oci-namespace-and-identity.md).
 
 ### Rows are not bytes
 
