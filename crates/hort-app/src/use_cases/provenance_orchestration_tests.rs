@@ -3657,6 +3657,43 @@ fn referrer_manifest_for(blob_hash: &ContentHash) -> Vec<u8> {
     .into_bytes()
 }
 
+#[test]
+fn proxy_subject_metadata_keeps_declared_fields_and_absence() {
+    let declared = serde_json::json!({
+        "artifactType": "application/vnd.example.declared",
+        "config": { "mediaType": "application/vnd.example.config" },
+        "annotations": { "org.example.key": "value" },
+    });
+    let projected = proxy_subject_metadata("local/image", declared.to_string().as_bytes())
+        .expect("valid manifest JSON");
+    assert_eq!(projected["name"], "local/image");
+    assert_eq!(
+        projected["artifact_type"],
+        "application/vnd.example.declared"
+    );
+    assert_eq!(
+        projected["config_media_type"],
+        "application/vnd.example.config"
+    );
+    assert_eq!(projected["annotations"], declared["annotations"]);
+
+    let absent = proxy_subject_metadata("local/image", b"{}").expect("valid manifest JSON");
+    assert!(absent.get("config_media_type").is_none());
+    assert!(absent.get("annotations").is_none());
+    assert!(absent["artifact_type"].is_null());
+
+    let index = serde_json::json!({
+        "mediaType": hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE,
+        "config": { "mediaType": "application/vnd.example.must-not-fallback" },
+        "annotations": {},
+    });
+    let projected_index = proxy_subject_metadata("local/image", index.to_string().as_bytes())
+        .expect("valid index JSON");
+    assert!(projected_index.get("config_media_type").is_none());
+    assert_eq!(projected_index["annotations"], serde_json::json!({}));
+    assert!(proxy_subject_metadata("local/image", b"not-json").is_err());
+}
+
 /// Seed a referrer manifest + its bundle blob into CAS (the manifest+blob
 /// shape): the `oci_subject` source artifact's CAS bytes are the **manifest**,
 /// and the bundle JSON blob lives at the hash the manifest's layer declares.
@@ -4374,6 +4411,19 @@ async fn proxy_fetches_upstream_referrer_writes_oci_subject_and_reaches_verdict(
     );
     assert_eq!(rows[0].kind, "oci_subject");
     assert_eq!(rows[0].target_content_hash, f.content_hash);
+    assert_eq!(
+        rows[0].metadata["name"],
+        f.artifacts.get(f.artifact_id).unwrap().name
+    );
+    assert_eq!(
+        rows[0].metadata["artifact_type"],
+        hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE
+    );
+    assert_eq!(
+        rows[0].metadata["config_media_type"],
+        "application/vnd.oci.empty.v1+json"
+    );
+    assert!(rows[0].metadata.get("annotations").is_none());
 
     // (3) The referrer manifest was landed via `commit_transition` as a
     //     status-`None` artifact (the narrow create) — NOT quarantined.

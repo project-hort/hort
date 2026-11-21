@@ -1590,24 +1590,60 @@ async fn set_tag_ref(
 /// is another artifact's content, so the failure mode is somebody else's
 /// bytes going away.
 ///
-/// Idempotency is unchanged and now belongs to the transition: the upsert is
-/// on `(repository_id, source_artifact_id, target_content_hash, kind)`, so a
-/// client retry of the same manifest refreshes the row.
+/// A same-digest retry reconciles missing claims but preserves metadata on an
+/// existing edge. The key `(repository_id, source_artifact_id,
+/// target_content_hash, kind)` excludes the OCI name, so two names for the
+/// same manifest and subject cannot retain separate descriptor projections.
+///
+/// Keep the descriptor's declared inputs beside the edge, not an effective
+/// `artifactType` verdict. A referrers request is client-waited and reads every
+/// surviving edge without a row cap; re-reading each payload from CAS would
+/// put unbounded I/O on that path (ADR 0066). Scan-time SBOM extraction can
+/// read CAS because nobody waits for it (ADR 0056). The read path interprets
+/// these inputs when needed, as evidence and policy stay separate in ADR 0041.
+///
+/// **Two of these keys are a cache; one is not, and the difference decides
+/// what a missing key means.** `config_media_type` and `annotations` are
+/// derivable from the manifest bytes, so CAS stays their source of truth and
+/// their absence means *not cached* — a reader that needs them and finds them
+/// missing reads through to the payload. `name` is not derivable from any
+/// payload: the bytes do not record which OCI name they were pushed under, so
+/// it is recorded here or it is lost, and its absence means *unknown*, never
+/// *none*. Treating either absence as a declaration would invert the spec's
+/// `artifactType` fallback, which turns on empty-or-missing versus present.
 fn subject_content_reference_claim(
     subject_digest_parsed: &Option<ContentHash>,
     media_type: &str,
+    name: &str,
     artifact_type_opt: &Option<String>,
+    parsed_manifest: &serde_json::Value,
+    is_index: bool,
 ) -> Option<ContentReferenceClaim> {
-    subject_digest_parsed
-        .clone()
-        .map(|subject_hash| ContentReferenceClaim {
+    subject_digest_parsed.clone().map(|subject_hash| {
+        let mut metadata = serde_json::json!({
+            "artifact_type": artifact_type_opt,
+            "media_type": media_type,
+            "name": name,
+        });
+        let config_media_type = if is_index {
+            None
+        } else {
+            parsed_manifest
+                .pointer("/config/mediaType")
+                .and_then(serde_json::Value::as_str)
+        };
+        if let Some(config_media_type) = config_media_type {
+            metadata["config_media_type"] = config_media_type.into();
+        }
+        if let Some(annotations) = parsed_manifest.get("annotations") {
+            metadata["annotations"] = annotations.clone();
+        }
+        ContentReferenceClaim {
             target_content_hash: subject_hash,
             kind: "oci_subject".into(),
-            metadata: serde_json::json!({
-                "artifact_type": artifact_type_opt,
-                "media_type": media_type,
-            }),
-        })
+            metadata,
+        }
+    })
 }
 
 /// The manifest→blob / index→child membership claims a manifest body
@@ -1792,8 +1828,14 @@ async fn put_manifest_dispatch_inner(
     // and the transaction that makes the referrer live is the only place it
     // can be recorded without leaving a window in which the subject has one
     // fewer claim against the storage GC.
-    let subject_claim =
-        subject_content_reference_claim(&subject_digest_parsed, &media_type, &artifact_type_opt);
+    let subject_claim = subject_content_reference_claim(
+        &subject_digest_parsed,
+        &media_type,
+        &name,
+        &artifact_type_opt,
+        &parsed_manifest,
+        media_type_is_index,
+    );
 
     // Parse and resolve the declared references BEFORE the mint. Both are
     // reads over data already in hand (the body, and `find_in_repo_by_hash`)
@@ -3601,6 +3643,67 @@ mod tests {
         serde_json::to_vec(&body).unwrap()
     }
 
+    #[test]
+    fn subject_claim_projects_declared_descriptor_inputs() {
+        let subject: ContentHash = "11".repeat(32).parse().unwrap();
+        let image = serde_json::json!({
+            "config": { "mediaType": "application/vnd.example.config+json" },
+            "annotations": { "org.example.note": "present" },
+        });
+        let claim = subject_content_reference_claim(
+            &Some(subject.clone()),
+            "application/vnd.oci.image.manifest.v1+json",
+            "library/nginx",
+            &None,
+            &image,
+            false,
+        )
+        .unwrap();
+        assert_eq!(claim.target_content_hash, subject);
+        assert_eq!(claim.metadata["name"], "library/nginx");
+        assert_eq!(
+            claim.metadata["config_media_type"],
+            "application/vnd.example.config+json"
+        );
+        assert_eq!(claim.metadata["annotations"], image["annotations"]);
+        assert!(claim.metadata["artifact_type"].is_null());
+    }
+
+    #[test]
+    fn subject_claim_keeps_index_config_and_missing_annotations_absent() {
+        let subject: ContentHash = "22".repeat(32).parse().unwrap();
+        let index = serde_json::json!({
+            "config": { "mediaType": "application/vnd.example.must-not-fallback" },
+        });
+        let claim = subject_content_reference_claim(
+            &Some(subject),
+            "application/vnd.oci.image.index.v1+json",
+            "library/nginx",
+            &Some("application/vnd.example.index".into()),
+            &index,
+            true,
+        )
+        .unwrap();
+        assert!(claim.metadata.get("config_media_type").is_none());
+        assert!(claim.metadata.get("annotations").is_none());
+        assert_eq!(
+            claim.metadata["artifact_type"],
+            "application/vnd.example.index"
+        );
+
+        let absent_config = subject_content_reference_claim(
+            &Some("33".repeat(32).parse().unwrap()),
+            "application/vnd.oci.image.manifest.v1+json",
+            "library/nginx",
+            &None,
+            &serde_json::json!({ "annotations": {} }),
+            false,
+        )
+        .unwrap();
+        assert!(absent_config.metadata.get("config_media_type").is_none());
+        assert_eq!(absent_config.metadata["annotations"], serde_json::json!({}));
+    }
+
     /// Construct a PUT request with the right media-type + body.
     fn put_request(uri: &str, body: Vec<u8>) -> axum::http::Request<Body> {
         let req = HttpRequest::put(uri)
@@ -4349,6 +4452,56 @@ mod tests {
                 1,
                 "one transition carries the manifest's whole edge set"
             );
+            let rows = h
+                .content_references
+                .find_by_target(repo_id, &subject_hash, Some("oci_subject"))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].metadata["name"], "library/nginx");
+            assert_eq!(
+                rows[0].metadata["config_media_type"],
+                "application/vnd.oci.image.config.v1+json"
+            );
+            assert!(rows[0].metadata.get("annotations").is_none());
+        });
+    }
+
+    #[test]
+    fn two_names_for_one_manifest_share_one_subject_edge() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"config-multiname");
+            let subject_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"subject-multiname");
+            let body = build_manifest_with_subject(&config_hash, &[], &subject_hash);
+            let manifest_hex = hex::encode(Sha256::digest(&body));
+
+            for name in ["first/image", "second/image"] {
+                let uri = format!("/v2/myrepo/{name}/manifests/v1");
+                let resp = router()
+                    .with_state(h.ctx.clone())
+                    .oneshot(put_request(&uri, body.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::CREATED);
+            }
+
+            let artifact = h
+                .artifacts
+                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .await
+                .unwrap()
+                .expect("one digest-addressed artifact row");
+            let rows = h
+                .content_references
+                .find_by_target(repo_id, &subject_hash, Some("oci_subject"))
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].source_artifact_id, artifact.id);
         });
     }
 
