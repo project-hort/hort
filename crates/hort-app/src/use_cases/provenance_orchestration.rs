@@ -64,6 +64,7 @@ use uuid::Uuid;
 
 use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::scan_policy::ProvenanceMode;
+use hort_domain::error::DomainError;
 use hort_domain::events::{system_actor, ArtifactIngested, DomainEvent, IngestSource};
 use hort_domain::ports::artifact_lifecycle::ArtifactLifecyclePort;
 use hort_domain::ports::artifact_repository::ArtifactRepository;
@@ -100,6 +101,44 @@ use crate::use_cases::{
 /// is recorded as an `"oci_subject"` row pointing AT the signed artifact's
 /// content hash (the OCI Referrers projection).
 const OCI_SUBJECT_KIND: &str = "oci_subject";
+
+/// Project only the referrer's declared descriptor inputs. The local image
+/// name is the name under which its referrer is served through this registry;
+/// the upstream mapping may use a different name. Referrers listing is a
+/// client-waited, unbounded fan-out, so a CAS read per row would put unbounded
+/// I/O on the request (ADR 0066). The scan-time CAS read for SBOM components
+/// serves background work instead (ADR 0056). Keep the inputs separate from
+/// the effective `artifactType` interpretation (ADR 0041).
+fn proxy_subject_metadata(name: &str, manifest_bytes: &[u8]) -> AppResult<serde_json::Value> {
+    let manifest: serde_json::Value = serde_json::from_slice(manifest_bytes)
+        .map_err(|e| DomainError::Validation(format!("not a valid OCI manifest: {e}")))?;
+    let mut metadata = serde_json::json!({
+        "name": name,
+        "artifact_type": manifest.get("artifactType").and_then(serde_json::Value::as_str),
+        "media_type": hort_domain::oci::OCI_IMAGE_MANIFEST_MEDIA_TYPE,
+    });
+    let is_index = matches!(
+        manifest
+            .get("mediaType")
+            .and_then(serde_json::Value::as_str),
+        Some(hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE)
+            | Some(hort_domain::oci::DOCKER_MANIFEST_LIST_MEDIA_TYPE)
+    );
+    let config_media_type = if is_index {
+        None
+    } else {
+        manifest
+            .pointer("/config/mediaType")
+            .and_then(serde_json::Value::as_str)
+    };
+    if let Some(config_media_type) = config_media_type {
+        metadata["config_media_type"] = config_media_type.into();
+    }
+    if let Some(annotations) = manifest.get("annotations") {
+        metadata["annotations"] = annotations.clone();
+    }
+    Ok(metadata)
+}
 
 /// Number of attempts (1 initial + N-1 retries) the orchestrator makes to
 /// fetch the bundle set / read the CAS preimage before giving up. On
@@ -1181,6 +1220,8 @@ impl ProvenanceOrchestrationUseCase {
             }
         }
 
+        let subject_metadata = proxy_subject_metadata(&artifact.name, &manifest_bytes)?;
+
         // d. Store the referrer manifest in CAS — its put-returned hash must
         //    equal the descriptor's declared digest.
         let manifest_put = self
@@ -1224,10 +1265,7 @@ impl ProvenanceOrchestrationUseCase {
                 &[ContentReferenceClaim {
                     target_content_hash: artifact.sha256_checksum.clone(),
                     kind: OCI_SUBJECT_KIND.to_string(),
-                    metadata: serde_json::json!({
-                        "artifact_type": hort_domain::oci::SIGSTORE_BUNDLE_MEDIA_TYPE,
-                        "media_type": "application/vnd.oci.image.manifest.v1+json",
-                    }),
+                    metadata: subject_metadata,
                 }],
             )
             .await?;
