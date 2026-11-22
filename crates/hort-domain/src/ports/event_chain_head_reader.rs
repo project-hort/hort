@@ -50,8 +50,29 @@
 //! The trait is intentionally minimal (one snapshot op); the read posture
 //! (runtime DML DSN, `SELECT` only) is an adapter concern documented on
 //! the implementation.
+//!
+//! ## A failed snapshot has two classes, and they are distinguished here
+//!
+//! A snapshot can fail because the store could not be reached — and
+//! because the **stored chain evidence cannot be read back**: a chain
+//! hash column that is not 32 bytes wide, a `StreamSealed` payload that
+//! does not decode. The second class is the thing this whole anchor
+//! mechanism exists to surface, and re-reading the same bytes returns
+//! the same verdict, so retrying only spends the caller's attempt budget
+//! before reaching the same end.
+//!
+//! [`ChainSnapshotError`] therefore carries the two classes as separate
+//! variants, with the corrupt-evidence half as a dedicated
+//! port-boundary payload ([`CorruptChainEvidence`]) — the shape
+//! [`CasIntegrityFailure`](super::storage::CasIntegrityFailure) already
+//! uses for at-rest corruption, and deliberately **not** a
+//! [`DomainError`] variant: the condition has no HTTP surface, so a new
+//! variant would reach every exhaustive match and the HTTP error mapping
+//! for a caller that does not exist.
 
-use crate::error::DomainResult;
+use core::fmt;
+
+use crate::error::DomainError;
 use crate::events::{SealedStreamRecord, StreamHead};
 
 use super::BoxFuture;
@@ -95,13 +116,171 @@ impl LiveChainSnapshot {
     }
 }
 
+/// Where an unreadable stored datum sits.
+///
+/// A closed, stable set, used as the value of the structured log field
+/// an operator alerts on — so the alert keys on a field rather than on a
+/// substring of a message. It names **the datum**, not the call site
+/// that noticed it: two code paths that find the same stored value
+/// unreadable report the same locus, and the free-text detail says which
+/// way it was unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainEvidenceLocus {
+    /// A stored 32-byte `bytea` chain-hash column (`event_hash` /
+    /// `prev_event_hash`) is not 32 bytes wide.
+    ChainHashColumn,
+    /// The audit-meta stream position an anchored checkpoint already
+    /// covered, as recovered from that checkpoint's signed witness, does
+    /// not fit the column it is compared against.
+    AnchoredRetentionPosition,
+    /// A stored `StreamSealed` payload on the audit-meta stream does not
+    /// decode into the record the checkpoint binds.
+    SealedRecordPayload,
+    /// A row read as a seal on the audit-meta stream decoded as some
+    /// other event.
+    SealedRecordEventType,
+}
+
+impl ChainEvidenceLocus {
+    /// The stable wire form — the log/alert field value. Changing one of
+    /// these strings breaks every operator alert keyed on it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ChainHashColumn => "chain_hash_column",
+            Self::AnchoredRetentionPosition => "anchored_retention_position",
+            Self::SealedRecordPayload => "sealed_record_payload",
+            Self::SealedRecordEventType => "sealed_record_event_type",
+        }
+    }
+}
+
+impl fmt::Display for ChainEvidenceLocus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The stored event-chain evidence a checkpoint is assembled from could
+/// not be read back as the chain format requires.
+///
+/// Carried as a typed port-boundary payload — the shape
+/// [`CasIntegrityFailure`](super::storage::CasIntegrityFailure) uses for
+/// the same question one layer down — because a caller has to tell this
+/// apart from the store being unreachable, and a message-only error
+/// cannot answer that without substring matching.
+///
+/// Locating the bad datum is the whole payload: `locus` + `subject` say
+/// *which* stored value, `detail` says what reading it produced.
+/// **Never the datum itself** — no raw bytes, no key material: a
+/// consumer logs this, and the bytes of a corrupt hash column are of no
+/// use to an operator who has to go and look at the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptChainEvidence {
+    /// Which stored value class is unreadable — the stable alert field.
+    pub locus: ChainEvidenceLocus,
+    /// Which instance of it: the column name, or the stream the row sits
+    /// on.
+    pub subject: String,
+    /// What reading it produced — a width, a decoder message. No raw
+    /// bytes.
+    pub detail: String,
+}
+
+impl CorruptChainEvidence {
+    /// A convenience constructor for the three parts. Pure.
+    pub fn new(
+        locus: ChainEvidenceLocus,
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            locus,
+            subject: subject.into(),
+            detail: detail.into(),
+        }
+    }
+}
+
+impl fmt::Display for CorruptChainEvidence {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "corrupt event-chain evidence [{}] at {}: {}",
+            self.locus, self.subject, self.detail
+        )
+    }
+}
+
+impl std::error::Error for CorruptChainEvidence {}
+
+/// Why a live-chain snapshot did not happen.
+///
+/// The two variants are the two classes, and keeping them apart **in the
+/// type** is the point: the consumer's correct response differs, and a
+/// single message-carrying error made tamper evidence indistinguishable
+/// from an outage.
+#[derive(Debug, Clone)]
+pub enum ChainSnapshotError {
+    /// The snapshot could not be taken: the store was unreachable, a
+    /// read transaction could not be opened or committed, a query
+    /// failed. An operational failure **of this cycle** that a later
+    /// cycle can still complete, so the consumer retries it.
+    Unavailable(DomainError),
+    /// The store answered, and what it holds cannot be read as chain
+    /// evidence. Not an outage: re-reading the same bytes returns the
+    /// same verdict, so a consumer must fail terminally rather than
+    /// spend an attempt budget reaching the same end.
+    CorruptEvidence(CorruptChainEvidence),
+}
+
+impl ChainSnapshotError {
+    /// The transient half: an infrastructure step of the snapshot
+    /// failed. Naming the class at every construction site is what keeps
+    /// the classification a decision rather than a default — there is
+    /// deliberately no `From<DomainError>`, so no `?` can classify a
+    /// failure as retryable without saying so.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(DomainError::Invariant(message.into()))
+    }
+
+    /// The corrupt-evidence verdict, if this is one.
+    ///
+    /// `None` for every infrastructure failure — which is precisely the
+    /// distinction a consumer must preserve, and the reason this travels
+    /// as a typed payload rather than as text to match on (mirrors
+    /// [`CasIntegrityFailure::from_io_error`](super::storage::CasIntegrityFailure::from_io_error)).
+    pub fn corrupt_evidence(&self) -> Option<&CorruptChainEvidence> {
+        match self {
+            Self::Unavailable(_) => None,
+            Self::CorruptEvidence(c) => Some(c),
+        }
+    }
+}
+
+impl fmt::Display for ChainSnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable(e) => write!(f, "{e}"),
+            Self::CorruptEvidence(c) => write!(f, "{c}"),
+        }
+    }
+}
+
+impl std::error::Error for ChainSnapshotError {}
+
+impl From<CorruptChainEvidence> for ChainSnapshotError {
+    fn from(c: CorruptChainEvidence) -> Self {
+        Self::CorruptEvidence(c)
+    }
+}
+
 /// Outbound port: snapshot the live chain heads for checkpoint emission.
 ///
 /// Read-only and side-effect-free: the emitter never writes `events`
 /// (the runtime DML DSN holds only `SELECT`/`INSERT`; this path only
-/// `SELECT`s). `Err` is an *operational* failure for this emission cycle
-/// (DB unreachable) — the task maps it to a `Failed { retry: true }`
-/// outcome, never a silently-skipped checkpoint.
+/// `SELECT`s). `Err` is never a silently-skipped checkpoint; which of
+/// the two [`ChainSnapshotError`] classes it carries decides whether the
+/// consumer retries the cycle.
 pub trait EventChainHeadReaderPort: Send + Sync {
     /// Snapshot every live stream's head + the consistent-cut
     /// `max_global_position` + the `StreamSealed` records past
@@ -118,7 +297,7 @@ pub trait EventChainHeadReaderPort: Send + Sync {
     fn snapshot_live_chain(
         &self,
         anchored_retention_position: Option<u64>,
-    ) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>>;
+    ) -> BoxFuture<'_, Result<LiveChainSnapshot, ChainSnapshotError>>;
 }
 
 #[cfg(test)]
@@ -133,6 +312,66 @@ mod tests {
     #[test]
     fn event_chain_head_reader_port_can_be_boxed() {
         let _: Option<Box<dyn EventChainHeadReaderPort>> = None;
+    }
+
+    fn corrupt(locus: ChainEvidenceLocus) -> CorruptChainEvidence {
+        CorruptChainEvidence::new(locus, "event_hash", "16 bytes, expected 32")
+    }
+
+    #[test]
+    fn every_locus_has_a_distinct_stable_wire_form() {
+        // The log field an operator alerts on. Two loci sharing a string
+        // would merge two conditions into one alert; a renamed string
+        // breaks the alert silently.
+        let all = [
+            ChainEvidenceLocus::ChainHashColumn,
+            ChainEvidenceLocus::AnchoredRetentionPosition,
+            ChainEvidenceLocus::SealedRecordPayload,
+            ChainEvidenceLocus::SealedRecordEventType,
+        ];
+        let names: Vec<&str> = all.iter().map(|l| l.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "chain_hash_column",
+                "anchored_retention_position",
+                "sealed_record_payload",
+                "sealed_record_event_type",
+            ]
+        );
+        for l in all {
+            assert_eq!(l.to_string(), l.as_str());
+        }
+    }
+
+    #[test]
+    fn corrupt_evidence_locates_the_datum_in_its_display() {
+        let c = corrupt(ChainEvidenceLocus::ChainHashColumn);
+        assert_eq!(c.locus, ChainEvidenceLocus::ChainHashColumn);
+        assert_eq!(c.subject, "event_hash");
+        let shown = c.to_string();
+        assert!(shown.contains("chain_hash_column"), "{shown}");
+        assert!(shown.contains("event_hash"), "{shown}");
+        assert!(shown.contains("16 bytes, expected 32"), "{shown}");
+        assert_eq!(c.clone(), c);
+        let _: &dyn std::error::Error = &c;
+    }
+
+    #[test]
+    fn the_two_classes_are_distinguishable_without_reading_a_message() {
+        // The defect this type exists to close: a consumer must be able
+        // to tell corrupt stored evidence from an unreachable store
+        // without substring-matching free text.
+        let transient = ChainSnapshotError::unavailable("begin snapshot tx failed: closed");
+        assert!(transient.corrupt_evidence().is_none());
+        assert!(transient.to_string().contains("begin snapshot tx failed"));
+
+        let evidence = corrupt(ChainEvidenceLocus::SealedRecordPayload);
+        let corrupted: ChainSnapshotError = evidence.clone().into();
+        assert_eq!(corrupted.corrupt_evidence(), Some(&evidence));
+        assert_eq!(corrupted.to_string(), evidence.to_string());
+        let _: &dyn std::error::Error = &corrupted;
+        let _ = format!("{:?}", corrupted.clone());
     }
 
     #[test]

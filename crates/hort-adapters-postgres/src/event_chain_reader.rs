@@ -22,15 +22,38 @@
 //! [`crate::event_chain_head_reader`] — the same parsing the emitter and
 //! the rest of the read path use, so the two read adapters agree
 //! byte-for-byte on the `StreamSealed` shape and the 32-byte hash check.
+//! They answer `CorruptChainEvidence`, the typed verdict the *emission*
+//! port distinguishes in its return type; [`EventChainReaderPort`]
+//! answers `DomainResult`, so this half reports that verdict as the
+//! operational error it has always reported (the `operational` mapper
+//! below). What an operator reads here is the verifier's own exit-code
+//! taxonomy, and that is unchanged.
 
 use sqlx::{PgPool, Row};
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{ChainRow, SealedStreamRecord};
+use hort_domain::ports::event_chain_head_reader::CorruptChainEvidence;
 use hort_domain::ports::event_chain_reader::EventChainReaderPort;
 use hort_domain::ports::BoxFuture;
 
 use crate::event_chain_head_reader::{retention_stream_id, sealed_record_from_row, to_event_hash};
+
+/// Report a corrupt-evidence verdict through the `DomainResult` channel
+/// [`EventChainReaderPort`] speaks.
+///
+/// Only the emission port ([`EventChainHeadReaderPort`]) distinguishes
+/// corrupt stored evidence from an unreachable store in its type,
+/// because only its consumer acts on the difference: it owns a retry
+/// decision, and retrying an unreadable byte width spends an attempt
+/// budget to reach the same verdict. This path has no retry to get
+/// wrong — the verifier runs once and exits — so the shared helpers'
+/// verdict is flattened here rather than widening a second port.
+///
+/// [`EventChainHeadReaderPort`]: hort_domain::ports::event_chain_head_reader::EventChainHeadReaderPort
+fn operational(c: &CorruptChainEvidence) -> DomainError {
+    DomainError::Invariant(c.to_string())
+}
 
 /// Bounded page size for per-stream reads — streams are paged so the
 /// verifier never buffers the whole table.
@@ -164,8 +187,10 @@ impl EventChainReaderPort for PgEventChainReader {
                         actor_id: row.get("actor_id"),
                         actor_source_file: row.get("actor_source_file"),
                         actor_spec_digest: row.get("actor_spec_digest"),
-                        stored_prev: to_event_hash(&prev, "prev_event_hash")?,
-                        stored_hash: to_event_hash(&hash, "event_hash")?,
+                        stored_prev: to_event_hash(&prev, "prev_event_hash")
+                            .map_err(|c| operational(&c))?,
+                        stored_hash: to_event_hash(&hash, "event_hash")
+                            .map_err(|c| operational(&c))?,
                     });
                 }
                 if (n as i64) < STREAM_PAGE {
@@ -201,7 +226,7 @@ impl EventChainReaderPort for PgEventChainReader {
             let mut out = Vec::with_capacity(rows.len());
             for row in &rows {
                 let event_data: serde_json::Value = row.get("event_data");
-                out.push(sealed_record_from_row(&event_data)?);
+                out.push(sealed_record_from_row(&event_data).map_err(|c| operational(&c))?);
             }
             Ok(out)
         })
@@ -213,6 +238,29 @@ mod tests {
     use super::*;
     use hort_domain::events::{verify_stream_chain, StreamRows, StreamVerdict};
     use serial_test::serial;
+
+    // ---- pure helper (no DB) -------------------------------------------
+
+    #[test]
+    fn a_corrupt_evidence_verdict_reaches_this_port_as_an_operational_error() {
+        // This port answers `DomainResult`, so the shared helpers'
+        // typed verdict is flattened here — carrying the locus and the
+        // subject into the message, since that is all the channel has.
+        use hort_domain::ports::event_chain_head_reader::ChainEvidenceLocus;
+        let e = operational(&CorruptChainEvidence::new(
+            ChainEvidenceLocus::ChainHashColumn,
+            "prev_event_hash",
+            "is 31 bytes, expected 32",
+        ));
+        match e {
+            DomainError::Invariant(msg) => {
+                assert!(msg.contains("chain_hash_column"), "msg={msg}");
+                assert!(msg.contains("prev_event_hash"), "msg={msg}");
+                assert!(msg.contains("31 bytes"), "msg={msg}");
+            }
+            other => panic!("expected Invariant, got {other:?}"),
+        }
+    }
 
     // ---- DB-backed (gated on DATABASE_URL; green locally without a DB) --
     //

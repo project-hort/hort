@@ -5562,7 +5562,7 @@ them).
 
 | Metric | Type | Labels | Unit | Notes |
 |--------|------|--------|------|-------|
-| `hort_event_chain_checkpoint_total` | counter | `result` | cycles | One increment per checkpoint-emission cycle. `result ∈ {emitted, sign_failed, anchor_write_failed}` — exactly these three, a per-metric closed enum. `emitted` = the signed checkpoint was durably WORM-anchored; `anchor_write_failed` = the cycle could not anchor (anchor-store read/write or live-chain DB read failed — retryable, the CronJob retries next tick); `sign_failed` = a signing fault. **Distinct** from `hort_event_chain_verify_total` (a different metric at a different layer — the verifier; never conflated, architect one-metric-one-layer + reserved-name discipline). |
+| `hort_event_chain_checkpoint_total` | counter | `result` | cycles | One increment per checkpoint-emission cycle. `result ∈ {emitted, sign_failed, anchor_write_failed}` — exactly these three, a per-metric closed enum. `emitted` = the signed checkpoint was durably WORM-anchored; `anchor_write_failed` = the cycle could not anchor (anchor-store read/write failed, the live-chain DB read failed, or the stored chain evidence could not be read back) — the first two retryable, the third terminal; `sign_failed` = a signing fault. **Distinct** from `hort_event_chain_verify_total` (a different metric at a different layer — the verifier; never conflated, architect one-metric-one-layer + reserved-name discipline). |
 
 **`result` label semantics** (closed taxonomy of exactly 3):
 
@@ -5571,6 +5571,7 @@ them).
 | `emitted` | signed checkpoint durably WORM-anchored | `TaskOutcome::Completed` |
 | `sign_failed` | a signing fault (**reserved**: no v1 runtime path — the signing key is validated at adapter construction and ed25519 signing of an in-memory `Vec` is infallible, so a cycle cannot reach a sign fault at run time; the label is in the closed taxonomy and exercised by the `DebuggingRecorder` catalog test so the schema is complete and a future signing-fault surface has a pre-reserved label — documented, not faked) | `TaskOutcome::Failed { retry: true }` |
 | `anchor_write_failed` | could not anchor this cycle (anchor-store read/write failure, or the live-chain DB snapshot failed — the taxonomy has no separate `db_read_failed`; "could not anchor this cycle" is `anchor_write_failed`) | `TaskOutcome::Failed { retry: true }` |
+| `anchor_write_failed` | the **stored chain evidence could not be read back** (a chain-hash column that is not 32 bytes, a `StreamSealed` payload that does not decode). Same label — the enum stays closed at three values, and this is still "could not anchor this cycle" — but **not** the same condition: reading the same bytes again reaches the same verdict | `TaskOutcome::Failed { retry: false }`, so `hort_admin_tasks_completed_total{kind="eventstore-checkpoint",result="failed_terminal"}` rather than `failed_retry`, plus a distinct `error!` carrying `chain_evidence_locus` |
 
 **Single emitter (architect "one metric, one layer, no double-count"):**
 emitted **only** at the `hort-app` emission-task layer
@@ -5600,7 +5601,13 @@ max_global_position, stream count, backfill flag — NO key material);
 No `#[instrument(err)]` (a failed cycle is a `TaskOutcome::Failed`, not
 a `Result::Err`).
 
-**Alert spec:** alert on
+**Alert spec:** unreadable stored chain evidence is the most urgent
+condition this emitter can report and it does **not** have its own
+`result` value, so alert on it where it is distinguishable:
+`increase(hort_admin_tasks_completed_total{kind="eventstore-checkpoint",result="failed_terminal"}[period]) > 0`,
+and on the `chain_evidence_locus` field of the emitter's `error!` event
+(a field match, never a substring match on the message). Separately,
+alert on
 `increase(hort_event_chain_checkpoint_total{result="anchor_write_failed"}[period]) > 0`
 (a sustained inability to anchor — the chain is no longer externally
 attested; this is the condition `hort_event_chain_verify_total{result="missing_checkpoint"}`
