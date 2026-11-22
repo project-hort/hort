@@ -17,9 +17,16 @@ and which namespace that identity lives in**. Kept in lockstep with
 
 The specification uses **"repository"** and **`<name>`** synonymously. Its
 manifest rule reads *"If the manifest is not found in the repository, the
-response code MUST be `404 Not Found`"*, and the same wording governs blobs and
-`subject` references. For a client, the repository is the full string it writes
-into the path.
+response code MUST be `404 Not Found`"*, and blob pulls use the same namespace.
+A manifest's `subject` is a digest reference that may name content the
+repository does not yet hold — *"A registry MUST initially accept an otherwise
+valid manifest with a `subject` field that references a manifest that does not
+exist in the repository"* — and the referrers list is scoped by the **referring**
+manifests' `<name>`: *"Each descriptor is of an image manifest or index in the
+same `<name>` namespace with a `subject` field that specifies the value of
+`<digest>`."* So the list's namespace rule is the spec's own, and the subject's
+namespace is not part of it. For a client, the repository is the full string it
+writes into the path.
 
 hort splits that string in two. The URL is
 
@@ -120,13 +127,17 @@ difference, and it is the part to update as units land (tracked by issue #459).
 (`manifests/<name>/sha256:<hex>` and `blobs/<name>/sha256:<hex>`). Digest
 GET/HEAD and digest DELETE resolve inside that name. A tag's key carries the
 name (`mutable_refs`), and its target resolves through the named manifest path
-for new rows. The referrers projection records the name on the `oci_subject`
-edge. During the expand window, reads fall back to name-free legacy rows;
-those rows still have unknown namespace and are not rewritten by a read.
+for new rows. The referrers list includes only referrers whose identity path
+carries the asked name. The subject's own namespace is deliberately not
+consulted: the `oci_subject` edge targets a content hash, not a namespaced
+artifact row, and a referrer may be pushed before its subject exists here. The
+edge also records a projected name. During the expand window,
+digest reads fall back to name-free legacy rows; those rows still have unknown
+namespace and are not rewritten by a read, so a legacy referrer remains listed
+under every asked name.
 
-**Not yet held:** the narrowing of a referrers list to the name that was asked,
-and the reading of a mount's `from` as an OCI namespace. Legacy name-free rows
-can still resolve through the temporary fallback until the contract step.
+**Not yet held:** reading a mount's `from` as an OCI namespace. Legacy name-free
+rows can still resolve through the temporary fallback until the contract step.
 
 ## What this model asks of other records
 
