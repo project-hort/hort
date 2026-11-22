@@ -81,6 +81,11 @@ rustls-native-certs = "0.8"
 # hort-app and the storage adapters; this is the explicit declaration so
 # the dep graph documents the use.
 sha2            = { workspace = true }
+# Lowercase-hex rendering of a finalised digest. `sha2`'s `finalize()`
+# yields a byte array with no hex formatting of its own, and
+# `ContentHash` only parses the canonical lowercase-hex form — so the
+# body digest the metadata-mirror frame carries is rendered here.
+hex             = { workspace = true }
 
 # RFC 7231 §7.1.1.1 HTTP-date parser for the `Last-Modified` response
 # header on cargo `.crate` tarball and OCI config/layer blob fetches.

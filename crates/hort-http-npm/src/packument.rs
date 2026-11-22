@@ -807,6 +807,17 @@ mod tests {
 
     use super::*;
 
+    /// SHA-256 of a body a mirror seed is about to write, in the form
+    /// `MetadataMirrorStore::put` takes it. The production caller
+    /// supplies the digest of exactly the bytes it streams, so a fixture
+    /// that seeds the mirror supplies it too.
+    fn body_digest(bytes: &[u8]) -> hort_domain::types::ContentHash {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(bytes))
+            .parse()
+            .expect("SHA-256 is a valid content hash")
+    }
+
     /// An `EphemeralStore` whose every operation fails. Drives
     /// [`evict_packument`]'s two best-effort arms: the eviction of a
     /// disproved packument is part of a refusal that has already been
@@ -1284,7 +1295,11 @@ mod tests {
         let mkey = mirror_key("npm", &mapping_id.to_string(), "express");
         mocks
             .metadata_mirror
-            .put(&mkey, Box::new(std::io::Cursor::new(raw.to_vec())))
+            .put(
+                &mkey,
+                Box::new(std::io::Cursor::new(raw.to_vec())),
+                body_digest(raw),
+            )
             .await
             .unwrap();
 
@@ -1341,7 +1356,11 @@ mod tests {
         let mkey = mirror_key("npm", &mapping_id.to_string(), "express");
         mocks
             .metadata_mirror
-            .put(&mkey, Box::new(std::io::Cursor::new(raw.to_vec())))
+            .put(
+                &mkey,
+                Box::new(std::io::Cursor::new(raw.to_vec())),
+                body_digest(raw),
+            )
             .await
             .unwrap();
         // The body no longer hashes to the digest recorded with it.

@@ -1815,9 +1815,21 @@ mod tests {
         // Seed only the mirror (no Redis projection), under the one
         // canonical key.
         let mkey = mirror_key("pypi", &mapping_id.to_string(), "flask");
+        // The digest of exactly the bytes being written — what the
+        // production caller supplies with the body.
+        let digest: hort_domain::types::ContentHash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(JSON_BODY))
+                .parse()
+                .unwrap()
+        };
         mocks
             .metadata_mirror
-            .put(&mkey, Box::new(std::io::Cursor::new(JSON_BODY.to_vec())))
+            .put(
+                &mkey,
+                Box::new(std::io::Cursor::new(JSON_BODY.to_vec())),
+                digest,
+            )
             .await
             .unwrap();
 
