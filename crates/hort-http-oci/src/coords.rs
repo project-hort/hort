@@ -7,14 +7,15 @@
 //! place so blob-pull, manifest-pull, and push paths all agree on the path
 //! layout.
 //!
+//! The role comes first so it can be read without parsing the name: `blobs`
+//! and `manifests` are both valid OCI image names.
+//!
 //! ## Path layout
 //!
-//! - **Blob** — `path = "blobs/sha256:<hex>"`. Matches the OCI
-//!   Distribution URL (`/v2/<name>/blobs/sha256:<hex>`) minus the
-//!   leading `/v2/<name>/`. Stored as the `Artifact.path` column so
-//!   `ArtifactRepository::find_by_path(repo, &path)` is a single indexed
-//!   lookup per client request.
-//! - **Manifest** — `path = "manifests/sha256:<hex>"`. Same shape as
+//! - **Blob** — `path = "blobs/<name>/sha256:<hex>"`. Stored as the
+//!   `Artifact.path` column so `ArtifactRepository::find_by_path` can use
+//!   one indexed lookup per client request.
+//! - **Manifest** — `path = "manifests/<name>/sha256:<hex>"`. Same shape as
 //!   blobs but with a distinct prefix so the same content hash can hold
 //!   both a manifest and a blob artifact under the same name without
 //!   colliding on the `(repository_id, path)` UNIQUE constraint. A
@@ -41,25 +42,23 @@
 //!   `IngestRequest::payload_metadata` at ingest time, not on coords.
 
 use hort_domain::entities::repository::RepositoryFormat;
-use hort_domain::oci::OCI_BLOB_PATH_PREFIX;
+use hort_domain::oci::{legacy_oci_artifact_path, oci_artifact_path, OciArtifactRole};
 use hort_domain::types::{ArtifactCoords, ContentHash};
 
 /// Build `ArtifactCoords` for an OCI blob addressed by `(name, digest)`.
 ///
-/// The `path` field lays out as `blobs/sha256:<hex>`, so the coords
+/// The `path` field lays out as `blobs/<name>/sha256:<hex>`, so the coords
 /// can feed `ArtifactRepository::find_by_path(repo_id, &coords.path)`
 /// directly in the pull handler.
 ///
-/// The prefix comes from [`OCI_BLOB_PATH_PREFIX`] because it is also the
-/// discriminator `OciFormatHandler::is_provenance_constituent` reads to
-/// decide that a row can never carry its own attestation — the two must
-/// not be able to drift.
+/// The domain path grammar is also parsed by the format handler when it
+/// decides whether a row can carry its own attestation.
 pub fn oci_blob_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
     ArtifactCoords {
         name: name.to_string(),
         name_as_published: name.to_string(),
         version: None,
-        path: format!("{OCI_BLOB_PATH_PREFIX}{}", digest.as_ref()),
+        path: oci_artifact_path(OciArtifactRole::Blob, name, digest),
         format: RepositoryFormat::Oci,
         metadata: serde_json::Value::Null,
     }
@@ -79,28 +78,18 @@ pub fn oci_manifest_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
         name: name.to_string(),
         name_as_published: name.to_string(),
         version: None,
-        path: oci_manifest_path(digest),
+        path: oci_artifact_path(OciArtifactRole::Manifest, name, digest),
         format: RepositoryFormat::Oci,
         metadata: serde_json::Value::Null,
     }
 }
 
-/// The `Artifact.path` an OCI manifest or image index is stored under —
-/// `manifests/sha256:<hex>`, the image name deliberately absent, so
-/// `(repository_id, path)` holds at most one manifest row per digest.
-///
-/// Split out of [`oci_manifest_coords`] because the **path alone** is the
-/// question an admission check has to ask: an image index may only name a
-/// child this registry would serve as a manifest, and what makes a row a
-/// manifest row rather than a blob row is this prefix (the same
-/// discriminator `OciFormatHandler::scan_kind` and
-/// `OciFormatHandler::is_provenance_constituent` read). Resolving a child
-/// by this path is therefore how admission asks the question delivery
-/// answers — a digest-addressed manifest `GET` resolves this exact
-/// string — rather than asking for "some row with these bytes", which a
-/// repository may legitimately hold more than one of.
+/// Legacy name-free manifest path, retained for index-child admission during
+/// the expand window. Admission asks for the manifest row by path rather than
+/// for some row holding these bytes: a repository may legitimately hold a
+/// blob and a manifest at the same digest.
 pub fn oci_manifest_path(digest: &ContentHash) -> String {
-    format!("manifests/sha256:{}", digest.as_ref())
+    legacy_oci_artifact_path(OciArtifactRole::Manifest, digest)
 }
 
 /// Build `ArtifactCoords` for the OCI manifest-group root addressed by
@@ -145,7 +134,7 @@ mod tests {
     #[test]
     fn blob_coords_path_is_blobs_sha256_hex() {
         let c = oci_blob_coords("library/nginx", &sample_hash());
-        assert_eq!(c.path, format!("blobs/sha256:{SAMPLE_HEX}"));
+        assert_eq!(c.path, format!("blobs/library/nginx/sha256:{SAMPLE_HEX}"));
     }
 
     #[test]
@@ -177,16 +166,16 @@ mod tests {
     #[test]
     fn manifest_coords_path_is_manifests_sha256_hex() {
         let c = oci_manifest_coords("library/nginx", &sample_hash());
-        assert_eq!(c.path, format!("manifests/sha256:{SAMPLE_HEX}"));
+        assert_eq!(
+            c.path,
+            format!("manifests/library/nginx/sha256:{SAMPLE_HEX}")
+        );
     }
 
-    /// The coords builder and the bare-path builder are one spelling:
-    /// admission resolves a child by the latter and a digest-addressed
-    /// `GET` resolves by the former, so a divergence would let the two
-    /// sides disagree about which row a digest names.
+    /// The name-free builder continues to describe old rows only.
     #[test]
     fn manifest_path_is_the_path_manifest_coords_carry() {
-        assert_eq!(
+        assert_ne!(
             oci_manifest_path(&sample_hash()),
             oci_manifest_coords("library/nginx", &sample_hash()).path
         );

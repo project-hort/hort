@@ -728,11 +728,43 @@ impl ArtifactUseCase {
         path: &str,
         actor: Option<&CallerPrincipal>,
     ) -> AppResult<(Repository, Artifact)> {
+        self.find_visible_by_paths(repo_key, path, None, actor)
+            .await
+    }
+
+    /// Resolve a scoped OCI path, then a name-free row from the expand window.
+    /// The second lookup runs only after a visible repository and a missing
+    /// scoped row; it never changes either row.
+    #[tracing::instrument(skip(self))]
+    pub async fn find_visible_by_path_with_fallback(
+        &self,
+        repo_key: &str,
+        path: &str,
+        legacy_path: &str,
+        actor: Option<&CallerPrincipal>,
+    ) -> AppResult<(Repository, Artifact)> {
+        self.find_visible_by_paths(repo_key, path, Some(legacy_path), actor)
+            .await
+    }
+
+    async fn find_visible_by_paths(
+        &self,
+        repo_key: &str,
+        path: &str,
+        legacy_path: Option<&str>,
+        actor: Option<&CallerPrincipal>,
+    ) -> AppResult<(Repository, Artifact)> {
         let repo = self
             .access()?
             .resolve(repo_key, actor, AccessLevel::Read)
             .await?;
-        match self.artifacts.find_by_path(repo.id, path).await? {
+        let mut found = self.artifacts.find_by_path(repo.id, path).await?;
+        if found.is_none() {
+            if let Some(legacy_path) = legacy_path {
+                found = self.artifacts.find_by_path(repo.id, legacy_path).await?;
+            }
+        }
+        match found {
             Some(a) => Ok((repo, self.hydrate_quarantine_deadline(a).await?)),
             None => Err(AppError::Domain(DomainError::NotFound {
                 entity: "Artifact",
@@ -3299,6 +3331,47 @@ mod visibility_extension_tests {
             .unwrap();
         assert_eq!(got_repo.key, "alpha");
         assert_eq!(got_artifact.id, a.id);
+    }
+
+    #[tokio::test]
+    async fn find_visible_by_path_fallback_prefers_scoped_and_does_not_rewrite_legacy() {
+        let artifacts = Arc::new(MockArtifactRepository::new());
+        let storage = Arc::new(MockStoragePort::new());
+        let repos = Arc::new(MockRepositoryRepository::new());
+        let metadata = Arc::new(MockArtifactMetadataRepository::new());
+        let repo = public_repo("alpha");
+        let repo_id = repo.id;
+        repos.insert(repo);
+        let legacy_path = format!("manifests/sha256:{VALID_SHA256}");
+        let scoped_path = format!("manifests/library/nginx/sha256:{VALID_SHA256}");
+        let legacy = artifact_in_repo(repo_id, &legacy_path, VALID_SHA256);
+        artifacts.insert(legacy.clone());
+        let uc = wired_use_case(
+            artifacts.clone(),
+            storage,
+            repos,
+            RbacAccess::Disabled,
+            metadata,
+        );
+        let (_, got) = uc
+            .find_visible_by_path_with_fallback("alpha", &scoped_path, &legacy_path, None)
+            .await
+            .unwrap();
+        assert_eq!(got.id, legacy.id);
+        assert_eq!(got.path, legacy_path);
+        assert!(artifacts
+            .find_by_path(repo_id, &scoped_path)
+            .await
+            .unwrap()
+            .is_none());
+
+        let scoped = artifact_in_repo(repo_id, &scoped_path, VALID_SHA256);
+        artifacts.insert(scoped.clone());
+        let (_, got) = uc
+            .find_visible_by_path_with_fallback("alpha", &scoped_path, &legacy_path, None)
+            .await
+            .unwrap();
+        assert_eq!(got.id, scoped.id);
     }
 
     // -- hydrate_quarantine_deadline (issue #76 item 2/2) -------------------

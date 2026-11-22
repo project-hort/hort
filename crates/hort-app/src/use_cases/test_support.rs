@@ -199,6 +199,7 @@ pub struct MockArtifactRepository {
     /// must not read a failed lookup as "not present" and re-fetch content the
     /// repository may already hold.
     find_by_path_errors: Mutex<std::collections::VecDeque<DomainError>>,
+    find_by_path_error_at: Mutex<Option<(String, DomainError)>>,
     /// FIFO of injected errors for
     /// [`find_by_name_in_repo`](ArtifactRepository::find_by_name_in_repo).
     /// Each call pops the front and returns it verbatim. Lets a test
@@ -289,6 +290,7 @@ impl MockArtifactRepository {
             oci_calls: Mutex::new(Vec::new()),
             package_version_status_errors: Mutex::new(std::collections::VecDeque::new()),
             find_by_path_errors: Mutex::new(std::collections::VecDeque::new()),
+            find_by_path_error_at: Mutex::new(None),
             find_by_name_in_repo_errors: Mutex::new(std::collections::VecDeque::new()),
             row_after_next_find_by_id: Mutex::new(HashMap::new()),
             status_after_next_find_by_path: Mutex::new(HashMap::new()),
@@ -416,6 +418,10 @@ impl MockArtifactRepository {
     /// failures.
     pub fn fail_next_find_by_path(&self, err: DomainError) {
         self.find_by_path_errors.lock().unwrap().push_back(err);
+    }
+
+    pub fn fail_find_by_path_at(&self, path: String, err: DomainError) {
+        *self.find_by_path_error_at.lock().unwrap() = Some((path, err));
     }
 
     /// Pin the allowlist that
@@ -902,6 +908,12 @@ impl ArtifactRepository for MockArtifactRepository {
         repository_id: Uuid,
         path: &str,
     ) -> BoxFut<'_, DomainResult<Option<Artifact>>> {
+        let mut targeted = self.find_by_path_error_at.lock().unwrap();
+        if targeted.as_ref().is_some_and(|(target, _)| target == path) {
+            let (_, err) = targeted.take().unwrap();
+            return Box::pin(async move { Err(err) });
+        }
+        drop(targeted);
         if let Some(err) = self.find_by_path_errors.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
@@ -1335,7 +1347,7 @@ impl ArtifactRepository for MockArtifactRepository {
 
     /// Mock for the OCI membership-edge-backfill candidacy query. Mirrors
     /// [`Self::find_pypi_wheels_without_kind`]'s shape: the SQL adapter's
-    /// `path LIKE '%.whl'` becomes `path LIKE 'manifests/sha256:%'`, and
+    /// `path LIKE '%.whl'` becomes a match on the domain manifest role prefix, and
     /// the media-type / index-exclusion join has no mock-side equivalent
     /// (this mock has no `artifact_metadata` table) — tests that need to
     /// model an index-shaped row simply do not insert it as a candidate
@@ -1364,7 +1376,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .filter(|a| {
-                a.path.starts_with("manifests/sha256:")
+                a.path.starts_with(hort_domain::oci::OCI_MANIFEST_PATH_PREFIX)
                     && match &filter {
                         None => true,
                         Some(allowed) => allowed.contains(&a.id),

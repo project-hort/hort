@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`bearer`/`basic`), or which separates scheme and credential with more than
   one space, is now accepted as the credential it is instead of being treated
   as no credential at all (#458).
+- A digest-addressed OCI manifest or blob request no longer resolves across
+  image names inside one hort repository: identity is now scoped to the OCI
+  `<name>` it was pushed under, so the same bytes can be held under two names.
+  Rows written by earlier releases keep the name-free path and stay readable;
+  they are rewritten in a later release (#459).
 
 ### Security
 

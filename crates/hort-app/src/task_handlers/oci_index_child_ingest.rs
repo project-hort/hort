@@ -250,8 +250,8 @@ use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::ApiActor;
 use hort_domain::oci::{
-    index_child_descriptors, is_image_index, ManifestBlobRole, DOCKER_MANIFEST_LIST_MEDIA_TYPE,
-    OCI_BLOB_PATH_PREFIX, OCI_IMAGE_INDEX_MEDIA_TYPE,
+    index_child_descriptors, is_image_index, legacy_oci_artifact_path, oci_artifact_path,
+    ManifestBlobRole, OciArtifactRole, DOCKER_MANIFEST_LIST_MEDIA_TYPE, OCI_IMAGE_INDEX_MEDIA_TYPE,
 };
 use hort_domain::ports::artifact_repository::ArtifactRepository;
 use hort_domain::ports::content_reference_index::ContentReferenceClaim;
@@ -504,19 +504,14 @@ fn resolve_media_type(declared: Option<&str>) -> String {
 /// the same value `hort-http-oci`'s lazy pull path passes, so an eagerly
 /// ingested child and a lazily ingested one carry an identical `Artifact.name`.
 ///
-/// `path = "manifests/sha256:<hex>"` — the same layout
-/// `hort-http-oci::coords::oci_manifest_coords` writes, so a later client GET
-/// for the same digest resolves this exact row by path. Re-derived here rather
-/// than reused because `hort-app` must not depend on `hort-http-oci` (ADR 0008
-/// runs the dependency the other way); the prefix is load-bearing in both
-/// places, and a divergence would leave the eagerly-ingested child unreachable
-/// from the read path.
+/// The domain path builder gives eager ingest and client GET the same
+/// `manifests/<name>/sha256:<hex>` identity without depending on the HTTP layer.
 fn child_manifest_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
     ArtifactCoords {
         name: name.to_string(),
         name_as_published: name.to_string(),
         version: None,
-        path: format!("manifests/sha256:{}", digest.as_ref()),
+        path: oci_artifact_path(OciArtifactRole::Manifest, name, digest),
         format: RepositoryFormat::Oci,
         metadata: serde_json::Value::Null,
     }
@@ -527,20 +522,14 @@ fn child_manifest_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
 /// child itself is minted under — so a blob warmed here and the same blob
 /// pulled lazily by a client carry an identical `Artifact.name`.
 ///
-/// `path = "blobs/sha256:<hex>"`, and the prefix comes from
-/// [`OCI_BLOB_PATH_PREFIX`] rather than a literal. The builder is re-derived
-/// here because `hort-app` must not depend on `hort-http-oci` (ADR 0008 runs
-/// the dependency the other way) — the same reason
-/// [`child_manifest_coords`] exists — but the prefix itself lives in the
-/// domain and both layers read it, so the two cannot drift. The manifest
-/// sibling has to spell its prefix out because no domain constant exists for
-/// manifests; this one must not.
+/// The domain path builder gives eager ingest and client GET the same
+/// `blobs/<name>/sha256:<hex>` identity without depending on the HTTP layer.
 ///
 /// The exactness is load-bearing in two directions. A client blob `GET`
-/// resolves `blobs/sha256:<hex>` by path, so a divergence would leave the
+/// resolves `blobs/<name>/sha256:<hex>` by path, so a divergence would leave the
 /// warmed row unreachable from the read path and the next client `GET` would
 /// mint a second row for the same bytes. And
-/// `OciFormatHandler::is_provenance_constituent` reads the same prefix to
+/// `OciFormatHandler::is_provenance_constituent` parses the same grammar to
 /// decide that a row can never carry its own attestation, so a warmed blob
 /// that did not match it would be asked for a signature it cannot have.
 fn child_blob_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
@@ -548,10 +537,29 @@ fn child_blob_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
         name: name.to_string(),
         name_as_published: name.to_string(),
         version: None,
-        path: format!("{OCI_BLOB_PATH_PREFIX}{}", digest.as_ref()),
+        path: oci_artifact_path(OciArtifactRole::Blob, name, digest),
         format: RepositoryFormat::Oci,
         metadata: serde_json::Value::Null,
     }
+}
+
+/// Find this digest held under the requested name and role, or under the
+/// legacy name-free path. A row holding the same bytes at another path is
+/// not this artifact.
+async fn find_oci_artifact(
+    artifacts: &dyn ArtifactRepository,
+    repo_id: Uuid,
+    role: OciArtifactRole,
+    name: &str,
+    digest: &ContentHash,
+) -> DomainResult<Option<hort_domain::entities::artifact::Artifact>> {
+    let path = oci_artifact_path(role, name, digest);
+    if let Some(artifact) = artifacts.find_by_path(repo_id, &path).await? {
+        return Ok(Some(artifact));
+    }
+    artifacts
+        .find_by_path(repo_id, &legacy_oci_artifact_path(role, digest))
+        .await
 }
 
 /// The config and layer blob digests among `edges` — the set the blob warm
@@ -826,72 +834,70 @@ impl OciIndexChildIngestHandler {
         // Scoped to the TARGET repository: ADR 0054 keeps the anchor per row,
         // so the same content held in another repository is not this
         // repository's row and must not suppress the mint here.
-        match self
-            .artifacts
-            .find_by_repo_and_checksum(repo.id, child_hash)
-            .await
+        match find_oci_artifact(
+            self.artifacts.as_ref(),
+            repo.id,
+            OciArtifactRole::Manifest,
+            &parsed.requested_name,
+            child_hash,
+        )
+        .await
         {
             Ok(Some(existing)) => {
                 // The original transition cannot be replayed. The stored
                 // manifest can still reassert any missing foreign-byte claims.
-                // A blob with the same checksum is not a manifest whose
-                // membership claims this task may derive.
-                if existing.path == child_manifest_coords(&parsed.requested_name, child_hash).path {
-                    match self.storage.get(&existing.sha256_checksum).await {
-                        Ok(mut stream) => {
-                            let mut body = Vec::new();
-                            if let Err(err) = stream.read_to_end(&mut body).await {
-                                return Err(TaskOutcome::fail(
-                                    format!(
-                                        "oci-index-child-ingest: stored child unreadable: {err}"
-                                    ),
-                                    true,
-                                ));
-                            }
-                            let claims = self.derive_claims(
-                                &repo,
-                                parsed,
-                                child_hash,
-                                &existing.content_type,
-                                &body,
-                                summary,
-                            );
-                            summary.membership_edges_written =
-                                self.ingest
-                                    .reconcile_claimed_edges(&existing, &claims.edges)
-                                    .await
-                                    .map_err(|err| {
-                                        TaskOutcome::fail(
+                match self.storage.get(&existing.sha256_checksum).await {
+                    Ok(mut stream) => {
+                        let mut body = Vec::new();
+                        if let Err(err) = stream.read_to_end(&mut body).await {
+                            return Err(TaskOutcome::fail(
+                                format!("oci-index-child-ingest: stored child unreadable: {err}"),
+                                true,
+                            ));
+                        }
+                        let claims = self.derive_claims(
+                            &repo,
+                            parsed,
+                            child_hash,
+                            &existing.content_type,
+                            &body,
+                            summary,
+                        );
+                        summary.membership_edges_written = self
+                            .ingest
+                            .reconcile_claimed_edges(&existing, &claims.edges)
+                            .await
+                            .map_err(|err| {
+                                TaskOutcome::fail(
                                     format!("oci-index-child-ingest: claim repair failed: {err}"),
                                     true,
                                 )
-                                    })?;
-                            // The second warm call site. A child minted
-                            // before the warm existed has its edges and none
-                            // of its bytes — the same cold state this
-                            // branch's claim repair was built for, one level
-                            // down — and both of the warm's inputs are
-                            // already in hand here: the digests out of the
-                            // `derive_claims` the repair just ran, and the
-                            // fetch route out of the mapping resolved above.
-                            self.warm_child_blobs(
-                                &repo,
-                                parsed,
-                                &mapping,
-                                &upstream_name,
-                                &claims.edges,
-                                summary,
-                            )
-                            .await;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                repository = %repo.key,
-                                artifact_id = %existing.id,
-                                error = %err,
-                                "oci-index-child-ingest: stored child unavailable for claim repair",
-                            );
-                        }
+                            })?;
+                        // The second warm call site. A child minted
+                        // before the warm existed has its edges and none
+                        // of its bytes — the same cold state this
+                        // branch's claim repair was built for, one level
+                        // down — and both of the warm's inputs are
+                        // already in hand here: the digests out of the
+                        // `derive_claims` the repair just ran, and the
+                        // fetch route out of the mapping resolved above.
+                        self.warm_child_blobs(
+                            &repo,
+                            parsed,
+                            &mapping,
+                            &upstream_name,
+                            &claims.edges,
+                            summary,
+                        )
+                        .await;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            repository = %repo.key,
+                            artifact_id = %existing.id,
+                            error = %err,
+                            "oci-index-child-ingest: stored child unavailable for claim repair",
+                        );
                     }
                 }
                 tracing::debug!(
@@ -1324,7 +1330,15 @@ impl OciIndexChildIngestHandler {
             // content the repository may already hold is the posture every
             // presence check in this handler refuses, and the blob is left to
             // the lazy path exactly as any other failure leaves it.
-            match self.artifacts.find_by_path(repo.id, &coords.path).await {
+            match find_oci_artifact(
+                self.artifacts.as_ref(),
+                repo.id,
+                OciArtifactRole::Blob,
+                &parsed.requested_name,
+                &blob_hash,
+            )
+            .await
+            {
                 Ok(Some(_)) => {
                     summary.blobs_already_present += 1;
                     continue;
@@ -2045,7 +2059,10 @@ mod tests {
     fn child_manifest_coords_use_the_manifests_prefix_and_oci_format() {
         let hash = deterministic_sha(7);
         let c = child_manifest_coords("library/nginx", &hash);
-        assert_eq!(c.path, format!("manifests/sha256:{}", hash.as_ref()));
+        assert_eq!(
+            c.path,
+            format!("manifests/library/nginx/sha256:{}", hash.as_ref())
+        );
         assert_eq!(c.name, "library/nginx");
         assert_eq!(c.name_as_published, "library/nginx");
         assert_eq!(c.version, None);
@@ -2357,7 +2374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn same_checksum_blob_row_is_not_read_as_a_manifest_for_claim_repair() {
+    async fn same_checksum_blob_row_does_not_suppress_child_manifest_mint() {
         let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
             config_and_layer_refs(1),
         ))
@@ -2365,9 +2382,8 @@ mod tests {
         let body = image_manifest_body();
         let hash: ContentHash = sha256_hex(&body).parse().expect("sha");
         let digest = format!("sha256:{}", hash.as_ref());
-        let mut existing = held_manifest(f.repo.id, &hash, &digest);
-        existing.path = format!("blobs/{digest}");
-        f.artifacts.insert(existing);
+        f.artifacts.insert(held_blob(f.repo.id, &body));
+        seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
 
         let summary = completed(
             f.handler
@@ -2375,10 +2391,56 @@ mod tests {
                 .await
                 .expect("task outcome"),
         );
+        assert_eq!(summary["outcome"], "ingested");
+        assert!(f.refs.entry_count() > 0);
+        assert!(
+            f.artifacts
+                .find_by_path(
+                    f.repo.id,
+                    &oci_artifact_path(OciArtifactRole::Manifest, "library/nginx", &hash)
+                )
+                .await
+                .unwrap()
+                .is_some(),
+            "a blob at the same digest must not prevent the child manifest row"
+        );
+    }
+
+    /// The scoped path is what every new row carries, so the short-circuit
+    /// has to hold on it directly rather than only through the expand-window
+    /// fallback. Its legacy-shape sibling above cannot show that: the
+    /// fallback answers for a legacy row whatever the scoped lookup does, so
+    /// a defect in the scoped branch of `find_oci_artifact` would be
+    /// invisible there — and the scoped branch is the only one left once the
+    /// contract step removes the fallback.
+    #[tokio::test]
+    async fn run_with_child_already_held_at_the_scoped_path_makes_no_upstream_request() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(
+            config_and_layer_refs(1),
+        ))
+        .await;
+        let body = image_manifest_body();
+        let hash: ContentHash = sha256_hex(&body).parse().expect("sha");
+        let digest = format!("sha256:{}", hash.as_ref());
+        // Deliberately NOT seeded on the proxy, as in the sibling: any
+        // upstream call would be an unseeded-fixture error.
+        let mut held = held_manifest(f.repo.id, &hash, &digest);
+        held.path = oci_artifact_path(OciArtifactRole::Manifest, "library/nginx", &hash);
+        f.artifacts.insert(held);
+
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .expect("Ok"),
+        );
         assert_eq!(summary["outcome"], "already_present");
-        assert_eq!(summary["membership_edges_written"], 0);
-        assert_eq!(f.storage.get_call_count(), 0);
+        assert_eq!(
+            summary["membership_edges_written"], 0,
+            "an already-held child writes nothing — no re-mint, no re-anchor"
+        );
         assert_eq!(f.refs.entry_count(), 0);
+        assert_no_rows_enqueued(&f.jobs);
     }
 
     /// The presence check is scoped to the TARGET repository: the same
@@ -2406,10 +2468,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_checksum_manifest_in_another_name_does_not_suppress_child_ingest() {
+        let f = fixture(OciMembershipEdgesStubBehaviour::Edges(Vec::new())).await;
+        let body = image_manifest_body();
+        let hash = body_hash(&body);
+        let digest = seed_child(&f.proxy, &body, IMAGE_MANIFEST_MEDIA_TYPE, None);
+        let mut other = held_manifest(f.repo.id, &hash, &digest);
+        other.path = oci_artifact_path(OciArtifactRole::Manifest, "other/thing", &hash);
+        f.artifacts.insert(other);
+        let summary = completed(
+            f.handler
+                .run(&params(f.repo.id, &digest), make_context())
+                .await
+                .unwrap(),
+        );
+        assert_eq!(summary["outcome"], "ingested");
+        assert!(f
+            .artifacts
+            .find_by_path(
+                f.repo.id,
+                &oci_artifact_path(OciArtifactRole::Manifest, "library/nginx", &hash,)
+            )
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn run_with_failing_presence_lookup_fails_with_retry() {
         let f = fixture(OciMembershipEdgesStubBehaviour::Edges(Vec::new())).await;
         f.artifacts
-            .fail_next_find_by_repo_and_checksum(DomainError::Invariant("simulated".into()));
+            .fail_next_find_by_path(DomainError::Invariant("simulated".into()));
         let digest = format!("sha256:{}", "d".repeat(64));
         let outcome = f
             .handler
@@ -2637,7 +2726,7 @@ mod tests {
             .expect("the child manifest row is minted in the target repository");
         assert_eq!(
             minted.path,
-            format!("manifests/sha256:{}", sha256_hex(&body)),
+            format!("manifests/library/nginx/sha256:{}", sha256_hex(&body)),
             "the row must be reachable by the digest path a later client GET uses"
         );
         assert!(
@@ -3697,7 +3786,7 @@ mod tests {
     /// Where the read path resolves `body`'s blob, and therefore where a
     /// warmed row has to be for a later client GET to find it.
     fn blob_path(body: &[u8]) -> String {
-        format!("{OCI_BLOB_PATH_PREFIX}{}", body_hash(body).as_ref())
+        oci_artifact_path(OciArtifactRole::Blob, "library/nginx", &body_hash(body))
     }
 
     /// Re-seed the fixture's repository with `enabled` on its prefetch
@@ -3727,10 +3816,13 @@ mod tests {
     fn child_blob_coords_use_the_domain_blob_prefix_and_oci_format() {
         let hash = deterministic_sha(0xB10B);
         let c = child_blob_coords("library/nginx", &hash);
-        assert_eq!(c.path, format!("blobs/sha256:{}", hash.as_ref()));
         assert_eq!(
             c.path,
-            format!("{OCI_BLOB_PATH_PREFIX}{}", hash.as_ref()),
+            format!("blobs/library/nginx/sha256:{}", hash.as_ref())
+        );
+        assert_eq!(
+            c.path,
+            oci_artifact_path(OciArtifactRole::Blob, "library/nginx", &hash),
             "the prefix must be the domain constant, not a literal re-typed here",
         );
         assert_eq!(c.name, "library/nginx");
@@ -4105,10 +4197,8 @@ mod tests {
     /// every presence check in this handler refuses; the blob is left to the
     /// lazy pull path and counted, exactly as any other failure leaves it.
     ///
-    /// Driven on the already-present branch because that is the only path
-    /// whose first `find_by_path` is the warm's own — the ingest path's
-    /// manifest `ingest_verified` makes one of its own first, and a one-shot
-    /// injection armed before `run` would land there instead.
+    /// The injected error targets the blob path so the preceding manifest
+    /// presence read still succeeds.
     #[tokio::test]
     async fn a_failing_blob_presence_probe_is_counted_failed_and_fetches_nothing() {
         let f = fixture(OciMembershipEdgesStubBehaviour::Edges(warm_refs(&[(
@@ -4127,8 +4217,10 @@ mod tests {
             .insert(held_manifest(f.repo.id, &child_hash, &digest));
         f.storage.insert_content(child_hash.clone(), body.clone());
         seed_blobs(&f.proxy, &[CONFIG_BLOB]);
-        f.artifacts
-            .fail_next_find_by_path(DomainError::Invariant("simulated probe failure".into()));
+        f.artifacts.fail_find_by_path_at(
+            blob_path(CONFIG_BLOB),
+            DomainError::Invariant("simulated probe failure".into()),
+        );
 
         let summary = completed(
             f.handler

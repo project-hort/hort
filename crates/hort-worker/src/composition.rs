@@ -1080,7 +1080,7 @@ pub async fn build_app_context(
     //             minted before the write path registered
     //             `content_references` membership edges on every
     //             manifest PUT/pull-through. Walks
-    //             `artifacts.path LIKE 'manifests/sha256:%'` (image-
+    //             `artifacts.path LIKE 'manifests/%'` (image-
     //             typed only) with no `oci_config` row; per row: stream
     //             the manifest from CAS → invoke
     //             `extract_oci_manifest_blob_refs` → insert the missing

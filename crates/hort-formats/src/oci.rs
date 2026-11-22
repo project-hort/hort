@@ -5,7 +5,7 @@ use std::io::Read;
 
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::oci::{ManifestBlobRef, OCI_BLOB_PATH_PREFIX};
+use hort_domain::oci::{parse_oci_artifact_path, ManifestBlobRef, OciArtifactRole};
 use hort_domain::ports::format_handler::{FormatHandler, GroupMembership};
 use hort_domain::types::{ArtifactCoords, ArtifactKind};
 
@@ -65,12 +65,10 @@ impl FormatHandler for OciFormatHandler {
     /// the materialisation a coincidence rather than a decision
     /// (ADR 0064 D6).
     fn scan_kind(&self, artifact: &Artifact) -> ArtifactKind {
-        if artifact.path.starts_with(OCI_BLOB_PATH_PREFIX) {
-            ArtifactKind::OciBlob
-        } else if artifact.path.starts_with("manifests/") {
-            ArtifactKind::OciManifest
-        } else {
-            ArtifactKind::Other
+        match parse_oci_artifact_path(&artifact.path).map(|parsed| parsed.role) {
+            Some(OciArtifactRole::Blob) => ArtifactKind::OciBlob,
+            Some(OciArtifactRole::Manifest) => ArtifactKind::OciManifest,
+            None => ArtifactKind::Other,
         }
     }
 
@@ -145,8 +143,9 @@ impl FormatHandler for OciFormatHandler {
     /// late-joiner self-clear.
     ///
     /// The discriminator is the row's own `path`: the OCI adapter projects
-    /// blobs at [`OCI_BLOB_PATH_PREFIX`]`<hex>` and manifests/indexes at
-    /// `manifests/sha256:<hex>`, and the two prefixes are disjoint by
+    /// blobs at `blobs/<name>/sha256:<hex>` and manifests/indexes at
+    /// `manifests/<name>/sha256:<hex>` (plus the legacy name-free paths),
+    /// and the two roles are disjoint by
     /// construction (they are what keeps a manifest and a blob sharing
     /// bytes from colliding on `(repository_id, path)`). Media type is
     /// deliberately NOT consulted: every blob is stored as
@@ -154,7 +153,10 @@ impl FormatHandler for OciFormatHandler {
     /// names it calls it a config or a layer, so the path is both the
     /// narrower and the more stable signal.
     fn is_provenance_constituent(&self, artifact: &Artifact) -> bool {
-        artifact.path.starts_with(OCI_BLOB_PATH_PREFIX)
+        matches!(
+            parse_oci_artifact_path(&artifact.path),
+            Some(path) if path.role == OciArtifactRole::Blob
+        )
     }
 
     /// Reads `content` under [`MANIFEST_BLOB_REFS_MAX_BYTES`] and delegates
@@ -389,7 +391,10 @@ mod tests {
     fn blob_rows_are_provenance_constituents() {
         let hex = "b".repeat(64);
         assert!(handler()
-            .is_provenance_constituent(&artifact_at(&format!("{OCI_BLOB_PATH_PREFIX}{hex}"))));
+            .is_provenance_constituent(&artifact_at(&format!("blobs/library/nginx/sha256:{hex}"))));
+        assert!(handler().is_provenance_constituent(&artifact_at(&format!("blobs/sha256:{hex}"))));
+        assert!(handler()
+            .is_provenance_constituent(&artifact_at(&format!("blobs/manifests/sha256:{hex}"))));
     }
 
     /// Manifests and indexes are SUBJECTS — they are the digests cosign
@@ -399,9 +404,9 @@ mod tests {
     #[test]
     fn manifest_and_index_rows_are_not_provenance_constituents() {
         let hex = "b".repeat(64);
-        assert!(
-            !handler().is_provenance_constituent(&artifact_at(&format!("manifests/sha256:{hex}")))
-        );
+        assert!(!handler().is_provenance_constituent(&artifact_at(&format!(
+            "manifests/library/nginx/sha256:{hex}"
+        ))));
         // The OCI group root, whose path is the empty string by contract.
         assert!(!handler().is_provenance_constituent(&artifact_at("")));
     }
@@ -414,25 +419,31 @@ mod tests {
     fn constituent_classification_is_prefix_anchored() {
         let hex = "b".repeat(64);
         assert!(!handler().is_provenance_constituent(&artifact_at(&format!(
-            "manifests/{OCI_BLOB_PATH_PREFIX}{hex}"
+            "manifests/blobs/library/nginx/sha256:{hex}"
         ))));
         // A different digest algorithm is not the CAS keyspace OCI blobs
         // are projected into, so it is not a blob row either.
-        assert!(!handler().is_provenance_constituent(&artifact_at(&format!("blobs/sha512:{hex}"))));
+        assert!(
+            !handler().is_provenance_constituent(&artifact_at(&format!("blobs/name/sha512:{hex}")))
+        );
     }
 
     // -- scan_kind -----------------------------------------------------------
 
-    /// The path prefix is the only role signal an OCI row carries: a
+    /// The parsed path is the only role signal an OCI row carries: a
     /// blob is a blob (layer or config — indistinguishable from the row),
     /// a manifest is a manifest, and anything else is unclaimed.
     #[test]
-    fn scan_kind_splits_blobs_from_manifests_by_path_prefix() {
+    fn scan_kind_splits_blobs_from_manifests_by_path_role() {
         let h = handler();
         let hex = "c".repeat(64);
         assert_eq!(
-            h.scan_kind(&artifact_at(&format!("{OCI_BLOB_PATH_PREFIX}{hex}"))),
+            h.scan_kind(&artifact_at(&format!("blobs/library/nginx/sha256:{hex}"))),
             ArtifactKind::OciBlob
+        );
+        assert_eq!(
+            h.scan_kind(&artifact_at(&format!("manifests/blobs/sha256:{hex}"))),
+            ArtifactKind::OciManifest
         );
         assert_eq!(
             h.scan_kind(&artifact_at(&format!("manifests/sha256:{hex}"))),
@@ -440,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             h.scan_kind(&artifact_at("manifests/v1.2.3")),
-            ArtifactKind::OciManifest
+            ArtifactKind::Other
         );
         assert_eq!(
             h.scan_kind(&artifact_at("referrers/sha256:abc")),

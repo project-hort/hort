@@ -601,7 +601,7 @@ pub const ADMIN_INVOKABLE_TASK_KINDS: &[&str] = &[
     // registered `content_references` membership edges on every manifest
     // PUT/pull-through; a row with no `oci_config`/`oci_layer` edges gives
     // its config/layer blobs no GC keepalive. Walks
-    // `artifacts.path LIKE 'manifests/sha256:%'` rows (image-typed only —
+    // `artifacts.path LIKE 'manifests/%'` rows (image-typed only —
     // an index is excluded via its stored media type) with no
     // `content_references` row of kind `oci_config`; per row: stream the
     // manifest from CAS, re-derive its blob set via

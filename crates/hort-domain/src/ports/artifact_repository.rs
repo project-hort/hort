@@ -622,8 +622,8 @@ pub trait ArtifactRepository: Send + Sync {
         skip_marker_kind: Option<&str>,
     ) -> BoxFuture<'_, DomainResult<Vec<Artifact>>>;
 
-    /// Find OCI **single-image manifest** artifacts (`path LIKE
-    /// 'manifests/sha256:%'`) that have no `content_references` row of the
+    /// Find OCI **single-image manifest** artifacts (paths under
+    /// [`crate::oci::OCI_MANIFEST_PATH_PREFIX`]) that have no `content_references` row of the
     /// given `kind` (in practice `"oci_config"`), bounded by `limit`.
     /// Mirrors [`Self::find_pypi_wheels_without_kind`]'s shape and posture
     /// one-for-one — same candidacy-query contract (including the `after`
@@ -650,7 +650,7 @@ pub trait ArtifactRepository: Send + Sync {
     /// backfill exists to repair.
     ///
     /// SQL contract: `SELECT … FROM artifacts WHERE path LIKE
-    /// 'manifests/sha256:%' AND ($5::uuid IS NULL OR id > $5) AND NOT
+    /// 'manifests/%' AND ($5::uuid IS NULL OR id > $5) AND NOT
     /// EXISTS (SELECT 1 FROM content_references WHERE source_artifact_id =
     /// artifacts.id AND kind = $1) AND ($6::text IS NULL OR NOT EXISTS
     /// (SELECT 1 FROM content_references WHERE source_artifact_id =
