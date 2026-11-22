@@ -12,15 +12,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Discovery now answers 404 instead of 403 for repositories the caller cannot
   read, matching the response for a missing repository (#458).
 
+## [0.18.0] - 2026-11-21
+
 ### Migration notice
 
-- **`artifacts.quarantine_status` is narrowed to the four storable states**
-  (migration `044_artifacts_quarantine_status_storable_set.sql`). Minimum
-  tolerating binary version: **0.14.1**. Upgrade from 0.14.1 or newer; take a
-  maintenance window or suspend automated remediation if old pods cannot
-  error during rollout. See the [upgrade how-to](docs/architecture/how-to/deploy/upgrade.md).
-  The register reports the strictest declared floor across applied migrations.
-  A migration applied before its declaration may now raise it; check the boot log before rollback.
+- **The declared rollback floor rises from 0.12.0 to 0.17.3.** Five migrations
+  that are already applied on any running instance are now declared as
+  contractions, and the strictest of them is
+  `039_policy_projections_quarantine_duration_nonnegative.sql`, whose
+  constraint has been in place since 0.17.3. The schema-compatibility register
+  therefore reports a `min_binary_version` of 0.17.3 where it previously
+  reported 0.12.0. No schema changes here and nothing errors during the
+  rollout — the register now states a floor the schema has imposed since
+  0.17.3 — but a rollback plan written against the older figure is wrong.
+  Check the boot log before rolling back, and see the
+  [upgrade how-to](docs/architecture/how-to/deploy/upgrade.md).
+- **`artifacts.quarantine_status` is narrowed to its four storable states**
+  (migration `044_artifacts_quarantine_status_storable_set.sql`), tolerated by
+  0.14.1 and newer. That is below the floor above, so it adds nothing an
+  operator must act on: every supported upgrade path starts at a release whose
+  writers cannot emit a value it refuses, and `hort-server migrate` refuses
+  and names the floor if an older one is connected.
 
 ### Added
 
