@@ -37,7 +37,8 @@
 //!    `result="token_kind_denied"`. The gate alone grants NO authority:
 //!    Gate 2 is what admits or denies a service-account caller.
 //! 2. **RBAC gate** — `Permission::Read` on the resolved repo. Denial
-//!    emits `result="permission_denied"`.
+//!    returns the same `NotFound` as a missing repo and emits
+//!    `result="permission_denied"`.
 //! 3. **OCI rejection** — if the upstream call returns
 //!    [`UpstreamFetchError::UnsupportedFormat`], the use case maps to
 //!    `result="oci_unsupported"` and returns the exact wording wrapped
@@ -230,21 +231,17 @@ impl DiscoveryUseCase {
             )));
         }
 
-        // -------- Resolve repository (anti-enumeration via NotFound) --
+        // -------- Resolve repository (unfiltered lookup) -------------
         //
-        // Pre-RBAC: a missing repo collapses to `NotFound` for callers
-        // who hold neither Read nor admin — the existing
-        // `RepositoryAccessUseCase` pattern. Discovery does NOT use
-        // `RepositoryAccessUseCase` because that helper is shaped around
-        // the `AccessLevel::{Read, Write}` enum and discovery's
-        // gate-order (token-kind before RBAC) lives more cleanly here.
-        // The two helpers are equivalent in the visible-Read case;
-        // discovery's response shape (`AppError::Domain(NotFound)`) is
-        // identical.
+        // This lookup does not filter visibility: Gate 2 must return the
+        // same `NotFound` envelope when Read is denied. Discovery does NOT
+        // use `RepositoryAccessUseCase` because that helper is shaped around
+        // `AccessLevel::{Read, Write}` and discovery checks token kind
+        // before resolving the repository.
         let repository = match self.repositories.find_by_key(repo_key).await {
             Ok(r) => r,
             Err(DomainError::NotFound { .. }) => {
-                // Anti-enumeration: do NOT tick a metric here — the
+                // Do NOT tick a metric for a missing repo — the
                 // architect-doc ceiling on `result` cardinality (12)
                 // does not include a "repo not found" bucket, and adding
                 // one would push past the ceiling without operator-
@@ -277,10 +274,13 @@ impl DiscoveryUseCase {
                 &repository_label,
                 DiscoveryResult::PermissionDenied,
             );
-            return Err(AppError::Domain(DomainError::Forbidden(format!(
-                "Permission::Read required on repository {}",
-                repository.key,
-            ))));
+            // Missing and invisible repositories have byte-identical client
+            // errors so Read cannot enumerate private repository keys.
+            // Token-kind refusal may remain Forbidden: it precedes lookup.
+            return Err(AppError::Domain(DomainError::NotFound {
+                entity: "Repository",
+                id: repo_key.to_string(),
+            }));
         }
 
         // -------- Fetch AK-held versions + quarantine anchors ---------
@@ -511,6 +511,7 @@ mod tests {
     };
     use uuid::Uuid;
 
+    use crate::use_cases::test_support::tracing_capture::capture_audit_events;
     use crate::use_cases::test_support::{
         sample_repository, MockArtifactRepository, MockPolicyProjectionRepository,
         MockRepositoryRepository, MockRepositoryUpstreamMappingRepository,
@@ -771,6 +772,9 @@ mod tests {
                 let repo = npm_repo();
                 let repo_id = repo.id;
                 let h = wire(repo, evaluator_with_read_grant("dev", repo_id));
+                h.repos.fail_next_find_by_key(DomainError::Invariant(
+                    "repository lookup was reached".into(),
+                ));
                 let actor = caller_with_token_kind(&["dev"], Some(TokenKind::Pat));
                 let err =
                     h.uc.list_versions("any-key", "left-pad", Some(&actor))
@@ -780,6 +784,16 @@ mod tests {
                 if let AppError::Domain(DomainError::Forbidden(msg)) = err {
                     assert!(msg.contains("CLI session"), "msg: {msg}");
                 }
+                let admitted = caller_cli_session(&["dev"]);
+                let lookup_error =
+                    h.uc.list_versions("any-key", "left-pad", Some(&admitted))
+                        .await
+                        .expect_err("the injected repository lookup must still be pending");
+                assert!(matches!(
+                    lookup_error,
+                    AppError::Domain(DomainError::Invariant(ref msg))
+                        if msg == "repository lookup was reached"
+                ));
             })
         });
         assert_eq!(
@@ -801,8 +815,8 @@ mod tests {
     // "a service account sees exactly what a CLI session sees" is an
     // assertion over every status variant rather than a claim, and the two
     // denial tests share one scenario for the same reason: both gates
-    // return `Forbidden`, so only the metric tells a caller refused for its
-    // KIND apart from one refused for its AUTHORITY.
+    // return different error variants, and the metric identifies which
+    // gate refused the caller for operators.
 
     /// Drive one package carrying **every** [`DiscoveryVersionStatus`]
     /// variant for `actor`, assert the complete `version → status` map, and
@@ -931,10 +945,9 @@ mod tests {
     }
 
     /// Assert that `actor` is refused by the **RBAC** gate and not by the
-    /// token-kind gate: the `Forbidden` carries the RBAC gate's wording,
-    /// `permission_denied` ticks once, and `token_kind_denied` does not tick
-    /// at all. Asserting only `Forbidden` would pass against a gate that
-    /// never moved.
+    /// token-kind gate: `NotFound` identifies the collapsed Read denial,
+    /// `permission_denied` ticks once, and `token_kind_denied` does not tick.
+    /// Asserting only a refusal would pass against the wrong gate.
     fn assert_denied_by_rbac_not_by_kind(
         repo: Repository,
         evaluator: RbacEvaluator,
@@ -948,13 +961,16 @@ mod tests {
                     h.uc.list_versions(&repo_key, "left-pad", Some(&actor))
                         .await
                         .expect_err("a caller without Permission::Read must be denied");
-                match err {
-                    AppError::Domain(DomainError::Forbidden(msg)) => assert!(
-                        msg.contains("Permission::Read required on repository"),
-                        "expected the RBAC gate's wording, not the token-kind gate's: {msg}",
+                assert!(
+                    matches!(
+                        err,
+                        AppError::Domain(DomainError::NotFound {
+                            entity: "Repository",
+                            ..
+                        })
                     ),
-                    other => panic!("expected Forbidden, got {other:?}"),
-                }
+                    "expected the RBAC gate's NotFound, got {err:?}",
+                );
             })
         });
         assert_eq!(
@@ -1035,6 +1051,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn read_denial_matches_missing_repository_and_preserves_operator_signal() {
+        let (snap, events) = capture_audit_events(|| {
+            capture(|| {
+                Box::pin(async {
+                    let repo = npm_repo();
+                    let key = repo.key.clone();
+                    let missing_repo = Repository {
+                        key: "some-other-repository".into(),
+                        ..npm_repo()
+                    };
+                    let invisible = wire(repo, empty_evaluator());
+                    let missing = wire(missing_repo, empty_evaluator());
+                    let actor = caller_cli_session(&[]);
+                    let missing_err = missing
+                        .uc
+                        .list_versions(&key, "left-pad", Some(&actor))
+                        .await
+                        .expect_err("missing repository must be hidden");
+                    let invisible_err = invisible
+                        .uc
+                        .list_versions(&key, "left-pad", Some(&actor))
+                        .await
+                        .expect_err("invisible repository must be hidden");
+                    assert!(matches!(
+                        missing_err,
+                        AppError::Domain(DomainError::NotFound { .. })
+                    ));
+                    assert!(matches!(
+                        invisible_err,
+                        AppError::Domain(DomainError::NotFound { .. })
+                    ));
+                    assert_eq!(
+                        invisible_err.to_string().as_bytes(),
+                        missing_err.to_string().as_bytes(),
+                        "an existing invisible repository and a missing repository must have identical client errors",
+                    );
+                })
+            })
+        });
+        assert_eq!(
+            counter_value(
+                &snap,
+                "hort_discovery_list_versions_total",
+                "permission_denied"
+            ),
+            Some(1),
+        );
+        let denial_logs: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.level == tracing::Level::INFO
+                    && event.target == module_path!().trim_end_matches("::tests")
+                    && event.message()
+                        == "discovery list_versions denied: missing Permission::Read on repository"
+            })
+            .collect();
+        assert_eq!(denial_logs.len(), 1, "captured events: {events:#?}");
+        assert_eq!(denial_logs[0].field("outcome"), Some("denied"));
+    }
+
     // --- Gate 2: RBAC ----------------------------------------------------
 
     #[test]
@@ -1049,7 +1126,13 @@ mod tests {
                     h.uc.list_versions(&key, "left-pad", Some(&actor))
                         .await
                         .expect_err("missing Permission::Read must deny");
-                assert!(matches!(err, AppError::Domain(DomainError::Forbidden(_))));
+                assert!(matches!(
+                    err,
+                    AppError::Domain(DomainError::NotFound {
+                        entity: "Repository",
+                        ..
+                    })
+                ));
             })
         });
         assert_eq!(
