@@ -77,6 +77,7 @@ use axum::response::{IntoResponse, Response};
 use hort_app::use_cases::oci_token_exchange_use_case::OciVerifyOutcome;
 use hort_domain::entities::caller::CallerPrincipal;
 
+use hort_http_core::auth_scheme::{strip_auth_scheme, AuthScheme};
 use hort_http_core::context::{AppContext, AuthContext};
 use hort_http_core::middleware::auth::{
     mint_authenticated_principal_for_format_middleware, AuthenticatedPrincipal,
@@ -284,18 +285,22 @@ fn is_non_safe_method(method: &axum::http::Method) -> bool {
 ///
 /// Returns `None` for missing / malformed / non-Bearer-non-Basic
 /// headers — every absence mode collapses to "no token".
+///
+/// Both scheme tokens are matched by
+/// [`hort_http_core::auth_scheme::strip_auth_scheme`], which folds ASCII
+/// case and the `1*SP` separator per RFC 7235 §2.1.
 fn extract_token(req: &Request<Body>) -> Option<String> {
     use base64::Engine as _;
 
     let header_val = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    if let Some(rest) = header_val.strip_prefix("Bearer ") {
+    if let Some(rest) = strip_auth_scheme(header_val, AuthScheme::Bearer) {
         let token = rest.trim();
         if token.is_empty() {
             return None;
         }
         return Some(token.to_string());
     }
-    if let Some(encoded) = header_val.strip_prefix("Basic ") {
+    if let Some(encoded) = strip_auth_scheme(header_val, AuthScheme::Basic) {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded.trim())
             .ok()?;
@@ -1205,6 +1210,109 @@ mod tests {
 
         let absent = HttpRequest::get("/v2/probe").body(Body::empty()).unwrap();
         assert!(extract_token(&absent).is_none());
+    }
+
+    // -------------------- 5a. RFC 7235 §2.1 scheme matching ------------
+    //
+    // `auth-scheme` is a token matched case-insensitively and `1*SP`
+    // separates it from the credential; `extract_token` reaches both
+    // through `hort_http_core::auth_scheme::strip_auth_scheme`. Each
+    // assertion below is an EQUALITY against the canonical-case
+    // single-space outcome — the property is that the spelling does not
+    // matter, which two independent literals would not catch when the two
+    // diverge.
+
+    /// A `/v2/*` request carrying `value` as its raw `Authorization`
+    /// header, so a non-canonical spelling reaches `extract_token`
+    /// verbatim.
+    fn auth_header_req(value: &str) -> Request<Body> {
+        HttpRequest::get("/v2/probe")
+            .header(header::AUTHORIZATION, value)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn extract_token_bearer_is_scheme_case_insensitive_and_1sp() {
+        let canonical = extract_token(&auth_header_req("Bearer abc.def.ghi"));
+        assert_eq!(
+            canonical.as_deref(),
+            Some("abc.def.ghi"),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in [
+            ("lower-case", "bearer abc.def.ghi"),
+            ("upper-case", "BEARER abc.def.ghi"),
+            ("mixed-case", "bEaReR abc.def.ghi"),
+            ("two spaces", "Bearer  abc.def.ghi"),
+            ("lower-case + 3 spaces", "bearer   abc.def.ghi"),
+        ] {
+            assert_eq!(
+                extract_token(&auth_header_req(value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_token_basic_is_scheme_case_insensitive_and_1sp() {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode("alice:eyJjbGFpbXMK");
+        let canonical = extract_token(&auth_header_req(&format!("Basic {encoded}")));
+        assert_eq!(
+            canonical.as_deref(),
+            Some("eyJjbGFpbXMK"),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in [
+            ("lower-case", format!("basic {encoded}")),
+            ("upper-case", format!("BASIC {encoded}")),
+            ("mixed-case", format!("bAsIc {encoded}")),
+            ("two spaces", format!("Basic  {encoded}")),
+            ("lower-case + 3 spaces", format!("basic   {encoded}")),
+        ] {
+            assert_eq!(
+                extract_token(&auth_header_req(&value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_token_still_refuses_an_unsupported_scheme() {
+        // Not a prefix-free "anything goes": neither branch claims a
+        // scheme that is not its own, in any case.
+        for value in [
+            "Digest abc.def.ghi",
+            "digest abc.def.ghi",
+            "Negotiate abc.def.ghi",
+            "Bearerish abc.def.ghi",
+            "Basicish aGVsbG86d29ybGQ=",
+        ] {
+            assert!(
+                extract_token(&auth_header_req(value)).is_none(),
+                "{value} was accepted as a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_token_empty_credential_is_unchanged() {
+        // Scheme present, nothing after it: still an absence mode on both
+        // branches, in every spelling and with no SP at all. Whether a
+        // malformed-but-present credential should instead be a 401 is a
+        // separate question this rule does not touch.
+        for value in [
+            "Bearer ", "bearer ", "Bearer", "bearer", "Basic ", "basic ", "Basic", "basic",
+        ] {
+            assert!(
+                extract_token(&auth_header_req(value)).is_none(),
+                "{value} changed the empty-credential classification"
+            );
+        }
     }
 
     // -------------------- Bearer challenge selector ----------

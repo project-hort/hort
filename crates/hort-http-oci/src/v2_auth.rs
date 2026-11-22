@@ -58,6 +58,7 @@ use serde::{Deserialize, Serialize};
 use hort_app::use_cases::oci_token_exchange_use_case::{
     OciAnonymousTokenRequest, OciTokenExchangeError, OciTokenExchangeRequest,
 };
+use hort_http_core::auth_scheme::{strip_auth_scheme, AuthScheme};
 use hort_http_core::context::AppContext;
 use hort_http_core::middleware::trust::RequestTrust;
 
@@ -256,9 +257,13 @@ pub async fn handle_v2_auth(
 /// Pull the password slot out of `Authorization: Basic <b64>`.
 /// Returns `None` for missing header, non-Basic schemes, malformed
 /// base64, missing `:`, or empty password.
+///
+/// The `Basic` scheme token is matched by
+/// [`hort_http_core::auth_scheme::strip_auth_scheme`], which folds ASCII
+/// case and the `1*SP` separator per RFC 7235 §2.1.
 fn extract_basic_password(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
-    let encoded = raw.strip_prefix("Basic ")?;
+    let encoded = strip_auth_scheme(raw, AuthScheme::Basic)?;
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(encoded.trim())
         .ok()?;
@@ -428,6 +433,75 @@ mod tests {
             HeaderValue::from_str(&format!("Basic {creds}")).unwrap(),
         );
         assert!(extract_basic_password(&h).is_none());
+    }
+
+    // -- RFC 7235 §2.1 scheme matching ---------------------------------
+    //
+    // `auth-scheme` is a token matched case-insensitively and `1*SP`
+    // separates it from the credential, both via
+    // `hort_http_core::auth_scheme::strip_auth_scheme`. The assertions are
+    // EQUALITIES against the canonical-case single-space outcome: the
+    // property is that the spelling does not matter, which two
+    // independent literals would not catch when the two diverge.
+
+    /// A `HeaderMap` carrying `value` as its raw `Authorization` header,
+    /// so a non-canonical spelling reaches the extractor verbatim.
+    fn auth_headers(value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, HeaderValue::from_str(value).unwrap());
+        h
+    }
+
+    #[test]
+    fn extract_basic_password_is_scheme_case_insensitive_and_1sp() {
+        let creds = base64::engine::general_purpose::STANDARD.encode("user:hunter2");
+        let canonical = extract_basic_password(&auth_headers(&format!("Basic {creds}")));
+        assert_eq!(
+            canonical.as_deref(),
+            Some("hunter2"),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in [
+            ("lower-case", format!("basic {creds}")),
+            ("upper-case", format!("BASIC {creds}")),
+            ("mixed-case", format!("bAsIc {creds}")),
+            ("two spaces", format!("Basic  {creds}")),
+            ("lower-case + 3 spaces", format!("basic   {creds}")),
+        ] {
+            assert_eq!(
+                extract_basic_password(&auth_headers(&value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_password_still_refuses_another_scheme() {
+        // Not a prefix-free "anything goes".
+        for value in [
+            "Digest aGVsbG86aHVudGVyMg==",
+            "digest aGVsbG86aHVudGVyMg==",
+            "bearer abc",
+            "Basicish aGVsbG86aHVudGVyMg==",
+        ] {
+            assert!(
+                extract_basic_password(&auth_headers(value)).is_none(),
+                "{value} was accepted as Basic"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_password_empty_credential_is_unchanged() {
+        // Scheme present, nothing after it — an absence mode, as before,
+        // in every spelling and with no SP at all.
+        for value in ["Basic ", "basic ", "Basic", "basic"] {
+            assert!(
+                extract_basic_password(&auth_headers(value)).is_none(),
+                "{value} changed the empty-credential classification"
+            );
+        }
     }
 
     #[test]
