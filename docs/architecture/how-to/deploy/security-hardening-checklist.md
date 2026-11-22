@@ -890,7 +890,9 @@ Several are in-binary correctness gates with no operator-tunable surface.
 - **Operator action required:** set `scheduledTasks.adminTasksEnabled: true`
   (the verifier then runs without further configuration). Pair it with
   `scheduledTasks.eventstoreCheckpoint` + an S3 Object-Lock anchor bucket
-  for full external-anchor attestation. A deployment with **no** anchor —
+  for full external-anchor attestation — see *Provision the anchor bucket
+  for WORM* below for what that bucket must actually be configured with.
+  A deployment with **no** anchor —
   a filesystem backend, or S3 with no provisioned anchor public key —
   verifies its chain, expects no anchor, and exits `0`; an unanchored
   deployment is a supported posture, not a degraded one, and it does not
@@ -914,6 +916,45 @@ Several are in-binary correctness gates with no operator-tunable surface.
   the liveness recording failing never blocks boot or any request path.
 
 ---
+
+### Provision the anchor bucket for WORM
+
+- **Control:** the checkpoint emitter writes each anchor with a **plain
+  `put`**. `object_store` 0.14 exposes no API to set per-object S3
+  Object-Lock retention on a write — `PutOptions` carries only
+  `mode` / `TagSet` / a fixed `#[non_exhaustive]` `Attributes` enum
+  (Content-\*, Cache-Control, Storage-Class, user metadata) / opaque
+  `extensions`, and the `Attribute` enum has no Object-Lock variant. The
+  adapter deliberately does not fake a retention it cannot set, so the
+  WORM guarantee is **entirely** the bucket's default retention.
+- **Operator action required:** create the anchor bucket with **S3 Object
+  Lock enabled AND a bucket default retention in COMPLIANCE mode**, with a
+  retention period at least as long as your audit-retention floor:
+  ```bash
+  aws s3api put-object-lock-configuration --bucket <anchor-bucket> \
+    --object-lock-configuration \
+    'ObjectLockEnabled=Enabled,Rule={DefaultRetention={Mode=COMPLIANCE,Days=<N>}}'
+  ```
+  S3 then stamps that retention onto every newly written object
+  automatically, and not even the account root can delete or overwrite a
+  checkpoint before it expires.
+- **Enabling Object Lock WITHOUT a default retention yields no WORM at
+  all.** This is the failure mode to check for: the bucket reports Object
+  Lock as enabled, every `put` still succeeds, and every checkpoint
+  written is mutable — because the only thing that would have stamped a
+  retention onto it is the default this bucket does not have, and the
+  application sets none per object. An attacker who reaches the anchor
+  credentials can then overwrite the anchors that would have exposed an
+  in-DB chain rewrite.
+- **The application cannot enforce or verify this.** There is no boot
+  check and no metric for it; a misprovisioned bucket is indistinguishable
+  from a correct one from inside hort. It is verified out of band:
+  ```bash
+  aws s3api get-object-lock-configuration --bucket <anchor-bucket>
+  # Expect ObjectLockEnabled=Enabled AND a Rule.DefaultRetention
+  # with Mode=COMPLIANCE. A response with no DefaultRetention is the
+  # no-WORM case above.
+  ```
 
 ## Quick verification command set
 

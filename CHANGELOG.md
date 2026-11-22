@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Discovery now answers 404 instead of 403 for repositories the caller cannot
   read, matching the response for a missing repository (#458).
+- The deployment hardening guide now states what the event-chain anchor bucket
+  must be provisioned with: S3 Object Lock enabled **and** a bucket default
+  retention in COMPLIANCE mode. Object Lock enabled without a default
+  retention stores every checkpoint mutably, which hort cannot detect —
+  re-check an existing anchor bucket with
+  `aws s3api get-object-lock-configuration` (#458).
 
 ## [0.18.0] - 2026-11-21
 
