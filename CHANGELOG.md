@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The upload-payload metadata cap now applies to verified ingest (hosted PyPI
+  publication, OCI manifest and blob writes, every pull-through) and to pushed
+  signature manifests, so an oversized payload is refused before any content
+  reaches storage instead of being accepted unbounded (#458).
+
 ### Security
 
 - Discovery now answers 404 instead of 403 for repositories the caller cannot

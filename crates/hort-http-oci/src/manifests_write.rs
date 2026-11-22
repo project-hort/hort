@@ -888,6 +888,11 @@ async fn run_manifest_ingest(
                 subject_digest_parsed.clone(),
                 claimed_edges,
                 stream,
+                // Same handler instance the sibling arm passes to
+                // `ingest_verified`: the narrow signature path writes
+                // `payload_metadata` too, so it resolves its cap from the
+                // same source of truth for this request's format.
+                &OciFormatHandler,
             )
             .await
     } else {
