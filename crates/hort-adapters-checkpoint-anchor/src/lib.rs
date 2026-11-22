@@ -457,7 +457,7 @@ pub enum EmitterAdapterError {
 ///
 /// ## S3 Object-Lock WORM — exact guarantee + required provisioning
 ///
-/// `object_store` 0.13 exposes **no API to set per-object S3
+/// `object_store` 0.14 exposes **no API to set per-object S3
 /// Object-Lock retention on `put`**: `PutOptions` carries only
 /// `mode`, a `TagSet`, a fixed `#[non_exhaustive]` `Attributes` enum
 /// (Content-*, Cache-Control, Storage-Class, user metadata) and opaque
@@ -480,12 +480,22 @@ pub enum EmitterAdapterError {
 /// satisfying the in-DB threat model. The residual
 /// (documented honestly, not fudged): WORM depends on correct bucket
 /// provisioning the *application cannot enforce or verify through
-/// `object_store`*; if the operator forgets to enable Object Lock the
-/// `put` still succeeds but the object is mutable. The deployment
-/// hardening guide MUST state the bucket-provisioning requirement; an
-/// `object_store` upgrade that adds a retention `PutOption` would let a
-/// future revision additionally assert per-object retention defensively
-/// (tracked, not done here — no faked guarantee).
+/// `object_store`*; if the operator forgets to enable Object Lock — or
+/// enables it without a bucket **default retention**, which stamps
+/// nothing onto a plain `put` — the write still succeeds and the object
+/// is mutable. There is no boot check and no metric that can see this,
+/// because a `put` to an unprotected bucket is indistinguishable from a
+/// protected one. The requirement, both failure modes and the out-of-band
+/// verification command live in the deployment hardening guide, section
+/// *Provision the anchor bucket for WORM*
+/// (`docs/architecture/how-to/deploy/security-hardening-checklist.md`).
+///
+/// The concrete trigger for revisiting this: `object_store`'s `Attribute`
+/// enum is `#[non_exhaustive]` and today carries no Object-Lock variant,
+/// so there is no retention to pass through `PutOptions::attributes`.
+/// Should a variant for it appear, a revision can assert per-object
+/// retention defensively instead of relying on the bucket default. Until
+/// then a plain `put` is the only honest write — no faked guarantee.
 pub struct ObjectStoreCheckpointEmitter {
     store: Arc<dyn ObjectStore>,
     signing_key: SigningKey,

@@ -5583,17 +5583,18 @@ adapter emit nothing. `result` is a per-metric schema label holding
 exactly the three values above; adding any other label/value is
 FORBIDDEN (per-metric closed-enum rule). Cardinality ≤ 3 series.
 
-**S3 Object-Lock WORM nuance (precise, not fudged):** `object_store`
-0.13 exposes no API to set per-object Object-Lock retention on `put`
-(`PutOptions` carries only `mode`/`TagSet`/a fixed `Attributes`
-enum/opaque ignored `extensions`). The emitter does a plain `put`; the
-WORM guarantee is the **operator-provisioned bucket default retention**
-— the anchor bucket MUST be created with **S3 Object Lock enabled + a
-COMPLIANCE-mode default retention** (S3 then stamps every new object
-automatically). The residual: the application cannot enforce/verify the
-bucket provisioning through `object_store`; the deployment hardening
-guide states the requirement (see the `ObjectStoreCheckpointEmitter`
-type doc). Tracing: `info!` on a successful emission (seq,
+**S3 Object-Lock WORM nuance, as it bears on these metrics:**
+`object_store` 0.14 exposes no API to set per-object Object-Lock
+retention on `put`, so the emitter does a plain `put` and the WORM
+guarantee is the operator-provisioned bucket default retention. **No
+metric here can observe whether that provisioning is correct** — a
+`put` to a bucket with no default retention succeeds and reports
+`result="ok"` exactly like a protected one, so a `success` series is
+not evidence of WORM. The requirement, both failure modes and the
+out-of-band verification command are in the deployment hardening guide,
+section *Provision the anchor bucket for WORM*; the
+`ObjectStoreCheckpointEmitter` type doc carries the library-level
+reasoning. Tracing: `info!` on a successful emission (seq,
 max_global_position, stream count, backfill flag — NO key material);
 `error!` on sign / anchor-write failure (unrecoverable for that cycle).
 No `#[instrument(err)]` (a failed cycle is a `TaskOutcome::Failed`, not
