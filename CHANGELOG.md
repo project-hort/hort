@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Discovery now answers 404 instead of 403 for repositories the caller cannot
+  read, matching the response for a missing repository (#458).
+
 ### Migration notice
 
 - **`artifacts.quarantine_status` is narrowed to the four storable states**
