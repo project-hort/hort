@@ -92,13 +92,23 @@
 //! # `cksum` invariant
 //!
 //! Per the cargo spec `cksum` is mandatory — every NDJSON line MUST
-//! carry a 64-hex-character SHA-256. The hosted source populates it
-//! from `Artifact.sha256_checksum` (always present in v2). The
-//! proxy source preserves the upstream-supplied `cksum`. The builder
-//! emits the field as-is; an empty string would produce a
-//! syntactically-valid line that cargo clients reject at resolve
-//! time — exactly the failure mode the legacy `unwrap_or("")` fallback
-//! had. We preserve that semantic to avoid introducing a new error mode.
+//! carry a 64-hex-character SHA-256, and a line carrying anything else
+//! (an empty string, a wrong-length or non-hex value) is syntactically
+//! valid and useless: the client rejects it when it resolves against
+//! it. The hosted source populates the field from
+//! `Artifact.sha256_checksum`, a validated `ContentHash`, so the shape
+//! holds there by construction. The proxy source preserves the
+//! upstream-supplied value and **withholds the version entirely** when
+//! that value is not one the pull-through could verify a download
+//! against — hort advertises nothing it will not serve (ADR 0062), and
+//! the upstream checksum is the precondition for serving a proxied
+//! version at all (ADR 0006). See
+//! `hort-http-cargo/src/index_source.rs::projection_to_entries`.
+//!
+//! The builder therefore never receives an unusable `cksum` from either
+//! source, and stays a pure formatter: it emits the field as-is and
+//! never re-filters, because a builder that second-guessed its entries
+//! would put the definition of the served set in two places.
 //!
 //! # URL construction (not a builder concern)
 //!

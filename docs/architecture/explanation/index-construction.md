@@ -41,7 +41,10 @@ The pipeline has three stages with sharply separated knowledge:
   in through `ArtifactUseCase::batch_metadata` — one batched read for
   the whole version set — as PyPI does for `requires-python` and
   cargo does for each version's `deps` / `features`. Sources know
-  where versions come from; they apply no policy.
+  where versions come from; they apply none of the shared policy,
+  which is the filters' — see
+  [Where a format-specific exclusion goes](#where-a-format-specific-exclusion-goes)
+  for the one drop a source does own and why no other stage can.
 
   A proxy source's served links point back at hort, so whichever
   digest it puts in them is the one a client checks the bytes *hort*
@@ -60,6 +63,20 @@ The pipeline has three stages with sharply separated knowledge:
   wins (serving the other value would be a check that cannot
   succeed) and the divergence is counted on
   `hort_index_digest_divergence_total`.
+
+  **This substitution is built for PyPI's simple index only.**
+  `ArtifactUseCase::package_file_digests` has exactly one
+  inbound-HTTP consumer; npm's packument and cargo's sparse index
+  serve the upstream document's digest verbatim, for files hort
+  holds as well as for files it does not. For an immutable upstream
+  the two values agree anyway — the stored bytes were verified
+  against that digest at ingest — so the exposure is an upstream
+  that *changes* a published version's digest after hort ingested
+  it: those two formats then advertise a digest the bytes hort
+  serves will not match, and nothing counts the disagreement.
+  Whether to extend the substitution to them, which would also
+  narrow cargo's checksum exclusion above to never-ingested
+  versions, is open.
 - A **filter pipeline** drops entries. Filters implement
   `IndexFilter` (`crates/hort-app/src/use_cases/index_serve.rs`) and
   operate only on the spine fields described below — they are pure
@@ -91,6 +108,49 @@ in the per-format HTTP crates — which, like all inbound-HTTP format
 crates, carry no adapter dependencies
 ([ADR 0008](../../adr/0008-per-format-adapter-free-http-crates.md)) —
 and reach data only through use cases.
+
+### Where a format-specific exclusion goes
+
+"Sources apply no policy" is about the *shared* reasons — quarantine
+status and index mode — which every format must have applied
+identically and which therefore belong to the filters. It is not a
+claim that a source advertises every line it parsed. A format
+sometimes knows, from the wire document alone, that a version is not
+servable at all: cargo's sparse index must carry a per-version
+`cksum`, and a line whose checksum the pull-through could not verify
+a download against names a version whose bytes hort refuses
+([ADR 0006](../../adr/0006-mandatory-upstream-verification.md)), so
+advertising it breaks the rule this page opens with.
+
+Such an exclusion belongs to the format's **source**, and neither
+other stage can host it. A filter reads the `VersionEntry` spine with
+the per-format payload opaque to it — that opacity is what keeps the
+filters format-agnostic, and a cargo-shaped predicate there would
+spend it. A builder formats and never re-filters, so a drop there
+would put the definition of the served set in two places. The source
+is also the only stage holding the upstream value together with the
+knowledge of what it means.
+
+Two constraints on such an exclusion, both load-bearing:
+
+- **Per version, never per package.** One unusable upstream line must
+  not deny the index for every conformant version of that package. A
+  package whose every version is unusable serves an index with no
+  versions — on a proxy repository a 200 with an empty document, the
+  honest answer and not a case to special-case around.
+- **At the entry mapping, not while projecting.** The cached
+  projection is the raw upstream picture and other legs read it:
+  cargo's download leg recovers the upstream `cksum` from that same
+  projection, so a line dropped while projecting turns its refusal
+  from "this entry has no checksum" into "upstream has no such
+  version" — a different answer to the client, with the diagnosis
+  lost.
+
+The withheld count is reported as one aggregated `warn` per request
+naming the package, so an operator can see that an upstream is
+advertising versions hort will not serve. Per-version logging is
+wrong at this scale: one broken upstream document would emit a line
+per version of a large package.
 
 ## The filter pipeline and its order
 

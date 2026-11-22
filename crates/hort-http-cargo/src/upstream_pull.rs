@@ -1011,6 +1011,45 @@ mod tests {
         );
     }
 
+    /// The same refusal for the two `cksum` values the served index
+    /// withholds: an empty string, and a value whose shape the SHA-256
+    /// rule rejects. Both must answer `ParseError` — the index *has* an
+    /// entry for the version, and the entry's checksum is unusable. The
+    /// distinction from `NotFoundUpstream` is load-bearing: it is why the
+    /// serve-side withholding lives at the proxy source's entry mapping
+    /// and not in the projector, which both legs read.
+    #[tokio::test]
+    async fn index_entry_with_unusable_cksum_returns_parse_error_not_not_found() {
+        for cksum in ["", "deadbeef"] {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = cargo_repo("crates-mirror");
+            mocks.repositories.insert(repo.clone());
+            seed_mapping(&mocks, repo.id, "");
+
+            mocks
+                .upstream_proxy
+                .insert_metadata("", "/config.json", CRATES_IO_CONFIG.to_vec());
+            mocks.upstream_proxy.insert_metadata(
+                "",
+                "/se/rd/serde",
+                ndjson_entry("serde", "1.0.0", cksum),
+            );
+
+            let err = try_upstream_crate_pull(&ctx, &repo, "serde", "1.0.0")
+                .await
+                .unwrap_err();
+
+            assert!(
+                matches!(err, UpstreamPullError::ParseError(_)),
+                "cksum {cksum:?}: expected ParseError, got {err:?}"
+            );
+            assert!(
+                !matches!(err, UpstreamPullError::NotFoundUpstream),
+                "cksum {cksum:?}: the entry exists upstream; its checksum is what is unusable"
+            );
+        }
+    }
+
     // ---- Branch 7: download fetch fails (transport) -------------------------
 
     #[tokio::test]

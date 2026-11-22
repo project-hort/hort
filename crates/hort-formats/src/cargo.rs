@@ -220,6 +220,29 @@ pub fn validate_cargo_version(version: &str) -> DomainResult<()> {
     Ok(())
 }
 
+/// The one definition of "is this sparse-index `cksum` a checksum hort can
+/// verify a download against".
+///
+/// Lower-cases first — the download leg has always accepted an upper-case
+/// hex digest — and then hands the shape verdict to
+/// [`UpstreamPublishedChecksum::new`], the workspace's single SHA-256
+/// length-and-charset rule. A `cksum` the upstream line omitted arrives here
+/// as [`CargoVersionLine`](crate::cargo::projection::CargoVersionLine)'s
+/// empty-string default and fails that length check, so no caller needs a
+/// blankness test of its own.
+///
+/// Two consumers share it on purpose, one per direction of the same
+/// guarantee: `parse_upstream_checksum` below refuses a **download** whose
+/// upstream checksum this rejects (ADR 0006), and the cargo proxy index
+/// source's serve mapping withholds the **advertisement** of that same
+/// version (ADR 0062 — hort advertises nothing it will not serve). Re-typing
+/// the rule on either side is how the two come to disagree, and the
+/// disagreement is silent: the served index resolves a client onto a version
+/// whose bytes the download leg will never hand back.
+pub fn parse_index_cksum(cksum: &str) -> DomainResult<UpstreamPublishedChecksum> {
+    UpstreamPublishedChecksum::new(HashAlgorithm::Sha256, cksum.to_lowercase())
+}
+
 impl FormatHandler for CargoFormatHandler {
     fn format_key(&self) -> &str {
         "cargo"
@@ -448,9 +471,7 @@ impl FormatHandler for CargoFormatHandler {
             // First matching line — extract cksum (captured; the loop
             // continues to EOF so the size cap sees the full body).
             matched = Some(match entry.get("cksum").and_then(|v| v.as_str()) {
-                Some(cksum) => {
-                    UpstreamPublishedChecksum::new(HashAlgorithm::Sha256, cksum.to_lowercase())
-                }
+                Some(cksum) => parse_index_cksum(cksum),
                 None => Err(DomainError::Validation(format!(
                     "upstream Cargo index entry for {}@{} has no cksum",
                     coords.name, version
@@ -2006,6 +2027,32 @@ mod tests {
             .unwrap();
         let path = handler().upstream_checksum_metadata_path(&coords);
         assert_eq!(path, Some("/se/rd/serde".to_string()));
+    }
+
+    // -- parse_index_cksum ---------------------------------------------------
+
+    #[test]
+    fn parse_index_cksum_accepts_a_lower_case_sha256_and_lower_cases_an_upper_case_one() {
+        let hex = "f55c3193aca71c12ad7890f1785d2b73e1b9f63a0bbc353c08ef26fe03fc56b5";
+        assert_eq!(parse_index_cksum(hex).unwrap().hex(), hex);
+        assert_eq!(
+            parse_index_cksum(&hex.to_uppercase()).unwrap().hex(),
+            hex,
+            "the download leg accepts an upper-case digest, so the rule must"
+        );
+    }
+
+    #[test]
+    fn parse_index_cksum_rejects_the_shapes_no_download_can_be_verified_against() {
+        // The empty string is what a line that omitted `cksum` projects
+        // to, which is why neither consumer needs a blankness test.
+        for bad in ["", "deadbeef", &"a".repeat(63), &"g".repeat(64)] {
+            let err = parse_index_cksum(bad).unwrap_err();
+            assert!(
+                matches!(err, DomainError::Validation(_)),
+                "cksum {bad:?}: expected Validation, got {err:?}"
+            );
+        }
     }
 
     // -- parse_upstream_checksum ---------------------------------------------
