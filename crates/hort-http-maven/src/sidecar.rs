@@ -22,8 +22,10 @@
 //!
 //! ## Quarantine inheritance (§11)
 //!
-//! A sidecar GET resolves the **same target artifact** as the file GET
-//! ([`ArtifactUseCase::find_visible_by_path`] on the base path) and
+//! A sidecar GET resolves the **same target artifact** as the file GET —
+//! [`ArtifactUseCase::find_visible_by_path`] on the path the caller
+//! resolved for both branches (the sidecar-stripped request path, and for
+//! an unresolved `-SNAPSHOT` the timestamped build it resolves to) — and
 //! applies the **same status gate** — literally the same function, so the
 //! two answers cannot drift: `Quarantined` → 503, carrying `Retry-After`
 //! only for a hold the clock resolves; `Rejected` → 403 naming the
@@ -62,27 +64,36 @@ const MAVENSUM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const HASH_READ_CHUNK: usize = 64 * 1024;
 
 /// Serve an on-demand checksum sidecar for the stored file at
-/// `base_path` (the request path with its `.{ext}` sidecar suffix already
-/// stripped) using the algorithm token `algorithm`
+/// `target_path` using the algorithm token `algorithm`
 /// (`"sha1"`/`"sha256"`/`"sha512"`/`"md5"`).
 ///
-/// Resolves the SAME target artifact and applies the SAME status gate as
-/// the file GET (`find_visible_by_path` → quarantine gate); a held target
+/// Serves the SAME target artifact and applies the SAME status gate as the
+/// file GET (`find_visible_by_path` → quarantine gate); a held target
 /// returns the file's own non-servable response and the digest is never
 /// computed. A missing target → 404 (same as a missing file).
+///
+/// `target_path` is the path of the CONTENT file this sidecar digests, and
+/// the caller owns its derivation entirely: [`crate::serve_file`] strips
+/// the `.{ext}` suffix off the request tail and then runs the mutable-
+/// version resolution ONCE, ahead of the file/sidecar branch, so an
+/// unresolved `foo-X-SNAPSHOT.jar.sha1` arrives here already pointing at
+/// the same timestamped build `foo-X-SNAPSHOT.jar` resolves to. Resolving
+/// here instead would be a second call that can drift from the file GET's
+/// — and would get the wrong answer, since `resolve_mutable_version`
+/// reads the requested extension off the filename it is handed.
 pub(crate) async fn serve_sidecar(
     ctx: &Arc<AppContext>,
     repo: &Repository,
-    base_path: &str,
+    target_path: &str,
     algorithm: &str,
     is_head: bool,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Response, ApiError> {
     // Resolve the target file (same hop, same anti-enumeration 404 as the
-    // file GET). A missing base file → 404 (a sidecar of nothing).
+    // file GET). A missing target file → 404 (a sidecar of nothing).
     let (_repo, artifact) = ctx
         .artifact_use_case
-        .find_visible_by_path(&repo.key, base_path, actor)
+        .find_visible_by_path(&repo.key, target_path, actor)
         .await?;
 
     // Quarantine inheritance (§11): if the target is non-servable, return
