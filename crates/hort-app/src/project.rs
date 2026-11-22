@@ -22,16 +22,8 @@
 //! See ADR 0026.
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::metadata_mirror_store::MetadataMirrorStore;
+use hort_domain::ports::metadata_mirror_store::{body_digest, MetadataMirrorStore};
 use hort_domain::ports::upstream_proxy::{CachedBodyHandle, MetadataProjector};
-use hort_domain::types::ContentHash;
-use sha2::{Digest, Sha256};
-
-fn body_digest(bytes: &[u8]) -> ContentHash {
-    hex::encode(Sha256::digest(bytes))
-        .parse()
-        .expect("SHA-256 is a valid content hash")
-}
 
 /// Write a buffered upstream body to a tempfile and return a
 /// [`CachedBodyHandle`] pointing at it. The production path streams the
@@ -273,6 +265,7 @@ mod fetch_and_project_tests {
     use chrono::Utc;
     use futures::future::BoxFuture;
     use hort_domain::ports::metadata_mirror_store::MetadataMirrorStore;
+    use hort_domain::types::ContentHash;
     use std::io::Write;
     use std::sync::Mutex;
     use tokio::io::{AsyncRead, AsyncReadExt};

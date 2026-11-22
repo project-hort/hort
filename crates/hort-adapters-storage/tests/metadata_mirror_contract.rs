@@ -55,11 +55,8 @@
 
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
-
 use hort_domain::error::DomainError;
-use hort_domain::ports::metadata_mirror_store::{mirror_key, MetadataMirrorStore};
-use hort_domain::types::ContentHash;
+use hort_domain::ports::metadata_mirror_store::{body_digest, mirror_key, MetadataMirrorStore};
 use object_store::{ObjectStore, ObjectStoreExt};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
@@ -68,20 +65,17 @@ use hort_adapters_storage::{FilesystemMetadataMirror, ObjectStoreMetadataMirror}
 /// Mapping id used to build realistic keys.
 const MAPPING: &str = "11111111-1111-1111-1111-111111111111";
 
-/// The digest a production caller supplies with a body: SHA-256 of
-/// exactly the bytes it is about to stream.
-fn digest(body: &[u8]) -> ContentHash {
-    hex::encode(Sha256::digest(body)).parse().unwrap()
-}
-
 /// `put` `body` under `key` with the digest its own bytes produce, the
-/// way the upstream-fetch caller does.
+/// way the upstream-fetch caller does. The digest comes from the port's
+/// own [`body_digest`] rather than a copy typed here: a helper that
+/// hashed differently from the one production supplies would make every
+/// assertion below about the difference.
 async fn put_body(
     store: &dyn MetadataMirrorStore,
     key: &str,
     body: Vec<u8>,
 ) -> Result<(), DomainError> {
-    let supplied = digest(&body);
+    let supplied = body_digest(&body);
     store
         .put(key, Box::new(std::io::Cursor::new(body)), supplied)
         .await
@@ -585,8 +579,6 @@ fn neither_backend_accumulates_the_body() {
         // The object-store backend's bounded multipart writer.
         "WriteMultipart::new_with_chunk_size(upload, UPLOAD_CHUNK_SIZE)",
         ".wait_for_capacity(MAX_PARTS_IN_FLIGHT)",
-        // Both verify the supplied digest against what they wrote.
-        "fn require_supplied_digest(",
         // The part size the round-trip test above sizes its body
         // against. Pinned here so that test stays a test about the
         // seam rather than about a number that drifted away from it.
@@ -615,6 +607,27 @@ fn neither_backend_accumulates_the_body() {
         2,
         "both backends' `put` must be in the scanned region; a third \
          implementation, or one moved below the test module, is outside it"
+    );
+    // Two calls to the port's own `require_supplied_digest` in the
+    // region that holds both `put`s and both their write helpers. Which
+    // helper reaches which call is NOT pinned here — both calls sit in
+    // free functions rather than in a `fn put` body, so a per-`put`
+    // scope would find none. That each backend actually refuses a
+    // mis-stated pair is pinned behaviourally, by
+    // `a_put_whose_digest_does_not_match_the_bytes_is_refused_on_both_backends`
+    // over `backends()`; this count is the structural backstop that the
+    // refusal is still reached in this module at all. The refusal is
+    // defined beside the port it belongs to
+    // (`hort_domain::ports::metadata_mirror_store`) so that every
+    // implementor including the in-memory test double consumes one
+    // definition, which is why what this file can pin is the calls and
+    // not the definition.
+    assert_eq!(
+        production.matches("require_supplied_digest(").count(),
+        2,
+        "each backend must verify the digest it was handed against the \
+         bytes it wrote; a `put` that does not reach the refusal commits \
+         a body whose own frame header every later `get` will reject"
     );
 
     // Mutation check. The text below is the object-store `put` as it

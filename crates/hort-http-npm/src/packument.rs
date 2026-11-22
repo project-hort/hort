@@ -804,19 +804,14 @@ mod tests {
     use hort_http_core::test_support::{build_mock_ctx, read_mirror, MockPorts};
 
     use hort_domain::error::DomainResult;
+    // The digest a mirror seed supplies with its body, taken from the
+    // port that refuses a pair that does not agree. The production
+    // caller supplies the digest of exactly the bytes it streams, so a
+    // fixture seeding the mirror supplies it too — from the same
+    // definition, not from a local re-type of it.
+    use hort_domain::ports::metadata_mirror_store::body_digest;
 
     use super::*;
-
-    /// SHA-256 of a body a mirror seed is about to write, in the form
-    /// `MetadataMirrorStore::put` takes it. The production caller
-    /// supplies the digest of exactly the bytes it streams, so a fixture
-    /// that seeds the mirror supplies it too.
-    fn body_digest(bytes: &[u8]) -> hort_domain::types::ContentHash {
-        use sha2::Digest;
-        hex::encode(sha2::Sha256::digest(bytes))
-            .parse()
-            .expect("SHA-256 is a valid content hash")
-    }
 
     /// An `EphemeralStore` whose every operation fails. Drives
     /// [`evict_packument`]'s two best-effort arms: the eviction of a
