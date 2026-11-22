@@ -596,10 +596,7 @@ pub(crate) async fn patch_upload_dispatch(
     }
 
     let repo_id = access.repository.id;
-    // Actor is carried for log / audit fields; `append_chunk` does not
-    // persist events (the session itself is the only state). The PUT
-    // finalize handler threads this actor into `IngestUseCase::ingest`.
-    let _actor = ApiActor {
+    let actor = ApiActor {
         user_id: access.principal.user_id,
     };
 
@@ -685,6 +682,8 @@ pub(crate) async fn patch_upload_dispatch(
                 max_bytes,
                 repo_id,
                 oci_cfg.session_max_age(),
+                actor,
+                &name,
             )
             .await
         }
@@ -697,6 +696,8 @@ pub(crate) async fn patch_upload_dispatch(
                 max_bytes,
                 repo_id,
                 oci_cfg.session_max_age(),
+                actor,
+                &name,
             )
             .await
         }
@@ -1033,7 +1034,17 @@ pub(crate) async fn delete_upload_dispatch(
 
     let repo_id = access.repository.id;
 
-    match super::upload_session::cancel(&ctx, session_id, repo_id, oci_cfg.session_max_age()).await
+    match super::upload_session::cancel(
+        &ctx,
+        session_id,
+        repo_id,
+        oci_cfg.session_max_age(),
+        ApiActor {
+            user_id: access.principal.user_id,
+        },
+        &name,
+    )
+    .await
     {
         Ok(()) => (StatusCode::NO_CONTENT, Body::empty()).into_response(),
         Err(AppError::Domain(DomainError::NotFound { .. })) => OciError::BlobUploadUnknown {
@@ -1079,6 +1090,7 @@ async fn handle_initiate(
     match super::upload_session::initiate(
         &ctx,
         repo_id,
+        name,
         actor,
         max_sessions_per_principal,
         session_max_age,
@@ -1172,7 +1184,7 @@ mod tests {
     use super::*;
 
     use axum::body::to_bytes;
-    use axum::http::Request as HttpRequest;
+    use axum::http::{Method, Request as HttpRequest};
     use chrono::Utc;
     use metrics_exporter_prometheus::PrometheusBuilder;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshot};
@@ -1238,7 +1250,7 @@ mod tests {
     /// inside the handler.
     fn test_principal() -> CallerPrincipal {
         CallerPrincipal {
-            user_id: Uuid::new_v4(),
+            user_id: Uuid::from_u128(0xC0FFEE),
             external_id: "test:sub".into(),
             username: "alice".into(),
             email: "alice@example.com".into(),
@@ -1648,7 +1660,7 @@ mod tests {
             h.repositories.insert(repo);
 
             // Seed a session via initiate.
-            let sid = initiate_for(&h.ctx, repo_id).await;
+            let sid = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
             let key = upload_session::session_key("oci", sid);
             assert!(h.ctx.ephemeral_durable.get(&key).await.unwrap().is_some());
 
@@ -2395,14 +2407,19 @@ mod tests {
     /// on PATCH behaviour without threading a POST roundtrip through the
     /// router first.
     async fn initiate_for(ctx: &Arc<AppContext>, repo_id: Uuid) -> Uuid {
+        initiate_for_name(ctx, repo_id, "nginx").await
+    }
+
+    async fn initiate_for_name(ctx: &Arc<AppContext>, repo_id: Uuid, name: &str) -> Uuid {
         // Pass a high cap so the existing PATCH/finalize tests are
         // unaffected by the per-`(repo, principal)` cap. Dedicated cap
         // tests exercise the rejection path in `upload_session.rs`.
         let outcome = upload_session::initiate(
             ctx,
             repo_id,
+            name,
             ApiActor {
-                user_id: Uuid::new_v4(),
+                user_id: Uuid::from_u128(0xC0FFEE),
             },
             10_000,
             OciHttpConfig::default().session_max_age(),
@@ -2421,6 +2438,72 @@ mod tests {
     }
 
     #[test]
+    fn patch_put_and_delete_reject_foreign_user_or_name_without_losing_owner_session() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let session_id = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
+            let key = upload_session::session_key("oci", session_id);
+            let router = router().with_state(h.ctx.clone());
+            let digest = hex_of(b"x");
+
+            for foreign_user in [true, false] {
+                let name = if foreign_user {
+                    "library/nginx"
+                } else {
+                    "other/image"
+                };
+                for method in [Method::PATCH, Method::PUT, Method::DELETE] {
+                    let uri = format!(
+                        "/v2/myrepo/{name}/blobs/uploads/{session_id}?digest=sha256:{digest}"
+                    );
+                    let request = match method {
+                        Method::PATCH => HttpRequest::patch(&uri)
+                            .header("Content-Range", "bytes 0-0")
+                            .header(CONTENT_LENGTH, "1")
+                            .body(Body::from("x"))
+                            .unwrap(),
+                        Method::PUT => HttpRequest::put(&uri).body(Body::empty()).unwrap(),
+                        _ => HttpRequest::delete(&uri).body(Body::empty()).unwrap(),
+                    };
+                    let request = if foreign_user {
+                        let mut request = request;
+                        let mut principal = test_principal();
+                        principal.user_id = Uuid::new_v4();
+                        hort_http_core::middleware::auth::test_support::inject_principal(
+                            &mut request,
+                            principal,
+                        );
+                        request
+                    } else {
+                        with_principal(request)
+                    };
+                    let response = router.clone().oneshot(request).await.unwrap();
+                    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+                    let body = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
+                    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(parsed["errors"][0]["code"], "BLOB_UPLOAD_UNKNOWN");
+                    assert!(h.ctx.ephemeral_durable.get(&key).await.unwrap().is_some());
+                }
+            }
+
+            patch_bytes(&router, "myrepo", "library/nginx", session_id, b"x", 0).await;
+            let uri = format!(
+                "/v2/myrepo/library/nginx/blobs/uploads/{session_id}?digest=sha256:{digest}"
+            );
+            let response = router
+                .oneshot(with_principal(
+                    HttpRequest::put(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        });
+    }
+
+    #[test]
     fn patch_correct_range_appends_and_returns_202_with_location_and_range_headers() {
         let content = b"patch me plz".to_vec();
         let (status, headers) = run(async {
@@ -2429,7 +2512,7 @@ mod tests {
             let repo_id = repo.id;
             h.repositories.insert(repo);
 
-            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let session_id = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
             let router = router().with_state(h.ctx.clone());
             let uri = format!("/v2/myrepo/library/nginx/blobs/uploads/{session_id}");
             let resp = router
@@ -2468,7 +2551,7 @@ mod tests {
             let repo = oci_repo("my-repo-key");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let session_id = initiate_for_name(&h.ctx, repo_id, "my/deep/name").await;
             let router = router().with_state(h.ctx);
             let uri = format!("/v2/my-repo-key/my/deep/name/blobs/uploads/{session_id}");
             let resp = router
@@ -2888,7 +2971,7 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let session_id = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
             let router = router().with_state(h.ctx);
             let uri =
                 format!("/v2/myrepo/library/nginx/blobs/uploads/{session_id}?digest=sha256:{hex}");
@@ -3014,7 +3097,7 @@ mod tests {
             let repo_id = repo.id;
             h.repositories.insert(repo);
 
-            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let session_id = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
             let router = router().with_state(h.ctx.clone());
             // PATCH all the bytes in, then PUT with matching digest.
             patch_bytes(&router, "myrepo", "library/nginx", session_id, &content, 0).await;
@@ -3089,7 +3172,7 @@ mod tests {
             let repo_id = repo.id;
             h.repositories.insert(repo);
 
-            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let session_id = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
             let router = router().with_state(h.ctx.clone());
             patch_bytes(&router, "myrepo", "library/nginx", session_id, &first, 0).await;
 
@@ -3135,7 +3218,7 @@ mod tests {
                 let repo = oci_repo("myrepo");
                 let repo_id = repo.id;
                 h.repositories.insert(repo);
-                let session_id = initiate_for(&h.ctx, repo_id).await;
+                let session_id = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
                 let router = router().with_state(h.ctx.clone());
                 patch_bytes(&router, "myrepo", "library/nginx", session_id, &real, 0).await;
 
@@ -3473,7 +3556,7 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let session_id = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
             let router = router().with_state(h.ctx);
             let uri =
                 format!("/v2/myrepo/library/nginx/blobs/uploads/{session_id}?digest=sha256:{hex}");
@@ -3512,7 +3595,7 @@ mod tests {
             let repo = oci_repo("myrepo");
             let repo_id = repo.id;
             h.repositories.insert(repo);
-            let session_id = initiate_for(&h.ctx, repo_id).await;
+            let session_id = initiate_for_name(&h.ctx, repo_id, "library/nginx").await;
             let router = router().with_state(h.ctx.clone());
             patch_bytes(&router, "myrepo", "library/nginx", session_id, &first, 0).await;
 

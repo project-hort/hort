@@ -74,6 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- OCI upload sessions are bound to the writer and the name that opened them.
+  Uploads in flight across the upgrade must be re-initiated (#458).
 - Accepted the informational `unmaintained` advisories for `chrono`
   (RUSTSEC-2026-0543) and `humantime` (RUSTSEC-2026-0542) — neither reports a
   defect, all versions are affected, and no upgrade exists (#448).
