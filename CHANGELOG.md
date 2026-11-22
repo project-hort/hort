@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A Maven checksum sidecar for an unresolved `-SNAPSHOT` path now resolves to
   the same timestamped build the file request resolves to, instead of
   answering 404 and failing a client with a strict checksum policy (#458).
+- Stored event-chain evidence that cannot be read back now fails the
+  checkpoint cycle terminally (`failed_terminal`, with a `chain_evidence_locus`
+  log field) instead of being retried as a transient outage (#458).
 
 ### Security
 

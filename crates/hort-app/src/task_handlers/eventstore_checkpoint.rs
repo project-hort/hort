@@ -91,6 +91,23 @@
 //! (unrecoverable for that cycle). `#[tracing::instrument(skip(...))]`
 //! WITHOUT `err` — a failed cycle is a `TaskOutcome::Failed`, not a
 //! `Result::Err`.
+//!
+//! ### Unreadable stored evidence is terminal, and visibly so
+//!
+//! A cycle can fail because the store is unreachable, and because the
+//! **stored chain evidence cannot be read back** — the finding this
+//! mechanism exists to produce. The `result` label set is a closed
+//! three-value enum and stays closed, so the distinction is carried
+//! where it already has an operator-visible home:
+//!
+//! * [`TaskOutcome::Failed`]'s `retry` field — `false` for unreadable
+//!   evidence, which the dispatcher counts as `failed_terminal` rather
+//!   than `failed_retry` and does not reschedule. Retrying it would
+//!   re-read the same bytes for the same verdict and reach terminality
+//!   only by exhausting the attempt budget.
+//! * a distinct `error!` event carrying `chain_evidence_locus` as a
+//!   field, so the alert is a field match rather than a substring match
+//!   on a message.
 
 use std::sync::Arc;
 
@@ -103,7 +120,9 @@ use hort_domain::events::{
 };
 use hort_domain::ports::checkpoint_anchor::CheckpointAnchorPort;
 use hort_domain::ports::checkpoint_emitter::CheckpointEmitterPort;
-use hort_domain::ports::event_chain_head_reader::EventChainHeadReaderPort;
+use hort_domain::ports::event_chain_head_reader::{
+    ChainSnapshotError, CorruptChainEvidence, EventChainHeadReaderPort,
+};
 use hort_domain::ports::task_handler::{TaskContext, TaskHandler, TaskOutcome};
 use hort_domain::ports::BoxFuture;
 
@@ -221,6 +240,13 @@ pub trait CheckpointEmissionHook: Send + Sync {
     /// sealed-but-unanchored streams. The next scheduled emission
     /// anchors those seals regardless, which makes a failure here a
     /// visibility and latency problem, not a durability one.
+    ///
+    /// The `Err` does **not** distinguish an unreachable store from
+    /// unreadable stored evidence, and needs no such distinction: the
+    /// sweep cannot re-seal what it already sealed, so it reports
+    /// `retry: false` for either cause. The distinction is logged at the
+    /// locus field by the cycle itself, which is where an operator alert
+    /// keys on it.
     fn emit_checkpoint_now(&self) -> BoxFuture<'_, DomainResult<()>>;
 }
 
@@ -287,11 +313,22 @@ impl EventstoreCheckpointHandler {
         //    witness read in step 1 — no extra I/O, and it advances only
         //    when a checkpoint is actually anchored, which is why a
         //    failed cycle's seals land in the next successful one.
+        //    A snapshot failure splits in two, and the split is the
+        //    reader's own type: the store being unreachable is this
+        //    cycle's bad luck, while stored chain evidence that cannot be
+        //    read back is the finding this whole anchor mechanism exists
+        //    to surface — and reading the same bytes again returns the
+        //    same verdict.
         let snapshot = self
             .heads
             .snapshot_live_chain(anchored_retention_position(&existing))
             .await
-            .map_err(CheckpointCycleError::HeadSnapshotFailed)?;
+            .map_err(|e| match e {
+                ChainSnapshotError::Unavailable(e) => CheckpointCycleError::HeadSnapshotFailed(e),
+                ChainSnapshotError::CorruptEvidence(c) => {
+                    CheckpointCycleError::ChainEvidenceCorrupt(c)
+                }
+            })?;
 
         // 3. Pure assembly: sorted witness + Merkle root + monotonic seq
         //    + first-only backfill_baseline. The builder
@@ -327,9 +364,9 @@ impl EventstoreCheckpointHandler {
 
 /// Why an emission cycle failed (maps to the distinct metric `result`,
 /// the structured log, and the caller's outcome shape). The `*Failed`
-/// suffix on every variant is intentional and semantically load-bearing
-/// (these *are* the closed set of failure modes); renaming to satisfy
-/// `enum_variant_names` would lose that meaning.
+/// suffix on the infrastructure variants is intentional and semantically
+/// load-bearing (these *are* the closed set of failure modes); renaming
+/// to satisfy `enum_variant_names` would lose that meaning.
 #[allow(clippy::enum_variant_names)]
 enum CheckpointCycleError {
     /// Reading the existing checkpoints failed (store unreachable).
@@ -337,13 +374,32 @@ enum CheckpointCycleError {
     /// failure — same class as a write failure for alerting; it is the
     /// anchor store being unreachable, not a signing problem).
     AnchorReadFailed(DomainError),
-    /// Snapshotting the live chain failed (DB unreachable). Retryable.
+    /// An infrastructure step of the live-chain snapshot failed — the DB
+    /// was unreachable, the read transaction could not be opened or
+    /// committed, a query failed. Retryable.
     /// Metric `anchor_write_failed` (an infrastructure read failure
     /// that prevented anchoring — not a signing fault; the closed
     /// 3-value enum has no separate `db_read_failed`, and the spec's
     /// taxonomy is `{emitted, sign_failed, anchor_write_failed}` —
     /// "could not anchor this cycle" is `anchor_write_failed`).
+    ///
+    /// Carries the infrastructure half **only**: stored evidence that
+    /// cannot be read back is [`Self::ChainEvidenceCorrupt`].
     HeadSnapshotFailed(DomainError),
+    /// The stored event-chain evidence cannot be read back as the chain
+    /// format requires (a chain-hash column of the wrong width, a
+    /// `StreamSealed` payload that does not decode).
+    ///
+    /// **Terminal, not retryable.** The bytes are what they are: a
+    /// retry re-reads them, reaches the same verdict, and only spends
+    /// the `jobs` row's attempt budget before the dispatcher fails it
+    /// anyway — so terminality by exhaustion instead of by decision,
+    /// with the transient series firing on the way there. Metric
+    /// `anchor_write_failed` (the closed 3-value taxonomy takes no
+    /// fourth value); what separates it for an operator is the
+    /// dispatcher's `failed_terminal` series and the distinct log event
+    /// carrying the corrupt locus.
+    ChainEvidenceCorrupt(CorruptChainEvidence),
     /// The emitter could not durably write the signed object.
     /// Retryable; metric `anchor_write_failed`.
     AnchorWriteFailed(DomainError),
@@ -362,7 +418,33 @@ impl CheckpointCycleError {
         match self {
             Self::AnchorReadFailed(_)
             | Self::HeadSnapshotFailed(_)
+            | Self::ChainEvidenceCorrupt(_)
             | Self::AnchorWriteFailed(_) => RESULT_ANCHOR_WRITE_FAILED,
+        }
+    }
+
+    /// Whether the dispatcher should run this cycle again
+    /// ([`TaskOutcome::Failed`]'s `retry` field).
+    ///
+    /// Every infrastructure failure is a property of the moment and
+    /// retries; unreadable stored evidence is a property of the bytes
+    /// and does not.
+    fn retry(&self) -> bool {
+        match self {
+            Self::AnchorReadFailed(_)
+            | Self::HeadSnapshotFailed(_)
+            | Self::AnchorWriteFailed(_) => true,
+            Self::ChainEvidenceCorrupt(_) => false,
+        }
+    }
+
+    /// The corrupt-evidence payload, if this cycle found one — the
+    /// structured log's locus comes from here rather than from a
+    /// substring of [`Self::message`].
+    fn corrupt_evidence(&self) -> Option<&CorruptChainEvidence> {
+        match self {
+            Self::ChainEvidenceCorrupt(c) => Some(c),
+            _ => None,
         }
     }
 
@@ -370,9 +452,29 @@ impl CheckpointCycleError {
         match self {
             Self::AnchorReadFailed(e) => format!("reading existing checkpoints failed: {e}"),
             Self::HeadSnapshotFailed(e) => format!("live-chain snapshot failed: {e}"),
+            Self::ChainEvidenceCorrupt(c) => format!("live-chain snapshot refused: {c}"),
             Self::AnchorWriteFailed(e) => format!("anchor checkpoint write failed: {e}"),
         }
     }
+}
+
+/// `error!` a corrupt-evidence verdict.
+///
+/// A distinct event from the transient-failure one, with the locus as a
+/// **field**: an operator alerts on `chain_evidence_locus` existing
+/// rather than on a substring of a message, which is the only thing that
+/// distinguished this class before. No key material, no raw bytes — the
+/// payload locates the datum and says nothing about its content.
+fn log_corrupt_evidence(c: &CorruptChainEvidence, message: &str) {
+    tracing::error!(
+        chain_evidence_locus = c.locus.as_str(),
+        chain_evidence_subject = %c.subject,
+        error = %message,
+        "stored event-chain evidence is unreadable — NOT a transient \
+         outage: this cycle fails terminally, the chain is unattested \
+         until the evidence is repaired, and a retry would only re-read \
+         the same bytes"
+    );
 }
 
 impl TaskHandler for EventstoreCheckpointHandler {
@@ -413,13 +515,18 @@ impl TaskHandler for EventstoreCheckpointHandler {
                 Err(e) => {
                     emit_metric(e.metric_result());
                     let msg = e.message();
-                    // Unrecoverable for this cycle → error!. The external
-                    // CronJob retries on the next tick (Failed{retry:true}).
-                    tracing::error!(
-                        error = %msg,
-                        "event-chain checkpoint emission failed for this cycle"
-                    );
-                    Ok(TaskOutcome::fail(msg, true))
+                    match e.corrupt_evidence() {
+                        // Unreadable stored evidence: terminal, and its
+                        // own log event.
+                        Some(c) => log_corrupt_evidence(c, &msg),
+                        // Unrecoverable for this cycle → error!. The
+                        // external CronJob retries on the next tick.
+                        None => tracing::error!(
+                            error = %msg,
+                            "event-chain checkpoint emission failed for this cycle"
+                        ),
+                    }
+                    Ok(TaskOutcome::fail(msg, e.retry()))
                 }
             }
         })
@@ -473,14 +580,17 @@ impl CheckpointEmissionHook for CheckpointEmitterHookAdapter {
                 Err(e) => {
                     emit_metric(e.metric_result());
                     let msg = e.message();
-                    tracing::error!(
-                        error = %msg,
-                        "post-sweep event-chain checkpoint emission failed — the \
-                         caller's seals are committed and cannot be undone, so it \
-                         must report a non-success outcome naming the \
-                         sealed-but-unanchored streams; the next scheduled emission \
-                         anchors them regardless"
-                    );
+                    match e.corrupt_evidence() {
+                        Some(c) => log_corrupt_evidence(c, &msg),
+                        None => tracing::error!(
+                            error = %msg,
+                            "post-sweep event-chain checkpoint emission failed — the \
+                             caller's seals are committed and cannot be undone, so it \
+                             must report a non-success outcome naming the \
+                             sealed-but-unanchored streams; the next scheduled emission \
+                             anchors them regardless"
+                        ),
+                    }
                     Err(DomainError::Invariant(msg))
                 }
             }
@@ -495,7 +605,7 @@ mod tests {
 
     use chrono::TimeZone;
     use hort_domain::events::{Checkpoint, EventHash, SealedStreamRecord, StreamHead, StreamId};
-    use hort_domain::ports::event_chain_head_reader::LiveChainSnapshot;
+    use hort_domain::ports::event_chain_head_reader::{ChainEvidenceLocus, LiveChainSnapshot};
     use metrics::SharedString;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshot};
     use metrics_util::{CompositeKey, MetricKind};
@@ -503,9 +613,20 @@ mod tests {
 
     // ---- mocks ---------------------------------------------------------
 
+    /// Which class of snapshot failure the mock reader answers with.
+    /// The reader's two classes are the premise of the retry assertions
+    /// below, so a test names the one it means.
+    #[derive(Clone, Copy)]
+    enum HeadsFailure {
+        /// The store could not be reached — this cycle's bad luck.
+        Unavailable,
+        /// The stored evidence cannot be read back.
+        CorruptEvidence,
+    }
+
     struct MockHeads {
         snapshot: Mutex<Option<LiveChainSnapshot>>,
-        fail: bool,
+        fail: Option<HeadsFailure>,
         /// The simulated audit-meta stream: `(stream_position, record)`.
         /// When set, the mock answers the way the adapter does — the head
         /// query sees the whole stream, the seal query is windowed on the
@@ -519,15 +640,24 @@ mod tests {
         fn ok(s: LiveChainSnapshot) -> Self {
             Self {
                 snapshot: Mutex::new(Some(s)),
-                fail: false,
+                fail: None,
                 audit_meta_stream: None,
                 bounds: Mutex::new(vec![]),
             }
         }
+        /// The transient half: the DB is unreachable.
         fn failing() -> Self {
+            Self::refusing(HeadsFailure::Unavailable)
+        }
+        /// The corrupt half: the store answered, and what it holds is
+        /// not readable as chain evidence.
+        fn corrupt() -> Self {
+            Self::refusing(HeadsFailure::CorruptEvidence)
+        }
+        fn refusing(fail: HeadsFailure) -> Self {
             Self {
                 snapshot: Mutex::new(None),
-                fail: true,
+                fail: Some(fail),
                 audit_meta_stream: None,
                 bounds: Mutex::new(vec![]),
             }
@@ -537,7 +667,7 @@ mod tests {
         fn over_audit_meta_stream(records: Vec<(u64, SealedStreamRecord)>) -> Self {
             Self {
                 snapshot: Mutex::new(None),
-                fail: false,
+                fail: None,
                 audit_meta_stream: Some(records),
                 bounds: Mutex::new(vec![]),
             }
@@ -546,11 +676,21 @@ mod tests {
             self.bounds.lock().unwrap().clone()
         }
     }
+
+    /// The locus the corrupt-evidence fixture reports — a stored chain
+    /// hash of the wrong width, the condition the schema `CHECK` is
+    /// supposed to make unreachable.
+    const CORRUPT_LOCUS: ChainEvidenceLocus = ChainEvidenceLocus::ChainHashColumn;
+
+    fn corrupt_evidence() -> CorruptChainEvidence {
+        CorruptChainEvidence::new(CORRUPT_LOCUS, "event_hash", "is 16 bytes, expected 32")
+    }
+
     impl EventChainHeadReaderPort for MockHeads {
         fn snapshot_live_chain(
             &self,
             anchored_retention_position: Option<u64>,
-        ) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>> {
+        ) -> BoxFuture<'_, Result<LiveChainSnapshot, ChainSnapshotError>> {
             self.bounds
                 .lock()
                 .unwrap()
@@ -579,10 +719,12 @@ mod tests {
                 None => self.snapshot.lock().unwrap().clone(),
             };
             Box::pin(async move {
-                if fail {
-                    Err(DomainError::Invariant("db unreachable".into()))
-                } else {
-                    Ok(s.expect("snapshot set"))
+                match fail {
+                    Some(HeadsFailure::Unavailable) => {
+                        Err(ChainSnapshotError::unavailable("db unreachable"))
+                    }
+                    Some(HeadsFailure::CorruptEvidence) => Err(corrupt_evidence().into()),
+                    None => Ok(s.expect("snapshot set")),
                 }
             })
         }
@@ -1142,6 +1284,126 @@ mod tests {
         ));
     }
 
+    // ---- unreadable stored evidence is terminal, an outage is not -----
+    //
+    // Both halves are asserted, and both are load-bearing: a change that
+    // made every failure terminal would satisfy the first alone, and the
+    // defect this pair pins was exactly the mirror of that — every
+    // failure retryable, with tamper evidence spending an attempt budget
+    // to reach the same verdict.
+
+    /// A snapshot refused over unreadable stored evidence fails the
+    /// cycle **terminally**, so the dispatcher counts it as
+    /// `failed_terminal` and never reschedules it.
+    #[test]
+    fn corrupt_chain_evidence_is_terminal() {
+        let h = EventstoreCheckpointHandler::new(
+            Arc::new(MockHeads::corrupt()),
+            Arc::new(MockAnchorRead::with(vec![])),
+            Arc::new(MockEmitter::ok()),
+            None,
+        );
+        let outcome = rt()
+            .block_on(h.run(&serde_json::Value::Null, ctx()))
+            .unwrap();
+        match outcome {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(
+                    !retry,
+                    "unreadable stored evidence cannot be fixed by reading it again"
+                );
+                // The reason is the text an operator reads off the
+                // `jobs` row, so it has to locate the datum.
+                assert!(reason.contains(CORRUPT_LOCUS.as_str()), "reason={reason}");
+                assert!(reason.contains("event_hash"), "reason={reason}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The sibling: an unreachable store still retries. Without this the
+    /// terminal assertion above is satisfied by a handler that gave up
+    /// on every failure, which would turn an S3 or Postgres blip into a
+    /// permanently-failed checkpoint row.
+    #[test]
+    fn a_transient_snapshot_failure_still_retries() {
+        let h = EventstoreCheckpointHandler::new(
+            Arc::new(MockHeads::failing()),
+            Arc::new(MockAnchorRead::with(vec![])),
+            Arc::new(MockEmitter::ok()),
+            None,
+        );
+        let outcome = rt()
+            .block_on(h.run(&serde_json::Value::Null, ctx()))
+            .unwrap();
+        match outcome {
+            TaskOutcome::Failed { retry, reason } => {
+                assert!(retry, "an unreachable store is this cycle's bad luck");
+                assert!(
+                    !reason.contains(CORRUPT_LOCUS.as_str()),
+                    "an outage must not report a corrupt locus: reason={reason}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    /// The `result` label set is a closed three-value enum, and the
+    /// corrupt-evidence class deliberately takes no fourth value — the
+    /// operator-visible split is the dispatcher's result series, not a
+    /// new label here. Pin that for **both** classes, so a later change
+    /// cannot widen the enum unnoticed.
+    #[test]
+    fn both_failure_classes_emit_exactly_one_of_the_three_result_values() {
+        for (label, heads) in [
+            ("corrupt evidence", Arc::new(MockHeads::corrupt())),
+            ("unreachable store", Arc::new(MockHeads::failing())),
+        ] {
+            let h = EventstoreCheckpointHandler::new(
+                heads,
+                Arc::new(MockAnchorRead::with(vec![])),
+                Arc::new(MockEmitter::ok()),
+                None,
+            );
+            let snap = capture(|| {
+                rt().block_on(h.run(&serde_json::Value::Null, ctx()))
+                    .unwrap();
+            });
+            let e = snap.into_vec();
+            let fired: Vec<&str> = CHECKPOINT_RESULTS
+                .into_iter()
+                .filter(|r| counter_for(&e, r).is_some())
+                .collect();
+            assert_eq!(
+                fired,
+                vec![RESULT_ANCHOR_WRITE_FAILED],
+                "{label} must fire exactly one of the closed three values"
+            );
+            assert!(matches!(
+                counter_for(&e, RESULT_ANCHOR_WRITE_FAILED),
+                Some(DebugValue::Counter(1))
+            ));
+            // Nothing outside the closed set may appear on this metric.
+            let values: Vec<String> = e
+                .iter()
+                .filter(|(ck, _, _, _)| ck.key().name() == METRIC_NAME)
+                .flat_map(|(ck, _, _, _)| {
+                    ck.key()
+                        .labels()
+                        .filter(|l| l.key() == "result")
+                        .map(|l| l.value().to_string())
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert!(
+                values
+                    .iter()
+                    .all(|v| CHECKPOINT_RESULTS.contains(&v.as_str())),
+                "{label} emitted a result value outside the closed set: {values:?}"
+            );
+        }
+    }
+
     #[test]
     fn anchor_read_failure_aborts_cycle_retryable() {
         // A transiently-unreadable anchor store must NOT emit a fresh
@@ -1222,6 +1484,37 @@ mod tests {
             counter_for(&e, RESULT_ANCHOR_WRITE_FAILED),
             Some(DebugValue::Counter(1))
         ));
+    }
+
+    /// The post-sweep hook runs the same cycle, so it reports the same
+    /// classes: a corrupt-evidence refusal reaches the sweep as `Err`
+    /// (which it reports with `retry: false` of its own accord, since it
+    /// cannot re-seal what it already sealed) and fires the same single
+    /// metric value.
+    #[test]
+    fn the_post_sweep_hook_reports_corrupt_evidence_too() {
+        let handler = Arc::new(EventstoreCheckpointHandler::new(
+            Arc::new(MockHeads::corrupt()),
+            Arc::new(MockAnchorRead::with(vec![])),
+            Arc::new(MockEmitter::ok()),
+            None,
+        ));
+        let hook = CheckpointEmitterHookAdapter::new(handler);
+        let snap = capture(|| {
+            let err = rt()
+                .block_on(hook.emit_checkpoint_now())
+                .expect_err("a refused snapshot must surface Err to the sweep");
+            assert!(
+                err.to_string().contains(CORRUPT_LOCUS.as_str()),
+                "err={err}"
+            );
+        });
+        let e = snap.into_vec();
+        assert!(matches!(
+            counter_for(&e, RESULT_ANCHOR_WRITE_FAILED),
+            Some(DebugValue::Counter(1))
+        ));
+        assert!(counter_for(&e, RESULT_EMITTED).is_none());
     }
 
     // ---- catalog test: every closed result value fires -----------------
