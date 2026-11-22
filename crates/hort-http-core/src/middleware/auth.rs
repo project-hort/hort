@@ -906,34 +906,40 @@ fn extract_basic_password_as_token(req: &Request) -> BasicAuthResult {
 /// 2. **`AuthContext::Disabled` — always `Basic`.** Defense-in-depth
 ///    backstop; `serve::ensure_auth_enabled` rejects this combo at
 ///    boot.
-/// 3. **`AuthContext::BearerOnly` — multi-scheme `Bearer + Basic`.**
+/// 3. **`AuthContext::BearerOnly` — `Bearer` and `Basic` in separate fields.**
 ///    No OIDC IdP; native-token bearer is the inbound path, Basic
 ///    advertises the token-carrier shape. No issuer URL to advertise.
-/// 4. **`AuthContext::Enabled` — multi-scheme Bearer-first
-///    `Bearer realm="<issuer>", Basic realm="hort"`.** RFC
-///    7235 §2.1 lets a single header carry multiple challenges;
-///    clients try the schemes in order. Bearer-first surfaces OIDC
-///    discovery (the realm URL is the IdP's), and Basic advertises
-///    the token-carrier path for package-manager tooling.
+/// 4. **`AuthContext::Enabled` — `Bearer` then `Basic` in separate fields.**
+///    Bearer surfaces OIDC discovery (the realm URL is the IdP's), and
+///    Basic advertises the token-carrier path for package-manager tooling.
+///    RFC 9110 allows multiple challenges in one field, but widely deployed
+///    clients read only the first challenge there and abort without trying
+///    the rest. One challenge per field keeps both paths reachable.
 ///
 /// `error="invalid_token"` is intentionally NOT included here — that
 /// parameter is appended by [`unauthorized_invalid_token`] only when
 /// the header carried a token that failed validation. The
 /// missing-header path uses the bare challenge.
-pub(crate) fn www_authenticate_for(ctx: &AuthContext, is_oci: bool) -> String {
+pub(crate) fn www_authenticate_for(ctx: &AuthContext, is_oci: bool) -> Vec<String> {
     if is_oci {
-        return r#"Basic realm="hort""#.to_string();
+        return vec![r#"Basic realm="hort""#.to_string()];
     }
     match ctx {
-        AuthContext::Disabled => r#"Basic realm="hort""#.to_string(),
-        AuthContext::BearerOnly { .. } => r#"Bearer realm="hort", Basic realm="hort""#.to_string(),
+        AuthContext::Disabled => vec![r#"Basic realm="hort""#.to_string()],
+        AuthContext::BearerOnly { .. } => vec![
+            r#"Bearer realm="hort""#.to_string(),
+            r#"Basic realm="hort""#.to_string(),
+        ],
         AuthContext::Enabled { issuer_url, .. } => {
             // The fallback realm covers
             // tests that construct `AuthContext::Enabled` without
             // pinning an issuer URL. Production composition always
             // populates `issuer_url`.
             let realm = issuer_url.as_deref().unwrap_or("hort");
-            format!(r#"Bearer realm="{realm}", Basic realm="hort""#)
+            vec![
+                format!(r#"Bearer realm="{realm}""#),
+                r#"Basic realm="hort""#.to_string(),
+            ]
         }
     }
 }
@@ -945,20 +951,30 @@ pub(crate) fn www_authenticate_for(ctx: &AuthContext, is_oci: bool) -> String {
 /// [`is_oci_path`] classifier still feeds the `is_oci` argument.
 fn unauthorized_missing_header(auth: &AuthContext, is_oci: bool) -> Response {
     let www = www_authenticate_for(auth, is_oci);
+    let schemes: Vec<_> = www
+        .iter()
+        .map(|challenge| {
+            challenge
+                .split_once(' ')
+                .map_or(challenge.as_str(), |(scheme, _)| scheme)
+        })
+        .collect();
     // tracing::debug! — challenge selection is not a security-sensitive
     // state change; debug-level keeps the log volume bounded while
     // still letting an operator confirm the selector wired up correctly.
-    tracing::debug!(
-        scheme = www.split_once(' ').map(|(s, _)| s).unwrap_or(www.as_str()),
-        is_oci,
-        "challenge selected (missing header)",
-    );
-    Response::builder()
+    tracing::debug!(?schemes, is_oci, "challenge selected (missing header)",);
+    let mut response = Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header(header::WWW_AUTHENTICATE, www)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"error":"missing Authorization header"}"#))
-        .expect("static response")
+        .expect("static response");
+    for challenge in www {
+        response.headers_mut().append(
+            header::WWW_AUTHENTICATE,
+            challenge.parse().expect("valid authentication challenge"),
+        );
+    }
+    response
 }
 
 /// `401` response used when the `Authorization` header carried a token
@@ -967,40 +983,40 @@ fn unauthorized_missing_header(auth: &AuthContext, is_oci: bool) -> Response {
 /// "credentials were bad".
 ///
 /// Selector logic delegates to [`www_authenticate_for`]; the
-/// `error="invalid_token"` parameter is appended only when the
-/// resulting challenge is a Bearer-style one (multi-scheme
-/// Bearer-first counts; the parameter still applies to the leading
-/// Bearer challenge per RFC 6750).
+/// `error="invalid_token"` parameter is appended only to a Bearer
+/// challenge, per RFC 6750.
 fn unauthorized_invalid_token(auth: &AuthContext, is_oci: bool) -> Response {
-    let base = www_authenticate_for(auth, is_oci);
-    // OCI / Disabled rows yield `Basic …` — RFC 6750's
-    // `error="invalid_token"` only applies to Bearer challenges, so
-    // the parameter is appended only when the leading scheme is
-    // Bearer.
-    let www = if base.starts_with("Bearer ") {
-        // Multi-scheme: `Bearer realm="…", Basic realm="…"` →
-        // `Bearer realm="…", error="invalid_token", Basic realm="…"`.
-        // Bearer-only: `Bearer realm="…"` →
-        // `Bearer realm="…", error="invalid_token"`.
-        if let Some((bearer_part, rest)) = base.split_once(", Basic ") {
-            format!(r#"{bearer_part}, error="invalid_token", Basic {rest}"#)
-        } else {
-            format!(r#"{base}, error="invalid_token""#)
-        }
-    } else {
-        base
-    };
-    tracing::debug!(
-        scheme = www.split_once(' ').map(|(s, _)| s).unwrap_or(www.as_str()),
-        is_oci,
-        "challenge selected (invalid token)",
-    );
-    Response::builder()
+    let www: Vec<_> = www_authenticate_for(auth, is_oci)
+        .into_iter()
+        .map(|challenge| {
+            if challenge.starts_with("Bearer ") {
+                format!(r#"{challenge}, error="invalid_token""#)
+            } else {
+                challenge
+            }
+        })
+        .collect();
+    let schemes: Vec<_> = www
+        .iter()
+        .map(|challenge| {
+            challenge
+                .split_once(' ')
+                .map_or(challenge.as_str(), |(scheme, _)| scheme)
+        })
+        .collect();
+    tracing::debug!(?schemes, is_oci, "challenge selected (invalid token)",);
+    let mut response = Response::builder()
         .status(StatusCode::UNAUTHORIZED)
-        .header(header::WWW_AUTHENTICATE, www)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(r#"{"error":"invalid or expired token"}"#))
-        .expect("static response")
+        .expect("static response");
+    for challenge in www {
+        response.headers_mut().append(
+            header::WWW_AUTHENTICATE,
+            challenge.parse().expect("valid authentication challenge"),
+        );
+    }
+    response
 }
 
 /// `500` response used when the middleware is misconfigured. Produced only
@@ -1551,16 +1567,15 @@ mod tests {
                         .await
                         .unwrap();
                     let status = resp.status();
-                    // WWW-Authenticate must include `Bearer` so clients
-                    // know how to respond.
-                    let www = resp
+                    let www: Vec<_> = resp
                         .headers()
-                        .get(header::WWW_AUTHENTICATE)
-                        .expect("WWW-Authenticate header missing")
-                        .to_str()
-                        .unwrap()
-                        .to_string();
-                    assert!(www.contains("Bearer"), "got: {www}");
+                        .get_all(header::WWW_AUTHENTICATE)
+                        .iter()
+                        .map(|value| value.to_str().unwrap())
+                        .collect();
+                    assert_eq!(www.len(), 2, "expected separate challenges: {www:?}");
+                    assert!(www[0].starts_with("Bearer realm="), "got: {www:?}");
+                    assert_eq!(www[1], r#"Basic realm="hort""#);
                     status
                 })
         });
@@ -1596,14 +1611,16 @@ mod tests {
                         .await
                         .unwrap();
                     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
-                    let www = resp
+                    let www: Vec<_> = resp
                         .headers()
-                        .get(header::WWW_AUTHENTICATE)
-                        .expect("WWW-Authenticate missing")
-                        .to_str()
-                        .unwrap()
-                        .to_string();
-                    assert!(www.contains("invalid_token"), "got: {www}");
+                        .get_all(header::WWW_AUTHENTICATE)
+                        .iter()
+                        .map(|value| value.to_str().unwrap())
+                        .collect();
+                    assert_eq!(www.len(), 2, "expected separate challenges: {www:?}");
+                    assert!(www[0].starts_with("Bearer realm="), "got: {www:?}");
+                    assert!(www[0].ends_with(r#", error="invalid_token""#));
+                    assert_eq!(www[1], r#"Basic realm="hort""#);
                     to_bytes(resp.into_body(), 1024).await.unwrap().to_vec()
                 })
         });
@@ -1715,19 +1732,14 @@ mod tests {
                         .unwrap();
                     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
                     resp.headers()
-                        .get(header::WWW_AUTHENTICATE)
-                        .expect("WWW-Authenticate missing")
-                        .to_str()
-                        .unwrap()
-                        .to_string()
+                        .get_all(header::WWW_AUTHENTICATE)
+                        .iter()
+                        .map(|value| value.to_str().unwrap().to_string())
+                        .collect::<Vec<_>>()
                 })
         })
         .1;
-        assert!(
-            www.starts_with("Basic"),
-            "expected Basic challenge on /v2/, got: {www}"
-        );
-        assert!(www.contains("realm="), "got: {www}");
+        assert_eq!(www, [r#"Basic realm="hort""#]);
     }
 
     #[test]
@@ -1750,16 +1762,12 @@ mod tests {
                     .unwrap();
                 assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
                 resp.headers()
-                    .get(header::WWW_AUTHENTICATE)
-                    .expect("WWW-Authenticate missing")
-                    .to_str()
-                    .unwrap()
-                    .to_string()
+                    .get_all(header::WWW_AUTHENTICATE)
+                    .iter()
+                    .map(|value| value.to_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
             });
-        assert!(
-            www.starts_with("Basic"),
-            "expected Basic challenge on /v2/ with invalid token, got: {www}"
-        );
+        assert_eq!(www, [r#"Basic realm="hort""#]);
     }
 
     #[test]
@@ -1781,16 +1789,14 @@ mod tests {
                     .unwrap();
                 assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
                 resp.headers()
-                    .get(header::WWW_AUTHENTICATE)
-                    .expect("WWW-Authenticate missing")
-                    .to_str()
-                    .unwrap()
-                    .to_string()
+                    .get_all(header::WWW_AUTHENTICATE)
+                    .iter()
+                    .map(|value| value.to_str().unwrap().to_string())
+                    .collect::<Vec<_>>()
             });
-        assert!(
-            www.starts_with("Bearer"),
-            "expected Bearer challenge on /admin/, got: {www}"
-        );
+        assert_eq!(www.len(), 2, "expected separate challenges: {www:?}");
+        assert!(www[0].starts_with("Bearer realm="), "got: {www:?}");
+        assert_eq!(www[1], r#"Basic realm="hort""#);
     }
 
     #[test]
@@ -3420,12 +3426,12 @@ mod tests {
     // HTTP-Basic-against-local-admin-row
     // identity path exists). Decision matrix:
     //
-    // | AuthContext | is_oci | Challenge                                                 |
-    // |-------------|--------|-----------------------------------------------------------|
-    // | Enabled(c)  | true   | `Basic realm="hort"`                           |
-    // | Enabled(c)  | false  | `Bearer realm="<c.issuer_url>", Basic realm="..."`        |
-    // | BearerOnly  | false  | `Bearer realm="hort", Basic realm="..."`       |
-    // | Disabled    | n/a    | `Basic realm="hort"`                           |
+    // | AuthContext | is_oci | Challenge fields                                   |
+    // |-------------|--------|----------------------------------------------------|
+    // | Enabled(c)  | true   | `Basic realm="hort"`                               |
+    // | Enabled(c)  | false  | `Bearer realm="<c.issuer_url>"`; `Basic realm="hort"` |
+    // | BearerOnly  | false  | `Bearer realm="hort"`; `Basic realm="hort"`          |
+    // | Disabled    | n/a    | `Basic realm="hort"`                               |
     //
     // Basic is always advertised on the multi-scheme arms as the
     // token-carrier path (pip / twine / cargo / docker embed PATs in
@@ -3461,7 +3467,8 @@ mod tests {
         for is_oci in [false, true] {
             let challenge = www_authenticate_for(&auth, is_oci);
             assert_eq!(
-                challenge, r#"Basic realm="hort""#,
+                challenge,
+                [r#"Basic realm="hort""#],
                 "Disabled must always yield Basic; got {challenge:?} for is_oci={is_oci}",
             );
         }
@@ -3476,27 +3483,38 @@ mod tests {
     #[test]
     fn www_authenticate_for_oci_path_always_basic_under_oidc() {
         let auth = enabled_auth_with_issuer(Some("https://keycloak.example/realms/hort"));
-        assert_eq!(www_authenticate_for(&auth, true), r#"Basic realm="hort""#,);
+        assert_eq!(www_authenticate_for(&auth, true), [r#"Basic realm="hort""#]);
     }
 
-    /// OIDC + non-OCI path — multi-scheme Bearer-first challenge.
+    #[tokio::test]
+    async fn www_authenticate_for_bearer_only_offers_separate_fields() {
+        let (ctx, _) = bearer_only_ctx(prom_handle());
+        assert_eq!(
+            www_authenticate_for(&ctx.auth, false),
+            [r#"Bearer realm="hort""#, r#"Basic realm="hort""#],
+        );
+    }
+
+    /// OIDC + non-OCI path — Bearer and Basic in separate fields.
     /// Bearer surfaces the issuer URL for OIDC discovery; Basic
     /// advertises the token-carrier path (pip / twine / cargo / docker
-    /// embed a PAT in the Basic password field). RFC 7235 §2.1
-    /// supports multiple challenges in a single header.
+    /// embed a PAT in the Basic password field).
     #[test]
-    fn www_authenticate_for_oidc_offers_multi_scheme() {
+    fn www_authenticate_for_oidc_offers_separate_fields() {
         let issuer = "https://keycloak.example/realms/hort";
         let auth = enabled_auth_with_issuer(Some(issuer));
         let challenge = www_authenticate_for(&auth, false);
         assert_eq!(
             challenge,
-            format!(r#"Bearer realm="{issuer}", Basic realm="hort""#),
+            [
+                format!(r#"Bearer realm="{issuer}""#),
+                r#"Basic realm="hort""#.to_string()
+            ],
         );
         // Defensive substring assertion — pins that the issuer URL
         // appears verbatim in the realm field.
         assert!(
-            challenge.contains(issuer),
+            challenge[0].contains(issuer),
             "issuer URL {issuer:?} not present in challenge {challenge:?}",
         );
     }

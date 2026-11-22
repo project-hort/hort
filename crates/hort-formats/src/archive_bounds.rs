@@ -1,11 +1,16 @@
 //! # archive_bounds — bounded archive metadata extraction
 //!
-//! **Preventive helper.** Archive *metadata* reads in this workspace
-//! route through this module to clamp the decompression-bomb attack
-//! surface — bounded output, bounded entry count, no nested archives.
+//! Archive *metadata* reads in this workspace route through this module
+//! to clamp the decompression-bomb attack surface — bounded output,
+//! bounded walks, no nested archives. A walk's entry cap guards a walk;
+//! a named ZIP lookup opens one entry through the central directory and
+//! must not charge the entries it never reads. Otherwise an archive is
+//! refused for its member count instead of the content the caller uses.
+//! A walk bounds each entry's expansion because it may read many entries;
+//! a named lookup reads one entry and bounds its output absolutely.
 //!
-//! Scope: this module reads **one named entry into memory** and never
-//! touches a filesystem path. It deliberately offers no extract-to-disk
+//! Scope: this module reads archive metadata and never touches a
+//! filesystem path. It deliberately offers no extract-to-disk
 //! API, so the one job it cannot serve is scan materialisation —
 //! unpacking a wheel, tarball or image layer onto disk so a scanner's
 //! analyzers can find the paths inside it. That lives in
@@ -17,7 +22,7 @@
 //!
 //! ## Invariants the helper enforces
 //!
-//! 1. **Bounded decompressed output.** Wrap the decompressor in
+//! 1. **Bounded decompressed output.** For walks, wrap the decompressor in
 //!    [`BoundedReader::new`] with `output_cap = min(10 × compressed_size,
 //!    [`MAX_OUTPUT_BYTES`])`. Reads past the cap return
 //!    [`BoundsError::OutputCapExceeded`] before the underlying reader can
@@ -37,12 +42,11 @@
 //!    rather than recursing. Recursion is a capability that has to be
 //!    re-introduced in a reviewed change.
 //!
-//! ## Why this module exists despite zero current call sites
+//! ## Why this module exists
 //!
-//! Without a
-//! pre-existing helper, the natural pattern is for a contributor to
-//! `cargo add tar flate2` directly inside an `hort-http-<format>` or `hort-
-//! formats` module and write the extraction inline — at which point the
+//! Without a shared helper, a contributor can call `tar`, `zip`, or
+//! `flate2` directly inside an `hort-http-<format>` or `hort-formats`
+//! module and write the extraction inline — at which point the
 //! caps are easy to forget. By putting the helper here first and adding
 //! the `cargo-deny [bans]` rule that limits `tar` / `zip` / `flate2` /
 //! `bzip2` / `xz2` to a named set of crates (via the `wrappers`
@@ -50,23 +54,18 @@
 //! module — this one for metadata reads, and the scanner adapter's
 //! `extract` for materialisation.
 //!
-//! ## How a future caller integrates a real archive crate
+//! ## How a new archive reader uses the primitives
 //!
-//! 1. Add the concrete archive crate as a direct dependency of
-//!    `hort-formats` (`flate2` is already in the lockfile transitively;
-//!    `tar` / `zip` / `bzip2` / `xz2` are not). The [bans] rule's
-//!    `wrappers = ["hort-formats"]` exception permits it here and only
-//!    here.
-//!
-//! 2. Wrap the decompressor: `BoundedReader::new(GzDecoder::new(input),
+//! 1. Wrap the decompressor: `BoundedReader::new(GzDecoder::new(input),
 //!    config.output_cap_for(compressed_size))`.
 //!
-//! 3. For tar entry iteration: `let mut counter =
+//! 2. For tar entry iteration: `let mut counter =
 //!    EntryCounter::new(config.max_entries); for entry in
-//!    archive.entries()? { counter.tick()?; ... }`. Wrap each
-//!    `entry.take(config.per_entry_cap)` to bound per-entry output too.
+//!    archive.entries()? { counter.tick()?; ... }`. Use a bounded
+//!    reader for each entry whose output needs its own cap; `Read::take`
+//!    turns a cap into a false EOF.
 //!
-//! 4. If an entry's name suggests another archive (`*.tar`, `*.zip`,
+//! 3. If an entry's name suggests another archive (`*.tar`, `*.zip`,
 //!    `*.tar.gz`, …), return [`BoundsError::NestedArchiveRejected`]. The
 //!    helper does not auto-detect; the caller knows the format-specific
 //!    file naming.
@@ -82,8 +81,8 @@
 //! - Open the archive itself, for the primitives. [`BoundedReader`] /
 //!   [`EntryCounter`] / [`BoundsConfig`] are building blocks a caller
 //!   composes with the concrete archive crate; [`iter_zip_entries`] and
-//!   [`read_tar_gz_entry`] are the two complete walks this module does
-//!   own.
+//!   [`read_tar_gz_entry`] are the two complete walks this module owns,
+//!   while [`read_zip_entry_by_name`] is a complete named lookup.
 //!
 //! ## Who reads through it today
 //!
@@ -113,6 +112,16 @@ use std::io::{self, Read, Seek};
 /// 10 MiB sits well above any legitimate metadata file and well below
 /// "we OOM'd extracting metadata".
 pub const MAX_OUTPUT_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Absolute decompressed-byte ceiling for one named ZIP metadata entry.
+///
+/// 512 KiB leaves over six times the 81,493-byte embedded POM measured in
+/// `com.google.cloud:google-cloud-bigquery:2.56.0` on Maven Central (3,837
+/// compressed bytes). It also covers the 101,858-byte standalone AWS SDK BOM
+/// POM sampled as a dependency-management-heavy comparison. A single named
+/// read cannot accumulate output across entries; 512 KiB is twenty times
+/// smaller than the general metadata walk's 10 MiB absolute ceiling.
+pub const MAX_NAMED_ZIP_OUTPUT_BYTES: u64 = 512 * 1024;
 
 /// Compression-ratio multiplier on the compressed input size.
 ///
@@ -258,8 +267,7 @@ impl BoundsConfig {
 /// pathologically large.
 #[derive(Debug, thiserror::Error)]
 pub enum BoundsError {
-    /// Decompressed output exceeded the cap derived from
-    /// [`BoundsConfig::output_cap_for`]. The reader stops yielding bytes
+    /// Decompressed output exceeded the caller's cap. The reader stops yielding bytes
     /// at the cap; this error is returned on the very next `read()`
     /// call.
     #[error("decompressed output cap exceeded ({cap} bytes)")]
@@ -545,6 +553,54 @@ where
         visit(&name, &mut bounded);
     }
     Ok(stats)
+}
+
+/// Errors returned by [`read_zip_entry_by_name`].
+#[derive(Debug, thiserror::Error)]
+pub enum ZipNamedError {
+    /// The reader could not be opened as a valid ZIP archive.
+    #[error("zip open failed: {0}")]
+    Open(zip::result::ZipError),
+    /// The named entry exists but could not be opened.
+    #[error("zip entry open failed: {0}")]
+    Entry(zip::result::ZipError),
+    /// Reading the named entry failed, including an output-cap trip.
+    #[error("zip entry read failed: {0}")]
+    Read(io::Error),
+}
+
+/// Read one file entry by its exact name through the ZIP central directory.
+///
+/// A missing name, a name this process cannot decode, or a directory entry
+/// returns `Ok(None)`. As in [`iter_zip_entries`], `zip` currently falls back
+/// to CP437 for undecodable UTF-8 names. Its by-name lookup uses the decoded
+/// name only when it equals the requested name; it never substitutes a lossy
+/// name. The caller must reject any path it does not intend to read.
+///
+/// Only the selected entry is decompressed, through [`BoundedReader`] with
+/// the supplied absolute output ceiling. Entry-count and compression-ratio
+/// caps apply to walks, not this lookup. Nested archive detection remains
+/// the caller's responsibility.
+pub fn read_zip_entry_by_name<R: Read + Seek>(
+    reader: R,
+    max_output_bytes: u64,
+    name: &str,
+) -> Result<Option<Vec<u8>>, ZipNamedError> {
+    let mut archive = zip::ZipArchive::new(reader).map_err(ZipNamedError::Open)?;
+    let mut entry = match archive.by_name(name) {
+        Ok(entry) => entry,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(source) => return Err(ZipNamedError::Entry(source)),
+    };
+    if !entry.is_file() {
+        return Ok(None);
+    }
+    let mut bounded = BoundedReader::new(&mut entry, max_output_bytes);
+    let mut bytes = Vec::new();
+    bounded
+        .read_to_end(&mut bytes)
+        .map_err(ZipNamedError::Read)?;
+    Ok(Some(bytes))
 }
 
 /// Build a minimal ZIP archive in memory, for use in tests.
@@ -1183,6 +1239,89 @@ mod tests {
             matches!(err, ZipIterError::Open(_)),
             "expected Open variant, got {err:?}"
         );
+    }
+
+    #[test]
+    fn read_zip_entry_by_name_reads_only_the_requested_file() {
+        let zip = make_zip(&[("other.txt", b"other"), ("pom.xml", b"pom")]);
+        let bytes = read_zip_entry_by_name(zip, MAX_NAMED_ZIP_OUTPUT_BYTES, "pom.xml")
+            .expect("named lookup succeeds");
+        assert_eq!(bytes, Some(b"pom".to_vec()));
+    }
+
+    #[test]
+    fn read_zip_entry_by_name_returns_none_for_missing_or_directory() {
+        use zip::write::SimpleFileOptions;
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            writer
+                .add_directory("directory/", SimpleFileOptions::default())
+                .expect("directory entry");
+            writer.finish().expect("finish");
+        }
+        assert_eq!(
+            read_zip_entry_by_name(
+                Cursor::new(&bytes),
+                MAX_NAMED_ZIP_OUTPUT_BYTES,
+                "missing.xml"
+            )
+            .expect("missing entry is ordinary"),
+            None
+        );
+        assert_eq!(
+            read_zip_entry_by_name(
+                Cursor::new(&bytes),
+                MAX_NAMED_ZIP_OUTPUT_BYTES,
+                "directory/"
+            )
+            .expect("directory is not a file"),
+            None
+        );
+    }
+
+    #[test]
+    fn read_zip_entry_by_name_reports_open_entry_and_output_failures() {
+        assert!(matches!(
+            read_zip_entry_by_name(
+                Cursor::new(b"not a zip"),
+                MAX_NAMED_ZIP_OUTPUT_BYTES,
+                "pom.xml"
+            ),
+            Err(ZipNamedError::Open(_))
+        ));
+
+        let zip = make_zip(&[("pom.xml", b"pom")]);
+        let mut corrupt = zip.into_inner();
+        corrupt[0] = b'X';
+        assert!(matches!(
+            read_zip_entry_by_name(Cursor::new(corrupt), MAX_NAMED_ZIP_OUTPUT_BYTES, "pom.xml"),
+            Err(ZipNamedError::Entry(_))
+        ));
+
+        let payload = vec![b'x'; 200];
+        let zip = make_zip(&[("pom.xml", &payload)]);
+        assert!(matches!(
+            read_zip_entry_by_name(zip, 10, "pom.xml"),
+            Err(ZipNamedError::Read(_))
+        ));
+    }
+
+    #[test]
+    fn read_zip_entry_by_name_refuses_entry_above_named_ceiling() {
+        let payload = vec![b'x'; MAX_NAMED_ZIP_OUTPUT_BYTES as usize + 1];
+        let zip = make_zip(&[("pom.xml", &payload)]);
+        let error = read_zip_entry_by_name(zip, MAX_NAMED_ZIP_OUTPUT_BYTES, "pom.xml")
+            .expect_err("entry above the ceiling must be refused");
+        assert!(matches!(
+            error,
+            ZipNamedError::Read(source)
+                if matches!(
+                    source.get_ref().and_then(|error| error.downcast_ref::<BoundsError>()),
+                    Some(BoundsError::OutputCapExceeded { cap })
+                        if *cap == MAX_NAMED_ZIP_OUTPUT_BYTES
+                )
+        ));
     }
 
     #[cfg(feature = "test-support")]

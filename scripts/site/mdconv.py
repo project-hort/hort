@@ -6,8 +6,8 @@ Not a general CommonMark implementation -- it covers exactly the constructs
 used across docs/architecture/{how-to,reference,tutorial} and README.md:
 ATX headings, paragraphs, bullet/numbered lists (one level of nesting),
 fenced code blocks (with a language class), GFM pipe tables, blockquotes,
-horizontal rules, and inline bold/italic/code/links. Anything outside that
-set (raw HTML blocks, footnotes, images, deep nesting) is intentionally
+horizontal rules, and inline bold/italic/code/links/images. Anything outside that
+set (raw HTML blocks, footnotes, deep nesting) is intentionally
 unhandled -- see scripts/site/generate.py's docstring for why a hand-rolled
 subset was chosen over a third-party dependency.
 
@@ -77,21 +77,24 @@ def slugify(text, seen):
 
 _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _LINK_RE = re.compile(r"\[([^\]]*)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+_LINKED_IMAGE_RE = re.compile(r"\[!\[([^\]]*)\]\(([^)\s]+)\)\]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)")
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\s]+)\)")
 _BOLD_RE = re.compile(r"\*\*([^*]+)\*\*|__([^_]+)__")
 _ITALIC_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)|(?<!\w)_([^_]+)_(?!\w)")
 
 
-def render_inline(text, link_resolver):
-    """Render inline markdown (code spans, bold, italic, links) to HTML.
+def render_inline(text, link_resolver, image_resolver=None):
+    """Render inline markdown (code spans, bold, italic, links, images) to HTML.
 
-    `link_resolver(href) -> href` rewrites a link target; plain text is
-    HTML-escaped, code-span/link content is escaped independently so raw
+    `link_resolver(href) -> href` rewrites a link target;
+    `image_resolver(src) -> src` validates and rewrites a published asset.
+    Plain text and code-span/link content are escaped independently so raw
     '<', '>', '&' in prose (e.g. literal placeholder tokens like <UUID>)
     never get interpreted as HTML.
     """
-    # Links are extracted FIRST, from the raw (still-has-real-backticks)
-    # text, and each label is fully rendered right away via a recursive
-    # call. This must happen before code-span stashing below: a link
+    # After images are stashed, links are extracted from the raw
+    # (still-has-real-backticks) text, and each label is rendered via a
+    # recursive call. This must happen before code-span stashing below: a link
     # label like [`x.md`](x.html) has its own inline code span, and if
     # the outer pass stashed code spans first, the label text handed to
     # this function's own recursive call would already be an opaque
@@ -99,12 +102,54 @@ def render_inline(text, link_resolver):
     # (and unresolvable by) the inner call, which has no visibility into
     # the outer scope's `codes` list. Resolving links to complete HTML
     # up front avoids that cross-scope placeholder collision entirely.
+    image_codes = []
+    images = []
+    if "![" in text:
+        def _stash_image_code(m):
+            if "![" not in m.group(0):
+                return m.group(0)
+            image_codes.append(f"<code>{html.escape(m.group(1))}</code>")
+            return f"\x00IMAGECODE{len(image_codes) - 1}\x00"
+
+        text = _INLINE_CODE_RE.sub(_stash_image_code, text)
+
+        def _image(alt, src):
+            if not alt.strip():
+                raise ValueError(f"image requires non-empty alt text: {src}")
+            if image_resolver is None:
+                raise ValueError(f"image resolution is unavailable: {src}")
+            resolved = image_resolver(src)
+            return (
+                f'<img src="{html.escape(resolved, quote=True)}" '
+                f'alt="{html.escape(alt, quote=True)}" loading="lazy" decoding="async">'
+            )
+
+        def _stash_linked_image(m):
+            image = _image(m.group(1), m.group(2))
+            href = html.escape(link_resolver(m.group(3)), quote=True)
+            images.append(f'<a href="{href}">{image}</a>')
+            return f"\x00IMAGE{len(images) - 1}\x00"
+
+        text = _LINKED_IMAGE_RE.sub(_stash_linked_image, text)
+
+        def _stash_image(m):
+            images.append(_image(m.group(1), m.group(2)))
+            return f"\x00IMAGE{len(images) - 1}\x00"
+
+        text = _IMAGE_RE.sub(_stash_image, text)
+        if "![" in text:
+            raise ValueError("unsupported image syntax")
+        if re.search(r"\[\x00IMAGE\d+\x00\]", text):
+            raise ValueError("unsupported linked image syntax")
+        if any("\x00IMAGE" in m.group(1) for m in _LINK_RE.finditer(text)):
+            raise ValueError("unsupported linked image syntax")
+
     links = []
 
     def _stash_link(m):
         label, href = m.group(1), m.group(2)
         resolved = link_resolver(href)
-        links.append((render_inline(label, link_resolver), resolved))
+        links.append((render_inline(label, link_resolver, image_resolver), resolved))
         return f"\x00LINK{len(links) - 1}\x00"
 
     text = _LINK_RE.sub(_stash_link, text)
@@ -141,6 +186,10 @@ def render_inline(text, link_resolver):
         text = text.replace(
             f"\x00LINK{i}\x00", f'<a href="{href_escaped}">{label}</a>'
         )
+    for i, image in enumerate(images):
+        text = text.replace(f"\x00IMAGE{i}\x00", image)
+    for i, code in enumerate(image_codes):
+        text = text.replace(f"\x00IMAGECODE{i}\x00", code)
     return text
 
 
@@ -149,7 +198,7 @@ def render_inline(text, link_resolver):
 # ---------------------------------------------------------------------------
 
 
-def _render_list(lines, start, link_resolver):
+def _render_list(lines, start, link_resolver, image_resolver):
     """Render a contiguous run of list-item lines (with possible one-level
     nested sub-lists and indented continuation text) starting at `start`.
     Returns (html, next_index)."""
@@ -194,13 +243,13 @@ def _render_list(lines, start, link_resolver):
     def render_items(items):
         parts = []
         for content, extra in items:
-            body = render_inline(content, link_resolver)
+            body = render_inline(content, link_resolver, image_resolver)
             nested_lines = [l for kind, l in extra if kind == "nested"]
             cont_lines = [l for kind, l in extra if kind == "cont"]
             if cont_lines:
-                body += " " + render_inline(" ".join(cont_lines), link_resolver)
+                body += " " + render_inline(" ".join(cont_lines), link_resolver, image_resolver)
             if nested_lines:
-                sub_html, _ = _render_list(nested_lines, 0, link_resolver)
+                sub_html, _ = _render_list(nested_lines, 0, link_resolver, image_resolver)
                 body += sub_html
             parts.append(f"<li>{body}</li>")
         return "".join(parts)
@@ -209,7 +258,7 @@ def _render_list(lines, start, link_resolver):
     return f"<{tag}>{render_items(items)}</{tag}>", i
 
 
-def _render_table(lines, start, link_resolver):
+def _render_table(lines, start, link_resolver, image_resolver):
     header = [c.strip() for c in lines[start].strip().strip("|").split("|")]
     i = start + 2  # skip header + separator row
     rows = []
@@ -219,19 +268,19 @@ def _render_table(lines, start, link_resolver):
         i += 1
     out = ["<table><thead><tr>"]
     for c in header:
-        out.append(f"<th>{render_inline(c, link_resolver)}</th>")
+        out.append(f"<th>{render_inline(c, link_resolver, image_resolver)}</th>")
     out.append("</tr></thead><tbody>")
     for row in rows:
         out.append("<tr>")
         for j in range(len(header)):
             cell = row[j] if j < len(row) else ""
-            out.append(f"<td>{render_inline(cell, link_resolver)}</td>")
+            out.append(f"<td>{render_inline(cell, link_resolver, image_resolver)}</td>")
         out.append("</tr>")
     out.append("</tbody></table>")
     return "".join(out), i
 
 
-def convert(markdown_text, link_resolver, diagram_renderer=None):
+def convert(markdown_text, link_resolver, diagram_renderer=None, image_resolver=None):
     """Convert `markdown_text` to an HTML fragment.
 
     Returns (html_fragment, headings) where headings is a list of
@@ -256,9 +305,8 @@ def convert(markdown_text, link_resolver, diagram_renderer=None):
             text = m.group(2)
             slug = slugify(text, seen_slugs)
             headings.append((level, slug, text))
-            out.append(
-                f'<h{level} id="{slug}">{render_inline(text, link_resolver)}</h{level}>'
-            )
+            body = render_inline(text, link_resolver, image_resolver)
+            out.append(f'<h{level} id="{slug}">{body}</h{level}>')
             i += 1
             continue
 
@@ -286,7 +334,7 @@ def convert(markdown_text, link_resolver, diagram_renderer=None):
             continue
 
         if _ULIST_RE.match(line) or _OLIST_RE.match(line):
-            list_html, i = _render_list(lines, i, link_resolver)
+            list_html, i = _render_list(lines, i, link_resolver, image_resolver)
             out.append(list_html)
             continue
 
@@ -295,7 +343,7 @@ def convert(markdown_text, link_resolver, diagram_renderer=None):
             and i + 1 < n
             and _TABLE_SEP_RE.match(lines[i + 1])
         ):
-            table_html, i = _render_table(lines, i, link_resolver)
+            table_html, i = _render_table(lines, i, link_resolver, image_resolver)
             out.append(table_html)
             continue
 
@@ -306,9 +354,8 @@ def convert(markdown_text, link_resolver, diagram_renderer=None):
             while i < n and _BLOCKQUOTE_RE.match(lines[i]):
                 quote_lines.append(_BLOCKQUOTE_RE.match(lines[i]).group(1))
                 i += 1
-            out.append(
-                f"<blockquote><p>{render_inline(' '.join(quote_lines), link_resolver)}</p></blockquote>"
-            )
+            body = render_inline(" ".join(quote_lines), link_resolver, image_resolver)
+            out.append(f"<blockquote><p>{body}</p></blockquote>")
             continue
 
         # Paragraph: gather lines until a blank line or a new block starts.
@@ -327,6 +374,6 @@ def convert(markdown_text, link_resolver, diagram_renderer=None):
                 break
             para_lines.append(nxt)
             i += 1
-        out.append(f"<p>{render_inline(' '.join(para_lines), link_resolver)}</p>")
+        out.append(f"<p>{render_inline(' '.join(para_lines), link_resolver, image_resolver)}</p>")
 
     return "\n".join(out), headings

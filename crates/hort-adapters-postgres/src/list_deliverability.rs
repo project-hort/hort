@@ -106,10 +106,58 @@
 //! of LLVM compilation per execution. From the sixth execution the
 //! statement flips to a generic plan whose estimate sits below the
 //! threshold, JIT stops firing, and the steady state above is what a
-//! long-lived pool sees. Note the direction: here the custom→generic
-//! flip is a 50× **improvement**, the opposite of the `= ANY` cliff
+//! long-lived pool sees on that corpus — and the corpus is
+//! load-bearing: whether the flip still clears the threshold on a much
+//! larger edge set is open, and neither measurement in this comment
+//! answers it. The sweep below ran with `jit = off`, deliberately, so
+//! that compilation could not confound the block counts; and a plain
+//! `EXPLAIN` is always a custom plan, so it cannot show a generic one at
+//! all. Settling it needs a `PREPARE` executed at least six times, which
+//! is the only shape that produces the plan in question. Note the
+//! direction: here the
+//! custom→generic flip is a 50× **improvement**, the opposite of the `= ANY` cliff
 //! above — which is why the two must not be confused when reading a
 //! latency graph after a restart.
+//!
+//! Measured again 2026-11-19 on a production-shaped corpus — 46,500
+//! artifacts, 281,000 edges, 30,000 terminal rows, closures of the
+//! depth that occurs (index -> manifest -> blob) — under
+//! `work_mem = 4MB`, `hash_mem_multiplier = 2` and `jit = off`, as
+//! `EXPLAIN (ANALYZE, BUFFERS)` block accesses per call:
+//!
+//! | candidate page | this statement | an index-driven parent walk |
+//! |---|---|---|
+//! | 1 | 27,306 | 3,428 |
+//! | 10 | 27,402 | 6,208 |
+//! | 100 | 27,498 | 34,066 |
+//! | 1,000 | 27,594 | 313,988 |
+//! | 2,000 | 27,690 | 624,164 |
+//!
+//! **That table is why the shape above is the one that is here.** Its
+//! cost is flat in the page because the dominant term is the
+//! repository's edge set; an index-driven walk is linear in the closure
+//! instead, which wins by 8x on a one-entry page and loses by 11x at
+//! `MAX_LIST_LIMIT`. The page is a client-chosen `?n=`, and
+//! `ref_use_case`'s ceiling exists precisely so that parameter cannot
+//! stall the server — so a shape whose cost that parameter multiplies is
+//! the wrong trade here, however good it looks on a small page. The
+//! crossover sits at `DEFAULT_LIST_LIMIT`.
+//!
+//! Materialising the kind-filtered edge set once is the only
+//! page-independent improvement found (17,574 hits, -36%), and it buys
+//! that by writing a 281,000-row tuplestore: ~10,200 buffer hits saved
+//! against ~9,400 temp blocks written. A wash in bytes, and the worse
+//! side of it in kind, so it is not here either.
+//!
+//! The terminal-hash aggregate's spill is **not** a shape question. It
+//! wants 8,241 kB against the 8 MB that `work_mem = 4MB` with
+//! `hash_mem_multiplier = 2` allows — 240 kB short — and at
+//! `work_mem = 16MB` it disappears from this statement at every page
+//! size with no change to the SQL. Read it as a memory-budget question
+//! about the terminal row count, not as a reason to reshape the walk.
+//!
+//! One corpus on one machine: the ratios within a row carry, the
+//! absolute numbers do not travel.
 //!
 //! # Liveness, not identity
 //!
@@ -588,6 +636,58 @@ mod tests {
             .await
             .expect("the census read terminates and succeeds")
             .is_empty());
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn seed_and_cyclic_terminal_members_withhold_only_their_own_candidates() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        seed_artifact(&pool, repo, 0x91, QuarantineStatus::Rejected, false).await;
+        let cyclic = seed_artifact(&pool, repo, 0x92, QuarantineStatus::Released, false).await;
+        let terminal = seed_artifact(&pool, repo, 0x93, QuarantineStatus::Rejected, false).await;
+        seed_artifact(&pool, repo, 0x94, QuarantineStatus::Released, false).await;
+        seed_edge(&pool, repo, cyclic, "oci_index_member", &hash_of(0x93)).await;
+        seed_edge(&pool, repo, terminal, "oci_index_member", &hash_of(0x92)).await;
+
+        let withheld = PgListDeliverabilityCensus::new(pool)
+            .non_deliverable_in(repo, &[hash_of(0x91), hash_of(0x92), hash_of(0x94)])
+            .await
+            .expect("the cyclic closure terminates");
+        assert_eq!(withheld, HashSet::from([hash_of(0x91), hash_of(0x92)]));
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn an_overlong_edge_hash_does_not_match_a_terminal_artifact() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let manifest = seed_artifact(&pool, repo, 0xa1, QuarantineStatus::Released, false).await;
+        seed_artifact(&pool, repo, 0xa2, QuarantineStatus::Rejected, false).await;
+        sqlx::query(
+            "INSERT INTO content_references \
+             (repository_id, source_artifact_id, target_content_hash, kind) \
+             VALUES ($1, $2, $3, 'oci_layer')",
+        )
+        .bind(repo)
+        .bind(manifest)
+        .bind(format!("{}0", hash_of(0xa2)))
+        .execute(&pool)
+        .await
+        .expect("seed an overlong projected hash");
+
+        let withheld = PgListDeliverabilityCensus::new(pool)
+            .non_deliverable_in(repo, &[hash_of(0xa1)])
+            .await
+            .expect("the census read succeeds");
+        assert!(
+            withheld.is_empty(),
+            "a cast must not truncate an edge into a terminal match"
+        );
     }
 
     /// An empty ask must not reach the database: a page with no

@@ -12,24 +12,26 @@
 //! into that old fleet's face. This suite drives the fence that closes
 //! that operational-ordering gap against a real Postgres, using the
 //! workspace's *actual* migration set and the *actual* checked-in
-//! `migrations/CONTRACTIONS.toml` (versions 9, 14, 20 are declared
-//! contractions there) — no fixtures needed, since the manifest already
+//! `migrations/CONTRACTIONS.toml` (versions 2, 9, 14, 17, 20, 31, 39, 44 are
+//! declared contractions there) — no fixtures needed, since the manifest already
 //! gives us both a contraction and several expand-only migrations to test
 //! against.
 //!
 //! 1. `pending_contraction_with_older_fleet_blocks_and_names_offender` —
-//!    a pending contraction + an older-version hort-shaped connection ⇒
+//!    a pending contraction + a client below its declared floor ⇒
 //!    the fence blocks and names the offender; `gate_on_fleet_fence`
 //!    refuses without the override and proceeds with it.
+//!    The focused tests below pin tolerated older clients, the boundary,
+//!    the strictest of two floors, and register agreement.
 //! 2. `pending_contraction_with_unversioned_hort_client_blocks` — same,
 //!    but the other connection is hort-shaped with NO version segment
 //!    (predates this fence) ⇒ fail-closed, treated as older.
 //! 3. `pending_contraction_with_no_older_fleet_does_not_block` — a
 //!    pending contraction but no other hort-shaped connection at all ⇒
 //!    not blocked; `migrate::run` then applies cleanly.
-//! 4. `expand_only_pending_set_is_never_fenced` — pending set has no
-//!    contraction, even with an older-version connection present ⇒ never
-//!    blocked; `migrate::run` applies cleanly.
+//! 4. `latest_pending_narrowing_tolerates_its_declared_floor` — only
+//!    migration 44 remains, and a client at its declared floor can stay
+//!    connected while `migrate::run` applies it.
 //! 5. `older_fleet_member_on_a_different_database_does_not_block` — an
 //!    older-version hort-shaped connection exists, but on a *different*
 //!    database in the same cluster ⇒ the fence must not treat it as an
@@ -70,6 +72,7 @@ use std::env;
 use std::str::FromStr;
 use std::time::Duration;
 
+use hort_server::contractions::contraction_minimum_binary_versions;
 use hort_server::migrate::{
     evaluate_fleet_fence, gate_on_fleet_fence, run as migrate_run, MIGRATOR,
 };
@@ -80,7 +83,7 @@ use uuid::Uuid;
 
 /// This test binary's own `CARGO_PKG_VERSION` — identical to
 /// `hort-server`'s (workspace-inherited `version.workspace = true`), so
-/// it is the correct "current version" side of the fence's comparison.
+/// it is the correct binary-version input for the fence's fallback.
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ---------------------------------------------------------------------------
@@ -151,27 +154,166 @@ async fn connect_with_application_name(db_name: &str, application_name: &str) ->
         .expect("connect as simulated fleet member")
 }
 
-/// A migration version, strictly below the lowest declared contraction
-/// (9), so `MIGRATOR.run_to(BEFORE_FIRST_CONTRACTION, ..)` leaves every
-/// declared contraction (9, 14, 20) pending.
-const BEFORE_FIRST_CONTRACTION: i64 = 8;
+/// A migration version that leaves every FENCE-RELEVANT declared
+/// contraction pending (9, 14, 17, 20, 31, 39, 44), and so leaves the
+/// strictest declared floor — 39's `0.17.3` — pending, which is the floor
+/// every assertion below is written against.
+///
+/// Deliberately not named for the *first* declared contraction: that is
+/// migration 2, and this value is after it.
+///
+/// Migration 2 is also a declared contraction and is deliberately BELOW
+/// this line: its declared floor is the oldest release in the repository's
+/// history, so whether it is pending or applied cannot change a fence
+/// verdict (no client can be below it). Running to 8 keeps the baseline
+/// schema whole, which the simulated fleet connections need.
+const BEFORE_FENCED_CONTRACTIONS: i64 = 8;
 
-/// The highest migration version below the workspace's current max —
-/// `MIGRATOR.run_to(EXPAND_ONLY_TARGET, ..)` leaves exactly the last
-/// migration pending. Computed from `MIGRATOR` itself (not hardcoded) so
-/// this stays correct as new expand-only migrations are appended.
-fn expand_only_target() -> i64 {
-    let max = MIGRATOR
-        .iter()
-        .map(|m| m.version)
-        .max()
-        .expect("migration set is non-empty at compile time");
-    max - 1
+/// The highest migration version below the latest **declared narrowing**, so
+/// a run to it leaves that narrowing pending.
+///
+/// Derived from the checked-in `migrations/CONTRACTIONS.toml` and deliberately
+/// not from `MIGRATOR.max()`. The two agree only while the newest migration in
+/// the set happens to be a contraction, which is a property of the corpus and
+/// not of the suite: the first additive migration authored after one moves
+/// `max()` past it, and `max() - 1` then names a version at which the latest
+/// narrowing is already applied — leaving this suite asserting a fence verdict
+/// over nothing pending. An expand-only migration must not be able to change
+/// what these tests are about.
+fn before_latest_narrowing() -> i64 {
+    let latest = *contraction_minimum_binary_versions()
+        .keys()
+        .next_back()
+        .expect("the checked-in contraction manifest declares at least one narrowing");
+    latest - 1
 }
 
 // ---------------------------------------------------------------------------
 // 1 — pending contraction + older fleet member: blocked, override works.
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn client_at_declared_floor_is_tolerated_and_migration_applies() {
+    let Some(admin) = admin_pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR
+        .run_to(38, &pool)
+        .await
+        .expect("partial migration run succeeds");
+
+    let _client = connect_with_application_name(&db_name, "hort-server/0.17.3").await;
+    let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
+        .await
+        .expect("fence evaluates");
+    assert!(
+        !fence.blocked,
+        "a client at the inclusive floor is tolerated"
+    );
+    gate_on_fleet_fence(&fence, false).expect("migration may proceed without override");
+    migrate_run(&pool)
+        .await
+        .expect("migrate::run applies the pending contraction cleanly");
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn client_below_declared_floor_is_blocked_and_message_names_floor() {
+    let Some(admin) = admin_pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR
+        .run_to(38, &pool)
+        .await
+        .expect("partial migration run succeeds");
+
+    let _client = connect_with_application_name(&db_name, "hort-worker/0.17.2").await;
+    let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
+        .await
+        .expect("fence evaluates");
+    assert!(fence.blocked, "the client is below migration 39's floor");
+    let refusal = gate_on_fleet_fence(&fence, false).expect_err("must refuse");
+    assert!(refusal.contains("migration 39"), "{refusal}");
+    assert!(refusal.contains("0.17.3"), "{refusal}");
+    assert!(refusal.contains("hort-worker/0.17.2 x1"), "{refusal}");
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn strictest_pending_floor_governs_two_declared_contractions() {
+    let Some(admin) = admin_pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR
+        .run_to(30, &pool)
+        .await
+        .expect("partial migration run succeeds");
+
+    let _client = connect_with_application_name(&db_name, "hort-server/0.17.2").await;
+    let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
+        .await
+        .expect("fence evaluates");
+    assert!(
+        fence.blocked,
+        "migration 39's floor governs over migration 31's"
+    );
+    let refusal = gate_on_fleet_fence(&fence, false).expect_err("must refuse");
+    assert!(refusal.contains("migration 39"), "{refusal}");
+    assert!(refusal.contains("0.17.3"), "{refusal}");
+    assert!(!refusal.contains("migration 31"), "{refusal}");
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
+
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn fence_floor_agrees_with_recorded_schema_compat_floor() {
+    let Some(admin) = admin_pool().await else {
+        eprintln!("DATABASE_URL unset; skipping");
+        return;
+    };
+    let (db_name, pool) = create_temp_db(&admin).await;
+    MIGRATOR
+        .run_to(38, &pool)
+        .await
+        .expect("partial migration run succeeds");
+
+    let declared = contraction_minimum_binary_versions();
+    let floor = declared.get(&39).expect("migration 39 is declared");
+    let _client = connect_with_application_name(&db_name, "hort-server/0.17.2").await;
+    let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
+        .await
+        .expect("fence evaluates");
+    let refusal = gate_on_fleet_fence(&fence, false).expect_err("must refuse");
+    assert!(
+        refusal.contains(&format!("migration 39: declared fleet floor {floor}")),
+        "{refusal}"
+    );
+
+    migrate_run(&pool)
+        .await
+        .expect("migration and register write succeed");
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT min_binary_version FROM schema_compat_register WHERE version = 39",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("register row for migration 39");
+    assert_eq!(recorded.as_deref(), Some(floor.as_str()));
+
+    drop_temp_db(&admin, &db_name, pool).await;
+}
 
 #[tokio::test]
 #[serial(hort_pg_db)]
@@ -183,7 +325,7 @@ async fn pending_contraction_with_older_fleet_blocks_and_names_offender() {
     let (db_name, pool) = create_temp_db(&admin).await;
 
     MIGRATOR
-        .run_to(BEFORE_FIRST_CONTRACTION, &pool)
+        .run_to(BEFORE_FENCED_CONTRACTIONS, &pool)
         .await
         .expect("partial migration run succeeds");
 
@@ -231,7 +373,7 @@ async fn pending_contraction_with_unversioned_hort_client_blocks_fail_closed() {
     let (db_name, pool) = create_temp_db(&admin).await;
 
     MIGRATOR
-        .run_to(BEFORE_FIRST_CONTRACTION, &pool)
+        .run_to(BEFORE_FENCED_CONTRACTIONS, &pool)
         .await
         .expect("partial migration run succeeds");
 
@@ -271,7 +413,7 @@ async fn pending_contraction_with_no_older_fleet_does_not_block() {
     let (db_name, pool) = create_temp_db(&admin).await;
 
     MIGRATOR
-        .run_to(BEFORE_FIRST_CONTRACTION, &pool)
+        .run_to(BEFORE_FENCED_CONTRACTIONS, &pool)
         .await
         .expect("partial migration run succeeds");
 
@@ -293,41 +435,45 @@ async fn pending_contraction_with_no_older_fleet_does_not_block() {
 }
 
 // ---------------------------------------------------------------------------
-// 4 — expand-only pending set: never fenced, even with an older fleet.
+// 4 — the latest narrowing permits a fleet at its declared floor.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 #[serial(hort_pg_db)]
-async fn expand_only_pending_set_is_never_fenced() {
+async fn latest_pending_narrowing_tolerates_its_declared_floor() {
     let Some(admin) = admin_pool().await else {
         eprintln!("DATABASE_URL unset; skipping");
         return;
     };
     let (db_name, pool) = create_temp_db(&admin).await;
 
-    let target = expand_only_target();
+    let target = before_latest_narrowing();
+    assert_eq!(target, 43, "the pending narrowing must be 44");
     MIGRATOR
         .run_to(target, &pool)
         .await
         .expect("partial migration run to just below the top succeeds");
 
-    // An older-version connection IS present — proves the pending set's
-    // shape (no contraction), not the absence of fleet members, is what
-    // holds this fence open.
-    let _older_conn = connect_with_application_name(&db_name, "hort-server/0.1.0").await;
+    let floor = contraction_minimum_binary_versions()
+        .get(&44)
+        .cloned()
+        .expect("migration 44 has a declared floor");
+    assert_eq!(floor, "0.14.1");
+    let _older_conn =
+        connect_with_application_name(&db_name, &format!("hort-server/{floor}")).await;
 
     let fence = evaluate_fleet_fence(&pool, CURRENT_VERSION)
         .await
         .expect("fence evaluates");
     assert!(
         !fence.blocked,
-        "an expand-only pending set must never be fenced: {:?}",
+        "a client at migration 44's floor must be tolerated: {:?}",
         fence.offenders
     );
 
     migrate_run(&pool)
         .await
-        .expect("migrate::run applies the last expand-only migration cleanly");
+        .expect("migrate::run applies migration 44 cleanly");
 
     drop_temp_db(&admin, &db_name, pool).await;
 }
@@ -350,7 +496,7 @@ async fn older_fleet_member_on_a_different_database_does_not_block() {
     let (other_db_name, other_pool) = create_temp_db(&admin).await;
 
     MIGRATOR
-        .run_to(BEFORE_FIRST_CONTRACTION, &pool)
+        .run_to(BEFORE_FENCED_CONTRACTIONS, &pool)
         .await
         .expect("partial migration run succeeds");
 

@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-21
+
+### Migration notice
+
+- **The declared rollback floor rises from 0.12.0 to 0.17.3.** Five migrations
+  that are already applied on any running instance are now declared as
+  contractions, and the strictest of them is
+  `039_policy_projections_quarantine_duration_nonnegative.sql`, whose
+  constraint has been in place since 0.17.3. The schema-compatibility register
+  therefore reports a `min_binary_version` of 0.17.3 where it previously
+  reported 0.12.0. No schema changes here and nothing errors during the
+  rollout — the register now states a floor the schema has imposed since
+  0.17.3 — but a rollback plan written against the older figure is wrong.
+  Check the boot log before rolling back, and see the
+  [upgrade how-to](docs/architecture/how-to/deploy/upgrade.md).
+- **`artifacts.quarantine_status` is narrowed to its four storable states**
+  (migration `044_artifacts_quarantine_status_storable_set.sql`), tolerated by
+  0.14.1 and newer. That is below the floor above, so it adds nothing an
+  operator must act on: every supported upgrade path starts at a release whose
+  writers cannot emit a value it refuses, and `hort-server migrate` refuses
+  and names the floor if an older one is connected.
+
+### Added
+
+- Refused Cargo, npm, PyPI and Maven content reads now leave a log line with the
+  artifact, repository, path, response status and withholding reason (#454).
+
+### Changed
+
+- `hort-server migrate` refuses a pending contraction only when a connected
+  release is older than that migration's own declared floor, and names the
+  floor it used (#433).
+
+### Fixed
+
+- Maven `.jar`/`.war` artifacts are no longer withheld as scan-indeterminate for
+  an unreadable embedded dependency declaration — a dependency that resolved
+  before no longer starts answering 403. An artifact already withheld clears on
+  its next scheduled rescan rather than on upgrade (#454).
+- A 401 now offers Bearer and Basic in separate `WWW-Authenticate` fields, so
+  `mvn deploy` and `gradle publish` can authenticate to HTTPS URLs without an explicit port (#453).
+- The Maven read path now answers 404 for maven-resolver's `.meta/prefixes.txt`
+  probe instead of a coordinate-validation 400 (#453).
+- Concurrent attempts to enqueue the same scan job now resolve as an ordinary
+  conflict without a database error or aborted transaction (#452).
+- The expiry backstop's in-flight `provenance-verify` lookup is now index-backed
+  instead of scanning the whole `jobs` table on every call (#451).
+- An upstream mapping whose host resolves to a private or loopback address —
+  an internal registry or in-cluster mirror — is no longer refused at connect;
+  a download URL taken from upstream metadata still is (#422).
+- A PyPI distribution whose dependency declaration cannot be read in full is
+  no longer reported as declaring nothing, or as declaring a complete list;
+  such a distribution now holds for scan review instead of completing as
+  not-applicable (#430).
+- Pushing an OCI manifest whose config or layer digest is held by a
+  terminally-blocked artifact is now refused every time, instead of sometimes
+  being accepted and then undeliverable on every pull (#432).
+- An event-chain checkpoint now anchors the stream seals since the last
+  anchored checkpoint rather than the whole seal history, so the anchor store
+  no longer grows with every tick (#423).
+- A scheduled task that fails transiently and then succeeds on retry no longer
+  ends as a permanently `Failed` Job (#449).
+- A bulk waive that could not apply every entry no longer reports success: it
+  is refused before anything is released when the reason is visible in
+  advance, and reported as partial — `outcome: "partial"`, CLI exit 4 — when it
+  is not (#435).
+
+### Removed
+
+- The token-list response (`GET /api/v1/users/me/tokens`) no longer carries
+  `last_used_at`, which always read `null`; when a token was last used is
+  answered by `GET /api/v1/events?category=token_use` (#436).
+
 ## [0.17.5] - 2026-11-17
 
 ### Security

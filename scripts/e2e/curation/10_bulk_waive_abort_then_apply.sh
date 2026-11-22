@@ -6,8 +6,10 @@
 # safety rests on one promise — ONE invalid entry releases NOTHING — and
 # that promise is a pre-validation pass over every entry of the batch
 # that runs before the first append (`CurationUseCase::waive_bulk`
-# step 5; the refusal is `409 Conflict` carrying the per-entry report,
-# ADR 0025). The promise holds in unit tests against a mock HTTP server;
+# resolves and state-checks every entry, and establishes that each one's
+# stream has room for its release event, ahead of its apply loop; the
+# refusal is `409 Conflict` carrying the per-entry report, ADR 0025).
+# The promise holds in unit tests against a mock HTTP server;
 # this scenario is where it meets a real Postgres, the real digest
 # resolver and a real HTTP boundary — which is where a property of this
 # shape usually breaks.

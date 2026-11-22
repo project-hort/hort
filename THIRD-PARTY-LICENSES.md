@@ -25,7 +25,7 @@ the result instead.
 | prost-types | 0.14.3 | Apache-2.0 | https://github.com/tokio-rs/prost |
 | prost | 0.14.3 | Apache-2.0 | https://github.com/tokio-rs/prost |
 | ring | 0.17.14 | Apache-2.0 | https://github.com/briansmith/ring |
-| async-nats | 0.51.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
+| async-nats | 0.52.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
 | aws-lc-sys | 0.47.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
 | blake3 | 1.8.7 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
 | constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
@@ -76,7 +76,11 @@ the result instead.
 | dotenvy | 0.15.7 | MIT | https://github.com/allan2/dotenvy |
 | quanta | 0.12.6 | MIT | https://github.com/metrics-rs/quanta |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
-| sqlx | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-core | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-macros-core | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-macros | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx-postgres | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
+| sqlx | 0.9.1 | MIT | https://github.com/launchbadge/sqlx |
 | sha1 | 0.10.6 | MIT | https://github.com/RustCrypto/hashes |
 | sha2 | 0.10.9 | MIT | https://github.com/RustCrypto/hashes |
 | lazy_static | 1.5.0 | MIT | https://github.com/rust-lang-nursery/lazy-static.rs |
@@ -84,10 +88,10 @@ the result instead.
 | core-foundation | 0.10.1 | MIT | https://github.com/servo/core-foundation-rs |
 | core-foundation | 0.9.4 | MIT | https://github.com/servo/core-foundation-rs |
 | hex | 0.4.3 | MIT | https://github.com/KokaKiwi/rust-hex |
-| form_urlencoded | 1.2.2 | MIT | https://github.com/servo/rust-url |
+| form_urlencoded | 1.2.3 | MIT | https://github.com/servo/rust-url |
 | idna | 1.1.0 | MIT | https://github.com/servo/rust-url/ |
 | percent-encoding | 2.3.2 | MIT | https://github.com/servo/rust-url/ |
-| url | 2.5.8 | MIT | https://github.com/servo/rust-url |
+| url | 2.5.9 | MIT | https://github.com/servo/rust-url |
 | cfg-if | 1.0.4 | MIT | https://github.com/rust-lang/cfg-if |
 | filetime | 0.2.29 | MIT | https://github.com/alexcrichton/filetime |
 | futures-timer | 3.0.3 | MIT | https://github.com/async-rs/futures-timer |
@@ -108,9 +112,9 @@ the result instead.
 | num-integer | 0.1.46 | MIT | https://github.com/rust-num/num-integer |
 | num-iter | 0.1.45 | MIT | https://github.com/rust-num/num-iter |
 | num-traits | 0.2.19 | MIT | https://github.com/rust-num/num-traits |
-| regex-automata | 0.4.16 | MIT | https://github.com/rust-lang/regex |
-| regex-syntax | 0.8.11 | MIT | https://github.com/rust-lang/regex |
-| regex | 1.13.1 | MIT | https://github.com/rust-lang/regex |
+| regex-automata | 0.4.19 | MIT | https://github.com/rust-lang/regex |
+| regex-syntax | 0.8.12 | MIT | https://github.com/rust-lang/regex |
+| regex | 1.13.2 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
 | uuid | 1.29.2 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
@@ -194,7 +198,7 @@ the result instead.
 | digest | 0.11.3 | MIT | https://github.com/RustCrypto/traits |
 | blake2 | 0.11.0 | MIT | https://github.com/RustCrypto/hashes |
 | aes | 0.8.4 | MIT | https://github.com/RustCrypto/block-ciphers |
-| bytes | 1.12.1 | MIT | https://github.com/tokio-rs/bytes |
+| bytes | 1.12.2 | MIT | https://github.com/tokio-rs/bytes |
 | rand_xoshiro | 0.7.0 | MIT | https://github.com/rust-random/rngs |
 | smallvec | 1.15.1 | MIT | https://github.com/servo/rust-smallvec |
 | ahash | 0.8.12 | MIT | https://github.com/tkaitchuck/ahash |
@@ -314,10 +318,10 @@ the result instead.
 | anstyle-query | 1.1.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle-wincon | 3.0.11 | MIT | https://github.com/rust-cli/anstyle.git |
 | anstyle | 1.0.14 | MIT | https://github.com/rust-cli/anstyle.git |
-| clap | 4.6.8 | MIT | https://github.com/clap-rs/clap |
+| clap | 4.6.9 | MIT | https://github.com/clap-rs/clap |
 | clap_builder | 4.6.7 | MIT | https://github.com/clap-rs/clap |
 | clap_complete | 4.6.12 | MIT | https://github.com/clap-rs/clap |
-| clap_derive | 4.6.8 | MIT | https://github.com/clap-rs/clap |
+| clap_derive | 4.6.9 | MIT | https://github.com/clap-rs/clap |
 | clap_lex | 1.1.0 | MIT | https://github.com/clap-rs/clap |
 | colorchoice | 1.0.5 | MIT | https://github.com/rust-cli/anstyle.git |
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
@@ -337,7 +341,7 @@ the result instead.
 | arrayvec | 0.7.6 | MIT | https://github.com/bluss/arrayvec |
 | synstructure | 0.13.2 | MIT | https://github.com/mystor/synstructure |
 | ipnet | 2.12.2 | MIT | https://github.com/krisprice/ipnet |
-| rand | 0.10.3 | MIT | https://github.com/rust-random/rand |
+| rand | 0.10.4 | MIT | https://github.com/rust-random/rand |
 | rand | 0.8.6 | MIT | https://github.com/rust-random/rand |
 | rand | 0.9.4 | MIT | https://github.com/rust-random/rand |
 | rand_chacha | 0.3.1 | MIT | https://github.com/rust-random/rand |
@@ -383,12 +387,9 @@ the result instead.
 | objc2-core-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-encode | 4.1.0 | MIT | https://github.com/madsmtm/objc2 |
 | objc2-foundation | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
+| objc2-system-configuration | 0.3.2 | MIT | https://github.com/madsmtm/objc2 |
 | objc2 | 0.6.4 | MIT | https://github.com/madsmtm/objc2 |
 | object_store | 0.14.2 | MIT | https://github.com/apache/arrow-rs-object-store |
-| sqlx-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-macros-core | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-macros | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
-| sqlx-postgres | 0.9.0 | MIT | https://github.com/launchbadge/sqlx |
 | typed-path | 0.9.3 | MIT | https://github.com/chipsenkbeil/typed-path |
 | whoami | 2.1.2 | MIT | https://github.com/ardaku/whoami |
 | winapi-x86_64-pc-windows-gnu | 0.4.0 | MIT | https://github.com/retep998/winapi-rs |
@@ -3133,7 +3134,7 @@ limitations under the License.
 
 ```
 
-### async-nats 0.51.0 — Apache-2.0
+### async-nats 0.52.0 — Apache-2.0
 
 Repository: https://github.com/nats-io/nats.rs
 
@@ -5503,7 +5504,143 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### sqlx 0.9.0 — MIT
+### sqlx-core 0.9.1 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-macros-core 0.9.1 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-macros 0.9.1 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx-postgres 0.9.1 — MIT
+
+Repository: https://github.com/launchbadge/sqlx
+
+```text
+Copyright (C) SQLx Contributors
+Portions of this work Copyright (C) LaunchBadge, LLC
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the &quot;Software&quot;), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+```
+
+### sqlx 0.9.1 — MIT
 
 Repository: https://github.com/launchbadge/sqlx
 
@@ -5767,7 +5904,7 @@ SOFTWARE.
 
 ```
 
-### form_urlencoded 1.2.2 — MIT
+### form_urlencoded 1.2.3 — MIT
 
 Repository: https://github.com/servo/rust-url
 
@@ -5866,7 +6003,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### url 2.5.8 — MIT
+### url 2.5.9 — MIT
 
 Repository: https://github.com/servo/rust-url
 
@@ -6551,7 +6688,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex-automata 0.4.16 — MIT
+### regex-automata 0.4.19 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -6584,7 +6721,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex-syntax 0.8.11 — MIT
+### regex-syntax 0.8.12 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -6617,7 +6754,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### regex 1.13.1 — MIT
+### regex 1.13.2 — MIT
 
 Repository: https://github.com/rust-lang/regex
 
@@ -9331,7 +9468,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### bytes 1.12.1 — MIT
+### bytes 1.12.2 — MIT
 
 Repository: https://github.com/tokio-rs/bytes
 
@@ -13190,7 +13327,7 @@ SOFTWARE.
 
 ```
 
-### clap 4.6.8 — MIT
+### clap 4.6.9 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -13271,7 +13408,7 @@ SOFTWARE.
 
 ```
 
-### clap_derive 4.6.8 — MIT
+### clap_derive 4.6.9 — MIT
 
 Repository: https://github.com/clap-rs/clap
 
@@ -13811,7 +13948,7 @@ THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRES
 
 ```
 
-### rand 0.10.3 — MIT
+### rand 0.10.4 — MIT
 
 Repository: https://github.com/rust-random/rand
 
@@ -15111,6 +15248,32 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ```
 
+### objc2-system-configuration 0.3.2 — MIT
+
+Repository: https://github.com/madsmtm/objc2
+
+```text
+MIT License
+
+Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
+associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
+following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial
+portions of the Software.
+
+THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
+LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+```
+
 ### objc2 0.6.4 — MIT
 
 Repository: https://github.com/madsmtm/objc2
@@ -15140,110 +15303,6 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 ### object_store 0.14.2 — MIT
 
 Repository: https://github.com/apache/arrow-rs-object-store
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-core 0.9.0 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-macros-core 0.9.0 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-macros 0.9.0 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
-
-```text
-MIT License
-
-Copyright (c) &lt;year&gt; &lt;copyright holders&gt;
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and
-associated documentation files (the &quot;Software&quot;), to deal in the Software without restriction, including
-without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the
-following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial
-portions of the Software.
-
-THE SOFTWARE IS PROVIDED &quot;AS IS&quot;, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT
-LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
-EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
-IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
-USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-```
-
-### sqlx-postgres 0.9.0 — MIT
-
-Repository: https://github.com/launchbadge/sqlx
 
 ```text
 MIT License

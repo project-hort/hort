@@ -170,9 +170,17 @@ keeping the intended deletions.
 #215.*
 
 **The policy.** Destructive DDL — `DROP COLUMN`, `DROP TABLE`, `RENAME` of a
-table or a column, a column type change, and `SET NOT NULL` on an existing
-column — may ship only in a release **strictly after** the last release whose
-code references the affected identifier. **Expand and contract never share a
+table or a column, a column type change, `SET NOT NULL` on an existing column,
+and a `CHECK` constraint added to a column the migration did not create — may
+ship only in a release **strictly after** the last release whose code
+references the affected identifier.
+
+`SET NOT NULL` is the special case `CHECK (c IS NOT NULL)`, and the general
+form carries the same obligation for the same reason: every column the `CHECK`
+body names loses values its writers could previously emit, so from the instant
+the migration commits the still-running previous release can produce a value
+the database now refuses. `NOT VALID` is not an escape — it exempts existing
+rows, never a future `INSERT` or `UPDATE`. **Expand and contract never share a
 release.** Schema change is therefore always two releases:
 
 1. **Expand.** Add the new column or table, dual-write if there is a cutover,
@@ -196,7 +204,9 @@ identifiers compared as whole tokens, never substrings; the shared lexer both
 guards walk lives in `crates/hort-app/tests/sql_scan/mod.rs`. Recognised
 destructive shapes yield either a **removal** (`DROP TABLE`, `DROP COLUMN`,
 the source side of a `RENAME`) or a **narrowing** (`ALTER COLUMN … TYPE`,
-`SET NOT NULL`). Each is cross-checked against the checked-in manifest
+`SET NOT NULL`, `ADD [CONSTRAINT …] CHECK` / `UNIQUE` / `PRIMARY KEY` /
+`FOREIGN KEY` / `EXCLUDE`, and `CREATE UNIQUE INDEX`, naming a column the
+migration did not create). Each is cross-checked against the checked-in manifest
 `migrations/CONTRACTIONS.toml`, whose entries carry the migration file name,
 the affected identifiers (`table` or `table.column`), a
 `reference_removed_in = "X.Y.Z"` release, and a required `note`. The guard
@@ -216,6 +226,36 @@ fails when:
 - **(c) the claim is untrue of the present** — SQL text in the workspace's
   production sources (`crates/*/src/**/*.rs`) still names a removed
   identifier.
+
+**The widening exemption, and why it is syntactic.** The commonest `CHECK`
+edit is not a narrowing at all: replacing an enum `CHECK` with one whose
+admitted set has *grown* takes nothing away from any writer that has ever
+existed. Such a statement is exempt — but only on four conditions the guard
+can establish without understanding semantics: the same migration drops the
+same constraint name, the previous definition of that name is findable in the
+migration set, both definitions are `<col> IN (<literal>, …)` over the same
+single column, and the new set is a superset of the old. Every other case
+**fails closed** and is reported, including an unfindable previous definition,
+either side not in the `IN` form, and a set that is neither superset nor
+comparable. The comparison is deliberately two enumerated literal lists and
+**not** an effects analysis: establishing that a predicate refuses nothing an
+older binary could write means reasoning about satisfaction across column
+defaults and disjunctions, which this guard does not do — so where it cannot
+decide it asks for a manifest entry it may not have needed, and the entry's
+`note` carries the reasoning a human did instead. A `CHECK` on a column the
+*same* migration creates is likewise not a narrowing, and the guard derives
+that from the migration set rather than from a list.
+
+This is a different question from the `_check` allow-list in the 2026-06-28
+amendment above, which asks whether a **sensitive table** emerges still
+constrained and deliberately does not compare admitted sets. Both apply
+independently: a drop-and-re-add on a sensitive table must satisfy that
+allow-list, and its re-added `CHECK` must satisfy this comparison.
+
+Getting that exemption right is load-bearing beyond the build: the runtime
+fence below keys on *whether* a pending migration is declared, so a widening
+declared as a contraction would fence a routine rolling upgrade this policy
+never intended to stop.
 
 The manifest is seeded with the tree's existing destructive migrations
 (`009`, `014`, `020`) so the guard starts from reality; `020`'s entry records
@@ -269,25 +309,102 @@ which is a follow-on item on the same initiative and is specified separately;
 it is named here only so that this decision is not mistaken for full
 coverage.
 
-**The runtime fence (backlog 145).** Built as the follow-on item named above.
-Every hort Postgres connection now sets `application_name =
+**The runtime fleet fence.** Every hort Postgres connection sets `application_name =
 "hort-{server|worker}/<workspace-version>"` (one call site per binary —
 `hort_server::pg_identity::connect_options` / `hort_worker::pg_identity::connect_options`,
 both thin wrappers over the shared, zero-I/O
 `hort_config::pg_identity::pg_application_name`). Before applying, `hort-server
 migrate` computes the pending migration set and, only when at least one
 pending migration is a declared contraction (`migrations/CONTRACTIONS.toml`),
-queries `pg_stat_activity` for hort-shaped clients other than itself. Finding
-any whose stamped version is older than the current binary — or hort-shaped
-with no version segment at all, a client that predates this scheme,
-fail-closed — refuses the run and names the offending clients. An
-expand-only pending set is never fenced, so routine rolling upgrades stay
-hook-driven and unattended. The operator override is `--allow-running-fleet`
-(env `HORT_ALLOW_RUNNING_FLEET`, plumbed through the Helm migrate Job,
+queries `pg_stat_activity` for hort-shaped clients other than itself. It takes
+the maximum `reference_removed_in` among pending declared contractions: a
+client must tolerate every migration in the run, and equality with this floor
+is tolerated. A client whose stamped version is strictly below that floor, or
+whose hort-shaped name has no parseable version, refuses the run and is named.
+If any pending declared floor does not parse, the whole decision falls back to
+comparing clients with the migrating binary's own version; if that version does
+not parse, evaluation fails. The build-time guard requires every embedded
+floor to be strictly below the binary version, so the declared-floor comparison
+refuses strictly less often than the binary comparison and never more; the
+manifest value and its mandatory reviewer check against the release that
+removed the reference bound this decision. An expand-only pending set is never
+fenced, so routine rolling upgrades stay hook-driven and unattended. The
+operator override is `--allow-running-fleet` (env `HORT_ALLOW_RUNNING_FLEET`,
+plumbed through the Helm migrate Job,
 default off), loudly logged when used. This closes the runtime half of the
 gap: the build-time guard above stops a contraction from being *authored*
 too early, and this fence stops it from being *applied* into a fleet that is
-still running the old binary.
+still running a binary below the migration's declared floor.
+
+### Amendment 2026-11-18 — a constraint addition is a narrowing whatever the constraint
+
+*Authorised by the maintainer after the best-practice question was put and
+answered.*
+
+**The decision.** `ADD CONSTRAINT … UNIQUE`, `… PRIMARY KEY`,
+`… FOREIGN KEY`, `… EXCLUDE` and `CREATE UNIQUE INDEX` on a column that
+existed before the migration are narrowings, and carry the same obligation
+as the `CHECK` addition amendment (c) already names. A `CREATE INDEX`
+without `UNIQUE` constrains no write and is not one.
+
+**The reason, which is (c)'s reason unchanged.** A duplicate and a dangling
+reference are values the still-running previous release's write paths can
+produce, and PostgreSQL refuses them from the instant the migration hook
+commits — before a single new pod is Ready. That is the same window, the
+same fleet and the same failure as a `CHECK` that forbids a value the old
+writer still emits. `SET NOT NULL` — the special case
+`CHECK (c IS NOT NULL)` — has been recognised since this policy landed, so
+the omission of the rest of the class was an inconsistency rather than a
+judgement. It is also mainstream expand/contract doctrine rather than a
+local reading: the pattern's recipes state it as *"application code must
+write to the column before enforcement constraints are applied"*.
+
+**The lock-side remedies do not discharge it.** `strong_migrations` and
+`squawk` flag these same statements, predominantly for **lock duration**,
+and prescribe `ADD … NOT VALID` plus a later `VALIDATE`, or
+`CREATE UNIQUE INDEX CONCURRENTLY`. Those address availability *during* the
+migration, which is a separate question from release sequencing, and they
+discharge none of this obligation: `NOT VALID` exempts existing **rows**,
+never a future `INSERT` or `UPDATE`, exactly as amendment (c) already says
+for `CHECK`. A finding under this rule is never fixed by adding one of them;
+it is fixed by shipping the constraint one release later.
+
+**Two syntactic escapes, and no others.** A column the same migration
+creates is not narrowed by a constraint on it — no previous release ever
+wrote a value it forbids — and the guard derives that from the migration
+set. And a uniqueness key is exempt when the same migration drops one whose
+replacement is **provably no stricter**: the predecessor is findable in the
+migration set, sits on the same table, is not itself partial, and its key
+columns are a subset of the new key's; plus, for a new `PRIMARY KEY`, every
+key column is already `NOT NULL`, since a primary key imposes `NOT NULL`
+alongside uniqueness. A key over more columns admits strictly more rows (two
+rows agreeing on the wider tuple agree on the narrower one), and the same
+key over a subset of the rows admits strictly more rows. Both shapes are
+real: `013_content_references_multivalue_pk.sql` widens a primary key from
+three columns to four, and `021_artifacts_soft_delete.sql` replaces a full
+`UNIQUE (repository_id, path)` with a partial unique index on the same
+columns. A `FOREIGN KEY` and an `EXCLUDE` have no comparable predecessor
+shape and are therefore never exempt by replacement.
+
+Everything else **fails closed**, including *"the old code never produced a
+duplicate"* — a semantic claim, deliberately not an escape. A harmless
+tightening pays the one release of sequencing, and that is the accepted
+price. For a `FOREIGN KEY` the narrowed identifier is the **referencing**
+column, whose admissible values shrink; the referenced column loses nothing.
+
+**What the manifest gained.** Two retroactive entries, both recording what
+happened rather than blessing it. `017_scan_policy_scope_unique.sql` is a
+real narrowing whose partial unique index and the apply-time rejection that
+stopped the gitops path producing duplicate-scope envelopes shipped in one
+commit, first released in 0.10.0 — the same-release shape this policy
+forbids. `002_repositories.sql` declares the deferred foreign key on
+`permission_grants.repository_id`, a column created in `001`: the guard
+reads one migration file at a time and cannot see that 001 and 002 are both
+part of the baseline set and have shipped as one unit in every release there
+has ever been, so it fails closed and the entry carries that reasoning.
+Neither moves an operator-facing number — the fleet fence and the
+schema-compatibility register both key on the strictest declared floor, and
+`039`'s `0.17.3` remains it.
 
 ## Consequences
 

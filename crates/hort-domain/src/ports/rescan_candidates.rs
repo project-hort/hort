@@ -2,8 +2,9 @@
 //!
 //! `CronRescanTickHandler` (in `hort-app::task_handlers::cron_rescan_tick`)
 //! delegates the SQL-side eligibility predicate — joining `artifacts`
-//! to `policy_projections` via the repo→policy chain, filtering
-//! `quarantine_status='released'` and `rescan_interval_hours > 0`,
+//! to `policy_projections` via the repo→policy chain, filtering on the
+//! live statuses [`RescanCandidatesRepository::select_eligible`] names
+//! and on `rescan_interval_hours > 0`,
 //! comparing both `last_scan_at` and the artifact's most recent
 //! `kind='scan'` request against the policy interval, and excluding
 //! artifacts that already have an in-flight `kind='scan'` job — to this
@@ -232,6 +233,16 @@ pub struct RescanCandidate {
 pub trait RescanCandidatesRepository: Send + Sync {
     /// Return up to `batch_size` artifacts whose policy-derived rescan
     /// interval has elapsed and that have no in-flight scan job.
+    ///
+    /// Live means `quarantine_status = 'released'` **or** the
+    /// permissive-default `NULL`, the same pair
+    /// [`Self::select_composite_unassessed`] selects on. The `NULL` arm
+    /// is not an oversight to be tightened: an artifact under no
+    /// operator policy, or under one with `quarantine_duration_secs = 0`,
+    /// is downloadable and terminal in exactly that state, so excluding
+    /// it would leave an out-of-the-box deployment's artifacts
+    /// un-rescanned — and it is also the state a decision that never ran
+    /// leaves behind, which is the row this sweep most needs to reach.
     ///
     /// `now` is the wall-clock timestamp the handler captured at the
     /// start of the tick — passed in (rather than read inside the

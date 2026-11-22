@@ -538,22 +538,34 @@ impl MockArtifactRepository {
         self.insert(artifact);
     }
 
-    /// The status of `hash` inside `repo` as a **deliverability** read
-    /// sees it: repository-scoped and `deleted_at`-filtered, which is
-    /// what the Postgres constituent statement does and what every live
-    /// `ArtifactRepository` read does.
+    /// The status of **every** live row for `hash` inside `repo`, as a
+    /// **deliverability** read sees them: repository-scoped and
+    /// `deleted_at`-filtered, which is what the Postgres constituent
+    /// statements do and what every live `ArtifactRepository` read does.
+    ///
+    /// Plural, and that is the point. `artifacts` is unique on
+    /// `(repository_id, path)` and not on the checksum, so one repository
+    /// legitimately holds several live rows for one hash — a blob and a
+    /// manifest sharing bytes, with independent statuses — and the
+    /// Postgres statements join **all** of them before keeping the
+    /// strongest. A singular helper would hand
+    /// [`MockConstituentStatusReader`] one arbitrarily-chosen row, which
+    /// is the identity lookup's answer and not the verdict: the double
+    /// would then answer a question production answers differently, and
+    /// every test standing on it would be proving the wrong thing.
     ///
     /// Deliberately narrower than this mock's own
     /// `find_by_repo_and_checksum`, which does not filter retirement.
     /// [`MockConstituentStatusReader`] serves from here so a test cannot
     /// prove a manifest withheld by a row no read path can see.
-    pub fn live_status_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Option<QuarantineStatus> {
-        self.live_row_in_repo(repo, hash)
+    pub fn live_statuses_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Vec<QuarantineStatus> {
+        self.live_rows_in_repo(repo, hash)
+            .into_iter()
             .map(|(_id, status)| status)
+            .collect()
     }
 
-    /// The same live, repository-scoped row as
-    /// [`Self::live_status_in_repo`], but carrying its **id** as well.
+    /// One live, repository-scoped row for `hash`, carrying its **id**.
     ///
     /// [`MockListDeliverabilityCensus`] needs the id because the
     /// membership projection keys its edges on `source_artifact_id`, so
@@ -567,14 +579,23 @@ impl MockArtifactRepository {
         repo: Uuid,
         hash: &ContentHash,
     ) -> Option<(Uuid, QuarantineStatus)> {
+        self.live_rows_in_repo(repo, hash).into_iter().next()
+    }
+
+    /// Every live, repository-scoped row for `hash`, as `(id, status)` —
+    /// the one place the retirement and repository filters are written,
+    /// which is what keeps the singular and plural readers above from
+    /// drifting apart.
+    fn live_rows_in_repo(&self, repo: Uuid, hash: &ContentHash) -> Vec<(Uuid, QuarantineStatus)> {
         self.artifacts
             .lock()
             .unwrap()
             .values()
-            .find(|a| {
+            .filter(|a| {
                 a.repository_id == repo && a.sha256_checksum == *hash && a.deleted_at.is_none()
             })
             .map(|a| (a.id, a.quarantine_status))
+            .collect()
     }
 
     /// Seed a synthetic `(name, version, status)`
@@ -739,12 +760,27 @@ impl ArtifactRepository for MockArtifactRepository {
             return Box::pin(async move { Err(err) });
         }
         let sha = sha256.as_ref().to_string();
+        // The adapter's statement is `LIMIT 1` with no `ORDER BY` over a
+        // set a repository may legitimately hold more than one member of
+        // (unique on `(repository_id, path)`, not on the checksum), so
+        // production may answer with **either** row and a double has to
+        // pick one. It picks the **most permissive** — the row whose
+        // status would let a caller through — because that is the plan
+        // choice a verdict read off this lookup gets wrong, and a double
+        // that flipped a coin instead would turn the test that catches it
+        // into one that catches it half the time. The id breaks the
+        // remaining tie so the answer is the same on every run.
+        //
+        // This is identity, not a verdict: whoever needs a verdict over
+        // these bytes asks `ConstituentStatusReader`, which ranks every
+        // row by the domain's refusal precedence.
         let result = self
             .artifacts
             .lock()
             .unwrap()
             .values()
-            .find(|a| a.repository_id == repository_id && a.sha256_checksum.as_ref() == sha)
+            .filter(|a| a.repository_id == repository_id && a.sha256_checksum.as_ref() == sha)
+            .min_by_key(|a| (a.quarantine_status.is_terminal(), a.id))
             .map(Self::projected);
         Box::pin(async move { Ok(result) })
     }
@@ -2604,16 +2640,6 @@ impl hort_domain::ports::api_token_repository::ApiTokenRepository for MockApiTok
         Box::pin(async move { Ok(Page { items, total }) })
     }
 
-    fn update_last_used(
-        &self,
-        _token_id: Uuid,
-        _at: DateTime<Utc>,
-        _client_ip: Option<&str>,
-        _user_agent: Option<&str>,
-    ) -> BoxFut<'_, DomainResult<()>> {
-        Box::pin(async { Ok(()) })
-    }
-
     fn revoke(&self, token_id: Uuid) -> BoxFut<'_, DomainResult<()>> {
         self.revokes.lock().unwrap().push(token_id);
         Box::pin(async { Ok(()) })
@@ -2717,6 +2743,11 @@ pub struct MockEventStore {
     /// [`MockEventStore::fail_read_stream_at`]. Armed as
     /// `(0-based call index, error)`; consumed when that call fires.
     fail_read_stream_at: Mutex<Option<(usize, DomainError)>>,
+    /// Call-indexed one-shot stream replacement — see
+    /// [`MockEventStore::set_stream_after_read_at`]. Armed as
+    /// `(0-based call index, stream key, replacement)`; installed after
+    /// that call serves, and consumed then.
+    stream_after_read_at: Mutex<Option<(usize, String, Vec<PersistedEvent>)>>,
     /// Total `read_stream` invocations, including failed ones. Lets
     /// tests pin a "no read round-trip on this path anymore" claim
     /// (issue #87: `ExpectedVersion::Any` appends need no
@@ -2744,6 +2775,7 @@ impl MockEventStore {
             stream_after_next_read: Mutex::new(HashMap::new()),
             fail_next_read_stream: Mutex::new(None),
             fail_read_stream_at: Mutex::new(None),
+            stream_after_read_at: Mutex::new(None),
             read_stream_calls: AtomicUsize::new(0),
             deleted_streams: Mutex::new(Vec::new()),
             archived_streams: Mutex::new(Vec::new()),
@@ -2873,6 +2905,29 @@ impl MockEventStore {
             .lock()
             .unwrap()
             .insert(stream_id.to_string(), events);
+    }
+
+    /// Arm a one-shot stream replacement that fires after the
+    /// `read_stream` call at 0-based index `n` — the same counter
+    /// [`Self::read_stream_call_count`] reports.
+    ///
+    /// [`Self::set_stream_after_next_read`] can only ever reach the FIRST
+    /// read, exactly as [`Self::fail_next_read_stream`] can only reach
+    /// the first failure, and for the same reason this exists beside it: a
+    /// caller that reads one stream twice for two different questions —
+    /// a batch verb establishing a cap precondition ahead of its loop and
+    /// then pairing the artifact inside it — needs the concurrent append
+    /// to land between those two reads. That is the interleaving a lost
+    /// append actually has; arming the earlier read instead gives the
+    /// apply step a version that matches, and the append it was supposed
+    /// to lose succeeds.
+    pub fn set_stream_after_read_at(
+        &self,
+        n: usize,
+        stream_id: &StreamId,
+        events: Vec<PersistedEvent>,
+    ) {
+        *self.stream_after_read_at.lock().unwrap() = Some((n, stream_id.to_string(), events));
     }
 
     /// Seed the category feed that [`read_category`] serves. Events
@@ -3039,7 +3094,19 @@ impl EventStore for MockEventStore {
         // this read serves the current content; subsequent reads see
         // the armed replacement — a concurrent append between reads.
         if let Some(next) = self.stream_after_next_read.lock().unwrap().remove(&key) {
-            self.streams.lock().unwrap().insert(key, next);
+            self.streams.lock().unwrap().insert(key.clone(), next);
+        }
+        // The call-indexed form of the same one-shot, for a caller whose
+        // second read of this stream is the one the swap has to precede.
+        {
+            let mut armed = self.stream_after_read_at.lock().unwrap();
+            if armed
+                .as_ref()
+                .is_some_and(|(n, armed_key, _)| *n == call_index && *armed_key == key)
+            {
+                let (_, armed_key, next) = armed.take().expect("just checked it is armed");
+                self.streams.lock().unwrap().insert(armed_key, next);
+            }
         }
         let truncated: Vec<PersistedEvent> = events.into_iter().take(max_count as usize).collect();
         Box::pin(async move { Ok(truncated) })
@@ -6428,7 +6495,7 @@ impl EventRepositoryResolver for MockEventRepositoryResolver {
 /// on behaviour production does not have:
 ///
 /// - **repository scope** and **retirement** — served through
-///   [`MockArtifactRepository::live_status_in_repo`];
+///   [`MockArtifactRepository::live_statuses_in_repo`];
 /// - **which statuses are terminal** — filtered through
 ///   `QuarantineStatus::is_terminal`, never a written-out list;
 /// - **which verdict wins, and which constituent is named** — the
@@ -6459,9 +6526,74 @@ impl MockConstituentStatusReader {
     }
 
     /// How many times the reader was asked — the handle for the
-    /// "one lookup, not one per constituent" assertion.
+    /// "one lookup, not one per constituent" assertion. Both port
+    /// methods count, because the property is about round trips and not
+    /// about which of the two a caller needed.
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
+    }
+
+    /// The ranked answer both port methods are a slice of: one entry per
+    /// hash carrying a terminal status, strongest first, ties by the
+    /// caller's own position.
+    ///
+    /// One ranking for both answers, so the double cannot disagree with
+    /// itself where production cannot: the `LIMIT 1` statement and the
+    /// per-hash one share their CTEs, their binding and their
+    /// `(precedence, position)` key, and the adapter has a DB-backed test
+    /// pinning that the first per-hash entry is the single answer.
+    ///
+    /// **Every** live row for a hash is considered, not one of them. A
+    /// repository may hold a blob row and a manifest row for the same
+    /// bytes with independent statuses; the statements join all of them
+    /// and keep the strongest, and a double that read one arbitrary row
+    /// would be answering the identity lookup's question instead — the
+    /// very confusion the admission path had.
+    fn ranked(
+        &self,
+        repository_id: Uuid,
+        constituents: &[ContentHash],
+    ) -> Vec<TerminalConstituent> {
+        let precedence = terminal_statuses_by_refusal_precedence();
+        let mut ranked: Vec<(usize, usize, ContentHash, QuarantineStatus)> = Vec::new();
+        for (position, hash) in constituents.iter().enumerate() {
+            // One entry per hash: the statement's ranking partitions by
+            // the hash and keeps `rank = 1`, so an array that repeats a
+            // hash keeps its earliest position — and a manifest may
+            // legitimately name the same layer twice.
+            if ranked.iter().any(|(_, _, held, _)| held == hash) {
+                continue;
+            }
+            let strongest = self
+                .artifacts
+                .live_statuses_in_repo(repository_id, hash)
+                .into_iter()
+                .filter_map(|status| {
+                    // `position` in the derived set is the rank; a status
+                    // the predicate does not call terminal is not in it,
+                    // which is the filter and never a written-out list.
+                    Some((precedence.iter().position(|s| *s == status)?, status))
+                })
+                .min_by_key(|(rank, _)| *rank);
+            if let Some((rank, status)) = strongest {
+                ranked.push((rank, position, hash.clone(), status));
+            }
+        }
+        ranked.sort_by_key(|(rank, position, _, _)| (*rank, *position));
+        ranked
+            .into_iter()
+            .map(|(_, _, content_hash, status)| TerminalConstituent {
+                content_hash,
+                status,
+            })
+            .collect()
+    }
+
+    /// The injected-failure arm, shared by both methods: one FIFO, so a
+    /// test arming a failure drives whichever call its consumer makes.
+    fn armed_error(&self) -> Option<DomainError> {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.errors.lock().unwrap().pop_front()
     }
 }
 
@@ -6471,27 +6603,22 @@ impl ConstituentStatusReader for MockConstituentStatusReader {
         repository_id: Uuid,
         constituents: &'a [ContentHash],
     ) -> BoxFut<'a, DomainResult<Option<TerminalConstituent>>> {
-        self.calls.fetch_add(1, Ordering::Relaxed);
-        if let Some(err) = self.errors.lock().unwrap().pop_front() {
+        if let Some(err) = self.armed_error() {
             return Box::pin(async move { Err(err) });
         }
-        // Rank by the domain's refusal precedence, then by the caller's
-        // closure position — the statement's `ORDER BY t.precedence,
-        // w.position`.
-        let precedence = terminal_statuses_by_refusal_precedence();
-        let answer = constituents
-            .iter()
-            .enumerate()
-            .filter_map(|(position, hash)| {
-                let status = self.artifacts.live_status_in_repo(repository_id, hash)?;
-                let rank = precedence.iter().position(|s| *s == status)?;
-                Some((rank, position, hash.clone(), status))
-            })
-            .min_by_key(|(rank, position, _, _)| (*rank, *position))
-            .map(|(_, _, content_hash, status)| TerminalConstituent {
-                content_hash,
-                status,
-            });
+        let answer = self.ranked(repository_id, constituents).into_iter().next();
+        Box::pin(async move { Ok(answer) })
+    }
+
+    fn terminal_constituents<'a>(
+        &'a self,
+        repository_id: Uuid,
+        constituents: &'a [ContentHash],
+    ) -> BoxFut<'a, DomainResult<Vec<TerminalConstituent>>> {
+        if let Some(err) = self.armed_error() {
+            return Box::pin(async move { Err(err) });
+        }
+        let answer = self.ranked(repository_id, constituents);
         Box::pin(async move { Ok(answer) })
     }
 }
@@ -10767,9 +10894,6 @@ mod tests {
             repository_ids: None,
             expires_at: None,
             revoked_at: None,
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: Uuid::new_v4(),
             created_at: Utc::now(),
             issued_via: IssuedVia::HttpMint,

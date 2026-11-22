@@ -34,13 +34,14 @@
 //!
 //! The bulk routes are the fail-open half of curation and their contract
 //! is the inverse of `block versions`'. One entry that is unresolvable,
-//! ambiguous, or in a state a bulk waive does not reach aborts the whole
-//! batch: `409 Conflict` carrying the full per-entry report, and **zero
-//! releases applied**. `ArtifactReleased` is history that cannot be
-//! retracted, so releasing the resolvable subset of a list the curator
-//! wrote wrongly is the defect that contract exists to prevent — while a
-//! block the curator did not mean is reversible a minute later. Hence
-//! also the entry cap: 25 per bulk waive against `block`'s 100.
+//! ambiguous, in a state a bulk waive does not reach, or on a stream with
+//! no room for its release event aborts the whole batch: `409 Conflict`
+//! carrying the full per-entry report, and **zero releases applied**.
+//! `ArtifactReleased` is history that cannot be retracted, so releasing
+//! the resolvable subset of a list the curator wrote wrongly is the defect
+//! that contract exists to prevent — while a block the curator did not
+//! mean is reversible a minute later. Hence also the entry cap: 25 per
+//! bulk waive against `block`'s 100.
 //!
 //! The report is **data, not a message**: it names every entry, the fine
 //! ones included, so a curator who asked for five releases and got none
@@ -48,6 +49,19 @@
 //! It is therefore printed to the chosen output stream — verbatim under
 //! `--output json` — and the command exits [`WAIVE_ABORTED_EXIT`] rather
 //! than flattening the report into an error sentence on stderr.
+//!
+//! # Three exit codes, because a batch has three answers
+//!
+//! What pre-validation cannot exclude is an artifact moving between the
+//! check and the append — each release is its own transaction. So a `200`
+//! comes in two kinds, and the body says which: `outcome: "ok"` exits `0`,
+//! `outcome: "partial"` exits [`WAIVE_PARTIAL_EXIT`] with the `FAILED`
+//! section naming the entries to re-issue. A `409` exits
+//! [`WAIVE_ABORTED_EXIT`]. **The asymmetry with `block` is deliberate and
+//! must not be tidied away**: a partial block is its documented contract
+//! and exits `0`, because what landed there is the restrictive direction
+//! and a retry costs the operator nothing. The two verbs share the failure
+//! *rendering* and nothing about the verdict.
 //!
 //! # Client-side validation
 //!
@@ -89,6 +103,21 @@ use super::{
 /// `RetentionExit`, which separates "I never saw the result" from "the
 /// operator said no" for the same reason.
 pub const WAIVE_ABORTED_EXIT: u8 = 3;
+
+/// Exit code for a bulk waive that applied part of itself.
+///
+/// Its own code rather than [`WAIVE_ABORTED_EXIT`], because the two need
+/// opposite reactions: an aborted batch released nothing and is re-runnable
+/// in full once the named entries are fixed, while a partial one already
+/// emitted `ArtifactReleased` events that nothing retracts — the operator
+/// re-issues the **failed subset only**, and re-running the whole list
+/// would be a second decision over artifacts already released.
+///
+/// And not `0`, which is the defect this code exists to close: the server
+/// has always named the failed entries in the body and this command has
+/// always printed them, but an unattended caller saw a zero exit and a
+/// batch that had released part of what it was asked to.
+pub const WAIVE_PARTIAL_EXIT: u8 = 4;
 
 // ---------------------------------------------------------------------------
 // Wire DTOs (request bodies)
@@ -141,6 +170,10 @@ struct WaiveDigestsRequestBody<'a> {
 /// `hort-http-core::handlers::admin::curation::waive_bulk`.
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 pub struct WaiveOutcomeDto {
+    /// Which of the two `200` outcomes this is: `"ok"` (every entry
+    /// applied) or `"partial"` (at least one did not). The exit code is
+    /// read off this and nothing else — see [`applied_exit`].
+    pub outcome: String,
     /// Shared by every `ArtifactReleased` this call emitted.
     pub correlation_id: Uuid,
     /// Artifacts released **on this call** — one `ArtifactReleased` each.
@@ -455,7 +488,7 @@ async fn submit_bulk<B: serde::Serialize>(
     match answer {
         Ok(outcome) => {
             render_outcome(&outcome, output, out, use_ansi)?;
-            Ok(ExitCode::SUCCESS)
+            Ok(applied_exit(&outcome))
         }
         Err(failure) => match parse_abort(&failure) {
             Some(abort) => {
@@ -500,6 +533,23 @@ fn removed_form_error(captured: &[String]) -> anyhow::Error {
          hort-cli curation waive digests --repo <key> --digests <sha256>,… \
          --justification '…'"
     )
+}
+
+/// The exit code a `200` deserves, read off the body's own `outcome`
+/// discriminator.
+///
+/// **Not recomputed from `failed.len()`.** The server decides which of
+/// the two successful outcomes a call is, and a client that re-derives
+/// that verdict from the server's data can disagree with the body it is
+/// printing. Anything other than `"ok"` is treated as partial: on this
+/// verb the unsafe direction is reporting success, so an answer this
+/// build cannot name exits non-zero rather than zero.
+fn applied_exit(outcome: &WaiveOutcomeDto) -> ExitCode {
+    if outcome.outcome == "ok" {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(WAIVE_PARTIAL_EXIT)
+    }
 }
 
 /// Recognise the abort report, or `None` when this refusal is not it.
@@ -694,6 +744,7 @@ mod tests {
 
     fn applied() -> WaiveOutcomeDto {
         WaiveOutcomeDto {
+            outcome: "ok".to_string(),
             correlation_id: Uuid::nil(),
             released_artifact_ids: vec![uuid(ARTIFACT_A)],
             already_released_ids: vec![uuid(ARTIFACT_B)],
@@ -890,6 +941,7 @@ mod tests {
     #[test]
     fn an_empty_list_renders_no_section_for_itself() {
         let outcome = WaiveOutcomeDto {
+            outcome: "ok".to_string(),
             correlation_id: Uuid::nil(),
             released_artifact_ids: vec![uuid(ARTIFACT_A)],
             already_released_ids: vec![],
@@ -931,8 +983,9 @@ mod tests {
             assert!(!out.contains('\x1b'), "JSON never carries ANSI: {out:?}");
             let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid json");
             let obj = parsed.as_object().expect("object");
-            assert_eq!(obj.len(), 4, "exactly the server's members: {out}");
+            assert_eq!(obj.len(), 5, "exactly the server's members: {out}");
             for key in [
+                "outcome",
                 "correlation_id",
                 "released_artifact_ids",
                 "already_released_ids",
@@ -948,7 +1001,8 @@ mod tests {
     #[test]
     fn the_outcome_dto_round_trips_the_servers_body() {
         let body = format!(
-            r#"{{"correlation_id":"{ARTIFACT_A}","released_artifact_ids":["{ARTIFACT_B}"],
+            r#"{{"outcome":"ok","correlation_id":"{ARTIFACT_A}",
+                 "released_artifact_ids":["{ARTIFACT_B}"],
                  "already_released_ids":[],"failed":[]}}"#
         );
         let parsed: WaiveOutcomeDto = serde_json::from_str(&body).expect("parses");
@@ -957,6 +1011,56 @@ mod tests {
                 .expect("valid json");
         let original: serde_json::Value = serde_json::from_str(&body).expect("valid json");
         assert_eq!(reserialized, original);
+    }
+
+    // -- the exit code the applied arm hands back ---------------------------
+
+    /// The missing signal, as the only thing a script can see: a batch
+    /// that released part of what it was asked to must not leave a zero
+    /// exit behind the `FAILED` section it just printed.
+    #[test]
+    fn a_partial_apply_exits_nonzero_and_a_full_one_exits_zero() {
+        let mut partial = applied();
+        partial.outcome = "partial".to_string();
+        partial.failed.push(FailedBlockEntryDto {
+            artifact_id: uuid(ARTIFACT_A),
+            error_kind: "conflict".to_string(),
+            message: "event-store version conflict".to_string(),
+        });
+        assert_eq!(
+            format!("{:?}", applied_exit(&partial)),
+            format!("{:?}", ExitCode::from(WAIVE_PARTIAL_EXIT))
+        );
+        assert_eq!(
+            format!("{:?}", applied_exit(&applied())),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+    }
+
+    /// A discriminator this build cannot name exits non-zero. On a verb
+    /// whose failure mode is an irreversible release, "I did not
+    /// understand the answer" must not render as success.
+    #[test]
+    fn an_unrecognised_discriminator_does_not_exit_zero() {
+        let mut odd = applied();
+        odd.outcome = "something-new".to_string();
+        assert_eq!(
+            format!("{:?}", applied_exit(&odd)),
+            format!("{:?}", ExitCode::from(WAIVE_PARTIAL_EXIT))
+        );
+    }
+
+    /// The two non-zero codes are distinct, because the two outcomes need
+    /// opposite reactions: re-run the fixed list, or re-issue the failed
+    /// subset only.
+    #[test]
+    fn the_aborted_and_partial_exit_codes_are_distinct() {
+        assert_ne!(WAIVE_ABORTED_EXIT, WAIVE_PARTIAL_EXIT);
+        assert_ne!(WAIVE_PARTIAL_EXIT, 0);
+        assert_ne!(
+            WAIVE_PARTIAL_EXIT, 1,
+            "1 is \"never got a readable answer\""
+        );
     }
 
     // -- the aborted arm ----------------------------------------------------

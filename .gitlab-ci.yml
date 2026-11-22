@@ -158,10 +158,11 @@ workflow:
   - "about/**/*"
   - "THIRD-PARTY-LICENSES.md"
   - "THIRD-PARTY-LICENSES.json"
-  # The accepted-CVE list the image CVE gates honour (one list, shared with
-  # the ghcr publish gate). An edit to it changes a gate verdict, so it must
-  # re-run the gate that reads it.
+  # The repo-root project-wide list reaches the GitLab scans and ghcr publish;
+  # the base-image YAML list reaches only GitLab's --pull warning scan. Changes
+  # to either list must re-run the gate whose verdict they can alter.
   - ".trivyignore"
+  - ".trivyignore.base-images.yaml"
 
 # Shared rule template for jobs with no other rules: `!reference`'d as
 # `<<: [*other-anchor, *rules-code-changed]` (YAML merge; GitLab supports
@@ -739,7 +740,13 @@ test:unit:
     - *hort-auth-steps
     - !reference [.sccache, before_script]
   script:
-    - cargo test --workspace --lib --verbose
+    # No `--verbose`: it prints every rustc invocation, and those command
+    # lines exhaust GitLab's 4 MB job-log limit DURING COMPILATION — the log
+    # stops collecting before the first test result, so a failing test is
+    # undiagnosable from CI and has to be reproduced locally. Plain output
+    # still carries one `Compiling <crate>` line each, which is what a
+    # timeout diagnosis actually needs, for about 20 KB.
+    - cargo test --workspace --lib
 
 # Parity with coverage. hort-domain/hort-app are pure Rust zero-I/O libraries
 # and the adapter crates use runtime sqlx (no query! macros), so no
@@ -851,7 +858,13 @@ test:integration:
     - apt-get install -y -qq --no-install-recommends postgresql-client
     - for i in $(seq 1 30); do pg_isready -h postgres -U "${POSTGRES_USER}" && break; sleep 1; done
   script:
-    - cargo test --workspace --tests --verbose
+    # No `--verbose`: it prints every rustc invocation, and those command
+    # lines exhaust GitLab's 4 MB job-log limit DURING COMPILATION — the log
+    # stops collecting before the first test result, so a failing test is
+    # undiagnosable from CI and has to be reproduced locally. Plain output
+    # still carries one `Compiling <crate>` line each, which is what a
+    # timeout diagnosis actually needs, for about 20 KB.
+    - cargo test --workspace --tests
 
 # GitLab-side cargo-proxy warm + a scheduled readiness probe. develop lives
 # on GitLab, so a GitLab-side warm reacts to a Cargo.lock change immediately

@@ -96,6 +96,44 @@ pub trait ConstituentStatusReader: Send + Sync {
         repository_id: Uuid,
         constituents: &'a [ContentHash],
     ) -> BoxFuture<'a, DomainResult<Option<TerminalConstituent>>>;
+
+    /// The same question answered **per hash**: one entry for every
+    /// member of `constituents` that has at least one live row in
+    /// `repository_id` carrying a terminal status, holding the
+    /// **strongest** terminal status among that hash's rows. A hash with
+    /// no live row — or with live rows none of which is terminal — has no
+    /// entry, for the same reason [`Self::strongest_terminal_constituent`]
+    /// answers [`None`] for it: absence is not a hold.
+    ///
+    /// Ordered strongest first, ties inside one status class by the
+    /// caller's own position in `constituents`, which is the ordering
+    /// [`Self::strongest_terminal_constituent`] ranks by. So the first
+    /// entry **is** that method's answer, and an implementation MUST keep
+    /// the two equal — this is one question with two budgets, never two
+    /// selections.
+    ///
+    /// # Why both exist
+    ///
+    /// A manifest read needs one answer about a whole closure and runs on
+    /// the registry's hottest path, so it asks for one row. **Admission**
+    /// needs the verdict per declared reference as well: its refusal
+    /// names one constituent, so its per-reference log is the record of
+    /// the others, and that record must come from this derivation rather
+    /// than from a second lookup with a selection of its own. A
+    /// repository may legitimately hold more than one live row for one
+    /// hash (a blob and a manifest sharing bytes, with independent
+    /// statuses), and an identity lookup answers "some row for these
+    /// bytes" — which is not a verdict.
+    ///
+    /// One call for the whole set, for the reason in the module doc: a
+    /// per-constituent fan-out puts a round trip on every reference of
+    /// every push. An empty `constituents` slice MUST NOT reach the
+    /// database.
+    fn terminal_constituents<'a>(
+        &'a self,
+        repository_id: Uuid,
+        constituents: &'a [ContentHash],
+    ) -> BoxFuture<'a, DomainResult<Vec<TerminalConstituent>>>;
 }
 
 /// The terminal statuses, strongest first — the set an implementation
@@ -206,6 +244,14 @@ mod tests {
         ) -> BoxFuture<'a, DomainResult<Option<TerminalConstituent>>> {
             Box::pin(async { Ok(None) })
         }
+
+        fn terminal_constituents<'a>(
+            &'a self,
+            _repository_id: Uuid,
+            _constituents: &'a [ContentHash],
+        ) -> BoxFuture<'a, DomainResult<Vec<TerminalConstituent>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
     }
 
     #[tokio::test]
@@ -217,6 +263,28 @@ mod tests {
                 .await
                 .expect("the no-op reader cannot fail"),
             None
+        );
+    }
+
+    /// The per-hash answer agrees with the single-answer one on the
+    /// contract they share: nothing terminal is an empty list, never an
+    /// invented hold — and its first entry is the other method's answer.
+    #[tokio::test]
+    async fn an_implementation_that_knows_nothing_reports_no_terminal_constituent_per_hash() {
+        let port: &dyn ConstituentStatusReader = &NothingTerminal;
+        let hash: ContentHash = "a".repeat(64).parse().expect("valid sha256");
+        let repo = Uuid::new_v4();
+        let per_hash = port
+            .terminal_constituents(repo, std::slice::from_ref(&hash))
+            .await
+            .expect("the no-op reader cannot fail");
+        assert_eq!(per_hash, Vec::new());
+        assert_eq!(
+            per_hash.first().cloned(),
+            port.strongest_terminal_constituent(repo, &[hash])
+                .await
+                .expect("the no-op reader cannot fail"),
+            "the first per-hash entry is the strongest-constituent answer"
         );
     }
 }

@@ -36,6 +36,13 @@ If none of these apply, prefer
 or
 [`federate-ci-oidc.md`](./federate-ci-oidc.md).
 
+**One trigger is not about the mechanism at all:** granting an existing
+ServiceAccount a permission it did not have. Its already-issued token
+carries a cap frozen at issuance, so the new grant reaches every future
+token and no existing one — a rotation is what delivers it. See
+[`operate/claim-based-rbac.md`](./operate/claim-based-rbac.md) §3 for
+when the freeze bites and when it does not.
+
 ---
 
 ## 2. How it works

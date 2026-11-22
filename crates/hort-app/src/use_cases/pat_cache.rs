@@ -77,9 +77,9 @@ impl CacheKey {
 /// The fields a cached PAT validation carries forward.
 ///
 /// Intentionally minimal — anything not needed by the auth-middleware
-/// hot path stays out (the `token_hash`, `token_prefix`,
-/// `last_used_*` columns are repository-only). The validator
-/// re-checks `expires_at` and `revoked_at` on every cache hit so a
+/// hot path stays out (the `token_hash` and `token_prefix` columns are
+/// repository-only). The validator re-checks `expires_at` and
+/// `revoked_at` on every cache hit so a
 /// token that expires mid-cache-TTL is still rejected without a round
 /// trip — see the cache-hit fast path ("Cache hit + non-revoked +
 /// non-expired → return cached").

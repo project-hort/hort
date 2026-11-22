@@ -631,7 +631,10 @@ pub struct Checkpoint {
     /// Per-stream heads this checkpoint anchored: `(stream_id,
     /// final_stream_position, head_event_hash)`.
     pub stream_heads: Vec<(String, u64, EventHash)>,
-    /// `StreamSealed` records covered since the previous checkpoint.
+    /// `StreamSealed` records covered since the previous **anchored**
+    /// checkpoint — a delta, so the full anchored seal set is the union
+    /// over every checkpoint (which is how
+    /// [`verify_against_checkpoint`] reads it).
     pub sealed_streams: Vec<SealedStreamRecord>,
 }
 
@@ -975,7 +978,16 @@ pub fn verify_against_checkpoint(
         // with a better answer.
         live_by_id.entry(sid.as_str()).or_insert((*pos, head));
     }
+    // `sealed` is the COMPLETE live seal history (the reader's
+    // `read_sealed_records` is unwindowed on purpose): a seal justifies an
+    // absence for as long as a checkpoint still names the absent stream,
+    // which outlives any window.
     let sealed_ids: HashSet<&str> = sealed.iter().map(|r| r.sealed_stream_id.as_str()).collect();
+    // The anchored side is the UNION over every checkpoint, which is what
+    // lets each checkpoint carry only the seals since the previous
+    // anchored one: the checkpoint that first carried a seal carries it
+    // forever, so a delta per checkpoint still leaves every seal anchored
+    // by some checkpoint.
     let anchored_seals: HashSet<(&str, &EventHash)> = checkpoints
         .iter()
         .flat_map(|c| c.sealed_streams.iter())
@@ -1770,6 +1782,102 @@ mod tests {
         assert_eq!(
             anchor_check(&live, &sealed, &cps),
             broke(AnchorBreak::SealUnanchored)
+        );
+    }
+
+    /// Union pin: with each checkpoint carrying only the seals since the
+    /// previous anchored one, a seal is anchored by exactly ONE
+    /// checkpoint — the first one that saw it — and never again. The
+    /// anchored side therefore has to be the union over every
+    /// checkpoint; judging a seal against the newest cut alone would
+    /// report `SealUnanchored` on every seal older than one tick.
+    #[test]
+    fn a_seal_anchored_only_by_an_older_checkpoint_is_still_anchored() {
+        let live_sid = "admin-a".to_string();
+        let live_head = EventHash([1u8; 32]);
+        let gone_sid = "admin-gone".to_string();
+        let gone_head = EventHash([9u8; 32]);
+
+        // The older checkpoint carried the seal as its delta.
+        let mut older = cp(1, 7_200, vec![(live_sid.clone(), 0, live_head)]);
+        older.sealed_streams = vec![SealedStreamRecord {
+            sealed_stream_id: gone_sid.clone(),
+            final_event_hash: gone_head,
+        }];
+        // Every later checkpoint's delta is empty: nothing was sealed
+        // since, which is the steady state the window produces.
+        let newer = cp(2, 60, vec![(live_sid.clone(), 0, live_head)]);
+        let newest = cp(3, 1, vec![(live_sid.clone(), 0, live_head)]);
+        assert!(
+            newer.sealed_streams.is_empty() && newest.sealed_streams.is_empty(),
+            "the point of this test is the two later deltas being empty"
+        );
+
+        let live = vec![(live_sid, 0, live_head)];
+        let sealed = vec![SealedStreamRecord {
+            sealed_stream_id: gone_sid,
+            final_event_hash: gone_head,
+        }];
+        assert_eq!(
+            anchor_check(&live, &sealed, &[older, newer, newest]),
+            AnchorFindings::default(),
+            "a seal only the oldest checkpoint carried must not read as \
+             SealUnanchored"
+        );
+    }
+
+    /// Absence pin: the live seal set the cross-check consults is the
+    /// COMPLETE history (`read_sealed_records` is unwindowed on purpose).
+    /// A stream sealed long before the newest checkpoint's window is
+    /// still absent now, and the ancient seal is the only thing that
+    /// justifies the absence — windowing that read too would turn every
+    /// long-ago-sealed stream into `UnsealedAbsentStream`, a tamper
+    /// finding on clean data.
+    #[test]
+    fn a_stream_sealed_before_the_window_and_now_absent_is_justified() {
+        let live_sid = "admin-a".to_string();
+        let live_head = EventHash([1u8; 32]);
+        let gone_sid = "admin-gone".to_string();
+        let gone_head = EventHash([9u8; 32]);
+
+        // The oldest checkpoint anchored the stream's head AND, as its
+        // delta, the seal that removed it.
+        let mut older = cp(
+            1,
+            7_200,
+            vec![
+                (live_sid.clone(), 0, live_head),
+                (gone_sid.clone(), 4, gone_head),
+            ],
+        );
+        older.sealed_streams = vec![SealedStreamRecord {
+            sealed_stream_id: gone_sid.clone(),
+            final_event_hash: gone_head,
+        }];
+        // The newest checkpoint no longer sees the stream (it is gone)
+        // and its seal delta is empty.
+        let newest = cp(2, 1, vec![(live_sid.clone(), 0, live_head)]);
+
+        let live = vec![(live_sid, 0, live_head)];
+        // The full live seal history — what the unwindowed verification
+        // read returns, and the only input that can justify the absence.
+        let sealed = vec![SealedStreamRecord {
+            sealed_stream_id: gone_sid.clone(),
+            final_event_hash: gone_head,
+        }];
+        assert_eq!(
+            anchor_check(&live, &sealed, &[older.clone(), newest.clone()]),
+            AnchorFindings::default()
+        );
+
+        // Counter-assertion: the same inputs with the seal history
+        // windowed away — what a filter on the verification read would
+        // produce — DO break, so the assertion above is not vacuous.
+        assert_eq!(
+            anchor_check(&live, &[], &[older, newest]),
+            broke(AnchorBreak::UnsealedAbsentStream),
+            "windowing the verification read must be what breaks, so this \
+             test fails if someone filters it"
         );
     }
 

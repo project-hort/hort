@@ -1024,14 +1024,13 @@ fn has_traversal_segment(name: &str) -> bool {
 /// Read `META-INF/maven/{group_id}/{artifact_id}/pom.xml` out of a
 /// `.jar`/`.war` payload and extract its declared dependencies.
 ///
-/// Bounded by [`crate::archive_bounds::BoundsConfig::default_for_metadata_extraction`]
-/// (10 MiB decompressed / 10x compression-ratio / 1024 entries — the same
-/// cap the PyPI wheel-METADATA extractor uses). Degrades to
-/// [`subject_only`] rather than erroring on every non-fatal outcome: no
+/// The named POM's decompressed bytes are bounded by
+/// [`crate::archive_bounds::MAX_NAMED_ZIP_OUTPUT_BYTES`] (512 KiB).
+/// The archive's other entries are not read. Degrades to [`subject_only`]
+/// rather than erroring on every non-fatal outcome: no
 /// embedded POM (the common case — most Maven jars don't embed one),
 /// a corrupt/non-ZIP jar, or an embedded POM that isn't well-formed XML.
-/// A bounds trip (entry-count or decompression-ratio cap exceeded) is the
-/// one outcome treated as hostile input and also degrades softly, logged
+/// A decompression bound trip is treated as hostile input and also degrades softly, logged
 /// at `warn` — SBOM enrichment must never abort a scan.
 fn extract_jar_embedded_pom_sbom(
     coords: &ArtifactCoords,
@@ -1044,11 +1043,12 @@ fn extract_jar_embedded_pom_sbom(
     // differently:
     //
     // - `Bytes` is seekable in place through a `Cursor`.
-    // - `ReadSeek` already is what the walk wants, and these bytes are
+    // - `ReadSeek` already is what the named lookup wants, and these bytes are
     //   deliberately not in memory — buffering them would spend the
     //   whole archive to read one `pom.xml`.
     // - `ReadStream` is forward-only, so a tail-indexed member table is
-    //   out of reach without buffering it first.
+    //   out of reach without buffering the whole jar first. This is the
+    //   only path that pulls the entire archive into memory.
     match payload {
         PayloadAccess::Bytes(b) => {
             jar_embedded_pom_sbom_from_zip(Cursor::new(b), coords, group_id, artifact_id, subject)
@@ -1068,8 +1068,8 @@ fn extract_jar_embedded_pom_sbom(
 
 /// The ZIP half of [`extract_jar_embedded_pom_sbom`], over any seekable
 /// archive. Generic rather than `&[u8]` for the reason the sibling PyPI
-/// kernel is: a ZIP's member table is its central directory, so the walk
-/// seeks to the one entry it wants and never needs the archive resident.
+/// kernel is: a ZIP's member table is its central directory, so the named
+/// lookup seeks to the one entry it wants and never needs the archive resident.
 fn jar_embedded_pom_sbom_from_zip<R: Read + Seek>(
     zip: R,
     coords: &ArtifactCoords,
@@ -1084,38 +1084,21 @@ fn jar_embedded_pom_sbom_from_zip<R: Read + Seek>(
     // not a slash-expanded one.
     let expected_path = format!("META-INF/maven/{group_id}/{artifact_id}/pom.xml");
 
-    let mut pom_bytes: Option<Vec<u8>> = None;
-    let mut read_err: Option<String> = None;
-    let iter_result = crate::archive_bounds::iter_zip_entries(
-        zip,
-        crate::archive_bounds::BoundsConfig::default_for_metadata_extraction(),
-        |name, reader| {
-            if read_err.is_some() || pom_bytes.is_some() {
-                return;
-            }
-            if has_traversal_segment(name) || name != expected_path {
-                return;
-            }
-            let mut out = Vec::new();
-            match reader.read_to_end(&mut out) {
-                Ok(_) => pom_bytes = Some(out),
-                Err(e) => read_err = Some(format!("maven jar embedded pom read failed: {e}")),
-            }
-        },
-    );
+    if has_traversal_segment(&expected_path) {
+        return Ok(subject_only(subject, SbomResolution::NoLockfile));
+    }
 
-    match iter_result {
-        // The skipped-name count is not picked up here: a jar with no
-        // readable embedded POM already degrades to the same subject-only
-        // resolution whatever the reason, and that resolution is reported
-        // with the artifact's own coordinates, so the count would not
-        // sharpen the operator's diagnosis.
-        Ok(_) => {}
+    let pom_bytes = match crate::archive_bounds::read_zip_entry_by_name(
+        zip,
+        crate::archive_bounds::MAX_NAMED_ZIP_OUTPUT_BYTES,
+        &expected_path,
+    ) {
+        Ok(bytes) => bytes,
         // Not a valid ZIP — non-fatal: the same leaf outcome as a jar
         // with no embedded POM. The primary-content-hash check already
         // verified this artifact at ingest; SBOM extraction just can't
         // say more about it.
-        Err(crate::archive_bounds::ZipIterError::Open(_)) => {
+        Err(crate::archive_bounds::ZipNamedError::Open(_)) => {
             return Ok(subject_only(subject, SbomResolution::NoLockfile));
         }
         Err(e) => {
@@ -1126,15 +1109,7 @@ fn jar_embedded_pom_sbom_from_zip<R: Read + Seek>(
             );
             return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
         }
-    }
-    if let Some(msg) = read_err {
-        tracing::warn!(
-            artifact = %coords.name,
-            error = %msg,
-            "maven SBOM: embedded pom.xml read failed; degrading to subject-only",
-        );
-        return Ok(subject_only(subject, SbomResolution::UnusableLockfile));
-    }
+    };
 
     let Some(pom_bytes) = pom_bytes else {
         // No embedded POM — the leaf case. OSV can still query the
@@ -2628,6 +2603,132 @@ mod tests {
     }
 
     #[test]
+    fn extract_sbom_jar_accepts_embedded_pom_above_ten_times_compressed_size() {
+        let dependency = r#"<dependency>
+            <groupId>com.example</groupId><artifactId>compile-lib</artifactId>
+            <version>1.1</version>
+        </dependency>"#;
+        let xml = pom_wrapped(&format!(
+            "<dependencies>{}</dependencies>",
+            dependency.repeat(120)
+        ));
+        let entry_path = "META-INF/maven/com.example/app/pom.xml";
+        let jar_bytes = crate::test_support::build_wheel_zip(&[(entry_path, xml.as_bytes())]);
+        {
+            let mut archive =
+                zip::ZipArchive::new(Cursor::new(&jar_bytes)).expect("fixture zip opens");
+            let entry = archive.by_name(entry_path).expect("fixture POM exists");
+            assert_eq!(entry.size(), xml.len() as u64);
+            assert!(
+                entry.size()
+                    > entry.compressed_size() * crate::archive_bounds::COMPRESSION_RATIO_LIMIT,
+                "fixture must compress beyond the walk's ratio limit"
+            );
+        }
+
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(&jar_bytes),
+            )
+            .expect("jar zip opens");
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        assert!(!extraction.sbom.expect("sbom present").components.is_empty());
+    }
+
+    #[test]
+    fn extract_sbom_jar_refuses_embedded_pom_above_named_ceiling() {
+        let xml = pom_wrapped(&format!(
+            "<description>{}</description>",
+            "x".repeat(crate::archive_bounds::MAX_NAMED_ZIP_OUTPUT_BYTES as usize)
+        ));
+        assert!(xml.len() as u64 > crate::archive_bounds::MAX_NAMED_ZIP_OUTPUT_BYTES);
+        assert!(pom::parse_pom_dependencies(&mut Cursor::new(xml.as_bytes())).is_ok());
+        let entry_path = "META-INF/maven/com.example/app/pom.xml";
+        let jar_bytes = crate::test_support::build_wheel_zip(&[(entry_path, xml.as_bytes())]);
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(&jar_bytes),
+            )
+            .expect("oversized POM degrades softly");
+        assert_eq!(extraction.resolution, SbomResolution::UnusableLockfile);
+        assert!(extraction
+            .sbom
+            .expect("subject-only fallback")
+            .components
+            .is_empty());
+    }
+
+    #[test]
+    fn extract_sbom_jar_with_1030_entries_reads_the_named_pom() {
+        const JAR_ENTRIES: usize = 1030;
+        const { assert!(JAR_ENTRIES > crate::archive_bounds::MAX_ENTRIES) };
+        let xml = pom_wrapped(
+            r#"<dependencies>
+                 <dependency>
+                   <groupId>com.example</groupId><artifactId>compile-lib</artifactId>
+                   <version>1.1</version>
+                 </dependency>
+               </dependencies>"#,
+        );
+        let names: Vec<String> = (0..JAR_ENTRIES - 2)
+            .map(|i| format!("com/example/C{i}.class"))
+            .collect();
+        let mut files: Vec<(&str, &[u8])> = vec![
+            (
+                "META-INF/maven/com.example/app/pom.properties",
+                b"groupId=com.example\nartifactId=app\nversion=1.2.3\n",
+            ),
+            ("META-INF/maven/com.example/app/pom.xml", xml.as_bytes()),
+        ];
+        files.extend(
+            names
+                .iter()
+                .map(|name| (name.as_str(), b"class".as_slice())),
+        );
+        assert_eq!(files.len(), JAR_ENTRIES);
+        let jar_bytes = crate::test_support::build_wheel_zip(&files);
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let extraction = payload_sbom()
+            .extract_sbom_from_payload(
+                &coords,
+                &serde_json::Value::Null,
+                PayloadAccess::Bytes(&jar_bytes),
+            )
+            .expect("jar zip opens");
+        assert_eq!(extraction.resolution, SbomResolution::Resolved);
+        let sbom = extraction.sbom.expect("sbom present");
+        assert_eq!(sbom.components.len(), 1);
+        assert_eq!(
+            sbom.components[0].purl,
+            "pkg:maven/com.example/compile-lib@1.1"
+        );
+        assert_eq!(
+            read_jar_descriptor_identity(&jar_bytes),
+            JarDescriptorIdentity::Undeclared {
+                reason: "jar zip walk stopped by the archive bounds",
+            },
+        );
+    }
+
+    #[test]
     fn extract_sbom_jar_without_embedded_pom_is_a_subject_only_leaf() {
         let jar_bytes = crate::test_support::build_wheel_zip(&[(
             "com/example/App.class",
@@ -2688,6 +2789,24 @@ mod tests {
             .expect("subject-only leaf")
             .components
             .is_empty());
+    }
+
+    #[test]
+    fn jar_embedded_pom_lookup_refuses_a_traversal_shaped_expected_path() {
+        let coords = file_coords(
+            "com.example:app",
+            "1.2.3",
+            "com/example/app/1.2.3/app-1.2.3.jar",
+        );
+        let subject = maven_subject_component(&coords).expect("valid subject");
+        let jar_bytes = crate::test_support::build_wheel_zip(&[(
+            "META-INF/maven/../app/pom.xml",
+            b"<project/>".as_slice(),
+        )]);
+        let extraction =
+            jar_embedded_pom_sbom_from_zip(Cursor::new(jar_bytes), &coords, "..", "app", subject)
+                .expect("traversal path degrades softly");
+        assert_eq!(extraction.resolution, SbomResolution::NoLockfile);
     }
 
     #[test]

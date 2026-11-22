@@ -77,7 +77,11 @@ spec:
             {{- include "hort-server.selectorLabels" . | nindent 12 }}
             hort-server.io/job: eventstore-archive
         spec:
-          restartPolicy: OnFailure
+          # Never, not OnFailure: under OnFailure the Job controller counts
+          # in-place container restarts against backoffLimit (with >=), so a
+          # transient error fails the Job even when the restart then succeeds.
+          # Under Never each attempt is its own pod, with its own log.
+          restartPolicy: Never
           securityContext:
             {{- toYaml .Values.podSecurityContext | nindent 12 }}
           containers:

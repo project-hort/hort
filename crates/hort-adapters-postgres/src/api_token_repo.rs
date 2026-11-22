@@ -3,21 +3,6 @@
 //! Implements ADR 0012 §3 (schema), §4 (issuance), §5 (validator path +
 //! multi-replica revocation invalidation via `LISTEN/NOTIFY`).
 //!
-//! # GDPR data minimisation
-//!
-//! [`PgApiTokenRepository::update_last_used`] is the sole writer of the
-//! `last_used_*` columns. `last_used` retention:
-//!
-//! - The `last_used_ip` column is **bucketed at adapter write** —
-//!   `/24` for IPv4, `/48` for IPv6 — by funnelling through
-//!   `hort_app::metrics::client_ip_bucket`. Raw IPs never reach the row.
-//! - The `last_used_user_agent` column is **truncated to 256 chars** at
-//!   write. Truncation respects UTF-8 boundaries: a multi-byte char that
-//!   straddles the 256-byte boundary is dropped wholly rather than split.
-//! - Inputs that fail to parse as `std::net::IpAddr` are stored verbatim
-//!   — the upstream filter rejects malformed input; this adapter MUST NOT
-//!   crash on malformed input.
-//!
 //! # Multi-replica revocation invalidation
 //!
 //! [`PgApiTokenRepository::revoke`] emits
@@ -28,8 +13,6 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
-use hort_app::metrics::client_ip_bucket;
 use hort_domain::entities::api_token::ApiToken;
 use hort_domain::error::DomainResult;
 use hort_domain::ports::api_token_repository::ApiTokenRepository;
@@ -105,13 +88,6 @@ fn duration_to_pg_interval(d: Duration) -> PgInterval {
     }
 }
 
-/// Cap on the persisted `last_used_user_agent` length.
-///
-/// UA strings longer than 256 chars are common fingerprinting signals
-/// and are not
-/// security-useful; persist the prefix only.
-pub(crate) const USER_AGENT_MAX_BYTES: usize = 256;
-
 /// PostgreSQL implementation of [`ApiTokenRepository`].
 pub struct PgApiTokenRepository {
     pool: PgPool,
@@ -131,49 +107,8 @@ const SELECT_COLS: &str = r#"
     token_hash, token_prefix,
     declared_permissions, repository_ids,
     expires_at, revoked_at,
-    last_used_at, last_used_ip, last_used_user_agent,
     created_by_user_id, created_at, issued_via
 "#;
-
-// ---------------------------------------------------------------------------
-// Pure helpers — testable without a DB
-// ---------------------------------------------------------------------------
-
-/// Bucket a raw client-IP string for the `last_used_ip` column.
-///
-/// Strings that fail to parse as [`std::net::IpAddr`] round-trip
-/// unchanged — the upstream validator is the layer that rejects
-/// malformed input; this adapter is best-effort and MUST NOT crash on a
-/// bad string. Strings that DO parse are funnelled through
-/// `hort_app::metrics::client_ip_bucket` (`/24` IPv4, `/48` IPv6) — the
-/// same buckets the brute-force lockout already operates on.
-pub(crate) fn bucket_or_passthrough_ip(raw: &str) -> String {
-    match raw.parse::<std::net::IpAddr>() {
-        Ok(ip) => client_ip_bucket(ip),
-        Err(_) => raw.to_owned(),
-    }
-}
-
-/// Truncate `ua` to at most [`USER_AGENT_MAX_BYTES`] bytes on a UTF-8
-/// boundary.
-///
-/// Naive byte truncation panics if the cut falls inside a multi-byte
-/// codepoint (`String::truncate` panics on a non-char-boundary index);
-/// this helper walks `char_indices` from the end to find the largest
-/// boundary `<= USER_AGENT_MAX_BYTES`. ASCII inputs hit the fast path
-/// (the boundary search is O(1) when every char is one byte).
-pub(crate) fn truncate_user_agent(ua: &str) -> String {
-    if ua.len() <= USER_AGENT_MAX_BYTES {
-        return ua.to_owned();
-    }
-    // `floor_char_boundary` would be cleanest but is unstable. Walk
-    // back from `USER_AGENT_MAX_BYTES` until we hit a char boundary.
-    let mut cut = USER_AGENT_MAX_BYTES;
-    while cut > 0 && !ua.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    ua[..cut].to_owned()
-}
 
 // ---------------------------------------------------------------------------
 // ApiTokenRepository impl
@@ -207,7 +142,6 @@ impl ApiTokenRepository for PgApiTokenRepository {
                     token_hash, token_prefix,
                     declared_permissions, repository_ids,
                     expires_at, revoked_at,
-                    last_used_at, last_used_ip, last_used_user_agent,
                     created_by_user_id, created_at, issued_via
                 )
                 VALUES (
@@ -215,8 +149,7 @@ impl ApiTokenRepository for PgApiTokenRepository {
                     $6, $7,
                     $8::text[], $9::uuid[],
                     $10, $11,
-                    $12, $13, $14,
-                    $15, $16, $17
+                    $12, $13, $14
                 )
                 "#,
             )
@@ -231,9 +164,6 @@ impl ApiTokenRepository for PgApiTokenRepository {
             .bind(&token.repository_ids)
             .bind(token.expires_at)
             .bind(token.revoked_at)
-            .bind(token.last_used_at)
-            .bind(&token.last_used_ip)
-            .bind(&token.last_used_user_agent)
             .bind(token.created_by_user_id)
             .bind(token.created_at)
             .bind(issued_via_str)
@@ -311,45 +241,6 @@ impl ApiTokenRepository for PgApiTokenRepository {
                 items,
                 total: total.unwrap_or(0).max(0) as u64,
             })
-        })
-    }
-
-    fn update_last_used(
-        &self,
-        token_id: Uuid,
-        at: DateTime<Utc>,
-        client_ip: Option<&str>,
-        user_agent: Option<&str>,
-    ) -> BoxFuture<'_, DomainResult<()>> {
-        // Bucket + truncate BEFORE the await — `client_ip` / `user_agent`
-        // are borrowed `&str` in the trait signature, and the GDPR
-        // discipline says raw IPs/UAs never reach the wire.
-        let bucketed_ip = client_ip.map(bucket_or_passthrough_ip);
-        let truncated_ua = user_agent.map(truncate_user_agent);
-        Box::pin(async move {
-            // Logging: never include the raw IP or UA. Token id is
-            // sufficient correlation; the bucketed IP is acceptable to
-            // log but offers no investigation value at debug level.
-            tracing::debug!(
-                entity = "ApiToken",
-                token_id = %token_id,
-                "update_last_used"
-            );
-
-            sqlx::query(
-                "UPDATE api_tokens \
-                 SET last_used_at = $2, last_used_ip = $3, last_used_user_agent = $4 \
-                 WHERE id = $1",
-            )
-            .bind(token_id)
-            .bind(at)
-            .bind(&bucketed_ip)
-            .bind(&truncated_ua)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_sqlx_error(&e, "ApiToken", &token_id.to_string()))?;
-
-            Ok(())
         })
     }
 
@@ -538,113 +429,6 @@ mod tests {
         assert_eq!(i.microseconds, i64::MAX);
         assert_eq!(i.months, 0);
         assert_eq!(i.days, 0);
-    }
-
-    /// IPv4 `203.0.113.42` buckets to `203.0.113.0/24`.
-    #[test]
-    fn bucket_or_passthrough_ip_v4_truncates_to_24() {
-        assert_eq!(bucket_or_passthrough_ip("203.0.113.42"), "203.0.113.0/24");
-    }
-
-    /// IPv6 input buckets to `/48` — the lower 80 bits zeroed. The
-    /// expected wire form is whatever `client_ip_bucket` produces; the
-    /// test asserts byte-for-byte rather than hand-rolling an
-    /// expectation that could drift.
-    #[test]
-    fn bucket_or_passthrough_ip_v6_matches_client_ip_bucket_helper() {
-        let raw = "2001:db8:abcd:0012:0000:0000:0000:0001";
-        let parsed: std::net::IpAddr = raw.parse().unwrap();
-        let expected = client_ip_bucket(parsed);
-        // Sanity that the helper actually buckets at /48 — the lower
-        // 80 bits are gone.
-        assert!(expected.ends_with("/48"));
-        assert!(expected.contains("2001:"));
-        assert!(expected.contains("db8:"));
-        assert!(expected.contains("abcd:"));
-        // The adapter must surface exactly what the helper produces.
-        assert_eq!(bucket_or_passthrough_ip(raw), expected);
-    }
-
-    /// Malformed IP strings (validator's job to filter) are written
-    /// verbatim — the adapter MUST NOT crash on a bad input. Acceptance
-    /// bullet 4 sub-bullet d: store as-is.
-    #[test]
-    fn bucket_or_passthrough_ip_malformed_round_trips_unchanged() {
-        assert_eq!(bucket_or_passthrough_ip("not-an-ip"), "not-an-ip");
-        assert_eq!(bucket_or_passthrough_ip(""), "");
-        // Looks-like-IPv4 but invalid octet count.
-        assert_eq!(bucket_or_passthrough_ip("203.0.113"), "203.0.113");
-    }
-
-    /// 4 KB ASCII UA truncates to exactly [`USER_AGENT_MAX_BYTES`]
-    /// chars. Acceptance bullet 4 sub-bullet c: a 4 KB UA surfaces as
-    /// 256 chars on read.
-    #[test]
-    fn truncate_user_agent_4kb_ascii_truncates_to_256_bytes() {
-        let ua = "x".repeat(4096);
-        let truncated = truncate_user_agent(&ua);
-        assert_eq!(truncated.len(), USER_AGENT_MAX_BYTES);
-        assert!(truncated.chars().all(|c| c == 'x'));
-    }
-
-    /// UA strings shorter than the cap pass through verbatim.
-    #[test]
-    fn truncate_user_agent_under_cap_passes_through() {
-        let ua = "Mozilla/5.0";
-        assert_eq!(truncate_user_agent(ua), ua);
-    }
-
-    /// UA exactly at the cap is kept verbatim — the boundary is
-    /// inclusive.
-    #[test]
-    fn truncate_user_agent_at_exact_cap_unchanged() {
-        let ua = "x".repeat(USER_AGENT_MAX_BYTES);
-        assert_eq!(truncate_user_agent(&ua).len(), USER_AGENT_MAX_BYTES);
-    }
-
-    /// Multi-byte char straddling the 256-byte boundary MUST NOT cause
-    /// a panic, and the truncated string MUST remain valid UTF-8.
-    /// Acceptance bullet 4 sub-bullet c second clause: pick a test
-    /// input that catches a naive byte split.
-    ///
-    /// Construction: 254 bytes of ASCII + a 3-byte UTF-8 char. Naive
-    /// truncation at byte 256 would land inside the 3-byte sequence
-    /// (bytes 254 / 255 of the multi-byte char) and panic via
-    /// `String::truncate`. The boundary-walking implementation backs
-    /// off to byte 254, dropping the multi-byte char wholly.
-    #[test]
-    fn truncate_user_agent_respects_utf8_boundary() {
-        let mut ua = "x".repeat(254);
-        // U+20AC EURO SIGN — encoded as 0xE2 0x82 0xAC (3 bytes).
-        ua.push('\u{20AC}');
-        // Add filler so the input clearly exceeds the 256-byte cap and
-        // forces the truncation path.
-        ua.extend(std::iter::repeat_n('y', 100));
-        assert!(ua.len() > USER_AGENT_MAX_BYTES);
-
-        let truncated = truncate_user_agent(&ua);
-        // Must be valid UTF-8 — the `String::from_utf8` round-trip would
-        // panic on a torn multi-byte sequence.
-        assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
-        // The 3-byte char straddled bytes 254..256; the boundary walker
-        // should back off to 254, dropping it wholly.
-        assert_eq!(truncated.len(), 254);
-        assert!(truncated.chars().all(|c| c == 'x'));
-    }
-
-    /// Boundary case: a 1-byte ASCII char immediately after the cap
-    /// boundary is dropped cleanly with no walk-back needed.
-    #[test]
-    fn truncate_user_agent_257_bytes_ascii_drops_one_char() {
-        let ua = "z".repeat(USER_AGENT_MAX_BYTES + 1);
-        let truncated = truncate_user_agent(&ua);
-        assert_eq!(truncated.len(), USER_AGENT_MAX_BYTES);
-    }
-
-    /// Empty input is the no-op fast path.
-    #[test]
-    fn truncate_user_agent_empty_string() {
-        assert_eq!(truncate_user_agent(""), "");
     }
 
     /// Compile-time + runtime assertion that [`PgApiTokenRepository`]

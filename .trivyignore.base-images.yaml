@@ -1,0 +1,21 @@
+vulnerabilities:
+  # `vulnerabilities:` must stay the FIRST line of this file: the warning gate
+  # assembles its effective ignore list by stripping exactly line 1 and
+  # appending the rest, and refuses to scan at all if the root key is not there.
+  # A comment added above it reddens every code-changing push.
+  #
+  # A base-only acceptance is reviewed for one pinned image and expires, so
+  # neither a stale pin nor an upstream rebuild can leave its warning hidden
+  # forever. The date errs SHORT on purpose: if it lapses before upstream has
+  # rebuilt, this warning gate goes yellow again and we see it, whereas a date
+  # set too late leaves a suppression standing in a list that also reaches the
+  # blocking gates, and nothing says so.
+  - id: CVE-2026-99362
+    expired_at: 2026-12-15
+    statement: >-
+      linux-libc-dev contains kernel headers, not the in-kernel NFS server
+      affected by this vulnerability. The package enters through the
+      digest-pinned rust builder image; the distroless runtime images do not
+      contain it. In the reporting pipeline, both built-image scans found no
+      fixable CRITICAL. Upstream must rebuild rust with fixed linux-libc-dev
+      before the pin can move.

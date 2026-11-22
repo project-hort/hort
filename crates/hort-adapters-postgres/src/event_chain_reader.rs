@@ -178,6 +178,16 @@ impl EventChainReaderPort for PgEventChainReader {
 
     fn read_sealed_records(&self) -> BoxFuture<'_, DomainResult<Vec<SealedStreamRecord>>> {
         Box::pin(async move {
+            // UNWINDOWED, PERMANENTLY — do not add a position filter,
+            // however closely this resembles the emitter's read of the
+            // same stream (`snapshot_live_chain`, windowed on purpose).
+            // `verify_against_checkpoint` consults this set to justify an
+            // anchored stream that is now absent, and that seal is as old
+            // as the absence: a window of any width turns every
+            // long-ago-sealed stream into `UnsealedAbsentStream`, a
+            // tamper finding on clean data. The emission side can window
+            // because it only has to leave each seal anchored by SOME
+            // checkpoint.
             let rows = sqlx::query(
                 r#"SELECT event_data
                    FROM events

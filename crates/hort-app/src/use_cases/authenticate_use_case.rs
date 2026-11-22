@@ -937,18 +937,14 @@ impl AuthenticateUseCase {
             }
         }
 
-        // TODO(token-last-used): debounced `update_last_used` is
-        // deliberately not wired — it is operator UX
-        // (last-seen attribution in the admin token-list view), not a
-        // security primitive. The intended debounce
-        // window is 5 min per token. When wired, this is the natural
-        // hook point: a fire-and-forget `tokio::spawn` enqueueing
-        // `(token_id, at, client_ip, user_agent)` onto a ring buffer
-        // drained by a background task that calls
-        // `ApiTokenRepository::update_last_used` at most once per
-        // 5 min per token. The `last_used_*` columns + the bucketed-IP
-        // / 256-byte-UA truncation already exist on the adapter,
-        // so the debounce is the only missing piece.
+        // No per-token row bookkeeping here. "When was this token last
+        // used" is answered by `PatValidationUseCase`'s throttled
+        // `ApiTokenUsed` append on the token's own
+        // `StreamCategory::TokenUse` stream — at most one event per hour
+        // per token, read back at `GET /api/v1/events?category=token_use`
+        // — so this path has nothing to write. An `UPDATE` on the
+        // credential row per authenticated request is what that append
+        // exists instead of.
         tracing::info!(
             user_id = %user.id,
             token_id = %validation.token_id,
@@ -2998,15 +2994,6 @@ mod tests {
                     })
                 })
             }
-            fn update_last_used(
-                &self,
-                _t: Uuid,
-                _at: DateTime<Utc>,
-                _ip: Option<&str>,
-                _ua: Option<&str>,
-            ) -> BoxFuture<'_, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
             fn revoke(&self, _t: Uuid) -> BoxFuture<'_, DomainResult<()>> {
                 Box::pin(async { Ok(()) })
             }
@@ -3142,9 +3129,6 @@ mod tests {
                     DateTime::<Utc>::from_timestamp(T0_SECS + 86_400 * 30, 0).unwrap(),
                 ),
                 revoked_at: None,
-                last_used_at: None,
-                last_used_ip: None,
-                last_used_user_agent: None,
                 created_by_user_id: user_id,
                 created_at: Utc::now(),
                 issued_via: IssuedVia::HttpMint,

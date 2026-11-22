@@ -2129,16 +2129,6 @@ mod tests {
             Box::pin(async move { Ok(hort_domain::types::Page { items, total }) })
         }
 
-        fn update_last_used(
-            &self,
-            _token_id: Uuid,
-            _at: chrono::DateTime<chrono::Utc>,
-            _client_ip: Option<&str>,
-            _user_agent: Option<&str>,
-        ) -> Fut<'_, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
         fn revoke(&self, token_id: Uuid) -> Fut<'_, ()> {
             self.revokes.lock().unwrap().push(token_id);
             Box::pin(async { Ok(()) })
@@ -2160,9 +2150,6 @@ mod tests {
             repository_ids: None,
             expires_at: None,
             revoked_at: revoked.then(chrono::Utc::now),
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: chrono::Utc::now(),
             issued_via: IssuedVia::AdminCli,
@@ -2307,15 +2294,6 @@ mod tests {
                         total: u64::MAX,
                     })
                 })
-            }
-            fn update_last_used(
-                &self,
-                _token_id: Uuid,
-                _at: chrono::DateTime<chrono::Utc>,
-                _client_ip: Option<&str>,
-                _user_agent: Option<&str>,
-            ) -> Fut<'_, ()> {
-                Box::pin(async { Ok(()) })
             }
             fn revoke(&self, _token_id: Uuid) -> Fut<'_, ()> {
                 Box::pin(async { Ok(()) })

@@ -763,15 +763,6 @@ mod tests {
                 })
             })
         }
-        fn update_last_used(
-            &self,
-            _token_id: uuid::Uuid,
-            _at: chrono::DateTime<Utc>,
-            _ip: Option<&str>,
-            _ua: Option<&str>,
-        ) -> BoxFuture<'_, DomainResult<()>> {
-            Box::pin(async { Ok(()) })
-        }
         fn revoke(&self, _token_id: uuid::Uuid) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -829,9 +820,6 @@ mod tests {
             repository_ids: None,
             expires_at: None,
             revoked_at: None,
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: Utc::now(),
             issued_via: IssuedVia::HttpMint,

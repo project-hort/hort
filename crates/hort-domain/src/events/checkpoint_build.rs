@@ -35,7 +35,7 @@
 //! [`EventHash`](super::EventHash) / [`SealedStreamRecord`](super::SealedStreamRecord)
 //! types — no parallel struct that could drift.
 
-use super::{Checkpoint, EventHash, SealedStreamRecord};
+use super::{Checkpoint, EventHash, SealedStreamRecord, StreamId};
 
 /// One live stream's head, as the emitter snapshots it from the runtime
 /// `events` table (the leaf tuple). Pure data — the adapter builds
@@ -89,9 +89,9 @@ pub struct CheckpointToEmit {
     /// covers these entries directly (no Merkle root intermediary;
     /// see module doc).
     pub stream_heads: Vec<StreamHead>,
-    /// `StreamSealed` records covered since the previous checkpoint
-    /// (may be empty when no stream was sealed since the previous
-    /// checkpoint — valid).
+    /// `StreamSealed` records covered since the previous **anchored**
+    /// checkpoint — a delta, not the whole seal history (may be empty
+    /// when no stream was sealed since that cut — valid).
     pub sealed_streams: Vec<SealedStreamRecord>,
     /// The honesty caveat — `Some` **only** on the first
     /// post-migration checkpoint.
@@ -128,14 +128,73 @@ pub fn is_first_checkpoint(existing: &[Checkpoint]) -> bool {
     existing.is_empty()
 }
 
+/// The `StreamSealed` audit-meta stream position an **anchored**
+/// checkpoint has already covered — the window boundary the next
+/// checkpoint's seal read starts after.
+///
+/// Every checkpoint's signed witness carries the head of every live
+/// stream at its cut, and the audit-meta stream
+/// ([`StreamId::eventstore_retention`]) is never deleted, so its
+/// anchored head position *is* the high-water mark of the seals already
+/// anchored. Reading it back out of the witness is why windowing needs
+/// no new field and no format change.
+///
+/// `None` means **no boundary**: no checkpoint has anchored that stream,
+/// so no seal is anchored yet and the next checkpoint must carry the
+/// whole history. `stream_position` is 0-based, so `Some(0)` is a real
+/// boundary — one event anchored — and has to stay distinguishable from
+/// `None`.
+///
+/// # Why the audit-meta stream position and not the consistent cut
+///
+/// `max_global_position` is tempting (it is the cut the checkpoint
+/// states) but it cannot bound this read: `events.global_position` comes
+/// from a sequence, so it is assigned in INSERT order while rows become
+/// visible in COMMIT order. A seal that took a lower `global_position`
+/// than an already-committed neighbour is invisible at the cut, is not
+/// carried, and a `global_position >` window past that cut never reads it
+/// again — a seal anchored by no checkpoint, which
+/// [`verify_against_checkpoint`](super::verify_against_checkpoint)
+/// reports forever as `AnchorBreak::SealUnanchored`.
+///
+/// A per-stream `stream_position` has no such skew: `UNIQUE (stream_id,
+/// stream_position)` is the append path's serializer, so a visible
+/// position implies every lower position on that stream is visible too.
+/// The anchored head is therefore an exact frontier and the windows tile
+/// without gaps.
+///
+/// # Why the max and not the newest `checkpoint_seq`
+///
+/// The two agree on any intact store — the audit-meta stream is never
+/// deleted, so its head only grows — and they differ only where the
+/// anchor store has been written to by something other than the emitter.
+/// There the max is the direction that cannot hide a seal: a boundary
+/// short of the true frontier re-anchors seals already anchored (waste,
+/// no finding), while a boundary past it leaves a live seal anchored by
+/// no checkpoint, which the verifier reports as
+/// `AnchorBreak::SealUnanchored`. Taking the max cannot be pushed
+/// forward by a *lower* claim.
+///
+/// Pure.
+pub fn anchored_retention_position(existing: &[Checkpoint]) -> Option<u64> {
+    let retention = StreamId::eventstore_retention().to_string();
+    existing
+        .iter()
+        .flat_map(|c| c.stream_heads.iter())
+        .filter(|(stream_id, _, _)| *stream_id == retention)
+        .map(|(_, position, _)| *position)
+        .max()
+}
+
 /// Assemble the pure checkpoint body from a consistent cut.
 ///
 /// * `existing` — every checkpoint already in the anchor store (drives
 ///   `checkpoint_seq` monotonicity + the first-checkpoint test).
 /// * `heads` — the live `(stream_id, final_position, head_hash)` set.
-/// * `sealed` — `StreamSealed` records since the previous checkpoint
-///   (may be empty when no stream was sealed since the previous
-///   checkpoint — valid).
+/// * `sealed` — `StreamSealed` records since the previous **anchored**
+///   checkpoint (see [`anchored_retention_position`], which derives the
+///   boundary the snapshot windows on; may be empty when no stream was
+///   sealed since that cut — valid).
 /// * `max_global_position` — the consistent-cut marker.
 /// * `created_at` — store-supplied emit time.
 /// * `backfill` — the honesty caveat; attached **only** on the first
@@ -176,6 +235,7 @@ pub fn build_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::StreamId;
     use chrono::{TimeZone, Utc};
 
     fn head(id: &str, pos: u64, b: u8) -> StreamHead {
@@ -235,6 +295,92 @@ mod tests {
             last = s;
             ex.push(cp(s));
         }
+    }
+
+    // ---- anchored_retention_position -----------------------------------
+
+    /// A checkpoint whose witness anchors the given streams.
+    fn cp_with_heads(seq: u64, heads: &[(&str, u64)]) -> Checkpoint {
+        let mut c = cp(seq);
+        c.stream_heads = heads
+            .iter()
+            .map(|(id, pos)| ((*id).to_string(), *pos, EventHash([0u8; 32])))
+            .collect();
+        c
+    }
+
+    fn retention_id() -> String {
+        StreamId::eventstore_retention().to_string()
+    }
+
+    #[test]
+    fn no_checkpoint_at_all_means_no_boundary() {
+        // Nothing anchored ⇒ no seal is anchored ⇒ the next checkpoint
+        // must carry the whole seal history, which is what `None` buys.
+        assert_eq!(anchored_retention_position(&[]), None);
+    }
+
+    #[test]
+    fn a_checkpoint_that_never_saw_the_audit_meta_stream_means_no_boundary() {
+        // The stream did not exist at that cut (nothing has been sealed
+        // and no destructive task has been audited), so the checkpoint
+        // anchored no seal and must not be read as a boundary.
+        let ex = vec![cp_with_heads(1, &[("artifact-a", 9), ("admin-other", 3)])];
+        assert_eq!(anchored_retention_position(&ex), None);
+    }
+
+    #[test]
+    fn position_zero_is_a_real_boundary_and_not_absence() {
+        // `stream_position` is 0-based: one anchored event is `Some(0)`,
+        // which must stay distinguishable from "nothing anchored" —
+        // collapsing them re-anchors that first seal on every tick.
+        let ex = vec![cp_with_heads(1, &[(&retention_id(), 0)])];
+        assert_eq!(anchored_retention_position(&ex), Some(0));
+    }
+
+    #[test]
+    fn boundary_is_the_max_across_every_checkpoint() {
+        // Out of seq order on purpose: the derivation must not depend on
+        // the store handing checkpoints back newest-last.
+        let rid = retention_id();
+        let ex = vec![
+            cp_with_heads(2, &[(&rid, 7)]),
+            cp_with_heads(1, &[(&rid, 3)]),
+            cp_with_heads(3, &[(&rid, 5)]),
+        ];
+        assert_eq!(anchored_retention_position(&ex), Some(7));
+    }
+
+    #[test]
+    fn a_lower_claim_cannot_push_the_boundary_forward() {
+        // The fail-safe direction: a checkpoint claiming a *lower*
+        // position than one already anchored re-anchors seals already
+        // anchored (waste), and can never window past a seal — which
+        // would leave it anchored by no checkpoint.
+        let rid = retention_id();
+        let ex = vec![
+            cp_with_heads(1, &[(&rid, 9)]),
+            cp_with_heads(2, &[(&rid, 1)]),
+        ];
+        assert_eq!(anchored_retention_position(&ex), Some(9));
+    }
+
+    #[test]
+    fn other_streams_heads_are_not_the_boundary() {
+        // The boundary is a position in ONE stream's position space;
+        // another stream's head is a different space entirely.
+        let rid = retention_id();
+        let ex = vec![cp_with_heads(
+            1,
+            &[("artifact-a", 9_000), (&rid, 2), ("policy-b", 400)],
+        )];
+        assert_eq!(anchored_retention_position(&ex), Some(2));
+    }
+
+    #[test]
+    fn extreme_position_does_not_panic() {
+        let ex = vec![cp_with_heads(1, &[(&retention_id(), u64::MAX)])];
+        assert_eq!(anchored_retention_position(&ex), Some(u64::MAX));
     }
 
     // ---- build_checkpoint ----------------------------------------------

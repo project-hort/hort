@@ -77,8 +77,8 @@ use crate::use_cases::repository_access::RepositoryAccessUseCase;
 use crate::use_cases::scan_kind_resolution::scan_kind_of;
 use crate::use_cases::upstream_index_cache_invalidator::invalidate_after_reject;
 use crate::use_cases::{
-    refuse_append_past_cap, rejected_reevaluation, scan_history, ArtifactAtVersion,
-    CallerPrivileges, OverCapStream,
+    observed_artifact_stream_len, refuse_append_past_cap, rejected_reevaluation, scan_history,
+    ArtifactAtVersion, CallerPrivileges, OverCapStream,
 };
 
 /// Maximum justification length in BYTES.
@@ -281,6 +281,17 @@ pub enum WaiveEntryVerdict {
     /// than [`CurationUseCase::waive`]'s own source-state set on purpose
     /// — see [`bulk_waive_applicability`].
     StateNotReleasable(QuarantineStatus),
+    /// Resolved and releasable, but the artifact's event stream has no
+    /// room for the `ArtifactReleased` this entry would append: it would
+    /// take the stream past the event cap, and the appending function
+    /// refuses exactly that.
+    ///
+    /// **The one apply failure that is readable in advance**, which is
+    /// why it is a pre-validation verdict and not a per-entry failure in
+    /// the applied half: a stream's length is a fact the batch can
+    /// establish before it releases anybody, and establishing it is what
+    /// keeps the all-or-nothing contract from applying part of itself.
+    StreamFull,
 }
 
 impl WaiveEntryVerdict {
@@ -292,6 +303,7 @@ impl WaiveEntryVerdict {
             Self::Unresolvable => "unresolvable",
             Self::Ambiguous(_) => "ambiguous",
             Self::StateNotReleasable(_) => "state_not_releasable",
+            Self::StreamFull => "stream_full",
         }
     }
 }
@@ -329,10 +341,42 @@ impl WaiveEntryReport {
             _ => None,
         }
     }
+
+    /// The row this entry would **append** to, when it is one that
+    /// appends at all.
+    ///
+    /// Narrower than [`Self::applicable_row`] by exactly the
+    /// `AlreadyReleased` case, and the difference is what the stream-cap
+    /// pre-flight asks about: an entry whose intent is already true
+    /// appends nothing, so it needs no room on its stream. Refusing the
+    /// batch over such an entry's length would make an idempotent
+    /// re-apply of a decision file fail forever on an artifact the batch
+    /// never writes to.
+    ///
+    /// Both this match and [`Self::applicable_row`] end in `_ => None`, so
+    /// a future `WaiveEntryVerdict` lands here as non-appending rather than
+    /// as a compile error. That is the fail-closed direction — an unknown
+    /// verdict refuses the batch instead of releasing over it — but it is
+    /// also the one place in this path the compiler will not point at, so a
+    /// verdict that *should* append has to name itself in both.
+    fn appending_row(&self) -> Option<Uuid> {
+        match (self.artifact_id, &self.verdict) {
+            (Some(id), WaiveEntryVerdict::Releasable) => Some(id),
+            _ => None,
+        }
+    }
 }
 
-/// The applied half of a bulk waive — the four partitions of a call that
-/// passed pre-validation.
+/// The applied half of a bulk waive — the two partitions of a call whose
+/// entries all applied.
+///
+/// **Carries no failure list, and that is the whole point.** A batch that
+/// could not apply one of its entries is a different outcome
+/// ([`WaivePartiallyApplied`]) rather than this one with a non-empty
+/// field. While the list lived here, reading it was something each
+/// consumer had to remember: the wire body carried it and the CLI
+/// printed it, while the audit log and the CLI's exit status reported
+/// the call a success beside it.
 #[derive(Debug)]
 pub struct WaiveApplied {
     /// Shared across every `ArtifactReleased` this call emits — the
@@ -346,11 +390,27 @@ pub struct WaiveApplied {
     /// Artifacts already `Released` — idempotent successes with no event
     /// appended, mirroring [`BlockOutcome::already_rejected_ids`].
     pub already_released_ids: Vec<Uuid>,
-    /// Per-artifact apply failures. Reachable only through the
-    /// validate→apply window: pre-validation admitted the entry and the
-    /// artifact moved, or its stream did, before the append landed. Never
-    /// silently skipped, and never retried into a release the curator did
-    /// not review.
+}
+
+/// A bulk waive that pre-validated, released part of itself, and could
+/// not release the rest.
+///
+/// Built only by [`CurationUseCase::waive_bulk`], whose apply loop is the
+/// only thing that can observe the condition.
+#[derive(Debug)]
+pub struct WaivePartiallyApplied {
+    /// What did apply — the same two partitions a full apply reports.
+    /// Released is released: these artifacts carry an `ArtifactReleased`
+    /// that nothing retracts.
+    pub applied: WaiveApplied,
+    /// What did not, and why. **Non-empty** — an empty one is
+    /// [`WaiveOutcome::Applied`], decided in one place
+    /// ([`WaiveTally::into_outcome`]).
+    ///
+    /// Reachable only through the validate→apply window: pre-validation
+    /// admitted the entry and the artifact moved, or its stream did,
+    /// before the append landed. Never silently skipped, and never
+    /// retried into a release the curator did not review.
     pub failed: Vec<(Uuid, AppError)>,
 }
 
@@ -363,23 +423,115 @@ pub struct WaiveApplied {
 /// [`WaiveApplied::released_artifact_ids`] without having handled
 /// [`Self::Aborted`] first, which makes the all-or-nothing contract the
 /// compiler's business rather than a reviewer's.
+///
+/// **And "part of it was applied" is a third variant for the same
+/// reason.** Partial application is irreversible — the releases that
+/// landed are history — so it cannot be a non-empty list inside the
+/// success variant, where noticing it was left to each consumer
+/// separately. Each of the three answers is a variant, so adding one
+/// reaches every consumer through the compiler rather than through a
+/// reviewer's memory.
 #[derive(Debug)]
 pub enum WaiveOutcome {
-    /// Every entry pre-validated. The appends below were attempted,
-    /// sequentially — appends across N artifact streams are not one
-    /// transaction, so this half is reported honestly rather than
-    /// claimed atomic.
+    /// Every entry pre-validated **and** applied: each one released, or
+    /// already released and so an idempotent success. Nothing was left
+    /// undone.
     Applied(WaiveApplied),
-    /// At least one entry was unresolvable, ambiguous, or in a state this
-    /// surface does not reach. **Zero events were appended and zero
-    /// artifacts released** — the whole batch aborts, because a batch
-    /// that releases the resolvable subset and reports the rest is the
-    /// defect this contract exists to prevent, not a kindness. 409 at the
-    /// HTTP edge (ADR 0025).
+    /// Every entry pre-validated; at least one then failed to apply.
+    ///
+    /// The irreducible remainder of the all-or-nothing contract, and it
+    /// is irreducible rather than unfixed: each release is its own
+    /// aggregate transaction and a transaction across aggregates is not
+    /// something this architecture offers, so an artifact that moves
+    /// inside the validate→apply window cannot be excluded in advance.
+    /// What *can* be excluded is a failure the batch could have seen
+    /// coming — pre-validation establishes every one of those, so this
+    /// variant means a state change raced the check, not that the check
+    /// was skipped.
+    ///
+    /// The same status code as [`Self::Applied`] at the HTTP edge, with
+    /// its own discriminator in the body: releases landed, so this is a
+    /// successful outcome at the HTTP semantics level and overloading the
+    /// abort's 409 would destroy the distinction that matters —
+    /// "nothing was released" against "some of it was".
+    PartiallyApplied(WaivePartiallyApplied),
+    /// At least one entry was unresolvable, ambiguous, in a state this
+    /// surface does not reach, or on a stream with no room for its
+    /// release event. **Zero events were appended and zero artifacts
+    /// released** — the whole batch aborts, because a batch that releases
+    /// the resolvable subset and reports the rest is the defect this
+    /// contract exists to prevent, not a kindness. 409 at the HTTP edge
+    /// (ADR 0025).
     Aborted {
         /// Every entry of the call, in the order the caller wrote them.
         entries: Vec<WaiveEntryReport>,
     },
+}
+
+impl WaiveOutcome {
+    /// Stable discriminator for the three answers — **one value, three
+    /// readers**: the wire body, the audit log's `outcome` field and the
+    /// CLI's exit code.
+    ///
+    /// Read off the variant rather than recomputed from the lists, which
+    /// is what the log line at the end of [`CurationUseCase::waive_bulk`]
+    /// got wrong: it emitted a literal `"ok"` beside its own
+    /// `failed_count`, so the audit trail claimed success for a call that
+    /// had released part of a batch. A second condition next to the
+    /// return value is a second condition that can disagree with it.
+    pub const fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::Applied(_) => "ok",
+            Self::PartiallyApplied(_) => "partial",
+            Self::Aborted { .. } => "aborted",
+        }
+    }
+}
+
+/// The running result of a bulk waive's apply loop — the three partitions
+/// as they accumulate, before the batch's verdict is read off them.
+///
+/// Private, and deliberately not the returned shape. [`WaiveOutcome`]
+/// splits a full apply from a partial one, and the split is decided
+/// **once**, by [`Self::into_outcome`]: no caller ever holds a tally, so
+/// "did anything fail?" is not a question any consumer answers for
+/// itself, and the discriminator the log prints is the discriminator the
+/// body carries.
+struct WaiveTally {
+    correlation_id: Uuid,
+    released_artifact_ids: Vec<Uuid>,
+    already_released_ids: Vec<Uuid>,
+    failed: Vec<(Uuid, AppError)>,
+}
+
+impl WaiveTally {
+    const fn new(correlation_id: Uuid) -> Self {
+        Self {
+            correlation_id,
+            released_artifact_ids: Vec::new(),
+            already_released_ids: Vec::new(),
+            failed: Vec::new(),
+        }
+    }
+
+    /// The one place a bulk waive's applied half becomes an outcome, and
+    /// therefore the one place "was this batch fully applied?" is
+    /// decided.
+    fn into_outcome(self) -> WaiveOutcome {
+        let applied = WaiveApplied {
+            correlation_id: self.correlation_id,
+            released_artifact_ids: self.released_artifact_ids,
+            already_released_ids: self.already_released_ids,
+        };
+        if self.failed.is_empty() {
+            WaiveOutcome::Applied(applied)
+        } else {
+            WaiveOutcome::PartiallyApplied(WaivePartiallyApplied {
+                applied,
+                failed: self.failed,
+            })
+        }
+    }
 }
 
 /// Result envelope for [`CurationUseCase::reevaluate`].
@@ -1797,21 +1949,27 @@ impl CurationUseCase {
     ///    gitops pipeline this addressing exists for included — reaches
     ///    the cap through this method and not through a route.
     /// 2. **Strict pre-validation, then apply.** Every entry is resolved
-    ///    and state-checked before any event is appended. One entry that
-    ///    is unresolvable, ambiguous, or in a state
-    ///    [`bulk_waive_applicability`] does not reach aborts the whole
-    ///    batch: [`WaiveOutcome::Aborted`] carrying a per-entry report,
-    ///    zero releases applied, 409 at the edge (ADR 0025).
+    ///    and state-checked, **and its stream's room for the one event it
+    ///    would append is established**, before any event is appended.
+    ///    One entry that is unresolvable, ambiguous, in a state
+    ///    [`bulk_waive_applicability`] does not reach, or on a stream the
+    ///    release would take past the event cap aborts the whole batch:
+    ///    [`WaiveOutcome::Aborted`] carrying a per-entry report, zero
+    ///    releases applied, 409 at the edge (ADR 0025).
     /// 3. **`Released` entries are idempotent successes** — reported in
     ///    [`WaiveApplied::already_released_ids`] with no event, mirroring
     ///    block's `already_rejected_ids`. Without that, a gitops re-apply
     ///    of the same decision file would fail forever.
-    /// 4. **Apply is sequential and honestly reported.** Appends across N
-    ///    artifact streams are not one transaction, so this method does
-    ///    not claim they are: a state change inside the validate→apply
-    ///    window surfaces through [`Self::waive_one`] per ADR 0060 —
-    ///    re-read, already-`Released` ⇒ idempotent success, otherwise the
-    ///    entry lands in `failed`.
+    /// 4. **Apply is sequential, and what it could not do is a distinct
+    ///    outcome.** Appends across N artifact streams are not one
+    ///    transaction, so this method does not claim they are: a state
+    ///    change inside the validate→apply window surfaces through
+    ///    [`Self::waive_one`] per ADR 0060 — re-read, already-`Released` ⇒
+    ///    idempotent success, otherwise the entry lands in `failed` and
+    ///    the call answers [`WaiveOutcome::PartiallyApplied`] rather than
+    ///    a success envelope with a list in it. That window is the only
+    ///    way the variant is reachable, because step 2 establishes every
+    ///    apply precondition a batch can read in advance.
     /// 5. **One `ArtifactReleased` per released artifact, one shared
     ///    `correlation_id` per call**, each event carrying
     ///    `released_by_user_id` and the justification verbatim.
@@ -1911,10 +2069,38 @@ impl CurationUseCase {
             }
         };
 
-        // 5) Pre-validation. Every entry, then the verdict on the batch.
-        //    `applicable_row` answers both halves at once, so the apply
-        //    loop below receives rows and not verdicts to re-interpret.
-        let entries = reduce_waive_entries(resolved);
+        // 5) Pre-validation, first pass: what each entry resolved to and
+        //    what state it is in.
+        let mut entries = reduce_waive_entries(resolved);
+
+        // 6) Pre-validation, second pass: room on the stream for the one
+        //    event each releasing entry would append. Runs over the whole
+        //    list even when the first pass already doomed the batch —
+        //    one refusal has to name every entry the curator must change,
+        //    or fixing the first one earns them a second refusal and the
+        //    bisecting this report exists to spare them.
+        //
+        //    A read failure here is not a per-entry verdict: the
+        //    precondition could not be established, and a batch that
+        //    cannot establish it releases nothing.
+        if let Err(e) = self.refuse_entries_without_stream_room(&mut entries).await {
+            let result = classify_append_error(&e);
+            let repo_label = self.repository_access.metric_label(repository_id).await;
+            emit_curation_decision(CurationDecisionLabel::Waive, Some(&repo_label), result);
+            tracing::info!(
+                actor_id = %user_id,
+                correlation_id = %correlation_id,
+                mode,
+                outcome = result.as_str(),
+                "curation bulk waive: stream-room pre-validation could not be \
+                 established, so nothing was released"
+            );
+            return Err(e);
+        }
+
+        // 7) The verdict on the batch. `applicable_row` answers both
+        //    halves at once, so the apply loop below receives rows and not
+        //    verdicts to re-interpret.
         let applicable: Vec<(Uuid, bool)> = entries
             .iter()
             .filter_map(WaiveEntryReport::applicable_row)
@@ -1942,15 +2128,10 @@ impl CurationUseCase {
             return Ok(WaiveOutcome::Aborted { entries });
         }
 
-        // 6) Apply. Sequential, one artifact at a time, deduplicated by
+        // 8) Apply. Sequential, one artifact at a time, deduplicated by
         //    resolved row: two entries spelling one digest two ways name
         //    one artifact and release it once.
-        let mut applied = WaiveApplied {
-            correlation_id,
-            released_artifact_ids: Vec::new(),
-            already_released_ids: Vec::new(),
-            failed: Vec::new(),
-        };
+        let mut tally = WaiveTally::new(correlation_id);
         let mut seen: Vec<Uuid> = Vec::with_capacity(applicable.len());
         for (artifact_id, already_released) in applicable {
             if seen.contains(&artifact_id) {
@@ -1961,7 +2142,7 @@ impl CurationUseCase {
                 // Idempotent success, decided at pre-validation and not
                 // re-read: this entry appends nothing, so there is no
                 // decision for a fresher read to protect.
-                applied.already_released_ids.push(artifact_id);
+                tally.already_released_ids.push(artifact_id);
                 let repo_label = self.repository_access.metric_label(repository_id).await;
                 emit_curation_decision(
                     CurationDecisionLabel::Waive,
@@ -1974,27 +2155,98 @@ impl CurationUseCase {
                     &actor,
                     &justification,
                     correlation_id,
-                    &mut applied,
+                    &mut tally,
                 )
                 .await;
             }
         }
 
+        let released_count = tally.released_artifact_ids.len();
+        let already_count = tally.already_released_ids.len();
+        let failed_count = tally.failed.len();
+        // The discriminator is read off the value being returned, not
+        // written as a literal beside the counts. A literal `"ok"` here
+        // is what let the audit trail claim success for a batch that had
+        // released part of itself and reported `failed_count` in the same
+        // record.
+        let outcome = tally.into_outcome();
         tracing::info!(
             actor_id = %user_id,
             correlation_id = %correlation_id,
             mode,
-            released_count = applied.released_artifact_ids.len(),
-            already_count = applied.already_released_ids.len(),
-            failed_count = applied.failed.len(),
-            outcome = "ok",
+            released_count,
+            already_count,
+            failed_count,
+            outcome = outcome.wire_kind(),
             "curator bulk waive call complete"
         );
-        Ok(WaiveOutcome::Applied(applied))
+        Ok(outcome)
+    }
+
+    /// Establish, per entry that would append, that the artifact's stream
+    /// has room for the one `ArtifactReleased` the entry carries —
+    /// rewriting the verdict of any entry that does not to
+    /// [`WaiveEntryVerdict::StreamFull`].
+    ///
+    /// # Why this belongs in pre-validation
+    ///
+    /// The cap refusal also lives at the append site
+    /// ([`Self::waive_one`]), where it has to: the stream can grow between
+    /// the two reads. But a refusal *only* there is a refusal that fires
+    /// after siblings have already been released, and the releases are
+    /// history. A stream's length is readable before anything is applied,
+    /// so an all-or-nothing batch reads it and refuses whole — which is
+    /// the difference between "this list cannot be applied" and "this list
+    /// was applied in part".
+    ///
+    /// The question is asked with [`refuse_append_past_cap`], the same
+    /// predicate the append site asks, so the pre-flight and the append
+    /// cannot disagree about where the cap is. Everything that predicate
+    /// declines to refuse it declines to refuse here too — notably a
+    /// stream *already* past the cap, which stays the appending function's
+    /// question for the reason that function documents.
+    ///
+    /// # What it reads, and what it deliberately does not keep
+    ///
+    /// One capped stream read per distinct releasing row, and the
+    /// **length only** ([`observed_artifact_stream_len`]). It keeps no
+    /// version: `waive_one`'s `expected_version` is what turns a
+    /// concurrent append into a conflict, and applying with a version
+    /// taken at pre-validation time would convert a benign race into a
+    /// failure — the opposite of this pass's purpose. The apply loop
+    /// loads fresh.
+    async fn refuse_entries_without_stream_room(
+        &self,
+        entries: &mut [WaiveEntryReport],
+    ) -> AppResult<()> {
+        // One row, one answer. Two entries spelling one digest two ways
+        // name one artifact, so asking twice would spend a second read
+        // and could hand the two entries different verdicts.
+        let mut answered: Vec<(Uuid, bool)> = Vec::with_capacity(entries.len());
+        for entry in entries.iter_mut() {
+            let Some(artifact_id) = entry.appending_row() else {
+                continue;
+            };
+            let has_room = match answered.iter().find(|(id, _)| *id == artifact_id) {
+                Some((_, has_room)) => *has_room,
+                None => {
+                    let stream_id = StreamId::artifact(artifact_id);
+                    let stream_len =
+                        observed_artifact_stream_len(&*self.events, &stream_id).await?;
+                    let has_room = refuse_append_past_cap(&stream_id, stream_len, 1).is_ok();
+                    answered.push((artifact_id, has_room));
+                    has_room
+                }
+            };
+            if !has_room {
+                entry.verdict = WaiveEntryVerdict::StreamFull;
+            }
+        }
+        Ok(())
     }
 
     /// Release one pre-validated artifact as part of a bulk waive, and
-    /// record the result in `applied`.
+    /// record the result in the call's `tally`.
     ///
     /// **This is the appending function**, so the stream-cap refusal
     /// lives here rather than one call away: a bulk waive is repeatable
@@ -2017,7 +2269,7 @@ impl CurationUseCase {
         actor: &ApiActor,
         justification: &str,
         correlation_id: Uuid,
-        applied: &mut WaiveApplied,
+        tally: &mut WaiveTally,
     ) {
         let mut paired = match ArtifactAtVersion::load(
             &*self.artifacts,
@@ -2031,7 +2283,7 @@ impl CurationUseCase {
             Err(e) => {
                 let result = classify_append_error(&e);
                 emit_curation_decision(CurationDecisionLabel::Waive, None, result);
-                applied.failed.push((artifact_id, e));
+                tally.failed.push((artifact_id, e));
                 return;
             }
         };
@@ -2044,7 +2296,7 @@ impl CurationUseCase {
         if applicability == WaiveApplicability::AlreadyTrue {
             // ADR 0060 (b) ahead of the append: the intent is already
             // true, so this is an idempotent success with no event.
-            applied.already_released_ids.push(artifact_id);
+            tally.already_released_ids.push(artifact_id);
             emit_curation_decision(
                 CurationDecisionLabel::Waive,
                 Some(&repo_label),
@@ -2064,7 +2316,7 @@ impl CurationUseCase {
                  the ArtifactReleased this waiver would append"
             );
             emit_curation_decision(CurationDecisionLabel::Waive, Some(&repo_label), result);
-            applied.failed.push((artifact_id, e));
+            tally.failed.push((artifact_id, e));
             return;
         }
 
@@ -2119,7 +2371,7 @@ impl CurationUseCase {
                      state this surface releases from"
                 );
                 emit_curation_decision(CurationDecisionLabel::Waive, Some(&repo_label), result);
-                applied.failed.push((artifact_id, app_err));
+                tally.failed.push((artifact_id, app_err));
                 return;
             }
         };
@@ -2154,12 +2406,12 @@ impl CurationUseCase {
             .await
         {
             let app_err = AppError::Domain(e);
-            self.record_bulk_waive_append_failure(artifact_id, app_err, &repo_label, applied)
+            self.record_bulk_waive_append_failure(artifact_id, app_err, &repo_label, tally)
                 .await;
             return;
         }
 
-        applied.released_artifact_ids.push(artifact_id);
+        tally.released_artifact_ids.push(artifact_id);
         emit_curation_decision(
             CurationDecisionLabel::Waive,
             Some(&repo_label),
@@ -2189,7 +2441,7 @@ impl CurationUseCase {
         artifact_id: Uuid,
         app_err: AppError,
         repo_label: &str,
-        applied: &mut WaiveApplied,
+        tally: &mut WaiveTally,
     ) {
         let result = classify_append_error(&app_err);
         if matches!(app_err, AppError::Domain(DomainError::Conflict(_))) {
@@ -2204,7 +2456,7 @@ impl CurationUseCase {
                         "curation bulk waive entry converged: the artifact was released \
                          inside the validate-apply window, so this entry appends nothing"
                     );
-                    applied.already_released_ids.push(artifact_id);
+                    tally.already_released_ids.push(artifact_id);
                     emit_curation_decision(
                         CurationDecisionLabel::Waive,
                         Some(repo_label),
@@ -2238,7 +2490,7 @@ impl CurationUseCase {
             }
         }
         emit_curation_decision(CurationDecisionLabel::Waive, Some(repo_label), result);
-        applied.failed.push((artifact_id, app_err));
+        tally.failed.push((artifact_id, app_err));
     }
 
     /// Per-call entry-count cap for a bulk target.
@@ -6255,20 +6507,37 @@ mod tests {
         }
 
         fn expect_aborted(outcome: WaiveOutcome) -> Vec<WaiveEntryReport> {
+            assert_eq!(outcome.wire_kind(), "aborted", "got {outcome:?}");
             match outcome {
                 WaiveOutcome::Aborted { entries } => entries,
-                WaiveOutcome::Applied(applied) => {
-                    panic!("expected an aborted batch, got {applied:?}")
-                }
+                other => panic!("expected an aborted batch, got {other:?}"),
             }
         }
 
+        /// A **fully** applied batch. Reaching the payload is the
+        /// assertion: a batch that could not apply one of its entries is
+        /// a different variant, so no test asserting on this value can be
+        /// standing on a partial apply.
         fn expect_applied(outcome: WaiveOutcome) -> WaiveApplied {
+            assert_eq!(outcome.wire_kind(), "ok", "got {outcome:?}");
             match outcome {
                 WaiveOutcome::Applied(applied) => applied,
-                WaiveOutcome::Aborted { entries } => {
-                    panic!("expected an applied batch, got {entries:?}")
+                other => panic!("expected a fully applied batch, got {other:?}"),
+            }
+        }
+
+        /// A batch that applied part of itself — the validate→apply race.
+        fn expect_partial(outcome: WaiveOutcome) -> WaivePartiallyApplied {
+            assert_eq!(outcome.wire_kind(), "partial", "got {outcome:?}");
+            match outcome {
+                WaiveOutcome::PartiallyApplied(partial) => {
+                    assert!(
+                        !partial.failed.is_empty(),
+                        "the partial variant exists for a non-empty failure list"
+                    );
+                    partial
                 }
+                other => panic!("expected a partially applied batch, got {other:?}"),
             }
         }
 
@@ -6982,7 +7251,6 @@ mod tests {
 
             assert_eq!(applied.released_artifact_ids, vec![first, second]);
             assert!(applied.already_released_ids.is_empty());
-            assert!(applied.failed.is_empty());
 
             let transitions = lifecycle.committed_transitions();
             assert_eq!(transitions.len(), 2, "one ArtifactReleased per artifact");
@@ -7112,7 +7380,6 @@ mod tests {
             );
             assert!(applied.released_artifact_ids.is_empty());
             assert_eq!(applied.already_released_ids, vec![first, second]);
-            assert!(applied.failed.is_empty());
             assert!(
                 lifecycle.committed_transitions().is_empty(),
                 "an idempotent success appends nothing"
@@ -7465,18 +7732,21 @@ mod tests {
                 "blobs/a",
                 QuarantineStatus::Quarantined,
             );
-            // Pre-validation reads rows, not streams, so arming the
-            // stream read reaches the apply stage only.
-            events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+            // Read 0 is pre-validation's own stream read (the cap
+            // pre-flight); read 1 is the apply step's pairing. Failing
+            // the LATER one is what puts the failure inside the apply
+            // stage rather than ahead of it — pre-validation reaching the
+            // same error refuses the batch whole, which is the next test.
+            events.fail_read_stream_at(1, DomainError::Invariant("event store down".into()));
 
-            let applied = expect_applied(
+            let partial = expect_partial(
                 waive_digests(&uc, repo_id, &[DIGEST_A])
                     .await
                     .expect("pre-validation passed, so the batch applies"),
             );
-            assert!(applied.released_artifact_ids.is_empty());
-            assert_eq!(applied.failed.len(), 1);
-            assert_eq!(applied.failed[0].0, id);
+            assert!(partial.applied.released_artifact_ids.is_empty());
+            assert_eq!(partial.failed.len(), 1);
+            assert_eq!(partial.failed[0].0, id);
             assert!(lifecycle.committed_transitions().is_empty());
         }
 
@@ -7503,29 +7773,29 @@ mod tests {
             );
             artifacts.set_status_after_next_checksum_read(id, QuarantineStatus::Rejected);
 
-            let applied = expect_applied(
+            let partial = expect_partial(
                 waive_digests(&uc, repo_id, &[DIGEST_A])
                     .await
                     .expect("pre-validation saw a releasable row"),
             );
-            assert!(applied.released_artifact_ids.is_empty());
-            assert_eq!(applied.failed.len(), 1);
-            assert_eq!(applied.failed[0].0, id);
+            assert!(partial.applied.released_artifact_ids.is_empty());
+            assert_eq!(partial.failed.len(), 1);
+            assert_eq!(partial.failed[0].0, id);
             assert!(
                 matches!(
-                    applied.failed[0].1,
+                    partial.failed[0].1,
                     AppError::Domain(DomainError::InvalidState(_))
                 ),
                 "a state precondition, not an internal error: {:?}",
-                applied.failed[0].1
+                partial.failed[0].1
             );
             assert!(
-                applied.failed[0]
+                partial.failed[0]
                     .1
                     .to_string()
                     .contains("the state changed after this batch was validated"),
                 "got: {}",
-                applied.failed[0].1
+                partial.failed[0].1
             );
             assert!(lifecycle.committed_transitions().is_empty());
         }
@@ -7566,6 +7836,14 @@ mod tests {
         /// Arm the interleaving the ADR 0060 arms are about: this call's
         /// append loses to an event that landed after the pairing, and
         /// the row the re-read then sees is `after_read`.
+        ///
+        /// The concurrent append is armed on read **1**, not on the next
+        /// read: a single-entry bulk waive reads the stream twice, once
+        /// for pre-validation's cap pre-flight and once for the apply
+        /// step's pairing, and only a swap after the second one leaves
+        /// the apply step holding a version the commit finds stale.
+        /// Arming the first would hand the pairing the post-append stream
+        /// and the append under test would win.
         fn arm_lost_append(
             artifacts: &Arc<MockArtifactRepository>,
             events: &Arc<MockEventStore>,
@@ -7573,7 +7851,8 @@ mod tests {
             after_read: Option<QuarantineStatus>,
         ) {
             let stream_id = StreamId::artifact(artifact_id);
-            events.set_stream_after_next_read(
+            events.set_stream_after_read_at(
+                1,
                 &stream_id,
                 vec![
                     dummy_persisted_event(&stream_id, artifact_id, 0),
@@ -7614,7 +7893,9 @@ mod tests {
                 vec![id],
                 "the intent is already true, so the entry converges"
             );
-            assert!(applied.failed.is_empty());
+            // Nothing failed: `expect_applied` would have refused a
+            // partial outcome, so the absence is the variant rather than
+            // an empty list anybody has to remember to check.
             assert!(
                 lifecycle.committed_transitions().is_empty(),
                 "a converged entry appends nothing"
@@ -7641,17 +7922,17 @@ mod tests {
             );
             arm_lost_append(&artifacts, &events, id, Some(QuarantineStatus::Quarantined));
 
-            let applied = expect_applied(
+            let partial = expect_partial(
                 waive_digests(&uc, repo_id, &[DIGEST_A])
                     .await
                     .expect("pre-validation passed"),
             );
-            assert!(applied.released_artifact_ids.is_empty());
-            assert!(applied.already_released_ids.is_empty());
-            assert_eq!(applied.failed.len(), 1);
-            assert_eq!(applied.failed[0].0, id);
+            assert!(partial.applied.released_artifact_ids.is_empty());
+            assert!(partial.applied.already_released_ids.is_empty());
+            assert_eq!(partial.failed.len(), 1);
+            assert_eq!(partial.failed[0].0, id);
             assert!(matches!(
-                applied.failed[0].1,
+                partial.failed[0].1,
                 AppError::Domain(DomainError::Conflict(_))
             ));
             assert!(
@@ -7677,21 +7958,21 @@ mod tests {
             );
             arm_lost_append(&artifacts, &events, id, None);
 
-            let applied = expect_applied(
+            let partial = expect_partial(
                 waive_digests(&uc, repo_id, &[DIGEST_A])
                     .await
                     .expect("pre-validation passed"),
             );
-            assert_eq!(applied.failed.len(), 1);
+            assert_eq!(partial.failed.len(), 1);
             assert!(
                 matches!(
-                    applied.failed[0].1,
+                    partial.failed[0].1,
                     AppError::Domain(DomainError::Conflict(_))
                 ),
                 "the append's own error survives the failed re-read: {:?}",
-                applied.failed[0].1
+                partial.failed[0].1
             );
-            assert!(applied.already_released_ids.is_empty());
+            assert!(partial.applied.already_released_ids.is_empty());
             assert!(lifecycle.committed_transitions().is_empty());
         }
 
@@ -7714,14 +7995,14 @@ mod tests {
             artifacts.set_status_after_next_find_by_id(id, QuarantineStatus::Released);
             lifecycle.fail_next_commit(DomainError::Invariant("event store down".into()));
 
-            let applied = expect_applied(
+            let partial = expect_partial(
                 waive_digests(&uc, repo_id, &[DIGEST_A])
                     .await
                     .expect("pre-validation passed"),
             );
-            assert_eq!(applied.failed.len(), 1);
+            assert_eq!(partial.failed.len(), 1);
             assert!(
-                applied.already_released_ids.is_empty(),
+                partial.applied.already_released_ids.is_empty(),
                 "an infrastructure failure must not be reported as convergence"
             );
             assert!(lifecycle.committed_transitions().is_empty());
@@ -7761,14 +8042,161 @@ mod tests {
                 vec![id],
                 "the intent was already true by the time the append ran"
             );
-            assert!(applied.failed.is_empty());
             assert!(lifecycle.committed_transitions().is_empty());
         }
 
-        /// A stream already at the event cap: the waiver is refused
-        /// rather than appending the event that would freeze it.
+        // -- the cap pre-flight: a refusal before the first release ---
+
+        /// Fill `artifact_id`'s stream to exactly
+        /// [`crate::use_cases::STREAM_EVENT_CAP`] events — the length at
+        /// which one more append would cross, and therefore the length
+        /// pre-validation has to refuse.
+        fn fill_stream_to_the_cap(events: &Arc<MockEventStore>, artifact_id: Uuid) {
+            let stream_id = StreamId::artifact(artifact_id);
+            let full: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP)
+                .map(|p| dummy_persisted_event(&stream_id, artifact_id, p))
+                .collect();
+            events.set_stream(&stream_id, full);
+        }
+
+        /// Every `ArtifactReleased` the event store holds, for whichever
+        /// of a batch's artifacts it was appended to.
+        ///
+        /// The outcome variant is not the assertion a cap abort needs:
+        /// "the batch aborted" and "nothing was released" are two claims,
+        /// and the second is the one `ArtifactReleased` being history
+        /// makes load-bearing.
+        fn released_events_in_store(events: &Arc<MockEventStore>, ids: &[Uuid]) -> Vec<Uuid> {
+            ids.iter()
+                .copied()
+                .filter(|id| {
+                    events
+                        .stream_snapshot(&StreamId::artifact(*id))
+                        .iter()
+                        .any(|e| matches!(e.event, DomainEvent::ArtifactReleased(_)))
+                })
+                .collect()
+        }
+
+        /// A stream with no room for its release event aborts the whole
+        /// batch **before the first release**, and the siblings that were
+        /// perfectly releasable stay unreleased.
+        ///
+        /// This is the defect that made the all-or-nothing contract
+        /// half-true: the cap refusal used to live only at the append
+        /// site, where it fires after the siblings ahead of it in the
+        /// loop have already been released — and a release is history.
+        /// The length is readable before anything is applied, so it is
+        /// read before anything is applied.
         #[tokio::test]
-        async fn an_over_cap_stream_refuses_the_bulk_waiver() {
+        async fn a_stream_with_no_room_aborts_the_batch_before_any_release() {
+            let (uc, artifacts, events, lifecycle) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            // Ordered so the roomy entry is applied FIRST under the old
+            // behaviour: if the refusal ever moves back to the append
+            // site, this artifact is released and the assertion below
+            // catches it.
+            let roomy = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Quarantined,
+            );
+            let full = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_B,
+                "blobs/b",
+                QuarantineStatus::Quarantined,
+            );
+            fill_stream_to_the_cap(&events, full);
+
+            let entries = expect_aborted(
+                waive_digests(&uc, repo_id, &[DIGEST_A, DIGEST_B])
+                    .await
+                    .expect("a refused batch is an outcome, not an error"),
+            );
+
+            assert_eq!(
+                released_events_in_store(&events, &[roomy, full]),
+                Vec::<Uuid>::new(),
+                "no artifact of an aborted batch carries an ArtifactReleased"
+            );
+            assert!(
+                lifecycle.committed_transitions().is_empty(),
+                "and nothing was committed at all"
+            );
+            // The report still names every entry, the fine one included.
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].verdict, WaiveEntryVerdict::Releasable);
+            assert_eq!(entries[0].artifact_id, Some(roomy));
+            assert_eq!(entries[1].verdict, WaiveEntryVerdict::StreamFull);
+            assert_eq!(
+                entries[1].artifact_id,
+                Some(full),
+                "the refused entry names the row the curator has to act on"
+            );
+        }
+
+        /// The report tells the three blocking reasons apart. A curator
+        /// fixes a typo, re-addresses an ambiguous digest and escalates a
+        /// frozen stream — three different actions, so one verdict
+        /// covering all of them would be no report at all.
+        #[tokio::test]
+        async fn the_abort_report_distinguishes_a_full_stream_from_the_other_refusals() {
+            let (uc, artifacts, events, _lifecycle) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            let full = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Quarantined,
+            );
+            fill_stream_to_the_cap(&events, full);
+            let rejected = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_B,
+                "blobs/b",
+                QuarantineStatus::Rejected,
+            );
+
+            let entries = expect_aborted(
+                waive_digests(&uc, repo_id, &[DIGEST_A, DIGEST_B, DIGEST_MISSING])
+                    .await
+                    .expect("a refused batch is an outcome, not an error"),
+            );
+
+            assert_eq!(entries[0].verdict, WaiveEntryVerdict::StreamFull);
+            assert_eq!(entries[0].artifact_id, Some(full));
+            assert_eq!(
+                entries[1].verdict,
+                WaiveEntryVerdict::StateNotReleasable(QuarantineStatus::Rejected)
+            );
+            assert_eq!(entries[1].artifact_id, Some(rejected));
+            assert_eq!(entries[2].verdict, WaiveEntryVerdict::Unresolvable);
+            assert_eq!(entries[2].artifact_id, None);
+            // And the three carry three wire discriminators, which is
+            // what a scripted caller branches on.
+            let kinds: Vec<&str> = entries.iter().map(|e| e.verdict.wire_kind()).collect();
+            assert_eq!(
+                kinds,
+                vec!["stream_full", "state_not_releasable", "unresolvable"]
+            );
+        }
+
+        /// One short of the cap there is room for the release, so the
+        /// same batch applies. The boundary matters: the pre-flight asks
+        /// the append site's own predicate, and refusing a stream that
+        /// still has room would refuse batches the append would accept.
+        #[tokio::test]
+        async fn one_event_short_of_the_cap_still_applies() {
             let (uc, artifacts, events, lifecycle) = make_use_case();
             let repo_id = Uuid::new_v4();
             let id = seed_with_digest(
@@ -7780,24 +8208,417 @@ mod tests {
                 QuarantineStatus::Quarantined,
             );
             let stream_id = StreamId::artifact(id);
-            let full: Vec<_> = (0..1000)
+            let nearly_full: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP - 1)
                 .map(|p| dummy_persisted_event(&stream_id, id, p))
                 .collect();
-            events.set_stream(&stream_id, full);
+            events.set_stream(&stream_id, nearly_full);
 
             let applied = expect_applied(
                 waive_digests(&uc, repo_id, &[DIGEST_A])
                     .await
-                    .expect("pre-validation passed"),
+                    .expect("one more event still fits"),
             );
-            assert!(applied.released_artifact_ids.is_empty());
-            assert_eq!(applied.failed.len(), 1);
-            assert!(
-                applied.failed[0].1.to_string().contains("1000-event cap"),
-                "got: {}",
-                applied.failed[0].1
+            assert_eq!(applied.released_artifact_ids, vec![id]);
+            assert_eq!(lifecycle.committed_transitions().len(), 1);
+        }
+
+        /// An entry whose intent is already true appends nothing, so its
+        /// stream's length is none of the pre-flight's business.
+        ///
+        /// Refusing the batch over it would make a gitops re-apply of the
+        /// same decision file fail forever on an artifact the batch never
+        /// writes to — the failure mode `already_released_ids` exists to
+        /// prevent, reintroduced one layer up.
+        #[tokio::test]
+        async fn an_already_released_entry_on_a_full_stream_does_not_abort_the_batch() {
+            let (uc, artifacts, events, lifecycle) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            let converged = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Released,
+            );
+            fill_stream_to_the_cap(&events, converged);
+            let releasable = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_B,
+                "blobs/b",
+                QuarantineStatus::Quarantined,
+            );
+
+            let applied = expect_applied(
+                waive_digests(&uc, repo_id, &[DIGEST_A, DIGEST_B])
+                    .await
+                    .expect("the converged entry needs no room"),
+            );
+            assert_eq!(applied.released_artifact_ids, vec![releasable]);
+            assert_eq!(applied.already_released_ids, vec![converged]);
+            assert_eq!(lifecycle.committed_transitions().len(), 1);
+        }
+
+        /// A stream *already past* the cap is not a crossing, and the
+        /// pre-flight asks the append site's predicate rather than a
+        /// comparison of its own — so it refuses exactly what that
+        /// predicate refuses and no more. The entry proceeds to the apply
+        /// step, where the version its `Tolerate` pairing derives decides
+        /// the outcome, exactly as it did before the pre-flight existed.
+        #[tokio::test]
+        async fn a_stream_already_past_the_cap_is_not_refused_by_the_pre_flight() {
+            let (uc, artifacts, events, lifecycle) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            let id = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Quarantined,
+            );
+            let stream_id = StreamId::artifact(id);
+            let over_cap: Vec<_> = (0..crate::use_cases::STREAM_EVENT_CAP + 1)
+                .map(|p| dummy_persisted_event(&stream_id, id, p))
+                .collect();
+            events.set_stream(&stream_id, over_cap);
+
+            let applied = expect_applied(
+                waive_digests(&uc, repo_id, &[DIGEST_A])
+                    .await
+                    .expect("already past the cap is the append site's question"),
+            );
+            assert_eq!(applied.released_artifact_ids, vec![id]);
+            assert_eq!(lifecycle.committed_transitions().len(), 1);
+        }
+
+        /// The pre-flight could not read a stream, so the precondition is
+        /// unestablished — and an all-or-nothing batch that cannot
+        /// establish its preconditions releases nothing rather than
+        /// finding out one artifact at a time.
+        #[tokio::test]
+        async fn an_unreadable_stream_at_pre_validation_releases_nothing() {
+            let (uc, artifacts, events, lifecycle) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            let first = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Quarantined,
+            );
+            let second = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_B,
+                "blobs/b",
+                QuarantineStatus::Quarantined,
+            );
+            events.fail_next_read_stream(DomainError::Invariant("event store down".into()));
+
+            let err = waive_digests(&uc, repo_id, &[DIGEST_A, DIGEST_B])
+                .await
+                .expect_err("an unestablished precondition is not a batch outcome");
+            assert!(err.to_string().contains("event store down"), "got {err}");
+            assert_eq!(
+                released_events_in_store(&events, &[first, second]),
+                Vec::<Uuid>::new(),
+                "nothing released"
             );
             assert!(lifecycle.committed_transitions().is_empty());
+        }
+
+        /// Two entries spelling one digest two ways name one row, and the
+        /// pre-flight asks about it once: one row has one answer, and
+        /// asking twice would both spend a read and risk handing the two
+        /// entries different verdicts.
+        #[tokio::test]
+        async fn two_spellings_of_one_digest_cost_one_pre_flight_read() {
+            let (uc, artifacts, events, _lifecycle) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Quarantined,
+            );
+            let before = events.read_stream_call_count();
+
+            expect_applied(
+                waive_digests(&uc, repo_id, &[DIGEST_A, &format!("sha256:{DIGEST_A}")])
+                    .await
+                    .expect("one row, released once"),
+            );
+
+            assert_eq!(
+                events.read_stream_call_count() - before,
+                2,
+                "one pre-flight read for the row plus the apply step's own pairing"
+            );
+        }
+
+        // -- the three outcomes, and the log that names them ----------
+
+        /// The axis the whole unit turns on: three batches, three
+        /// discriminators. A partial apply is neither of the other two,
+        /// and it is driven through the use case rather than constructed,
+        /// so the test fails if the loop stops producing it.
+        #[tokio::test]
+        async fn the_three_batch_outcomes_carry_three_discriminators() {
+            // Full apply.
+            let (uc, artifacts, events, _l) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Quarantined,
+            );
+            let full = waive_digests(&uc, repo_id, &[DIGEST_A])
+                .await
+                .expect("applies");
+            assert_eq!(full.wire_kind(), "ok");
+            assert!(matches!(full, WaiveOutcome::Applied(_)));
+
+            // Partial: one releasable sibling, one artifact that moves
+            // out of reach inside the validate->apply window.
+            let (uc, artifacts, events, _l) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            let released = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Quarantined,
+            );
+            let moved = seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_B,
+                "blobs/b",
+                QuarantineStatus::Quarantined,
+            );
+            artifacts.set_status_after_next_checksum_read(moved, QuarantineStatus::Rejected);
+            let partial = waive_digests(&uc, repo_id, &[DIGEST_A, DIGEST_B])
+                .await
+                .expect("pre-validation passed");
+            assert_eq!(partial.wire_kind(), "partial");
+            let partial = expect_partial(partial);
+            assert_eq!(partial.applied.released_artifact_ids, vec![released]);
+            assert_eq!(partial.failed.len(), 1);
+            assert_eq!(partial.failed[0].0, moved);
+
+            // Abort.
+            let (uc, artifacts, events, _l) = make_use_case();
+            let repo_id = Uuid::new_v4();
+            seed_with_digest(
+                &artifacts,
+                &events,
+                repo_id,
+                DIGEST_A,
+                "blobs/a",
+                QuarantineStatus::Quarantined,
+            );
+            let aborted = waive_digests(&uc, repo_id, &[DIGEST_A, DIGEST_MISSING])
+                .await
+                .expect("a refused batch is an outcome");
+            assert_eq!(aborted.wire_kind(), "aborted");
+            assert!(matches!(aborted, WaiveOutcome::Aborted { .. }));
+        }
+
+        /// The audit record a bulk waive leaves, asserted on the emitted
+        /// **fields** rather than on a rendered line: `outcome` is what
+        /// an audit query filters on, and a test matching formatted text
+        /// would pass on a line that merely mentions the word.
+        mod the_completion_record {
+            use std::collections::BTreeMap;
+            use std::sync::OnceLock;
+
+            use tracing_subscriber::layer::SubscriberExt;
+            use tracing_subscriber::Registry;
+
+            use super::*;
+
+            /// One field map per emitted event. Mirrors the capture block
+            /// in `task_handlers/quarantine_release_sweep.rs` — a global
+            /// passthrough subscriber installed once so callsite interest
+            /// is not cached as "never", then a thread-local subscriber
+            /// per test with the interest cache rebuilt.
+            #[derive(Clone, Default)]
+            struct FieldCapturingLayer {
+                records: Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>,
+            }
+
+            impl<S> tracing_subscriber::Layer<S> for FieldCapturingLayer
+            where
+                S: tracing::Subscriber,
+            {
+                fn register_callsite(
+                    &self,
+                    _meta: &'static tracing::Metadata<'static>,
+                ) -> tracing::subscriber::Interest {
+                    tracing::subscriber::Interest::sometimes()
+                }
+
+                fn enabled(
+                    &self,
+                    _meta: &tracing::Metadata<'_>,
+                    _ctx: tracing_subscriber::layer::Context<'_, S>,
+                ) -> bool {
+                    true
+                }
+
+                fn on_event(
+                    &self,
+                    event: &tracing::Event<'_>,
+                    _ctx: tracing_subscriber::layer::Context<'_, S>,
+                ) {
+                    let mut visitor = FieldVisitor::default();
+                    event.record(&mut visitor);
+                    self.records.lock().unwrap().push(visitor.fields);
+                }
+            }
+
+            #[derive(Default)]
+            struct FieldVisitor {
+                fields: BTreeMap<String, String>,
+            }
+
+            impl tracing::field::Visit for FieldVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.fields
+                        .insert(field.name().to_string(), format!("{value:?}"));
+                }
+                fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+                fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+                    self.fields
+                        .insert(field.name().to_string(), value.to_string());
+                }
+            }
+
+            fn install_passthrough_subscriber() {
+                static INSTALLED: OnceLock<()> = OnceLock::new();
+                INSTALLED.get_or_init(|| {
+                    let subscriber = Registry::default().with(FieldCapturingLayer::default());
+                    let _ = tracing::subscriber::set_global_default(subscriber);
+                });
+            }
+
+            /// Run `call` under a thread-local capturing subscriber and
+            /// return the completion record's fields.
+            ///
+            /// Synchronous, with its own current-thread runtime, because
+            /// `set_default` is thread-scoped: a multi-thread runtime
+            /// could run the future on a worker the guard does not cover.
+            fn capture_completion_record<F>(call: F) -> BTreeMap<String, String>
+            where
+                F: std::future::Future<Output = AppResult<WaiveOutcome>>,
+            {
+                install_passthrough_subscriber();
+                let layer = FieldCapturingLayer::default();
+                let records = layer.records.clone();
+                let subscriber = Registry::default().with(layer);
+                let _guard = tracing::subscriber::set_default(subscriber);
+                tracing::callsite::rebuild_interest_cache();
+
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime builds");
+                rt.block_on(async { call.await.expect("the call itself succeeds") });
+
+                let captured = records.lock().unwrap().clone();
+                captured
+                    .into_iter()
+                    .find(|fields| {
+                        fields
+                            .get("message")
+                            .is_some_and(|m| m.contains("curator bulk waive call complete"))
+                    })
+                    .expect("the completion record was emitted")
+            }
+
+            /// The defect, as a field assertion: a batch that released
+            /// one artifact and could not release the other used to log
+            /// `outcome = "ok"` beside `failed_count = 1`, so the audit
+            /// trail recorded a success for an irreversible partial
+            /// effect.
+            #[test]
+            fn a_partial_apply_does_not_record_outcome_ok() {
+                let (uc, artifacts, events, _l) = make_use_case();
+                let repo_id = Uuid::new_v4();
+                seed_with_digest(
+                    &artifacts,
+                    &events,
+                    repo_id,
+                    DIGEST_A,
+                    "blobs/a",
+                    QuarantineStatus::Quarantined,
+                );
+                let moved = seed_with_digest(
+                    &artifacts,
+                    &events,
+                    repo_id,
+                    DIGEST_B,
+                    "blobs/b",
+                    QuarantineStatus::Quarantined,
+                );
+                artifacts.set_status_after_next_checksum_read(moved, QuarantineStatus::Rejected);
+
+                let fields = capture_completion_record(uc.waive_bulk(
+                    digest_target(repo_id, &[DIGEST_A, DIGEST_B]),
+                    api_actor(),
+                    curator_privileges(),
+                    sample_justification(),
+                ));
+
+                assert_eq!(fields.get("outcome").map(String::as_str), Some("partial"));
+                assert_eq!(fields.get("failed_count").map(String::as_str), Some("1"));
+                assert_eq!(fields.get("released_count").map(String::as_str), Some("1"));
+            }
+
+            /// And a batch that applied in full still records `ok` — the
+            /// field has to stay usable as the success signal.
+            #[test]
+            fn a_full_apply_records_outcome_ok_with_no_failures() {
+                let (uc, artifacts, events, _l) = make_use_case();
+                let repo_id = Uuid::new_v4();
+                seed_with_digest(
+                    &artifacts,
+                    &events,
+                    repo_id,
+                    DIGEST_A,
+                    "blobs/a",
+                    QuarantineStatus::Quarantined,
+                );
+
+                let fields = capture_completion_record(uc.waive_bulk(
+                    digest_target(repo_id, &[DIGEST_A]),
+                    api_actor(),
+                    curator_privileges(),
+                    sample_justification(),
+                ));
+
+                assert_eq!(fields.get("outcome").map(String::as_str), Some("ok"));
+                assert_eq!(fields.get("failed_count").map(String::as_str), Some("0"));
+            }
         }
     }
 }

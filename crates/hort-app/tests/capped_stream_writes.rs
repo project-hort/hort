@@ -237,7 +237,14 @@ const EXPECTED_REFUSAL_CALLS: &[(&str, usize)] = &[
         1,
     ),
     ("crates/hort-app/src/use_cases/cas_scrub_use_case.rs", 1),
-    ("crates/hort-app/src/use_cases/curation_use_case.rs", 4),
+    // 5 against 4 append sites: the bulk waive asks the refusal twice —
+    // once in the function that appends, and once per entry ahead of its
+    // loop. The batch refuses whole rather than applying part of itself,
+    // which needs the answer before the first release; the appending
+    // function keeps its own, because the stream can grow in between.
+    // Both ask this predicate, so the two cannot disagree about where
+    // the cap is.
+    ("crates/hort-app/src/use_cases/curation_use_case.rs", 5),
     ("crates/hort-app/src/use_cases/policy_use_case.rs", 2),
     ("crates/hort-app/src/use_cases/promotion_use_case.rs", 4),
     (

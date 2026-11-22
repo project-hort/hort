@@ -224,14 +224,41 @@ exchange curl and tool-config steps run only when the proxy is live — the gate
 off-unless-exactly-`true`; setting the variable to `false` or leaving it unset
 has no effect.
 
-**Surface 2 — dev fetch token (static `hort_svc_*`, minimum-read, DB-direct).**
+**Surface 2 — dev operator token (static `hort_svc_*`, DB-direct).**
 
-Minted by the `gitops` Ansible role via `hort-server admin issue-svc-token --name
-maintainer-dev --permission read` (no admin API, no IdP). Operators log in via
-`hort-cli auth login --paste` with this token. Global `read` is acceptable on
-this instance because the only private repos are the dependency proxies;
-`hort-oci`, `hort-crates`, `hort-base` and `hort-charts` are public. This is not a GitHub PAT and is not
-bound to any GitHub identity.
+Minted by the `gitops` Ansible role (no admin API, no IdP); operators log in via
+`hort-cli auth login --paste` with this token. The `maintainer-dev` service
+account carries three global serviceAccount-subject grants — `read`, `prefetch`
+and `write` — applied through the gitops tree, and the mint issues **one** token
+carrying all three. Global `read` is acceptable on this instance because the only
+private repos are the dependency proxies; `hort-oci`, `hort-crates`, `hort-base`
+and `hort-charts` are public. `prefetch` and `write` back operator actions gated
+on those permissions — concretely the manual per-artifact rescan
+(`ManualRescanUseCase`), which is the only rescan path for a terminal artifact.
+The grants are **global** because the token is minted unscoped: an unscoped mint
+is preflighted against unscoped grants, and a repo-scoped grant does not satisfy
+that preflight. This is not a GitHub PAT and is not bound to any GitHub identity.
+
+**Global write is acceptable on this instance because the token is
+host-confined.** It is used only for local operations on registry.hort.rs and is
+not transmitted off that host, so "a leaked write token could push to the public
+hosted repos" requires compromising registry.hort.rs itself — beyond which the
+single-host dogfood is already fully compromised, and the write grant adds no
+blast radius short of that. The bound is therefore *where the token is used*
+rather than how narrowly it is minted: the gitops mint is one token with all
+three permissions, not a per-action mint. What stays revocable is the grant —
+delete `maintainer-dev-write.yaml` and re-apply — and because the mint is
+idempotent by name, a host provisioned before the permission set widened keeps
+its narrower token until an operator deliberately rotates it.
+
+Until 2026-08-13 this surface held `read` alone, and this ADR described it as
+"minimum-read" with a justification that reasons about read and about which
+repositories are private — an argument that does not reach write. The grants
+widened on that date and the mint followed on 2026-08-20; this paragraph did
+not, so the ADR described a posture the deployment no longer had. The
+justification above is what was missing, and it belongs here because a grant
+envelope's comment is not where anyone evaluating this deployment's posture will
+look.
 
 **Surface 3 — emergency early-release token (static, curator-permission only,
 DB-direct).**

@@ -30,16 +30,14 @@
 //! and a horizon keyed on provenance would retain or discard credentials
 //! by origin rather than by whether they can still authenticate anybody.
 //!
-//! # What the window is actually deciding
+//! # Why a horizon at all
 //!
-//! The deleted row carries `last_used_at`, `last_used_ip` and
-//! `last_used_user_agent`, which exist **nowhere else in the system** —
-//! the event store keeps `ApiTokenIssued`, `ApiTokenRevoked` and
-//! `ApiTokenUsed`, not those three fields. So [`DEFAULT_HORIZON`] is the
-//! decision that they are not worth keeping past it, which is why this is
-//! a horizon and not an immediate delete: a credential that expired this
-//! morning is already dead, and the 90 days buy an investigator its
-//! last-use trail rather than buying the credential anything.
+//! `api_tokens` had none before this handler — nothing in the tree
+//! deleted a row — while a row accrues per issued credential and the
+//! federation branch of `/auth/token-exchange` writes one per workload
+//! exchange. The deletion releases no authority and forecloses no
+//! decision: the row it reaches could not authenticate anybody for the
+//! length of the horizon before it went.
 //!
 //! # No cache invalidation per deleted row, deliberately
 //!
@@ -125,14 +123,12 @@ use super::sweep_horizon::resolve_sweep_horizon;
 /// 90 days — the retention horizon, and the only one any supported path
 /// produces (see the module docs).
 ///
-/// Longer than the three `jobs`-row sweeps' 7 days, because what ages out
-/// here is not operational accounting: it is the last-use trail
-/// (`last_used_at`, `last_used_ip`, `last_used_user_agent`) of a
-/// credential that existed, and 90 days is a quarter — long enough that
-/// an investigation opened on a credential retired last month still finds
-/// where it was used from, short enough that a table growing by one row
-/// per issued credential, plus one per federated workload exchange,
-/// reaches a steady state instead of accumulating forever.
+/// Longer than the three `jobs`-row sweeps' 7 days, which age out
+/// operational accounting. What ages out here is the record that a
+/// credential existed, in the table that decides who may do what — and
+/// a table growing by one row per issued credential, plus one per
+/// federated workload exchange, needs a window short enough to reach a
+/// steady state instead of accumulating forever.
 pub const DEFAULT_HORIZON: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// Hard upper bound on any horizon that reaches this handler — 365 days.
@@ -283,8 +279,9 @@ mod tests {
     ///
     /// The row it removes could not authenticate anybody for 90 days
     /// before it went, so no authority is released and no decision is
-    /// foreclosed; what the window discards is the last-use trail, and
-    /// discarding that is the decision the horizon *is*. A destructive
+    /// foreclosed; what the window discards is the record that the
+    /// credential existed, and discarding that is the decision the
+    /// horizon *is*. A destructive
     /// kind carries a per-UTC-day idempotency key because a second run
     /// would destroy more than the first; a second run of this sweep
     /// deletes the rows the first one already took, which is to say
@@ -465,15 +462,6 @@ mod tests {
                     })
                 })
             }
-            fn update_last_used(
-                &self,
-                _token_id: Uuid,
-                _at: chrono::DateTime<Utc>,
-                _client_ip: Option<&str>,
-                _user_agent: Option<&str>,
-            ) -> BoxFuture<'_, DomainResult<()>> {
-                Box::pin(async { Ok(()) })
-            }
             fn revoke(&self, _token_id: Uuid) -> BoxFuture<'_, DomainResult<()>> {
                 Box::pin(async { Ok(()) })
             }
@@ -497,8 +485,8 @@ mod tests {
     /// The default must sit strictly inside the cap (or the cap would
     /// reject the only horizon any supported path produces), and must be
     /// longer than the `jobs`-row sweeps' 7 days — what ages out here is
-    /// a credential's last-use trail, not operational accounting, and the
-    /// two windows are answering different questions.
+    /// the record that a credential existed, not operational accounting,
+    /// and the two windows are answering different questions.
     #[test]
     fn the_default_horizon_sits_inside_the_cap_and_above_the_jobs_row_window() {
         assert!(
@@ -507,7 +495,7 @@ mod tests {
         );
         assert!(
             DEFAULT_HORIZON > crate::task_handlers::scan_row_retention_sweep::DEFAULT_HORIZON,
-            "a credential's last-use trail outlives a terminal job row by design"
+            "the record that a credential existed outlives a terminal job row by design"
         );
     }
 }

@@ -68,8 +68,9 @@ mod challenge;
 // Connect-time guarded DNS resolver — closes the SSRF / DNS-rebind TOCTOU
 // between `check_ssrf_safe` (URL-validation-time resolve) and reqwest's
 // independent dial-time resolve (security audit finding INJ-1). Bound to
-// the upstream artifact / metadata / manifest clients at the two
-// `Client::builder()` sites. Mirrors the webhook crate's connect-time
+// the clients that dial a destination upstream data nominated, and not to
+// the clients that dial the operator's own configured upstream — see
+// `EgressPosture`. Mirrors the webhook crate's connect-time
 // `GuardedDnsResolver`; reuses `hort_net_egress::is_routable`.
 mod dns_guard;
 mod extra_ca;
@@ -97,7 +98,11 @@ pub use resolver::CachingResolver;
 // (security audit finding INJ-1) re-runs `is_routable` on every dial-time
 // resolution so a DNS-rebind between check and dial cannot smuggle an
 // internal address past the URL-validation check. All three reuse this one
-// `is_routable` predicate; the guard does NOT reimplement it.
+// `is_routable` predicate; the guard does NOT reimplement it. All three
+// are also scoped to a destination upstream data nominated — the first by
+// `resolve_artifact_url`'s absolute branch, the other two by
+// `EgressPosture` — because an operator-configured upstream that resolves
+// to RFC 1918 is the deployment rather than a pivot.
 // `build_egress_redirect_policy` (the old `hort-net-egress` redirect-policy
 // export) stays retired — this crate builds its own redirect policy.
 use hort_net_egress::is_routable;
@@ -657,6 +662,18 @@ struct ReferrerDescriptorBody {
 
 /// HTTP-backed [`UpstreamProxy`].
 pub struct HttpUpstreamProxy {
+    /// The [`EgressPosture::UpstreamNominated`] client: the connect-time
+    /// DNS guard bound and the redirect policy's routability leg in
+    /// force.
+    ///
+    /// Used as a client at exactly two sites, both of which have
+    /// classified the destination as one upstream data nominated —
+    /// `send_with_challenge`'s [`CredentialScope::ForeignOrigin`] arm
+    /// and `fetch_bearer_token`'s anonymous
+    /// [`ExchangeClient::Shared`] arm. The credentialed `Shared` arm
+    /// takes [`Self::exchange_client_origin_bound`], which is this
+    /// posture plus the hop binding. An own-origin dial takes
+    /// [`Self::client_for_mapping`] instead.
     client: Client,
     config: HttpUpstreamProxyConfig,
     secret_port: Arc<dyn SecretPort>,
@@ -672,9 +689,12 @@ pub struct HttpUpstreamProxy {
     /// Populated when a 401 → exchange completes.
     challenge_memo: Arc<tokio::sync::RwLock<HashMap<String, Challenge>>>,
     /// Per-mapping `reqwest::Client` cache (ADR 0010). Mappings without
-    /// TLS material reuse `self.client`; mappings with `ca_bundle_ref`
-    /// / `mtls_*_ref` / `pinned_cert_sha256` produce a tailored client
-    /// built once on first use and reused for the process lifetime.
+    /// TLS material share `self.client_operator_configured`; mappings
+    /// with `ca_bundle_ref` / `mtls_*_ref` / `pinned_cert_sha256`
+    /// produce a tailored client built once on first use and reused for
+    /// the process lifetime. Both are
+    /// [`EgressPosture::OperatorConfigured`] — see
+    /// [`HttpUpstreamProxy::client_for_mapping`].
     ///
     /// **Cache lifetime trade-off:** the cache is never invalidated
     /// inside a process. Operators who rotate cert / key / CA must
@@ -694,7 +714,9 @@ pub struct HttpUpstreamProxy {
     /// INJ-1), and the two realm gates in
     /// [`HttpUpstreamProxy::fetch_bearer_token`] (scheme and
     /// routability) via [`HttpUpstreamProxy::realm_is_test_allowlisted`]
-    /// and [`check_ssrf_safe_allowing`].
+    /// and [`check_ssrf_safe_allowing`]. The first two read it only on
+    /// the clients that carry [`EgressPosture::UpstreamNominated`]; on
+    /// the other arm there is no routability question for it to answer.
     /// **Always empty in production** (built via [`HttpUpstreamProxy::new`],
     /// [`HttpUpstreamProxy::with_client`]); only the `#[cfg(test)]`
     /// constructor populates it with the wiremock loopback `SocketAddr`s so
@@ -723,17 +745,49 @@ pub struct HttpUpstreamProxy {
     /// amortised across every exchange (and bearer tokens are cached,
     /// so exchanges are per-token-lifetime, not per-request).
     exchange_client_origin_bound: Arc<tokio::sync::OnceCell<Client>>,
+    /// The [`EgressPosture::OperatorConfigured`] client: `client`'s
+    /// posture with neither routability refusal, for a dial to the
+    /// destination the operator wrote into the mapping.
+    ///
+    /// **Read in exactly one function**,
+    /// [`HttpUpstreamProxy::client_for_mapping`], whose two fallback
+    /// arms are the mappings that declare no TLS material — and that is
+    /// the whole of how "the unguarded client is unreachable from a
+    /// foreign-origin dial" is held. The builder is an inner item of
+    /// that function, so no other function in the crate can name it,
+    /// and `client_for_mapping` itself is reached only from the two
+    /// own-origin sites (the census in its own doc). A new caller that
+    /// wants this client has to go through the function that proves the
+    /// destination is the mapping's own.
+    ///
+    /// Lazy for the same reason [`Self::exchange_client_origin_bound`]
+    /// is: a deployment whose upstreams are all public never dials an
+    /// internal address, and the cost when it is reached is one extra
+    /// connection pool for the process lifetime. Built from
+    /// `self.config`, so [`Self::with_client`] needs no new signature
+    /// and an injected client stays `self.client` — the guarded one.
+    client_operator_configured: Arc<tokio::sync::OnceCell<Client>>,
 }
 
-/// Build the outbound `reqwest::Client` for the supplied config.
+/// Build a `reqwest::ClientBuilder` carrying this crate's transport
+/// posture.
 ///
-/// Single source of truth for the transport posture, shared by
-/// [`HttpUpstreamProxy::new`] (one client per instance) and
-/// [`HttpUpstreamProxy::build_client`] (one client shared across a
-/// per-format family), so the two paths cannot drift apart.
+/// **Single source of truth for every upstream-http client**, and the
+/// one place in the crate where [`EgressPosture`] turns into wiring.
+/// Both build paths go through it — the free one
+/// ([`build_client_inner`], reached by [`HttpUpstreamProxy::new`] and
+/// [`HttpUpstreamProxy::build_client`]) and the `&self` one
+/// ([`HttpUpstreamProxy::base_client_builder`], reached by the
+/// per-mapping TLS clients and the origin-bound exchange client) — so
+/// no client can disagree with another about what a posture means. The
+/// posture decides whether the connect-time DNS guard is bound and
+/// whether the redirect policy carries its routability leg, and a
+/// second copy of those two lines is exactly how one path would end up
+/// guarded and the other not.
 ///
 /// SSRF defence, three layers, all reusing `is_routable`:
-///  - `check_ssrf_safe` validates the initial absolute URL at parse time;
+///  - `check_ssrf_safe` validates a metadata-supplied absolute URL at
+///    parse time;
 ///  - the redirect policy re-runs `is_routable` on every hop's resolved
 ///    host and stops the chain when a hop resolves non-routable, while
 ///    still enforcing the `max_redirect_hops` cap;
@@ -743,40 +797,78 @@ pub struct HttpUpstreamProxy {
 ///    resolve cannot pivot to IMDS / RFC1918 / loopback (security audit
 ///    finding INJ-1). Cross-origin Authorization-strip remains.
 ///
+/// The second and third layers are the two the posture scopes: they
+/// answer a question about a destination *upstream data chose*, so they
+/// are bound on [`EgressPosture::UpstreamNominated`] and absent on
+/// [`EgressPosture::OperatorConfigured`]. The first layer is not a
+/// client property at all — `resolve_artifact_url` runs it on the
+/// absolute branch only, which is the same scoping one layer up.
+///
 /// The guard shares the same `redirect_test_allowlist` seam (empty in
 /// production) the redirect policy uses, so wiremock host-name tests can
 /// drive it on loopback while production refuses every loopback /
 /// RFC1918 / link-local resolution.
+fn upstream_client_builder(
+    config: &HttpUpstreamProxyConfig,
+    redirect_test_allowlist: &Arc<Vec<SocketAddr>>,
+    hops: HopBinding,
+    egress: EgressPosture,
+) -> DomainResult<reqwest::ClientBuilder> {
+    let mut builder = Client::builder()
+        .timeout(config.timeout)
+        .user_agent(config.user_agent.as_str());
+
+    // Bound only for an upstream-nominated destination. reqwest keeps
+    // its default resolver otherwise — there is no "permissive guard"
+    // variant, because a guard that permits everything is a line a
+    // later reader has to decide the meaning of.
+    if egress == EgressPosture::UpstreamNominated {
+        builder = builder.dns_resolver(Arc::new(dns_guard::GuardedDnsResolver::new(
+            redirect_test_allowlist.clone(),
+        )));
+    }
+
+    let builder = builder.redirect(build_redirect_policy(
+        config.max_redirect_hops,
+        redirect_test_allowlist.clone(),
+        hops,
+        egress,
+    ));
+
+    // Apply the process-wide extra CA bundle (ADR 0010). Failure here is
+    // fatal at the composition-root call site: composition aborts rather
+    // than running with a partially-trusted TLS posture. The helper
+    // returns the builder unchanged when `extra_trust_anchors` is `None`.
+    extra_ca::apply_to_reqwest_builder(builder, config.extra_trust_anchors.as_ref())
+}
+
+/// Build the shared outbound `reqwest::Client` for the supplied config —
+/// the one that carries every dial to a destination upstream data
+/// nominated, and therefore the guarded posture.
+///
+/// Shared by [`HttpUpstreamProxy::new`] (one client per instance) and
+/// [`HttpUpstreamProxy::build_client`] (one client shared across a
+/// per-format family), so the two paths cannot drift apart.
 fn build_client_inner(
     config: &HttpUpstreamProxyConfig,
     redirect_test_allowlist: &Arc<Vec<SocketAddr>>,
 ) -> DomainResult<Client> {
-    let base_builder = Client::builder()
-        .timeout(config.timeout)
-        .user_agent(config.user_agent.as_str())
-        .dns_resolver(Arc::new(dns_guard::GuardedDnsResolver::new(
-            redirect_test_allowlist.clone(),
-        )))
-        .redirect(build_redirect_policy(
-            config.max_redirect_hops,
-            redirect_test_allowlist.clone(),
-            // The shared client presents no identity and carries no
-            // pin, so a cross-origin hop here leaks nothing: the CDN
-            // redirect every public upstream relies on must keep
-            // working (`redirect_hop_to_routable_cdn_is_allowed`).
-            HopBinding::AnyOrigin,
-        ));
-
-    // Apply the process-wide extra CA bundle (ADR 0010) to the base
-    // client. Failure here is fatal: composition aborts rather than
-    // running with a partially-trusted TLS posture. The helper returns
-    // the builder unchanged when `extra_trust_anchors` is `None`.
-    let base_builder =
-        extra_ca::apply_to_reqwest_builder(base_builder, config.extra_trust_anchors.as_ref())?;
-
-    base_builder
-        .build()
-        .map_err(|e| DomainError::Invariant(format!("building reqwest client failed: {e}")))
+    upstream_client_builder(
+        config,
+        redirect_test_allowlist,
+        // The shared client presents no identity and carries no
+        // pin, so a cross-origin hop here leaks nothing: the CDN
+        // redirect every public upstream relies on must keep
+        // working (`redirect_hop_to_routable_cdn_is_allowed`).
+        HopBinding::AnyOrigin,
+        // The shared client is reachable only from the two
+        // foreign-origin sites (see
+        // `HttpUpstreamProxy::client_for_mapping`'s census), which is
+        // what makes this unconditional rather than a decision.
+        EgressPosture::UpstreamNominated,
+    )?
+    .build()
+    .map_err(|e| DomainError::Invariant(format!("building reqwest client failed: {e}")))
 }
 
 impl HttpUpstreamProxy {
@@ -835,6 +927,7 @@ impl HttpUpstreamProxy {
             tls_client_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             redirect_test_allowlist: Arc::new(Vec::new()),
             exchange_client_origin_bound: Arc::new(tokio::sync::OnceCell::new()),
+            client_operator_configured: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -870,6 +963,7 @@ impl HttpUpstreamProxy {
             tls_client_cache: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             redirect_test_allowlist,
             exchange_client_origin_bound: Arc::new(tokio::sync::OnceCell::new()),
+            client_operator_configured: Arc::new(tokio::sync::OnceCell::new()),
         })
     }
 
@@ -877,9 +971,13 @@ impl HttpUpstreamProxy {
     /// shared base config — timeout, redirect cap, and the process-wide
     /// extra CA bundle (ADR 0010).
     ///
-    /// Extracted so the per-mapping TLS client build path produces a
-    /// `Client` that is structurally identical to
-    /// `self.client` on every dimension except the rustls TLS config.
+    /// The `&self` half of [`upstream_client_builder`], which every
+    /// client in this crate is built through: the per-mapping TLS path
+    /// and the origin-bound exchange client reach it here, the shared
+    /// client reaches it through [`build_client_inner`]. So a client
+    /// built here differs from `self.client` on exactly the dimensions
+    /// its caller names — the rustls TLS config, `hops` and `egress` —
+    /// and on nothing else.
     ///
     /// Returns `DomainResult` because applying the extra CA bundle can
     /// fail if reqwest rejects a cert (e.g. it is syntactically DER but
@@ -887,43 +985,61 @@ impl HttpUpstreamProxy {
     /// build site — the error propagates up and the cache entry is NOT
     /// written, allowing a retry on the next request.
     ///
-    /// `hops` is the one dimension on which a per-mapping client may
-    /// legitimately differ from `self.client` besides its TLS config:
-    /// a client that presents the mapping's identity binds every
-    /// redirect hop to the requested origin (see [`HopBinding`]). It is
-    /// a parameter rather than a field read because the answer is the
-    /// mapping's, and this builder never sees a mapping.
-    fn base_client_builder(&self, hops: HopBinding) -> DomainResult<reqwest::ClientBuilder> {
-        // Per-mapping (TLS) clients get the same per-hop redirect SSRF
-        // policy AND the same connect-time DNS guard as the base client so
-        // the redirect-following surface and the dial-time DNS-rebind
-        // surface are closed uniformly across every upstream-http client
-        // (security audit finding INJ-1). Same allowlist instance as the
-        // base client (empty in production).
-        let builder = Client::builder()
-            .timeout(self.config.timeout)
-            .user_agent(self.config.user_agent.as_str())
-            .dns_resolver(Arc::new(dns_guard::GuardedDnsResolver::new(
-                self.redirect_test_allowlist.clone(),
-            )))
-            .redirect(build_redirect_policy(
-                self.config.max_redirect_hops,
-                self.redirect_test_allowlist.clone(),
-                hops,
-            ));
-
-        // Apply process-wide extra CA bundle. Returns the builder unchanged
-        // when `extra_trust_anchors` is `None`.
-        extra_ca::apply_to_reqwest_builder(builder, self.config.extra_trust_anchors.as_ref())
+    /// `hops` and `egress` are the two dimensions on which a client
+    /// built here may legitimately differ from `self.client` besides
+    /// its TLS config, and both are parameters rather than field reads
+    /// because the answer belongs to the caller: a client that presents
+    /// the mapping's identity binds every redirect hop to the requested
+    /// origin (see [`HopBinding`]), and a client that only ever dials
+    /// the operator's own upstream carries neither routability refusal
+    /// (see [`EgressPosture`]). This builder never sees a mapping and
+    /// never sees a URL, so it cannot derive either.
+    fn base_client_builder(
+        &self,
+        hops: HopBinding,
+        egress: EgressPosture,
+    ) -> DomainResult<reqwest::ClientBuilder> {
+        // Same free builder, same allowlist instance (empty in
+        // production) and therefore the same answer to "what does this
+        // posture bind?" as the shared client gets.
+        upstream_client_builder(&self.config, &self.redirect_test_allowlist, hops, egress)
     }
 
     /// Resolve the `reqwest::Client` to use for `mapping`. Mappings
-    /// without operator-supplied TLS material reuse the proxy's
-    /// default client (which already trusts the system CA bundle and
-    /// performs no client-auth). Mappings with any of `ca_bundle_ref`,
-    /// `mtls_cert_ref` + `mtls_key_ref`, or `pinned_cert_sha256` get
-    /// a per-mapping client built from a `rustls::ClientConfig` via
-    /// `use_preconfigured_tls`.
+    /// without operator-supplied TLS material get the proxy's
+    /// own-origin client (which trusts the system CA bundle plus
+    /// `HORT_EXTRA_CA_BUNDLE` and performs no client-auth). Mappings
+    /// with any of `ca_bundle_ref`, `mtls_cert_ref` + `mtls_key_ref`,
+    /// or `pinned_cert_sha256` get a per-mapping client built from a
+    /// `rustls::ClientConfig` via `use_preconfigured_tls`.
+    ///
+    /// # Every client this returns is `EgressPosture::OperatorConfigured`
+    ///
+    /// …because every caller of this function has already established
+    /// that the destination is the mapping's own origin, and that is a
+    /// census, not a convention:
+    ///
+    /// - `send_with_challenge` resolves this only on the
+    ///   [`CredentialScope::MappingOrigin`] arm; the
+    ///   [`CredentialScope::ForeignOrigin`] arm takes `self.client`.
+    /// - `fetch_bearer_token` resolves this only on the
+    ///   [`ExchangeClient::PerMapping`] arm, which the caller selects
+    ///   from [`credential_scope`] applied to the realm — a realm on
+    ///   the mapping's own origin.
+    ///
+    /// Those are the two production call sites. The posture is
+    /// therefore unconditional here rather than a parameter: a caller
+    /// that could pass the other arm would be a caller that has not
+    /// established the destination, and the thing to add then is the
+    /// origin check, not an argument.
+    ///
+    /// The unguarded client itself is built by an inner item of this
+    /// function and `self.client_operator_configured` is read nowhere
+    /// else, so there is no accessor a foreign-origin dial could reach
+    /// for. The per-mapping TLS clients are the same posture: a
+    /// mapping that pins a leaf or presents an mTLS identity describes
+    /// one operator-configured origin and is fetched only there (the
+    /// [`HopBinding::RequestedOrigin`] interlock).
     ///
     /// First call for a given `mapping.id` resolves all secrets via
     /// [`SecretPort`], builds the rustls config + client, and stores
@@ -937,13 +1053,57 @@ impl HttpUpstreamProxy {
         &self,
         mapping: &RepositoryUpstreamMapping,
     ) -> DomainResult<Client> {
-        // Fast path: no TLS fields → reuse default client.
+        /// Build-or-return the one [`EgressPosture::OperatorConfigured`]
+        /// client, for the mappings that declare no TLS material.
+        ///
+        /// An inner item on purpose: the enclosing function's doc
+        /// explains why every client it returns carries this posture,
+        /// and an inner item cannot be named from anywhere that reasoning
+        /// does not cover. It takes the `OnceCell` rather than `&self`
+        /// because that is all it needs, which is also what keeps the
+        /// field's one reader visible — `client_operator_configured`
+        /// appears in this function and nowhere else in the crate.
+        async fn operator_configured(
+            cell: &tokio::sync::OnceCell<Client>,
+            config: &HttpUpstreamProxyConfig,
+            allowlist: &Arc<Vec<SocketAddr>>,
+        ) -> DomainResult<Client> {
+            cell.get_or_try_init(|| async {
+                // `AnyOrigin`: this client presents no identity and
+                // carries no pin, so the hop binding is the shared
+                // client's — a private registry answering a blob `GET`
+                // with a `302` to object storage on another host is the
+                // normal deployment (see `hop_binding_for`).
+                upstream_client_builder(
+                    config,
+                    allowlist,
+                    HopBinding::AnyOrigin,
+                    EgressPosture::OperatorConfigured,
+                )?
+                .build()
+                .map_err(|e| {
+                    classified_error(
+                        UpstreamErrorKind::NetworkError,
+                        &format!("own-origin upstream client build failed: {e}"),
+                    )
+                })
+            })
+            .await
+            .cloned()
+        }
+
+        // Fast path: no TLS fields → the own-origin client.
         let any_tls_field = mapping.mtls_cert_ref.is_some()
             || mapping.mtls_key_ref.is_some()
             || mapping.ca_bundle_ref.is_some()
             || mapping.pinned_cert_sha256.is_some();
         if !any_tls_field {
-            return Ok(self.client.clone());
+            return operator_configured(
+                &self.client_operator_configured,
+                &self.config,
+                &self.redirect_test_allowlist,
+            )
+            .await;
         }
 
         // Cache hit?
@@ -960,8 +1120,16 @@ impl HttpUpstreamProxy {
         if !material.any_present() {
             // Defensive: the value-object pairing invariant should make
             // this unreachable when we got past the early any_tls_field
-            // check, but if it ever happens, fall back to default client.
-            return Ok(self.client.clone());
+            // check, but if it ever happens, fall back to the same
+            // own-origin client the fast path returns. Falling back to
+            // the guarded shared client instead would refuse an internal
+            // mirror on a mapping the fast path would have served.
+            return operator_configured(
+                &self.client_operator_configured,
+                &self.config,
+                &self.redirect_test_allowlist,
+            )
+            .await;
         }
         // Pass the process-wide extra trust anchors (ADR 0010) into the
         // per-mapping rustls config so that mappings relying solely on
@@ -976,14 +1144,17 @@ impl HttpUpstreamProxy {
             build_rustls_client_config(&material, self.config.extra_trust_anchors.as_ref())?;
 
         // `use_preconfigured_tls` swaps the entire TLS backend; pair it
-        // with the shared base builder so timeouts / redirects / DNS
-        // policy stay aligned with `self.client`. The one deliberate
-        // divergence is the hop binding: a client that presents this
-        // mapping's certificate, or applies its leaf pin, may not follow
-        // a hop off the origin the request was asked for.
+        // with the shared base builder so timeouts and the redirect cap
+        // stay aligned with `self.client`. Two deliberate divergences:
+        // the hop binding — a client that presents this mapping's
+        // certificate, or applies its leaf pin, may not follow a hop off
+        // the origin the request was asked for — and the egress posture,
+        // which is the own-origin one because this client is only ever
+        // handed a URL on the mapping's own origin (the function's
+        // caller census).
         let hops = hop_binding_for(mapping);
         let client = self
-            .base_client_builder(hops)?
+            .base_client_builder(hops, EgressPosture::OperatorConfigured)?
             .use_preconfigured_tls(rustls_config)
             .build()
             .map_err(|e| {
@@ -1055,14 +1226,23 @@ impl HttpUpstreamProxy {
     async fn origin_bound_exchange_client(&self) -> DomainResult<Client> {
         self.exchange_client_origin_bound
             .get_or_try_init(|| async {
-                self.base_client_builder(HopBinding::RequestedOrigin)?
-                    .build()
-                    .map_err(|e| {
-                        classified_error(
-                            UpstreamErrorKind::NetworkError,
-                            &format!("origin-bound realm-exchange client build failed: {e}"),
-                        )
-                    })
+                // Guarded, like `self.client` whose trust posture this
+                // shares: the realm is a host upstream named in a
+                // `WWW-Authenticate` header, and the operator's consent
+                // to it (`allowed_realm_hosts`) is consent to send a
+                // credential there, not a statement that the host is
+                // their own infrastructure.
+                self.base_client_builder(
+                    HopBinding::RequestedOrigin,
+                    EgressPosture::UpstreamNominated,
+                )?
+                .build()
+                .map_err(|e| {
+                    classified_error(
+                        UpstreamErrorKind::NetworkError,
+                        &format!("origin-bound realm-exchange client build failed: {e}"),
+                    )
+                })
             })
             .await
             .cloned()
@@ -1229,10 +1409,15 @@ fn parse_last_modified(value: Option<&str>) -> Option<DateTime<Utc>> {
 /// itself, and reqwest re-resolves independently at dial time — a
 /// DNS-rebind/TOCTOU window between the two. That window is closed by the
 /// connect-time [`dns_guard::GuardedDnsResolver`] (security audit finding
-/// INJ-1) bound to the same clients, which re-runs the identical
+/// INJ-1), which re-runs the identical
 /// [`hort_net_egress::is_routable`] predicate on every dial-time
 /// resolution and fails the dial closed before any bytes leave the
-/// process. This check stays as the cheap first gate (it rejects an
+/// process. The guard is bound to the clients that dial an
+/// upstream-nominated destination ([`EgressPosture`]), which is the same
+/// set of requests this check runs on: `resolve_artifact_url` calls it on
+/// the absolute branch and composes the relative branch onto
+/// `mapping.upstream_url` unchecked, because the operator declared that
+/// destination. This check stays as the cheap first gate (it rejects an
 /// obviously-internal literal/host before a connection is even attempted)
 /// and as the parse-time URL validator.
 ///
@@ -1311,6 +1496,93 @@ const REDIRECT_SSRF_SENTINEL: &str = "hort-upstream-redirect-ssrf-blocked";
 /// test tell the two refusals apart in logs.
 const REDIRECT_OFF_ORIGIN_SENTINEL: &str = "hort-upstream-redirect-off-origin-refused";
 
+/// Who chose the destination a client is built to dial — and therefore
+/// whether this crate's two *routability* refusals apply to it.
+///
+/// # The distinction this names
+///
+/// The same vocabulary [`credential_scope`] already reads: a
+/// destination is either one the **operator configured**
+/// (`mapping.upstream_url` and its own origin) or one **upstream data
+/// nominated** (an absolute URL lifted out of a packument / index /
+/// sdist listing, a realm named by a `WWW-Authenticate` header). Only
+/// the second is attacker-influenceable, and the routability refusals
+/// exist for exactly that: a host that resolves to IMDS / RFC1918 /
+/// loopback is a pivot when upstream named it and is the deployment
+/// when the operator named it.
+///
+/// An operator who writes `https://artifactory.corp.internal` into a
+/// mapping has *declared* that destination; an internal Artifactory,
+/// an in-cluster verdaccio and an on-prem npm proxy all resolve to RFC
+/// 1918 / ULA / loopback, and refusing them refuses the supported
+/// topology rather than an attack. `resolve_artifact_url` has always
+/// read it that way — it runs [`check_ssrf_safe`] on the absolute
+/// branch and composes the relative branch onto `upstream_url` with no
+/// check at all.
+///
+/// That parse-time branch is chosen by the *shape* of the path, not by
+/// origin, and this posture does not change it: an absolute artifact
+/// URL is still routability-checked at parse time even when its host
+/// is the mapping's own. So a format whose download URL is absolute
+/// (npm `dist.tarball`, PyPI `urls[].url`, the Cargo `dl`-composed
+/// URL) still cannot reach an internal mirror's artifact leg, while
+/// its metadata leg and every path composed onto `upstream_url` can.
+/// Making that branch origin-aware is a separate decision about the
+/// parse-time gate, not about which client carries a dial.
+///
+/// # What each arm selects
+///
+/// Two things, together, because they are two legs of one question
+/// ("may this client dial an internal address?"):
+///
+/// - whether [`dns_guard::GuardedDnsResolver`] is bound as the
+///   client's resolver, which re-runs
+///   [`hort_net_egress::is_routable`] on every dial-time resolution;
+/// - whether [`build_redirect_policy`]'s per-hop routability refusal
+///   runs.
+///
+/// Nothing else differs. The hop **cap** and the [`HopBinding`]
+/// refusal are independent of this and apply on both arms: the cap
+/// bounds how many hops whoever named the target, and the origin leg
+/// is about whose certificate the hop would receive, which the
+/// operator's own consent to a destination says nothing about.
+///
+/// # Why the posture is a property of the client
+///
+/// A resolver and a redirect policy are bound at `Client::builder()`
+/// time and cannot be varied per request. So the split has to be
+/// carried by *which client* a request runs on, and this crate already
+/// decides that from the same origin comparison: `send_with_challenge`
+/// routes a `CredentialScope::MappingOrigin` request to
+/// [`HttpUpstreamProxy::client_for_mapping`] and a
+/// `CredentialScope::ForeignOrigin` request to the shared client. The
+/// posture rides along that existing seam rather than adding a second
+/// decision — see [`HttpUpstreamProxy::client_for_mapping`] for the
+/// census that makes it sound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EgressPosture {
+    /// The destination is upstream-nominated data. Bind the
+    /// connect-time DNS guard and enforce the per-hop routability
+    /// refusal: this is the client that dials an absolute URL out of a
+    /// metadata document, and a host name there can resolve to one
+    /// address when [`check_ssrf_safe`] asks and another when reqwest
+    /// dials.
+    UpstreamNominated,
+    /// The destination is the operator's own configured upstream.
+    /// Neither routability refusal applies — the operator vetted the
+    /// target, which is the same trust model `hort-adapters-oidc` and
+    /// `hort-adapters-storage` apply to theirs.
+    ///
+    /// What still covers this client: reqwest's cross-origin
+    /// `Authorization` strip plus [`credential_scope`]'s withholding on
+    /// the initial request, the mandatory upstream checksum
+    /// verification on the content itself (ADR 0006), TLS certificate
+    /// validation against the system store plus
+    /// `HORT_EXTRA_CA_BUNDLE` (ADR 0010 — no `*_INSECURE_TLS` knob),
+    /// the hop cap, and the [`HopBinding`] refusal.
+    OperatorConfigured,
+}
+
 /// Whether a redirect hop may leave the origin the request was asked
 /// for, for the client the hop is being followed on.
 ///
@@ -1337,11 +1609,12 @@ const REDIRECT_OFF_ORIGIN_SENTINEL: &str = "hort-upstream-redirect-off-origin-re
 /// mapping, with nothing in the outcome saying so.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HopBinding {
-    /// Hops may cross origins, subject to the hop cap and the per-hop
-    /// routability re-check. This is the shared client — which presents
-    /// nothing and trusts only the system store plus the process-wide
-    /// `HORT_EXTRA_CA_BUNDLE` — and the per-mapping clients whose TLS
-    /// material says only *whom to trust* (see [`hop_binding_for`]).
+    /// Hops may cross origins, subject to the hop cap and — where the
+    /// client's [`EgressPosture`] carries it — the per-hop routability
+    /// re-check. This is the shared client and the own-origin client,
+    /// neither of which presents anything, plus the per-mapping clients
+    /// whose TLS material says only *whom to trust* (see
+    /// [`hop_binding_for`]).
     AnyOrigin,
     /// Every hop must stay on the origin of the URL this request was
     /// asked for. Bound per request rather than per client: the target
@@ -1380,11 +1653,16 @@ enum HopBinding {
 ///   the system roots — is exactly what makes that hop validate today.
 ///   Refusing it would turn a working pull-through into a
 ///   `parse_error` for no secret saved.
-/// - The hop keeps every control the shared client's hops keep: the hop
-///   cap, the per-hop routability re-check
-///   ([`dns_guard::addr_is_dialable`]), the connect-time DNS guard,
-///   reqwest's cross-origin `Authorization` strip, and the mandatory
-///   upstream checksum verification on the content itself (ADR 0006).
+/// - The hop keeps the controls that answer *this* question: the hop
+///   cap, reqwest's cross-origin `Authorization` strip, and the
+///   mandatory upstream checksum verification on the content itself
+///   (ADR 0006). The two routability controls — the per-hop re-check
+///   ([`dns_guard::addr_is_dialable`]) and the connect-time DNS guard —
+///   are absent, because a per-mapping client dials only the
+///   operator's own configured upstream and carries
+///   [`EgressPosture::OperatorConfigured`]; what is at stake in a hop
+///   off that origin is the trust set, which is what this binding is
+///   about.
 ///
 /// The residual this accepts: the private CA's signing power travels to
 /// an upstream-nominated origin, so a certificate that CA issued for
@@ -1418,6 +1696,16 @@ fn hop_binding_for(mapping: &RepositoryUpstreamMapping) -> HopBinding {
 /// redirect hop's resolved host and stops the chain with an error when
 /// any resolved address is non-routable, while still enforcing the hop
 /// **cap** (`max_redirect_hops`) the way `Policy::limited` did.
+///
+/// That routability leg runs on the
+/// [`EgressPosture::UpstreamNominated`] arm only. A client built to
+/// dial the operator's own configured upstream takes
+/// [`EgressPosture::OperatorConfigured`] and keeps the cap and the
+/// origin leg without it: an internal mirror that answers a blob `GET`
+/// with a `302` to an RFC 1918 host on its own network is the
+/// deployment, not a pivot, and the one thing the routability leg
+/// could say about it is "refuse". See [`EgressPosture`] for why the
+/// posture rides on which client a request runs on.
 ///
 /// # The second refusal: a hop that leaves the requested origin
 ///
@@ -1453,30 +1741,37 @@ fn hop_binding_for(mapping: &RepositoryUpstreamMapping) -> HopBinding {
 /// # Scoping (HARD constraint)
 ///
 /// This is bound **only** to the `hort-adapters-upstream-http` artifact /
-/// metadata / manifest `reqwest::Client`(s) at the two `Client::builder()`
-/// sites in this crate. It is NOT re-exported, is NOT placed in
-/// `hort-net-egress`, and is never threaded to the S3
+/// metadata / manifest `reqwest::Client`(s), all of which are built
+/// through [`upstream_client_builder`]. It is NOT re-exported, is NOT
+/// placed in `hort-net-egress`, and is never threaded to the S3
 /// (`hort-adapters-storage`) or OIDC (`hort-adapters-oidc`) clients —
-/// those use operator-vetted base targets.
+/// those use operator-vetted base targets, which is also why the
+/// `OperatorConfigured` arm here holds no routability leg: it is the
+/// same trust model applied to the same kind of target.
 ///
 /// # Relationship to the connect-time DNS guard
 ///
 /// This per-hop policy guards the *redirect* leg. The DNS-rebind/TOCTOU on
 /// the **initial dial** — the gap between [`check_ssrf_safe`]'s
 /// URL-validation-time resolution and reqwest's independent dial-time
-/// resolution — is now closed by the connect-time
-/// [`dns_guard::GuardedDnsResolver`] bound to the same clients (security
-/// audit finding INJ-1): it re-runs [`hort_net_egress::is_routable`] on
-/// every dial-time resolution and fails the dial closed before any bytes
-/// leave the process. The redirect path is itself re-guarded per hop here;
-/// reqwest re-resolves each followed hop through the bound DNS guard too,
-/// so a rebind on a redirect target is caught at connect time as well. The
-/// compensating layers (Authorization-strip, upstream checksum
-/// verification per ADR 0006, TLS-cert validation) remain.
+/// resolution — is closed by the connect-time
+/// [`dns_guard::GuardedDnsResolver`] bound to the clients that share this
+/// policy's `UpstreamNominated` posture (security audit finding INJ-1):
+/// it re-runs [`hort_net_egress::is_routable`] on every dial-time
+/// resolution and fails the dial closed before any bytes leave the
+/// process. The redirect path is itself re-guarded per hop here; reqwest
+/// re-resolves each followed hop through the bound DNS guard too, so a
+/// rebind on a redirect target is caught at connect time as well. The two
+/// legs are deliberately bound together by [`EgressPosture`] — a client
+/// that may dial an internal address at all must be able to be redirected
+/// to one, or the same mirror breaks one hop later. The compensating
+/// layers (Authorization-strip, upstream checksum verification per ADR
+/// 0006, TLS-cert validation) remain on both arms.
 fn build_redirect_policy(
     max_hops: usize,
     allowlist: Arc<Vec<SocketAddr>>,
     binding: HopBinding,
+    egress: EgressPosture,
 ) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt: reqwest::redirect::Attempt<'_>| {
         // Hop cap first, so an over-long chain is rejected independent
@@ -1530,47 +1825,56 @@ fn build_redirect_policy(
             }
         }
 
-        let next_url = attempt.url().clone();
-        let Some(host) = next_url.host_str() else {
-            return attempt.error(format!(
-                "{REDIRECT_SSRF_SENTINEL}: redirect target has no host"
-            ));
-        };
-        let port = next_url.port_or_known_default().unwrap_or(443);
-
-        // Resolve the next hop's host synchronously — the redirect
-        // closure is sync, so we cannot use the tokio resolver here.
-        // Literal IP → one addr; DNS name → OS resolver. A resolution
-        // failure is fail-closed (we cannot prove the target is safe).
-        let addrs: Vec<SocketAddr> = match (host, port).to_socket_addrs_owned() {
-            Ok(a) => a,
-            Err(_) => {
-                tracing::warn!(
-                    blocked_host = %host,
-                    "upstream redirect hop blocked: host did not resolve \
-                     (fail-closed)"
-                );
+        // The routability leg, and the whole of what the posture
+        // selects here. A client built for the operator's own upstream
+        // skips it: the hop is one that destination chose for a request
+        // the operator asked for, and the address it names being
+        // internal is what an internal mirror is. The hop cap above and
+        // the origin leg above it still ran.
+        if egress == EgressPosture::UpstreamNominated {
+            let next_url = attempt.url().clone();
+            let Some(host) = next_url.host_str() else {
                 return attempt.error(format!(
-                    "{REDIRECT_SSRF_SENTINEL}: redirect target host \
-                     {host} did not resolve"
+                    "{REDIRECT_SSRF_SENTINEL}: redirect target has no host"
                 ));
-            }
-        };
+            };
+            let port = next_url.port_or_known_default().unwrap_or(443);
 
-        // Reject if ANY resolved address is non-routable and not in the
-        // test allowlist — the attacker needs only one entry to pivot.
-        // One predicate, shared with the connect-time DNS guard.
-        for addr in &addrs {
-            if !dns_guard::addr_is_dialable(*addr, allowlist.as_slice()) {
-                tracing::warn!(
-                    blocked_host = %host,
-                    "upstream redirect hop blocked: resolves to a \
-                     non-routable address (fail-closed)"
-                );
-                return attempt.error(format!(
-                    "{REDIRECT_SSRF_SENTINEL}: redirect target {host} \
-                     resolves to a non-routable address"
-                ));
+            // Resolve the next hop's host synchronously — the redirect
+            // closure is sync, so we cannot use the tokio resolver here.
+            // Literal IP → one addr; DNS name → OS resolver. A resolution
+            // failure is fail-closed (we cannot prove the target is safe).
+            let addrs: Vec<SocketAddr> = match (host, port).to_socket_addrs_owned() {
+                Ok(a) => a,
+                Err(_) => {
+                    tracing::warn!(
+                        blocked_host = %host,
+                        "upstream redirect hop blocked: host did not resolve \
+                         (fail-closed)"
+                    );
+                    return attempt.error(format!(
+                        "{REDIRECT_SSRF_SENTINEL}: redirect target host \
+                         {host} did not resolve"
+                    ));
+                }
+            };
+
+            // Reject if ANY resolved address is non-routable and not in
+            // the test allowlist — the attacker needs only one entry to
+            // pivot. One predicate, shared with the connect-time DNS
+            // guard.
+            for addr in &addrs {
+                if !dns_guard::addr_is_dialable(*addr, allowlist.as_slice()) {
+                    tracing::warn!(
+                        blocked_host = %host,
+                        "upstream redirect hop blocked: resolves to a \
+                         non-routable address (fail-closed)"
+                    );
+                    return attempt.error(format!(
+                        "{REDIRECT_SSRF_SENTINEL}: redirect target {host} \
+                         resolves to a non-routable address"
+                    ));
+                }
             }
         }
 
@@ -5406,6 +5710,75 @@ mod tests {
         );
     }
 
+    /// A realm on a non-routable **host name**, on the production seam:
+    /// still refused, and refused before a client is selected.
+    ///
+    /// The realm is the one destination in this crate that is always
+    /// upstream-nominated — a `WWW-Authenticate` header names it — so
+    /// nothing about the operator having configured their own upstream
+    /// reaches it. Both clients the exchange can run on keep
+    /// `EgressPosture::UpstreamNominated` for that reason
+    /// (`self.client`, and `exchange_client_origin_bound` for the
+    /// credentialed foreign-realm arm), which makes the connect-time
+    /// guard the second refusal standing behind the URL-level gate
+    /// asserted here.
+    ///
+    /// A host *name* rather than the loopback literal its sibling above
+    /// uses: that is the shape the resolver sees, and the shape an
+    /// upstream would use to point the exchange at an internal service
+    /// by name.
+    #[tokio::test]
+    async fn a_nonroutable_hostname_realm_is_refused_on_the_production_seam() {
+        let realm = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/realm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token": "must-never-be-issued",
+                "expires_in": 300,
+            })))
+            .expect(0)
+            .mount(&realm)
+            .await;
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(2),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        // Production constructor — empty seam.
+        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
+        let challenge = Challenge {
+            realm: format!("https://localhost:{}/realm", realm.address().port()),
+            service: Some("svc".into()),
+            scope: Some("repository:foo:pull".into()),
+        };
+        // A mapping whose own origin is elsewhere, so the realm is
+        // foreign on every reading of it.
+        let m = realm_credential_mapping("https://ghcr.io");
+        let err = proxy
+            .fetch_bearer_token(
+                &challenge,
+                ExchangeClient::Shared,
+                RealmCredential::for_mapping(&m),
+            )
+            .await
+            .err()
+            .expect("a realm host resolving to loopback must be refused");
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "a non-routable realm is a content-validation refusal, not a \
+             transport failure; got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("realm host is SSRF-blocked"),
+            "the routability gate must be the refusal: got {err}"
+        );
+        assert!(
+            realm.received_requests().await.unwrap().is_empty(),
+            "the realm must observe nothing — that request is where the \
+             operator's credential would have travelled"
+        );
+    }
+
     /// The seam must stay empty on every production constructor. If a
     /// future edit seeds it — from config, from an env var, from a
     /// `Default` — the two realm gates, the per-hop redirect policy and
@@ -7820,103 +8193,127 @@ mod tests {
         HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap()
     }
 
-    /// INJ-1 regression — the connect-time DNS guard closes the
-    /// SSRF/DNS-rebind TOCTOU on the **initial dial** of a *host name*
-    /// upstream, which `check_ssrf_safe` never re-validates at dial time.
-    ///
-    /// A **relative**-path fetch composes onto `mapping.upstream_url` and
-    /// deliberately does NOT run `check_ssrf_safe` (only absolute URLs hit
-    /// that gate — see `resolve_artifact_url`). So a mapping whose
-    /// `upstream_url` host *name* resolves to a non-routable address is a
-    /// pure exercise of the connect-time guard: nothing else stands between
-    /// the request and the internal target. `localhost` is a host name
-    /// (not an IP literal — hyper-util's connector routes host names through
-    /// the bound `reqwest::dns::Resolve`, IP literals bypass it), resolving
-    /// to loopback. With the production proxy (empty test-allowlist) the
-    /// guard must refuse the dial and the failure must classify as
-    /// `ParseError` (the SSRF-refusal contract), proving the dial never
-    /// completed against the internal address.
-    #[tokio::test]
-    async fn fetch_relative_path_to_hostname_resolving_nonroutable_is_blocked_at_connect() {
-        let proxy = proxy_with_no_server();
-        // Host *name* (goes through the DNS guard) resolving to loopback,
-        // reached via a RELATIVE path so `check_ssrf_safe` is bypassed and
-        // only the connect-time guard can stop it. Port 9 (discard) so even
-        // if the guard were absent the connect would not reach a real
-        // server — but the assertion is on the classification, which only
-        // the guard produces.
-        let m = mapping("http://localhost:9", "", UpstreamAuth::Anonymous);
-        let Err(err) = proxy.fetch_artifact(m, "/internal-secret".into()).await else {
-            panic!(
-                "a relative-path fetch to a host name resolving to loopback must be \
-                 refused by the connect-time DNS guard"
-            );
-        };
-        assert_eq!(
-            classify_error(&err),
-            Some(UpstreamErrorKind::ParseError),
-            "connect-time SSRF refusal must classify as ParseError (the \
-             check_ssrf_safe refusal contract), got {err:?}"
-        );
-    }
+    // -- The connect-time DNS guard's scope: who chose the destination --
+    //
+    // The guard exists for the TOCTOU on a *metadata-supplied* absolute
+    // URL: `check_ssrf_safe` resolves that host once at URL-validation
+    // time and reqwest re-resolves independently at dial time, so a
+    // rebind in between pivots to IMDS / RFC1918 / loopback. It is bound
+    // to the clients that carry such a dial and to no others
+    // (`EgressPosture`).
+    //
+    // The pair below is that boundary, driven on the production
+    // constructor (`HttpUpstreamProxy::new`, empty allowlist seam) in
+    // both directions, with the SAME host name on both sides so the only
+    // difference is who named it:
+    //
+    //   - as `mapping.upstream_url` reached by a relative path, the dial
+    //     happens — the operator wrote that destination down, and
+    //     `resolve_artifact_url` already trusts it enough to compose onto
+    //     it without calling `check_ssrf_safe` at all;
+    //   - as an absolute URL out of upstream metadata, the dial is
+    //     refused before any bytes leave the process.
+    //
+    // Neither test seeds the test-allowlist seam: each passes because of
+    // the posture of the client its request was routed to, which is the
+    // only thing that can carry this distinction (a resolver is bound at
+    // `Client::builder()` time and cannot be varied per request). A test
+    // that reached its own loopback through the seam would pass on either
+    // posture and prove nothing about production.
 
-    /// INJ-1 positive — the connect-time guard does NOT break a legitimate
-    /// public-host dial. wiremock binds on loopback (an IP literal that
-    /// bypasses the resolver), so to drive the *resolver* path against a
-    /// permitted address we point the proxy at the wiremock server via its
-    /// loopback `SocketAddr` placed in the test-allowlist AND reference it
-    /// by the host *name* `localhost`. The guard resolves `localhost` →
-    /// loopback, finds the address allowlisted, and permits the dial; the
-    /// body must reach the caller. This is the analogue of "public host
-    /// resolves and is permitted" that is offline-safe.
+    /// An operator-configured upstream whose host *name* resolves to a
+    /// non-routable address — an internal Artifactory, an in-cluster
+    /// verdaccio, an on-prem npm proxy — must be dialed.
+    ///
+    /// `localhost` is a host name, so hyper-util routes it through the
+    /// bound `reqwest::dns::Resolve` (IP literals bypass any custom
+    /// resolver); a **relative** path composes onto `upstream_url` and
+    /// never reaches `check_ssrf_safe`. So this request's only possible
+    /// refusal is the connect-time guard, and the body arriving is the
+    /// proof the guard is not on this client.
     #[tokio::test]
-    async fn fetch_relative_path_to_allowlisted_hostname_is_permitted_at_connect() {
+    async fn relative_path_to_a_nonroutable_hostname_upstream_is_dialed() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/pkg.tgz"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"public-bytes".as_slice()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"internal-bytes".as_slice()))
             .mount(&server)
             .await;
 
-        // Allowlist every address `localhost` resolves to (v4 + v6),
-        // normalised to the `:0` port the connect-time guard resolves with,
-        // so the guard treats `localhost` → loopback as routable. The guard
-        // rejects a resolution if ANY returned address is non-routable and
-        // not allowlisted, so all of localhost's answers must be listed.
-        let allow: Vec<SocketAddr> = tokio::net::lookup_host("localhost:0")
-            .await
-            .expect("localhost resolves")
-            .map(|a| SocketAddr::new(a.ip(), 0))
-            .collect();
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
             ..HttpUpstreamProxyConfig::new("oci")
         };
-        let proxy = HttpUpstreamProxy::new_with_redirect_test_allowlist(
-            cfg,
-            Arc::new(AnonymousFallbackPort),
-            allow,
-        )
-        .unwrap();
-
-        // Reach the server by host NAME (so the guard's resolver fires)
-        // while the actual bound port comes from wiremock.
+        // Production constructor — empty seam. Reach the server by host
+        // NAME so the resolver path is the one under test; the port is
+        // wiremock's.
+        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
         let upstream = format!("http://localhost:{}", server.address().port());
         let m = mapping(&upstream, "", UpstreamAuth::Anonymous);
 
         let mut stream = proxy
             .fetch_artifact(m, "/pkg.tgz".into())
             .await
-            .expect("allowlisted host-name dial must be permitted by the connect guard")
+            .expect(
+                "an upstream the operator configured must be dialed even when \
+                 its host name resolves to a non-routable address",
+            )
             .stream;
         let mut bytes = Vec::new();
         while let Some(chunk) = stream.next().await {
             bytes.extend_from_slice(&chunk.unwrap());
         }
+        assert_eq!(bytes, b"internal-bytes");
+    }
+
+    /// INJ-1 regression, and the counter-assertion to the test above:
+    /// the *same* host name arriving as a metadata-supplied absolute URL
+    /// is still refused at connect, with the `ParseError` classification
+    /// the SSRF-refusal contract fixes.
+    ///
+    /// Driven through `fetch_artifact_url` rather than the public
+    /// `fetch_artifact` because the threat is precisely a URL that
+    /// *passed* `check_ssrf_safe` and then resolved somewhere else at
+    /// dial time — entering below that gate is how an offline test
+    /// stands where the rebind would have left it. The mapping's own
+    /// origin is elsewhere, so `credential_scope` routes the request to
+    /// the shared client, which is the guarded one.
+    #[tokio::test]
+    async fn metadata_supplied_absolute_url_on_a_nonroutable_hostname_is_blocked_at_connect() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"must-not-be-read".as_slice()))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let cfg = HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(2),
+            ..HttpUpstreamProxyConfig::new("oci")
+        };
+        let proxy = HttpUpstreamProxy::new(cfg, Arc::new(AnonymousFallbackPort)).unwrap();
+        let m = mapping("https://pypi.org", "", UpstreamAuth::Anonymous);
+        let absolute = format!("http://localhost:{}/pkg.tgz", server.address().port());
+
+        // `ArtifactFetch` carries a stream and is not `Debug`.
+        let Err(err) = proxy.fetch_artifact_url(&m, &absolute, &absolute).await else {
+            panic!(
+                "a metadata-supplied absolute URL whose host name resolves to \
+                 loopback must be refused by the connect-time DNS guard"
+            );
+        };
         assert_eq!(
-            bytes, b"public-bytes",
-            "a permitted host-name upstream's body must reach the caller \
-             (no false-positive over-block)"
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "a connect-time SSRF refusal must classify as ParseError (the \
+             check_ssrf_safe refusal contract), not as a network failure; \
+             got {err:?}"
+        );
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "the dial must never be made — the refusal is the resolver's, \
+             before any bytes leave the process"
         );
     }
 
@@ -8994,14 +9391,18 @@ mod tests {
             .mount(&server_a)
             .await;
 
-        // The per-hop redirect SSRF re-check means the loopback wiremock
-        // hop would be (correctly) refused under the production
-        // constructor. This test — which exists to pin reqwest's
-        // cross-origin Authorization-strip across a *real* redirect chain
-        // — uses the test-allowlist constructor with both wiremock
-        // servers' loopback addresses. The security behaviour itself is
-        // pinned by the dedicated `redirect_hop_to_*` tests, not weakened
-        // here.
+        // The test-allowlist constructor with both wiremock servers'
+        // loopback addresses, so this test pins reqwest's cross-origin
+        // Authorization-strip across a *real* redirect chain and nothing
+        // else. The seam is belt-and-braces here rather than load-bearing:
+        // the mapping is `server_a`'s own origin, so the request runs on
+        // the own-origin client, whose posture carries no routability
+        // refusal anyway (`EgressPosture`). Seeding it keeps the test
+        // independent of that posture — a future change to which client
+        // this request takes must not turn a credential-strip assertion
+        // into a `parse_error`. The routability behaviour itself is
+        // pinned by the dedicated `redirect_hop_to_*` tests and the
+        // posture A/B beside them, not weakened here.
         let cfg = HttpUpstreamProxyConfig {
             timeout: Duration::from_secs(2),
             ..HttpUpstreamProxyConfig::new("oci")
@@ -9495,13 +9896,14 @@ mod tests {
     /// assembly, which have their own tests above — and leaves the
     /// *selection* running exactly as it does against a warm cache,
     /// which is the thing under test. The seeded client is built
-    /// through the proxy's own `base_client_builder`, so it carries the
-    /// same timeout, DNS guard and redirect policy a real per-mapping
+    /// through the proxy's own `base_client_builder` with the same
+    /// arguments `client_for_mapping` passes, so it carries the same
+    /// timeout, egress posture and redirect policy a real per-mapping
     /// client would; only the TLS config (irrelevant over wiremock's
     /// plaintext) and the agent differ.
     async fn seed_per_mapping_client(proxy: &HttpUpstreamProxy, mapping_id: Uuid) {
         let marked = proxy
-            .base_client_builder(HopBinding::AnyOrigin)
+            .base_client_builder(HopBinding::AnyOrigin, EgressPosture::OperatorConfigured)
             .expect("base client builder")
             .user_agent(PER_MAPPING_UA)
             .build()
@@ -11087,50 +11489,87 @@ mod tests {
     // Without a per-hop redirect SSRF re-check, a poisoned upstream index
     // could `302 Location:` the client onto an internal IMDS / RFC1918
     // target and stream the response back as artifact/metadata content.
-    // These tests pin the reinstated per-hop `is_routable` re-check.
+    // These tests pin that per-hop `is_routable` re-check — and its
+    // scope, which is the same one the connect-time guard has: the leg
+    // runs on the clients that dial a destination upstream data
+    // nominated (`EgressPosture::UpstreamNominated`) and not on the
+    // clients that dial the operator's own upstream. A mirror that
+    // answers a blob `GET` with a `302` to object storage on its own
+    // internal network would otherwise be refused one hop after the
+    // initial dial was allowed, which is half a fix.
     //
     // Test wiring: wiremock binds on loopback, which `is_routable`
-    // classifies as non-routable. The redirect-policy is therefore built
-    // with a *test-only* allowlist of the wiremock `SocketAddr`s (scoped
-    // private to this crate, NOT re-exported, NOT in `hort-net-egress`).
-    // Production builds the policy with an empty allowlist (every
-    // loopback/RFC1918/link-local hop is rejected). The "blocked" case
-    // redirects to a host that is NOT in the allowlist, so it exercises
-    // the real refusal path even though the test runs on loopback.
+    // classifies as non-routable. Two consequences, and which one a test
+    // relies on is the thing to read first:
+    //
+    //   - a test that needs a loopback hop to count as *routable* (the
+    //     CDN case — wiremock cannot bind a public address) builds the
+    //     policy with a *test-only* allowlist of the wiremock
+    //     `SocketAddr`s, scoped private to this crate, NOT re-exported,
+    //     NOT in `hort-net-egress`;
+    //   - a test whose subject is the posture itself uses the production
+    //     constructor and its empty allowlist, because a loopback hop
+    //     refused on one posture and followed on the other is exactly
+    //     what it has to show. `nonroutable_hop_posture_pair` below is
+    //     that A/B.
+    //
+    // The "blocked" cases redirect to a host that is NOT in any
+    // allowlist, so they exercise the real refusal path even on loopback.
 
     /// Build a proxy whose redirect policy treats the supplied wiremock
     /// servers' loopback addresses as routable (test-only), so the
-    /// allow / hop-cap paths can be exercised against wiremock while a
-    /// redirect to any OTHER non-routable host is still refused.
+    /// allow path can be exercised against wiremock while a redirect to
+    /// any OTHER non-routable host is still refused.
     fn proxy_with_redirect_test_allowlist(
         servers: &[&MockServer],
         max_redirect_hops: usize,
     ) -> HttpUpstreamProxy {
         let allow: Vec<SocketAddr> = servers.iter().map(|s| *s.address()).collect();
-        let cfg = HttpUpstreamProxyConfig {
-            timeout: Duration::from_secs(2),
-            max_redirect_hops,
-            ..HttpUpstreamProxyConfig::new("oci")
-        };
         HttpUpstreamProxy::new_with_redirect_test_allowlist(
-            cfg,
+            redirect_cfg(max_redirect_hops),
             Arc::new(AnonymousFallbackPort),
             allow,
         )
         .unwrap()
     }
 
+    /// The production constructor at a chosen hop cap — empty allowlist
+    /// seam, as [`HttpUpstreamProxy::new`] builds it.
+    fn production_proxy_with_hop_cap(max_redirect_hops: usize) -> HttpUpstreamProxy {
+        HttpUpstreamProxy::new(
+            redirect_cfg(max_redirect_hops),
+            Arc::new(AnonymousFallbackPort),
+        )
+        .unwrap()
+    }
+
+    fn redirect_cfg(max_redirect_hops: usize) -> HttpUpstreamProxyConfig {
+        HttpUpstreamProxyConfig {
+            timeout: Duration::from_secs(2),
+            max_redirect_hops,
+            ..HttpUpstreamProxyConfig::new("oci")
+        }
+    }
+
     /// Case 1: a 302 `Location:` to a non-routable host
-    /// (169.254.169.254 — AWS IMDS) is BLOCKED. The internal target's
-    /// body must NOT be streamed back; the fetch surfaces as a
+    /// (169.254.169.254 — AWS IMDS) is BLOCKED on a dial to a
+    /// destination upstream data nominated. The internal target's body
+    /// must NOT be streamed back; the fetch surfaces as a
     /// content-validation refusal classified `ParseError` (the same
     /// classification a `check_ssrf_safe` refusal uses).
+    ///
+    /// Driven through `fetch_artifact_url` with the mapping's own origin
+    /// elsewhere, which is the shape the threat has: a poisoned index
+    /// names an absolute URL, `credential_scope` classifies it foreign,
+    /// and the request runs on the guarded shared client. The redirector
+    /// is reached by its loopback IP *literal*, which bypasses any
+    /// custom resolver — so the initial dial is not what refuses here and
+    /// the production constructor needs no allowlist seam.
     #[tokio::test]
     async fn redirect_hop_to_link_local_imds_is_blocked() {
         let redirector = MockServer::start().await;
         // Redirect to the canonical AWS IMDS address. 169.254.169.254
-        // is link-local; `is_routable` rejects it and it is NOT in the
-        // test allowlist (only `redirector`'s loopback addr is).
+        // is link-local; `is_routable` rejects it.
         Mock::given(method("GET"))
             .and(path("/poisoned-index/foo-1.0.tar.gz"))
             .respond_with(
@@ -11140,14 +11579,11 @@ mod tests {
             .mount(&redirector)
             .await;
 
-        let proxy = proxy_with_redirect_test_allowlist(&[&redirector], 5);
-        let m = mapping(&redirector.uri(), "", UpstreamAuth::Anonymous);
+        let proxy = production_proxy_with_hop_cap(5);
+        let m = mapping("https://pypi.org", "", UpstreamAuth::Anonymous);
+        let absolute = format!("{}/poisoned-index/foo-1.0.tar.gz", redirector.uri());
 
-        let result = proxy
-            .fetch_artifact(m, "/poisoned-index/foo-1.0.tar.gz".into())
-            .await;
-
-        let Err(err) = result else {
+        let Err(err) = proxy.fetch_artifact_url(&m, &absolute, &absolute).await else {
             panic!("redirect to link-local IMDS must be refused, not followed");
         };
         // Same classification as a `check_ssrf_safe` refusal — the
@@ -11161,8 +11597,8 @@ mod tests {
         );
     }
 
-    /// Case 1b: a 302 to an RFC1918 private host is likewise blocked
-    /// (the same refusal class as IMDS).
+    /// Case 1b: a 302 to an RFC1918 private host is likewise blocked on
+    /// an upstream-nominated dial (the same refusal class as IMDS).
     #[tokio::test]
     async fn redirect_hop_to_rfc1918_is_blocked() {
         let redirector = MockServer::start().await;
@@ -11175,10 +11611,11 @@ mod tests {
             .mount(&redirector)
             .await;
 
-        let proxy = proxy_with_redirect_test_allowlist(&[&redirector], 5);
-        let m = mapping(&redirector.uri(), "", UpstreamAuth::Anonymous);
+        let proxy = production_proxy_with_hop_cap(5);
+        let m = mapping("https://registry.npmjs.org", "", UpstreamAuth::Anonymous);
+        let absolute = format!("{}/idx/pkg.tgz", redirector.uri());
 
-        let Err(err) = proxy.fetch_artifact(m, "/idx/pkg.tgz".into()).await else {
+        let Err(err) = proxy.fetch_artifact_url(&m, &absolute, &absolute).await else {
             panic!("redirect to RFC1918 must be refused");
         };
         assert_eq!(
@@ -11190,10 +11627,12 @@ mod tests {
 
     /// Case 2: a 302 to a *routable* host is ALLOWED — legitimate CDN
     /// redirect still works (no false-positive). npm / PyPI / crates
-    /// routinely 302 to a CDN; this must not break. Both wiremock
-    /// servers are in the test allowlist (they stand in for "routable"
-    /// public hosts since wiremock can only bind loopback); the policy
-    /// follows the hop and the redirected body reaches the caller.
+    /// routinely 302 to a CDN, and the URL that gets there is typically
+    /// the metadata-supplied one, so this is the guarded posture doing
+    /// the following. Both wiremock servers are in the test allowlist
+    /// (they stand in for "routable" public hosts since wiremock can only
+    /// bind loopback); the policy follows the hop and the redirected body
+    /// reaches the caller.
     #[tokio::test]
     async fn redirect_hop_to_routable_cdn_is_allowed() {
         let cdn = MockServer::start().await;
@@ -11214,27 +11653,115 @@ mod tests {
             .await;
 
         let proxy = proxy_with_redirect_test_allowlist(&[&redirector, &cdn], 5);
-        let m = mapping(&redirector.uri(), "", UpstreamAuth::Anonymous);
+        let m = mapping("https://pypi.org", "", UpstreamAuth::Anonymous);
+        let absolute = format!("{}/index/foo-1.0.tar.gz", redirector.uri());
 
-        let mut stream = proxy
-            .fetch_artifact(m, "/index/foo-1.0.tar.gz".into())
+        let fetch = proxy
+            .fetch_artifact_url(&m, &absolute, &absolute)
             .await
-            .expect("redirect to a routable CDN host must be followed")
-            .stream;
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            bytes.extend_from_slice(&chunk.unwrap());
-        }
+            .expect("redirect to a routable CDN host must be followed");
         assert_eq!(
-            bytes, b"cdn-artifact-bytes",
+            drain_artifact(fetch).await,
+            b"cdn-artifact-bytes",
             "the routable-CDN redirect target's body must reach the caller"
         );
     }
 
-    /// Case 3: the hop CAP is still enforced. A redirect chain longer
-    /// than `max_redirect_hops` is rejected as before — the custom
-    /// policy must still enforce the limit (it does not silently follow
-    /// forever once the per-hop SSRF check is added).
+    // -- The posture A/B on one identical hop -----------------------------
+    //
+    // Both tests below use the production constructor (empty allowlist
+    // seam) and an identical, non-routable redirect target: a second
+    // wiremock on loopback, named by its IP literal exactly as an
+    // internal mirror's `302` to on-network object storage would name it.
+    // The ONLY difference between them is who chose the URL the request
+    // was sent to, and therefore which client — and which posture — it
+    // runs on. Seeding the seam in either would collapse the pair: both
+    // would pass, and the seam would be standing in for the origin
+    // distinction that is the whole subject.
+
+    /// The redirector and the non-routable hop target it points at.
+    /// `/start` 302s to `/final` on a different loopback origin.
+    async fn nonroutable_hop_pair() -> (MockServer, MockServer) {
+        let target = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/final"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"after-the-hop".as_slice()))
+            .mount(&target)
+            .await;
+
+        let redirector = MockServer::start().await;
+        let location = format!("{}/final", target.uri());
+        Mock::given(method("GET"))
+            .and(path("/start"))
+            .respond_with(ResponseTemplate::new(302).insert_header("Location", location.as_str()))
+            .mount(&redirector)
+            .await;
+        (redirector, target)
+    }
+
+    /// Own-origin dial: the hop to a non-routable host is FOLLOWED.
+    ///
+    /// This is the internal mirror that answers a blob `GET` with a
+    /// `302` to object storage on its own network. Fixing only the
+    /// initial dial would leave this request refused one hop later, with
+    /// the same `parse_error` classification and the same operator
+    /// confusion.
+    #[tokio::test]
+    async fn nonroutable_redirect_hop_is_followed_on_an_own_origin_dial() {
+        let (redirector, target) = nonroutable_hop_pair().await;
+        let proxy = production_proxy_with_hop_cap(5);
+        // The mapping IS the redirector's origin and the path is
+        // relative, so `credential_scope` says `MappingOrigin` and the
+        // request runs on the own-origin client.
+        let m = mapping(&redirector.uri(), "", UpstreamAuth::Anonymous);
+
+        let fetch = proxy.fetch_artifact(m, "/start".into()).await.expect(
+            "a hop the operator's own upstream chose must be followed — \
+                 an internal mirror redirecting to on-network storage is the \
+                 supported topology",
+        );
+        assert_eq!(drain_artifact(fetch).await, b"after-the-hop");
+        assert_eq!(
+            target.received_requests().await.unwrap().len(),
+            1,
+            "the hop target must have served the body"
+        );
+    }
+
+    /// Foreign-origin dial: the SAME hop is REFUSED.
+    ///
+    /// Same proxy shape, same redirector, same `Location` — only the
+    /// origin of the URL the request was asked for differs, so the
+    /// request runs on the guarded client and the hop is a pivot rather
+    /// than a deployment.
+    #[tokio::test]
+    async fn nonroutable_redirect_hop_is_refused_on_a_foreign_origin_dial() {
+        let (redirector, target) = nonroutable_hop_pair().await;
+        let proxy = production_proxy_with_hop_cap(5);
+        let m = mapping("https://pypi.org", "", UpstreamAuth::Anonymous);
+        let absolute = format!("{}/start", redirector.uri());
+
+        let Err(err) = proxy.fetch_artifact_url(&m, &absolute, &absolute).await else {
+            panic!(
+                "a hop to a non-routable host must be refused when the URL \
+                 the request was asked for came out of upstream metadata"
+            );
+        };
+        assert_eq!(
+            classify_error(&err),
+            Some(UpstreamErrorKind::ParseError),
+            "got {err:?}"
+        );
+        assert!(
+            target.received_requests().await.unwrap().is_empty(),
+            "the hop target must never be reached on this posture"
+        );
+    }
+
+    /// Case 3: the hop CAP is still enforced, and on the own-origin
+    /// posture it is the only refusal left — the posture drops the
+    /// routability leg and a mapping with no TLS material keeps
+    /// `AnyOrigin`, so nothing else can terminate this chain.
     #[tokio::test]
     async fn redirect_chain_exceeding_hop_cap_is_rejected() {
         // A single server that always 302s back to a path on itself,
@@ -11248,10 +11775,10 @@ mod tests {
             .mount(&looper)
             .await;
 
-        // `looper` is allowlisted (loopback) so the chain is NOT
-        // short-circuited by the SSRF check — it must terminate purely
-        // on the hop cap.
-        let proxy = proxy_with_redirect_test_allowlist(&[&looper], 2);
+        // Production constructor: no allowlist seam to short-circuit the
+        // chain, and none needed — the chain must terminate purely on
+        // the hop cap.
+        let proxy = production_proxy_with_hop_cap(2);
         let m = mapping(&looper.uri(), "", UpstreamAuth::Anonymous);
 
         let Err(err) = proxy.fetch_artifact(m, "/loop".into()).await else {

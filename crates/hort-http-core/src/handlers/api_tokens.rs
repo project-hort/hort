@@ -285,6 +285,15 @@ pub struct IssuedTokenResponse {
 /// Response body row for `GET /users/me/tokens`. Excludes
 /// `token_hash`, `token_prefix`, and the full plaintext (which is
 /// only ever shown on the issuance response).
+///
+/// **Carries no "last used" field, and will not acquire one here.** When a
+/// token was last exercised is answered by the `ApiTokenUsed` event on the
+/// token's own `token_use` stream — `GET /api/v1/events?category=token_use`,
+/// admin-gated, one event per token per hour at most, and kept for the
+/// ≥36-month credential-audit floor rather than the credential row's
+/// 90-day horizon. Rebuilding that answer into this response would cost one
+/// stream read per listed token, which is the per-entry resolution ADR 0062
+/// §2b rules out for a list surface.
 #[derive(Debug, Serialize)]
 pub struct TokenSummary {
     pub id: Uuid,
@@ -296,7 +305,6 @@ pub struct TokenSummary {
     pub repository_ids: Option<Vec<Uuid>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub revoked_at: Option<DateTime<Utc>>,
-    pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// Which issuance path minted the row
     /// ([`IssuedVia`](hort_domain::entities::api_token::IssuedVia)) — the
@@ -561,7 +569,6 @@ fn token_summary(token: &ApiToken) -> TokenSummary {
         repository_ids: token.repository_ids.clone(),
         expires_at: token.expires_at,
         revoked_at: token.revoked_at,
-        last_used_at: token.last_used_at,
         created_at: token.created_at,
         issued_via: token.issued_via.as_str(),
     }
@@ -1028,9 +1035,6 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             repository_ids: None,
             expires_at: None,
             revoked_at: None,
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: user_id,
             created_at: Utc::now(),
             issued_via: IssuedVia::HttpMint,
@@ -1080,9 +1084,6 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             repository_ids: None,
             expires_at: None,
             revoked_at: None,
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: other_user_id,
             created_at: Utc::now(),
             issued_via: IssuedVia::HttpMint,
@@ -1121,9 +1122,6 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
                     repository_ids: None,
                     expires_at: None,
                     revoked_at: None,
-                    last_used_at: None,
-                    last_used_ip: None,
-                    last_used_user_agent: None,
                     created_by_user_id: user_id,
                     created_at: Utc::now(),
                     issued_via: IssuedVia::HttpMint,
@@ -1324,9 +1322,6 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             repository_ids: None,
             expires_at: None,
             revoked_at: None,
-            last_used_at: None,
-            last_used_ip: None,
-            last_used_user_agent: None,
             created_by_user_id: owner_id,
             created_at: Utc::now(),
             issued_via: IssuedVia::HttpMint,
