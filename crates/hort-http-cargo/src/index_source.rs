@@ -42,10 +42,18 @@
 //! # Output of the proxy source
 //!
 //! [`ProxyCargoSource::fetch`] parses the raw upstream NDJSON line-by-
-//! line and produces one [`VersionEntry`] per line, with `status`
-//! hydrated from [`ArtifactUseCase::package_version_status`] (`None`
-//! when the registry has never seen the version). Each entry's
+//! line and produces one [`VersionEntry`] per **servable** line, with
+//! `status` hydrated from [`ArtifactUseCase::package_version_status`]
+//! (`None` when the registry has never seen the version). Each entry's
 //! `payload.Cargo` carries the NDJSON-line fields the builder needs.
+//!
+//! A line whose upstream `cksum` the pull-through could not verify a
+//! download against is withheld here rather than advertised — hort
+//! advertises nothing it will not serve (ADR 0062), and the upstream
+//! checksum is the precondition for serving a proxied version at all
+//! (ADR 0006). The decision is per version and the projection itself
+//! stays verbatim; see [`projection_to_entries`] for why it sits at
+//! this mapping and nowhere earlier.
 //!
 //! # `truncated` channel
 //!
@@ -69,7 +77,7 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{Repository, RepositoryType};
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_formats::cargo::projection::CargoVersionLine;
-use hort_formats::cargo::CargoFormatHandler;
+use hort_formats::cargo::{parse_index_cksum, CargoFormatHandler};
 use hort_http_core::context::AppContext;
 
 use crate::index_cache::IndexFetchError;
@@ -387,7 +395,7 @@ impl IndexSource for ProxyCargoSource {
                 })
                 .collect();
 
-        let entries = projection_to_entries(projection, &status_map, &pubtime_map);
+        let entries = projection_to_entries(projection, &normalized, &status_map, &pubtime_map);
 
         Ok(IndexSourceOutput {
             entries,
@@ -397,9 +405,9 @@ impl IndexSource for ProxyCargoSource {
 }
 
 /// Map an already-projected cargo sparse-index
-/// `Vec<CargoVersionLine>` into `Vec<VersionEntry>`. Each line becomes
-/// one entry with `payload.Cargo` carrying the line's fields. The
-/// `status_map` hydrates the entry's `status` field via
+/// `Vec<CargoVersionLine>` into `Vec<VersionEntry>`. Each **servable**
+/// line becomes one entry with `payload.Cargo` carrying the line's
+/// fields. The `status_map` hydrates the entry's `status` field via
 /// `(version, status)` lookup; absent → `None` (unknown tier).
 /// `pubtime_map` hydrates `payload.pubtime` the same way; absent → the
 /// version is never-ingested, so `pubtime` stays `None` — never a
@@ -415,8 +423,35 @@ impl IndexSource for ProxyCargoSource {
 /// validate-before-commit) and surfaces as
 /// `IndexFetchError::MetadataMalformed` above — it never reaches here
 /// as a partially-projected body.
+///
+/// # A version with no verifiable upstream checksum is withheld
+///
+/// Hort advertises nothing it will not serve (ADR 0062), and for a
+/// proxied version the upstream-published checksum is the precondition
+/// for serving it at all (ADR 0006): the pull-through verifies the
+/// streamed bytes against the index `cksum` and refuses the download
+/// when that value is absent or malformed. Advertising such a version
+/// resolves a client onto bytes that can never arrive, so this mapping
+/// withholds it.
+///
+/// # Why the withholding sits here and nowhere earlier
+///
+/// The projection stays **verbatim**. Both legs read it: the download
+/// leg recovers the upstream `cksum` from the very same
+/// `CargoVersionLine` set, so a line dropped while projecting would turn
+/// the download's refusal from "this entry has no cksum" into "upstream
+/// has no entry for this version" — a different answer to the client,
+/// and the diagnosis lost. Nor can the withholding be a filter in the
+/// shared serve pipeline: those filters carry the *universal* reasons
+/// (quarantine status, index mode) and operate on the `VersionEntry`
+/// spine with the per-format payload opaque to them, which is the
+/// property that keeps them format-agnostic. A format's own wire-level
+/// verdict about the document it just parsed therefore belongs to the
+/// format's source, which is the one layer that holds both the upstream
+/// value and the knowledge of what it means.
 fn projection_to_entries(
     lines: Vec<CargoVersionLine>,
+    crate_name: &str,
     status_map: &std::collections::HashMap<
         String,
         hort_domain::entities::artifact::QuarantineStatus,
@@ -424,7 +459,23 @@ fn projection_to_entries(
     pubtime_map: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
 ) -> Vec<VersionEntry> {
     let mut entries: Vec<VersionEntry> = Vec::new();
+    let mut withheld = 0usize;
     for line in lines {
+        // The verdict is the download leg's own rule, called rather than
+        // restated: `parse_index_cksum` is what the cargo handler applies
+        // to this same field when it verifies a pull-through. A local
+        // blankness-or-shape test beside it is how the advertised set and
+        // the servable set come to disagree — silently, and in the
+        // direction that breaks a build.
+        //
+        // The refusal reaches exactly one version: every other version of
+        // the crate stays advertised, and a crate whose every version is
+        // unusable serves an index with no versions rather than an error.
+        // One unusable upstream line must not deny the crate.
+        if parse_index_cksum(&line.cksum).is_err() {
+            withheld += 1;
+            continue;
+        }
         let status = status_map.get(&line.vers).copied();
         let pubtime = pubtime_map.get(&line.vers).copied();
         entries.push(VersionEntry {
@@ -444,6 +495,18 @@ fn projection_to_entries(
                 pubtime,
             }),
         });
+    }
+    // One aggregated line per request, never one per version: a large
+    // crate behind an upstream that publishes no usable checksums would
+    // otherwise emit thousands. The enclosing instrumented span carries
+    // `repo_key`, so the operator can see which upstream is advertising
+    // versions hort will not serve.
+    if withheld > 0 {
+        tracing::warn!(
+            crate_name,
+            withheld_versions = withheld,
+            "cargo proxy index: upstream advertises versions with no verifiable checksum; withheld from the served index"
+        );
     }
     entries
 }
@@ -508,12 +571,14 @@ pub(crate) fn select_source(repo: &Repository) -> Box<dyn IndexSource> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — `projection_to_entries`'s `pubtime` precedence (backlog 148: cargo
-// sparse-index `pubtime`). The proxy source's three-way precedence
-// (upstream-asserted → first-seen-here → omitted) is pinned directly against
-// this pure mapping function rather than through the full HTTP serve stack,
-// since it needs no I/O and the precedence table is exactly this function's
-// contract.
+// Tests — `projection_to_entries`'s `pubtime` precedence and its withholding
+// of versions with no verifiable upstream checksum. Both are pinned directly
+// against this pure mapping function rather than through the full HTTP serve
+// stack, since neither needs I/O and both tables are exactly this function's
+// contract. What the *client* then sees for a withheld-only crate is the
+// unified serve handler's own behaviour: a proxy repository with an empty
+// entry set serves a 200 with an empty NDJSON body (the empty-set → 404 arm
+// in `crate::serve` is hosted/staging/virtual only).
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -521,8 +586,18 @@ mod tests {
     use std::collections::HashMap;
 
     use chrono::{DateTime, Utc};
+    use hort_domain::entities::artifact::QuarantineStatus;
 
     use super::*;
+
+    /// The entry's cargo payload, or a panic — every entry this module
+    /// builds comes out of the cargo mapping.
+    fn cargo_payload(entry: &VersionEntry) -> &CargoVersionPayload {
+        match &entry.payload {
+            PerVersionPayload::Cargo(p) => p,
+            _ => panic!("expected Cargo payload"),
+        }
+    }
 
     fn line(vers: &str) -> CargoVersionLine {
         CargoVersionLine {
@@ -551,7 +626,7 @@ mod tests {
         let mut pubtime_map = HashMap::new();
         pubtime_map.insert("1.0.0".to_string(), ts("2020-01-01T00:00:00Z"));
 
-        let entries = projection_to_entries(lines, &status_map, &pubtime_map);
+        let entries = projection_to_entries(lines, "serde", &status_map, &pubtime_map);
         let PerVersionPayload::Cargo(payload) = &entries[0].payload else {
             panic!("expected Cargo payload");
         };
@@ -567,7 +642,7 @@ mod tests {
         let status_map = HashMap::new();
         let pubtime_map = HashMap::new();
 
-        let entries = projection_to_entries(lines, &status_map, &pubtime_map);
+        let entries = projection_to_entries(lines, "serde", &status_map, &pubtime_map);
         let PerVersionPayload::Cargo(payload) = &entries[0].payload else {
             panic!("expected Cargo payload");
         };
@@ -586,7 +661,7 @@ mod tests {
         let status_map = HashMap::new();
         let pubtime_map = HashMap::new();
 
-        let entries = projection_to_entries(vec![l], &status_map, &pubtime_map);
+        let entries = projection_to_entries(vec![l], "serde", &status_map, &pubtime_map);
         let PerVersionPayload::Cargo(payload) = &entries[0].payload else {
             panic!("expected Cargo payload");
         };
@@ -606,7 +681,7 @@ mod tests {
         // "1.1.0" deliberately absent — never-ingested.
         pubtime_map.insert("1.2.0".to_string(), ts("2022-06-15T00:00:00Z"));
 
-        let entries = projection_to_entries(lines, &status_map, &pubtime_map);
+        let entries = projection_to_entries(lines, "serde", &status_map, &pubtime_map);
         let pubtimes: Vec<Option<DateTime<Utc>>> = entries
             .iter()
             .map(|e| match &e.payload {
@@ -622,5 +697,141 @@ mod tests {
                 Some(ts("2022-06-15T00:00:00Z")),
             ]
         );
+    }
+
+    /// A cksum with the right charset and the wrong length.
+    fn short_cksum() -> String {
+        "a".repeat(63)
+    }
+
+    /// A cksum with the right length and a byte outside lowercase hex.
+    fn non_hex_cksum() -> String {
+        "g".repeat(64)
+    }
+
+    #[test]
+    fn only_the_version_with_a_verifiable_cksum_is_advertised() {
+        // The three shapes the shared rule separates: a valid digest, the
+        // empty string an upstream that omitted the field projects to, and
+        // two malformed values. An `is_empty()` test would admit the last
+        // two, which the download leg refuses.
+        let valid = line("1.0.0");
+        let mut omitted = line("1.1.0");
+        omitted.cksum = String::new();
+        let mut short = line("1.2.0");
+        short.cksum = short_cksum();
+        let mut non_hex = line("1.3.0");
+        non_hex.cksum = non_hex_cksum();
+
+        let entries = projection_to_entries(
+            vec![valid, omitted, short, non_hex],
+            "serde",
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let served: Vec<&str> = entries.iter().map(|e| e.version.as_str()).collect();
+        assert_eq!(
+            served,
+            vec!["1.0.0"],
+            "exactly the version whose cksum the download leg would accept"
+        );
+    }
+
+    #[test]
+    fn every_version_unusable_serves_an_empty_set_and_not_an_error() {
+        // The honest outcome of a per-version refusal, deliberately not
+        // special-cased: the crate's index comes out with no versions.
+        let mut a = line("1.0.0");
+        a.cksum = String::new();
+        let mut b = line("2.0.0");
+        b.cksum = short_cksum();
+
+        let entries = projection_to_entries(vec![a, b], "serde", &HashMap::new(), &HashMap::new());
+
+        assert!(entries.is_empty(), "no versions, and no error");
+    }
+
+    #[test]
+    fn an_upper_case_cksum_stays_advertised_because_the_download_leg_accepts_it() {
+        // The shared rule lower-cases before judging shape, so the pull
+        // path verifies this version's bytes — and an index that withheld
+        // it would under-advertise something hort will serve. Inclusion is
+        // the only decision made here: the advertised value stays the
+        // verbatim upstream one.
+        let mut l = line("1.0.0");
+        l.cksum = "A".repeat(64);
+
+        let entries = projection_to_entries(vec![l], "serde", &HashMap::new(), &HashMap::new());
+
+        assert_eq!(entries.len(), 1);
+        let PerVersionPayload::Cargo(payload) = &entries[0].payload else {
+            panic!("expected Cargo payload");
+        };
+        assert_eq!(payload.cksum, "A".repeat(64));
+    }
+
+    #[test]
+    fn withholding_a_version_does_not_shift_what_its_siblings_carry() {
+        // Each surviving entry keeps its OWN status and pubtime: the
+        // hydration is a per-version lookup, never a positional walk that
+        // a withheld line could slide.
+        let valid_low = line("1.0.0");
+        let mut unusable = line("1.1.0");
+        unusable.cksum = String::new();
+        let valid_high = line("1.2.0");
+
+        let mut status_map = HashMap::new();
+        status_map.insert("1.2.0".to_string(), QuarantineStatus::Quarantined);
+        let mut pubtime_map = HashMap::new();
+        pubtime_map.insert("1.0.0".to_string(), ts("2020-01-01T00:00:00Z"));
+        // The withheld version's own row, which no surviving entry may pick up.
+        pubtime_map.insert("1.1.0".to_string(), ts("2021-01-01T00:00:00Z"));
+        pubtime_map.insert("1.2.0".to_string(), ts("2022-06-15T00:00:00Z"));
+
+        let entries = projection_to_entries(
+            vec![valid_low, unusable, valid_high],
+            "serde",
+            &status_map,
+            &pubtime_map,
+        );
+
+        let served: Vec<&str> = entries.iter().map(|e| e.version.as_str()).collect();
+        assert_eq!(served, vec!["1.0.0", "1.2.0"]);
+        assert_eq!(entries[0].status, None);
+        assert_eq!(entries[1].status, Some(QuarantineStatus::Quarantined));
+        assert_eq!(
+            cargo_payload(&entries[0]).pubtime,
+            Some(ts("2020-01-01T00:00:00Z"))
+        );
+        assert_eq!(
+            cargo_payload(&entries[1]).pubtime,
+            Some(ts("2022-06-15T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn the_projection_keeps_the_line_the_serve_mapping_withholds() {
+        // The placement property the withholding rests on. The download
+        // leg recovers the upstream cksum from this same projection, so
+        // the projector must keep the entry: its refusal is then "this
+        // entry has no cksum" rather than "upstream has no entry for this
+        // version", which is a different answer to the client.
+        use hort_domain::ports::upstream_proxy::MetadataProjector as _;
+        use hort_formats::cargo::projection::CargoSparseIndexProjector;
+
+        let body = br#"{"name":"serde","vers":"1.0.0","deps":[],"features":{},"yanked":false}"#;
+        let projection = CargoSparseIndexProjector::new()
+            .project(std::io::Cursor::new(body))
+            .expect("a line without cksum still projects");
+
+        assert_eq!(projection.len(), 1, "the projection stays verbatim");
+        assert_eq!(
+            projection[0].cksum, "",
+            "an omitted cksum projects to the empty default"
+        );
+
+        let entries = projection_to_entries(projection, "serde", &HashMap::new(), &HashMap::new());
+        assert!(entries.is_empty(), "the serve mapping withholds it");
     }
 }

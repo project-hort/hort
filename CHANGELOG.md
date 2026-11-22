@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   publication, OCI manifest and blob writes, every pull-through) and to pushed
   signature manifests, so an oversized payload is refused before any content
   reaches storage instead of being accepted unbounded (#458).
+- A proxied cargo sparse index no longer advertises a version whose upstream
+  `cksum` is missing or malformed; such a version's download was always
+  refused, so resolving to it broke the build (#458).
 
 ### Security
 
