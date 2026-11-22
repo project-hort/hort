@@ -2,8 +2,11 @@
 //!
 //! Two backends mirroring the CAS [`StoragePort`](super::filesystem) pair:
 //! a filesystem tree and an `object_store`-backed blob store. Unlike CAS,
-//! the mirror is logical-keyed + overwrite (metadata is mutable), so there
-//! is no hashing / dedup / refcount machinery here.
+//! the mirror is logical-keyed + overwrite (metadata is mutable), so the
+//! key is an argument rather than a function of the body and there is no
+//! dedup / refcount machinery here. Hashing there is: every body carries
+//! its own digest, written ahead of it and checked against the bytes
+//! before either backend commits (see the two sections below).
 //!
 //! Correctness invariants beyond the CAS adapters:
 //!
@@ -79,7 +82,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::StreamReader;
 
 use hort_domain::error::{DomainError, DomainResult};
-use hort_domain::ports::metadata_mirror_store::MetadataMirrorStore;
+use hort_domain::ports::metadata_mirror_store::{require_supplied_digest, MetadataMirrorStore};
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::ContentHash;
 
@@ -202,35 +205,6 @@ fn frame_header(digest_hex: &str) -> Vec<u8> {
     out.push(b'\n');
     debug_assert_eq!(out.len(), FRAME_LEN);
     out
-}
-
-/// Refuse a body whose bytes do not hash to the digest supplied with
-/// them.
-///
-/// Both backends write the frame header from the supplied digest before
-/// the first body byte and hash the body as it streams past, so this is
-/// the last step of every `put`: either the claim in the header is one
-/// the bytes support, or nothing is committed. `actual_hex` is the
-/// lowercase-hex digest the write computed.
-///
-/// The message carries both digests because the refusal has two
-/// different causes an operator has to tell apart — a caller that hashed
-/// one body and streamed another, or a body that changed underneath the
-/// two passes — and neither is distinguishable from "they differ" alone.
-/// It needs no log of its own: every caller already reports a failed
-/// mirror put, and this is the error it reports.
-fn require_supplied_digest(
-    actual_hex: &str,
-    supplied: &ContentHash,
-    key: &str,
-) -> DomainResult<()> {
-    if actual_hex == supplied.as_ref() {
-        return Ok(());
-    }
-    Err(DomainError::Invariant(format!(
-        "metadata mirror body for {key} does not hash to the digest supplied with it: \
-         the bytes written hash to {actual_hex}, the caller supplied {supplied}"
-    )))
 }
 
 /// The digest recorded in `raw`, which must be exactly [`FRAME_LEN`]
@@ -689,6 +663,12 @@ impl MetadataMirrorStore for ObjectStoreMetadataMirror {
 mod tests {
     use super::*;
 
+    // The in-memory hash a caller computes on the pass that wrote the
+    // upstream cache tempfile. Imported rather than re-typed here: a
+    // digest this module computes differently from the one production
+    // supplies would make every assertion below about the difference.
+    use hort_domain::ports::metadata_mirror_store::body_digest;
+
     /// SHA-256 of b"hello world".
     const HELLO_WORLD_SHA256: &str =
         "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
@@ -813,14 +793,6 @@ mod tests {
         )
     }
 
-    /// SHA-256 of `body`, as a caller computes it on the pass that wrote
-    /// the upstream cache tempfile.
-    fn digest_of(body: &[u8]) -> ContentHash {
-        hex::encode(Sha256::digest(body))
-            .parse()
-            .expect("SHA-256 is a valid content hash")
-    }
-
     /// A body that yields `prefix` and then fails, standing in for a
     /// cache tempfile that disappears or errors part-way through the
     /// mirror write.
@@ -875,7 +847,7 @@ mod tests {
                 .put(
                     &key,
                     Box::new(std::io::Cursor::new(body.clone())),
-                    digest_of(&body),
+                    body_digest(&body),
                 )
                 .await
                 .unwrap_or_else(|e| panic!("{name}: put must succeed: {e:?}"));
@@ -904,7 +876,7 @@ mod tests {
                 .put(
                     &key,
                     Box::new(std::io::Cursor::new(committed.clone())),
-                    digest_of(&committed),
+                    body_digest(&committed),
                 )
                 .await
                 .unwrap();
@@ -915,7 +887,7 @@ mod tests {
                 .put(
                     &key,
                     Box::new(std::io::Cursor::new(b"different bytes entirely".to_vec())),
-                    digest_of(b"not what follows"),
+                    body_digest(b"not what follows"),
                 )
                 .await
                 .expect_err("a mis-stated digest must be refused");
@@ -944,7 +916,7 @@ mod tests {
                 .put(
                     &key,
                     Box::new(std::io::Cursor::new(b"body".to_vec())),
-                    digest_of(b"a digest of something else"),
+                    body_digest(b"a digest of something else"),
                 )
                 .await
                 .expect_err("refused");
@@ -966,7 +938,7 @@ mod tests {
 
         for (name, store) in backends(dir.path()) {
             let err = store
-                .put(&key, failing_body(b"a prefix"), digest_of(b"a prefix"))
+                .put(&key, failing_body(b"a prefix"), body_digest(b"a prefix"))
                 .await
                 .expect_err("a failing body must not report success");
             assert!(
@@ -993,7 +965,7 @@ mod tests {
                 .put(
                     &key,
                     Box::new(std::io::Cursor::new(Vec::new())),
-                    digest_of(b""),
+                    body_digest(b""),
                 )
                 .await
                 .unwrap();

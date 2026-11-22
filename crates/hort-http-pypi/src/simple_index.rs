@@ -1201,6 +1201,11 @@ async fn prefetch_pypi_version(
 mod tests {
     use super::*;
 
+    // The digest a mirror seed supplies with its body, from the port
+    // that refuses a pair that does not agree — not a local re-type of
+    // the same two lines.
+    use hort_domain::ports::metadata_mirror_store::body_digest;
+
     /// Historical alpha-walk finding (runbook §7.2): the PEP 503 (HTML)
     /// and PEP 691 (JSON) representations used to need format-distinct
     /// dedup/coalescing keys, because the format actually FETCHED used
@@ -1816,13 +1821,9 @@ mod tests {
         // canonical key.
         let mkey = mirror_key("pypi", &mapping_id.to_string(), "flask");
         // The digest of exactly the bytes being written — what the
-        // production caller supplies with the body.
-        let digest: hort_domain::types::ContentHash = {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(JSON_BODY))
-                .parse()
-                .unwrap()
-        };
+        // production caller supplies with the body, from the port's own
+        // definition rather than a local re-type of it.
+        let digest = body_digest(JSON_BODY);
         mocks
             .metadata_mirror
             .put(

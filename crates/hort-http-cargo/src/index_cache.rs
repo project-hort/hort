@@ -556,6 +556,10 @@ mod tests {
     use hort_domain::entities::managed_by::ManagedBy;
     use hort_domain::entities::repository::{RepositoryFormat, RepositoryType};
     use hort_domain::ports::ephemeral_store::EphemeralStore;
+    // The digest a mirror seed supplies with its body, from the port
+    // that refuses a pair that does not agree — not a local re-type of
+    // the same two lines.
+    use hort_domain::ports::metadata_mirror_store::body_digest;
     use hort_domain::ports::repository_upstream_mapping_repository::{
         RepositoryUpstreamMapping, UpstreamAuth,
     };
@@ -904,11 +908,9 @@ mod tests {
         let raw = ndjson_entry("serde", "9.9.9", "feedface");
         let mkey = mirror_key("cargo", &mapping_id.to_string(), &path);
         // The digest of exactly the bytes being written — what the
-        // production caller supplies with the body.
-        let digest: hort_domain::types::ContentHash = {
-            use sha2::Digest;
-            hex::encode(sha2::Sha256::digest(&raw)).parse().unwrap()
-        };
+        // production caller supplies with the body, from the port's own
+        // definition rather than a local re-type of it.
+        let digest = body_digest(&raw);
         mocks
             .metadata_mirror
             .put(&mkey, Box::new(std::io::Cursor::new(raw)), digest)
