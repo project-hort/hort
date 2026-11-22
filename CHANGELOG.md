@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Stored event-chain evidence that cannot be read back now fails the
   checkpoint cycle terminally (`failed_terminal`, with a `chain_evidence_locus`
   log field) instead of being retried as a transient outage (#458).
+- An `Authorization` header whose scheme is not spelled in canonical case
+  (`bearer`/`basic`), or which separates scheme and credential with more than
+  one space, is now accepted as the credential it is instead of being treated
+  as no credential at all (#458).
 
 ### Security
 

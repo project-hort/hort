@@ -47,6 +47,7 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
 use hort_domain::ports::identity_provider::OidcValidationError;
 
+use crate::auth_scheme::{strip_auth_scheme, AuthScheme};
 use crate::context::{AppContext, AuthContext};
 use crate::error::ApiError;
 
@@ -776,6 +777,9 @@ fn basic_creds_reason(result: &BasicCredentialsResult) -> &'static str {
 /// Empty-password is still folded into `MissingColon` (same as the
 /// legacy helper): it's indistinguishable from "no credential" and
 /// gives a single, operator-readable bucket for probe traffic.
+///
+/// The scheme token is matched by [`strip_auth_scheme`], which folds
+/// ASCII case and the `1*SP` separator per RFC 7235 §2.1.
 fn extract_basic_credentials(req: &Request) -> BasicCredentialsResult {
     let Some(value) = req.headers().get(header::AUTHORIZATION) else {
         return BasicCredentialsResult::Absent;
@@ -783,7 +787,7 @@ fn extract_basic_credentials(req: &Request) -> BasicCredentialsResult {
     let Ok(raw) = value.to_str() else {
         return BasicCredentialsResult::MalformedBase64;
     };
-    let Some(encoded) = raw.strip_prefix("Basic ") else {
+    let Some(encoded) = strip_auth_scheme(raw, AuthScheme::Basic) else {
         return BasicCredentialsResult::Absent;
     };
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
@@ -827,10 +831,12 @@ fn is_token_carrier_username(username: &str) -> bool {
 /// Extract `Authorization: Bearer <token>` into an owned `String`.
 /// Returns `None` for missing, non-UTF-8, non-`Bearer`, or empty-token
 /// variants — the caller treats all absence modes as "no token".
+/// The scheme token is matched by [`strip_auth_scheme`], which folds
+/// ASCII case and the `1*SP` separator per RFC 7235 §2.1.
 fn extract_bearer(req: &Request) -> Option<String> {
     let value = req.headers().get(header::AUTHORIZATION)?;
     let s = value.to_str().ok()?;
-    let token = s.strip_prefix("Bearer ")?;
+    let token = strip_auth_scheme(s, AuthScheme::Bearer)?;
     if token.is_empty() {
         None
     } else {
@@ -854,6 +860,9 @@ fn extract_bearer(req: &Request) -> Option<String> {
 ///
 /// Returns a structured [`BasicAuthResult`] so callers can log
 /// header-format failures distinctly from a legitimately-absent header.
+///
+/// The scheme token is matched by [`strip_auth_scheme`], which folds
+/// ASCII case and the `1*SP` separator per RFC 7235 §2.1.
 #[allow(dead_code)]
 fn extract_basic_password_as_token(req: &Request) -> BasicAuthResult {
     let Some(value) = req.headers().get(header::AUTHORIZATION) else {
@@ -864,7 +873,7 @@ fn extract_basic_password_as_token(req: &Request) -> BasicAuthResult {
         // callers will classify as malformed.
         return BasicAuthResult::MalformedBase64;
     };
-    let Some(encoded) = raw.strip_prefix("Basic ") else {
+    let Some(encoded) = strip_auth_scheme(raw, AuthScheme::Basic) else {
         // Authorization present but not Basic (e.g. Bearer handled
         // separately, or Digest). Not our problem.
         return BasicAuthResult::Absent;
@@ -3903,5 +3912,185 @@ mod tests {
             format!("{h}.{p}.{s}")
         };
         assert!(!looks_like_cli_session_jwt(&oidc_shaped));
+    }
+    // -- RFC 7235 §2.1 scheme matching, per extractor -------------------
+    //
+    // `auth-scheme` is a token matched case-insensitively, and `1*SP`
+    // separates it from the credential. All three extractors below reach
+    // that rule through `auth_scheme::strip_auth_scheme`, so each test
+    // asserts the EQUALITY of a non-canonical spelling's outcome with the
+    // canonical one — the property is that the spelling does not matter,
+    // which a pair of independent literals would not catch when the two
+    // diverge.
+
+    /// Every spelling of `Basic` that RFC 7235 §2.1 admits, plus the
+    /// `1*SP` variants, against a canonical-case single-space baseline.
+    fn basic_scheme_spellings(encoded: &str) -> [(String, String); 5] {
+        [
+            ("lower-case".into(), format!("basic {encoded}")),
+            ("upper-case".into(), format!("BASIC {encoded}")),
+            ("mixed-case".into(), format!("bAsIc {encoded}")),
+            ("two spaces".into(), format!("Basic  {encoded}")),
+            ("lower-case + 3 spaces".into(), format!("basic   {encoded}")),
+        ]
+    }
+
+    #[test]
+    fn extract_basic_credentials_is_scheme_case_insensitive_and_1sp() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("__token__:hort_pat_x");
+        let canonical = extract_basic_credentials(&basic_header_req(&format!("Basic {encoded}")));
+        assert_eq!(
+            canonical,
+            BasicCredentialsResult::Ok {
+                username: "__token__".into(),
+                password: "hort_pat_x".into()
+            },
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in basic_scheme_spellings(&encoded) {
+            assert_eq!(
+                extract_basic_credentials(&basic_header_req(&value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_credentials_still_refuses_another_scheme() {
+        // Not a prefix-free "anything goes": a different scheme carries no
+        // Basic credential, whatever its case.
+        for value in [
+            "Digest aGVsbG86d29ybGQ=",
+            "digest aGVsbG86d29ybGQ=",
+            "Bearer tok",
+        ] {
+            assert_eq!(
+                extract_basic_credentials(&basic_header_req(value)),
+                BasicCredentialsResult::Absent,
+                "{value} was accepted as Basic"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_credentials_empty_credential_is_unchanged() {
+        // The scheme-present-but-empty boundary: `Basic ` decodes to an
+        // empty payload with no colon. Pinned as-is — whether a
+        // malformed-but-present credential should be anonymous or a 401 is
+        // a separate question this rule does not touch.
+        for value in ["Basic ", "basic "] {
+            assert_eq!(
+                extract_basic_credentials(&basic_header_req(value)),
+                BasicCredentialsResult::MissingColon,
+                "{value} changed the empty-credential classification"
+            );
+        }
+        // No SP at all is not `credentials` with a payload — absent, as
+        // before.
+        assert_eq!(
+            extract_basic_credentials(&basic_header_req("Basic")),
+            BasicCredentialsResult::Absent
+        );
+    }
+
+    #[test]
+    fn extract_bearer_is_scheme_case_insensitive_and_1sp() {
+        let canonical = extract_bearer(&basic_header_req("Bearer abc.def.ghi"));
+        assert_eq!(
+            canonical.as_deref(),
+            Some("abc.def.ghi"),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in [
+            ("lower-case", "bearer abc.def.ghi"),
+            ("upper-case", "BEARER abc.def.ghi"),
+            ("mixed-case", "bEaReR abc.def.ghi"),
+            ("two spaces", "Bearer  abc.def.ghi"),
+            ("lower-case + 3 spaces", "bearer   abc.def.ghi"),
+        ] {
+            assert_eq!(
+                extract_bearer(&basic_header_req(value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_bearer_still_refuses_another_scheme() {
+        for value in ["Digest abc.def.ghi", "digest abc.def.ghi", "Bearerish tok"] {
+            assert!(
+                extract_bearer(&basic_header_req(value)).is_none(),
+                "{value} was accepted as Bearer"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_bearer_empty_credential_is_unchanged() {
+        // `Bearer ` has no token to validate and stays an absence mode, in
+        // every spelling and with no SP at all.
+        for value in ["Bearer ", "bearer ", "Bearer", "bearer"] {
+            assert!(
+                extract_bearer(&basic_header_req(value)).is_none(),
+                "{value} changed the empty-credential classification"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_password_as_token_is_scheme_case_insensitive_and_1sp() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("__token__:my-jwt");
+        let canonical =
+            extract_basic_password_as_token(&basic_header_req(&format!("Basic {encoded}")));
+        assert_eq!(
+            canonical,
+            BasicAuthResult::Ok("my-jwt".into()),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in basic_scheme_spellings(&encoded) {
+            assert_eq!(
+                extract_basic_password_as_token(&basic_header_req(&value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_password_as_token_still_refuses_another_scheme() {
+        for value in ["Digest aGVsbG86d29ybGQ=", "digest aGVsbG86d29ybGQ="] {
+            assert_eq!(
+                extract_basic_password_as_token(&basic_header_req(value)),
+                BasicAuthResult::Absent,
+                "{value} was accepted as Basic"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_password_as_token_empty_credential_is_unchanged() {
+        for value in ["Basic ", "basic "] {
+            assert_eq!(
+                extract_basic_password_as_token(&basic_header_req(value)),
+                BasicAuthResult::MissingColon,
+                "{value} changed the empty-credential classification"
+            );
+        }
+        assert_eq!(
+            extract_basic_password_as_token(&basic_header_req("Basic")),
+            BasicAuthResult::Absent
+        );
+    }
+
+    /// A request carrying `value` as its raw `Authorization` header.
+    /// Built with `HeaderValue::from_str` rather than a typed scheme so
+    /// the non-canonical spellings reach the extractor verbatim.
+    fn basic_header_req(value: &str) -> Request<Body> {
+        HttpRequest::get("/")
+            .header(header::AUTHORIZATION, value)
+            .body(Body::empty())
+            .unwrap()
     }
 }
