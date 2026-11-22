@@ -62,6 +62,7 @@ use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
 use hort_domain::events::{ApiActor, RejectionReason};
+use hort_domain::oci::{legacy_oci_artifact_path, OciArtifactRole};
 use hort_domain::types::{ByteRange, ContentHash};
 use hort_formats::oci::OciFormatHandler;
 
@@ -420,7 +421,12 @@ pub(super) async fn serve(
     let coords = oci_blob_coords(name, &hash);
     let (repo, artifact) = match ctx
         .artifact_use_case
-        .find_visible_by_path(repo_key, &coords.path, actor)
+        .find_visible_by_path_with_fallback(
+            repo_key,
+            &coords.path,
+            &legacy_oci_artifact_path(OciArtifactRole::Blob, &hash),
+            actor,
+        )
         .await
     {
         Ok((r, a)) => (r, a),
@@ -1675,6 +1681,58 @@ mod tests {
         artifacts.insert(a);
         storage.insert_content(hash, content.to_vec());
         id
+    }
+
+    #[test]
+    fn scoped_blob_get_does_not_cross_names() {
+        use hort_domain::ports::artifact_repository::ArtifactRepository;
+        use sha2::Digest;
+        let (same, other) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let body = b"blob-identity";
+            let hex = hex::encode(sha2::Sha256::digest(body));
+            seed_blob(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &hex,
+                body,
+                QuarantineStatus::None,
+            );
+            let hash: ContentHash = hex.parse().unwrap();
+            let mut artifact = h
+                .artifacts
+                .find_by_path(repo_id, &format!("blobs/sha256:{hex}"))
+                .await
+                .unwrap()
+                .unwrap();
+            artifact.path = oci_blob_coords("library/nginx", &hash).path;
+            h.artifacts.insert(artifact);
+            let router = blob_router(h.ctx.clone());
+            let same = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v2/myrepo/library/nginx/blobs/sha256:{hex}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let other = router
+                .oneshot(
+                    Request::get(format!("/v2/myrepo/other/thing/blobs/sha256:{hex}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (same.status(), other.status())
+        });
+        assert_eq!(same, StatusCode::OK);
+        assert_eq!(other, StatusCode::NOT_FOUND);
     }
 
     /// Like [`seed_blob`], but for `Quarantined` lets the caller control

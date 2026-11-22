@@ -1055,9 +1055,8 @@ impl ArtifactRepository for PgArtifactRepository {
                 has_skip_marker_kind = skip_marker_kind.is_some(),
                 "find_oci_image_manifests_without_kind"
             );
-            // Backfill candidacy. Manifest-shaped rows only (`path LIKE
-            // 'manifests/sha256:%'`, the coords convention
-            // `hort-http-oci::coords` writes) AND no `content_references`
+            // Backfill candidacy. Manifest-shaped rows under the domain role
+            // prefix (legacy and scoped) AND no `content_references`
             // row of the given kind (in practice `oci_config`) AND NOT an
             // image index — discriminated on the stored media type
             // (`artifact_metadata.metadata->>'oci_media_type'`, mirroring
@@ -1073,7 +1072,7 @@ impl ArtifactRepository for PgArtifactRepository {
             // — see that method's doc for the resumability contract.
             let sql = format!(
                 "SELECT {SELECT_COLS} FROM artifacts \
-                 WHERE path LIKE 'manifests/sha256:%' \
+                 WHERE path LIKE '{manifest_prefix}%' \
                    AND deleted_at IS NULL \
                    AND ($5::uuid IS NULL OR id > $5) \
                    AND NOT EXISTS ( \
@@ -1095,7 +1094,8 @@ impl ArtifactRepository for PgArtifactRepository {
                          AND metadata->>'oci_media_type' IN ($3, $4) \
                    ) \
                  ORDER BY id \
-                 LIMIT $2"
+                 LIMIT $2",
+                manifest_prefix = hort_domain::oci::OCI_MANIFEST_PATH_PREFIX,
             );
             let rows: Vec<ArtifactRow> = sqlx::query_as(AssertSqlSafe(sql))
                 .bind(&kind)
@@ -2760,6 +2760,36 @@ mod tests {
             .await
             .expect("query");
         assert!(got.is_empty(), "no manifests seeded → empty candidate set");
+        cleanup_repo(&pool, repo).await;
+    }
+
+    #[tokio::test]
+    #[serial(hort_pg_db)]
+    async fn find_oci_image_manifests_without_kind_selects_scoped_and_legacy_paths() {
+        let Some(pool) = maybe_pool().await else {
+            return;
+        };
+        let repo = seed_repo(&pool).await;
+        let legacy = seed_artifact_at_path(
+            &pool,
+            repo,
+            "manifests/sha256:aaaa000000000000000000000000000000000000000000000000000000000000",
+            403,
+        )
+        .await;
+        let scoped = seed_artifact_at_path(
+            &pool, repo,
+            "manifests/library/nginx/sha256:bbbb000000000000000000000000000000000000000000000000000000000000",
+            404,
+        ).await;
+        let got = repo_under_test(&pool)
+            .await
+            .find_oci_image_manifests_without_kind("oci_config", 100, None, None)
+            .await
+            .expect("query");
+        let ids: std::collections::HashSet<Uuid> = got.into_iter().map(|a| a.id).collect();
+        assert!(ids.contains(&legacy));
+        assert!(ids.contains(&scoped));
         cleanup_repo(&pool, repo).await;
     }
 

@@ -124,3 +124,23 @@ Damit ist auch diese Einheit eine Entscheidung und keine Implementierung:
 Nicht anfangen, bevor die Entscheidung steht.
 
 **Abhängigkeit:** diese Einheit konsumiert `name` aus der Projektion in `backlog/430-project-what-the-referrers-list-needs.md`. Vor 430 gibt es keinen tragfähigen Namensschlüssel — `artifact.name` ist, wie oben gezeigt, der falsche.
+
+
+---
+
+## Superseded (2026-11-21)
+
+This item asked whether the list should filter on `artifact.name` and accept the
+multi-naming error, or not filter and serve the unnarrowed list. The question is
+gone: #459 decided that the OCI wire `<name>` is the namespace for artifact
+identity, with the reach confirmed as the whole OCI surface, so narrowing the
+list is a **consequence of identity** rather than a filter to design.
+
+The work lives in `backlog/461-the-referrers-list-belongs-to-the-asked-name.md`,
+which rests on the decided model instead of asking the question. Two of this
+item's premises were already falsified before the supersession and are recorded
+there so they are not re-derived: `artifact.name` is the wrong key, and the
+projected `name` on the edge — correct while identity was name-free — is now a
+second source of truth for a fact the path carries.
+
+Nothing here is to be implemented.

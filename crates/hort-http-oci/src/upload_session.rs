@@ -4088,6 +4088,10 @@ mod tests {
             // Artifact row exists in the mock with the expected size.
             assert_eq!(outcome.artifact.size_bytes as usize, content.len());
             assert_eq!(outcome.artifact.sha256_checksum, hash);
+            assert_eq!(
+                outcome.artifact.path,
+                format!("blobs/library/nginx/sha256:{}", hash.as_ref())
+            );
 
             // Session row is gone.
             let key = session_key("oci", session_id);

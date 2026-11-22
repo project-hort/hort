@@ -137,7 +137,7 @@ use hort_domain::entities::artifact::{Artifact, QuarantineStatus};
 use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::error::DomainError;
 use hort_domain::events::{Actor, ApiActor, RejectionReason};
-use hort_domain::oci::{AdmissionRefusal, ImageBudget};
+use hort_domain::oci::{legacy_oci_artifact_path, AdmissionRefusal, ImageBudget, OciArtifactRole};
 use hort_domain::ports::constituent_status::TerminalConstituent;
 use hort_domain::ports::content_reference_index::ContentReferenceClaim;
 use hort_domain::types::{ArtifactCoords, ContentHash};
@@ -2100,7 +2100,12 @@ async fn delete_by_digest(
     // crate and matches the enforcement guarantee.
     let artifact = match ctx
         .artifact_use_case
-        .find_visible_by_path(repo_key, &coords.path, Some(principal))
+        .find_visible_by_path_with_fallback(
+            repo_key,
+            &coords.path,
+            &legacy_oci_artifact_path(OciArtifactRole::Manifest, &hash),
+            Some(principal),
+        )
         .await
     {
         Ok((_repo, a)) => a,
@@ -2554,10 +2559,9 @@ struct ReferenceResolution {
 /// **Which lookup depends on what the reference is**, and the loop body
 /// records why: a config / layer reference is about bytes and takes
 /// `find_in_repo_by_hash`; an index child is about a *document* and
-/// takes `find_in_repo_by_path` over the manifest path that document
-/// will be delivered under. A child with no manifest row is absent, not
-/// resolved — "some row shares these bytes" is not the question a later
-/// `GET …/manifests/sha256:<hex>` asks.
+/// takes `find_in_repo_by_path` over the legacy name-free manifest path.
+/// This existence check has not yet narrowed to the parent's name; a
+/// child with no row at that path is absent for this admission check.
 ///
 /// **A row is not enough: a terminal verdict against those bytes decides
 /// too, and it decides which of two refusals the push gets.** A
@@ -2658,14 +2662,15 @@ async fn resolve_referenced_blobs(
             );
             continue;
         }
-        // **A child manifest is resolved the way it will be delivered,
+        // **A child manifest is resolved by a manifest path,
         // and that is not the same lookup a blob takes.** A blob
         // reference asks about bytes: the config / layer `GET` serves
         // whatever row holds them, so "some live row in this repository
         // for this hash" is exactly the question. An index child is a
         // *document*, and the client's next request for it is
-        // `GET …/manifests/sha256:<hex>`, which resolves the manifest
-        // row and nothing else. Asking the hash-keyed question for it
+        // `GET …/manifests/sha256:<hex>`. This check still resolves the
+        // legacy name-free manifest row until it carries the parent's
+        // requested name. Asking the hash-keyed question for it
         // admitted an index over a row that is not a manifest at all:
         // arbitrary bytes pushed through the blob route leave a live row
         // under the same hash, the index committed, and the child `GET`
@@ -2673,11 +2678,9 @@ async fn resolve_referenced_blobs(
         // registry will not serve (ADR 0062).
         //
         // The row's own layout is the fact in question and the only one
-        // consulted: the manifest prefix is what separates the two kinds
-        // of row, it is what every mint path writes (the hosted PUT and
-        // the eager child ingest alike), and `(repository_id, path)` is
-        // unique — so this resolves the one row a reader addressing that
-        // digest gets, while the hash-keyed lookup is a `LIMIT 1` with
+        // consulted: the manifest role prefix separates the two kinds
+        // of row, and `(repository_id, path)` is unique. This legacy
+        // path resolves one old row, while the hash-keyed lookup is a `LIMIT 1` with
         // no `ORDER BY` over a set a repository may legitimately hold
         // more than one member of. Nothing here reads the child's bytes;
         // a parse would be a second, weaker definition of "is this a
@@ -2999,9 +3002,8 @@ async fn terminal_verdict_for(
 /// **`mediaType`**: deliberately NOT compared — and the question it looks
 /// like it would answer is answered one step earlier instead. *Whether the
 /// child is a manifest at all* is settled by the resolution that produced
-/// `stored`: an index child is looked up at `manifests/sha256:<hex>`, the path
-/// every mint path writes a manifest row under and the one a later child `GET`
-/// resolves, so a row reaching here is a manifest row by construction. What a
+/// `stored`: an index child is looked up at the legacy manifest path, so a
+/// row reaching here is a manifest row by construction. What a
 /// `mediaType` comparison would add on top is the *finer* distinction — index
 /// versus single image, OCI versus Docker schema — and its apparent
 /// counterpart cannot carry it: `Artifact::content_type` is not the
@@ -3453,9 +3455,8 @@ mod tests {
     /// `MANIFEST_UNKNOWN` for. A fixture that keeps passing after admission
     /// starts asking the delivery question has not demonstrated the fix.
     ///
-    /// - The **row at `manifests/sha256:<hex>`** is what admission resolves
-    ///   and what a later child `GET` resolves — the two sides of the one
-    ///   question.
+    /// - The **row at `manifests/sha256:<hex>`** is what this legacy
+    ///   admission lookup resolves.
     /// - The **parseable manifest body** is what the closure walk reads to
     ///   learn the child's own constituents. Opaque bytes are a legal state
     ///   (the walk warns and judges the child alone), but a corpus made
@@ -3773,7 +3774,7 @@ mod tests {
             let group_count = h.group_lifecycle.commit_call_count();
             let ref_count = h.refs.list(repo_id, "library/nginx").await.unwrap().len();
             // Also prove the manifest artifact got committed.
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let got = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -4369,7 +4370,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len();
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let manifest_present = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -4423,7 +4424,10 @@ mod tests {
 
             let manifest = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("manifest minted");
@@ -4478,7 +4482,7 @@ mod tests {
     }
 
     #[test]
-    fn two_names_for_one_manifest_share_one_subject_edge() {
+    fn two_names_for_one_manifest_have_distinct_rows_and_subject_edges() {
         run(async {
             let h = harness();
             let repo = oci_repo("myrepo");
@@ -4499,19 +4503,34 @@ mod tests {
                 assert_eq!(resp.status(), StatusCode::CREATED);
             }
 
-            let artifact = h
+            let first = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/first/image/sha256:{manifest_hex}"),
+                )
                 .await
                 .unwrap()
-                .expect("one digest-addressed artifact row");
+                .expect("first name row");
+            let second = h
+                .artifacts
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/second/image/sha256:{manifest_hex}"),
+                )
+                .await
+                .unwrap()
+                .expect("second name row");
+            assert_ne!(first.id, second.id);
             let rows = h
                 .content_references
                 .find_by_target(repo_id, &subject_hash, Some("oci_subject"))
                 .await
                 .unwrap();
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].source_artifact_id, artifact.id);
+            assert_eq!(rows.len(), 2);
+            let sources: std::collections::HashSet<_> =
+                rows.iter().map(|row| row.source_artifact_id).collect();
+            assert_eq!(sources, [first.id, second.id].into_iter().collect());
         });
     }
 
@@ -4573,7 +4592,10 @@ mod tests {
                 .len();
             let manifest_present = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -4648,7 +4670,10 @@ mod tests {
                 .len();
             let index_present = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{index_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -4697,7 +4722,10 @@ mod tests {
 
             let index = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{index_hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("index minted");
@@ -4781,7 +4809,10 @@ mod tests {
 
             let manifest = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("manifest must persist so client retry reconciles");
@@ -4915,7 +4946,7 @@ mod tests {
                 .unwrap()
                 .len();
             // The committed manifest artifact must be status None.
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let artifact_status = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -5171,7 +5202,10 @@ mod tests {
             let envelope = error_envelope(resp).await;
             let minted = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -5251,7 +5285,10 @@ mod tests {
             let envelope = error_envelope(resp).await;
             let minted = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -5304,7 +5341,10 @@ mod tests {
             let status = resp.status();
             let artifact_status = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                )
                 .await
                 .unwrap()
                 .map(|a| a.quarantine_status);
@@ -5586,7 +5626,7 @@ mod tests {
 
             // The manifest artifact must NOT be committed — pre-ingest
             // validation rejected the request.
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let manifest_present = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -5701,7 +5741,7 @@ mod tests {
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             // Assert the manifest artifact IS committed — the client
             // retries after pushing the blob.
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let found = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -5991,7 +6031,10 @@ mod tests {
         let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
         let document_committed = h
             .artifacts
-            .find_by_path(repo_id, &format!("manifests/sha256:{document_hex}"))
+            .find_by_path(
+                repo_id,
+                &format!("manifests/library/nginx/sha256:{document_hex}"),
+            )
             .await
             .unwrap()
             .is_some();
@@ -6876,7 +6919,10 @@ mod tests {
             let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             let manifest_committed = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -7124,7 +7170,7 @@ mod tests {
             // ONE add_member call — the primary manifest. No config /
             // layer members for an index.
             let group_calls = h.group_lifecycle.commit_call_count();
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let a = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -7210,7 +7256,7 @@ mod tests {
             let status = resp.status();
 
             // The index artifact is the source of every member row.
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let index_artifact_id = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -7306,7 +7352,7 @@ mod tests {
             let resp = router.oneshot(put_request(uri, body)).await.unwrap();
             let status = resp.status();
 
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let manifest_artifact_id = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -7938,7 +7984,7 @@ mod tests {
                 .unwrap();
             let status = resp.status();
             let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let present = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -7982,7 +8028,7 @@ mod tests {
             let resp = router.oneshot(put_request(uri, index_body)).await.unwrap();
             let status = resp.status();
             let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let present = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -8091,7 +8137,7 @@ mod tests {
             let status = resp.status();
             let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             let group_calls = h.group_lifecycle.commit_call_count();
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
             let present = h
                 .artifacts
                 .find_by_path(repo_id, &manifest_path)
@@ -8212,7 +8258,10 @@ mod tests {
             let group_calls = h.group_lifecycle.commit_call_count();
             let index_present = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{index_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -8296,7 +8345,10 @@ mod tests {
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             let index_minted = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{index_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -8626,7 +8678,10 @@ mod tests {
             let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             let index_minted = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{index_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -8697,7 +8752,10 @@ mod tests {
             let rbody = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             let minted = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{index_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/library/nginx/sha256:{index_hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -9788,7 +9846,7 @@ mod tests {
             let mut a = sample_artifact(QuarantineStatus::None);
             let artifact_id = a.id;
             a.repository_id = repo_id;
-            a.path = format!("manifests/sha256:{hex}");
+            a.path = format!("manifests/library/nginx/sha256:{hex}");
             a.sha256_checksum = hash.clone();
             a.size_bytes = content.len() as i64;
             h.artifacts.insert(a);
@@ -9816,7 +9874,7 @@ mod tests {
             // After DELETE: artifact gone, content_references gone.
             let post_artifact = h
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(repo_id, &format!("manifests/library/nginx/sha256:{hex}"))
                 .await
                 .unwrap();
             let post_refs = h.content_references.entry_count();
@@ -9831,6 +9889,43 @@ mod tests {
             post_refs, 0,
             "content_references rows with this source must be swept"
         );
+    }
+
+    #[test]
+    fn delete_digest_in_another_name_does_not_delete_scoped_manifest() {
+        let (status, still_present) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let body = b"scoped-delete-manifest";
+            let hex = hex::encode(Sha256::digest(body));
+            let hash: ContentHash = hex.parse().unwrap();
+            let path = oci_manifest_coords("library/nginx", &hash).path;
+            let mut artifact = sample_artifact(QuarantineStatus::None);
+            artifact.repository_id = repo_id;
+            artifact.path = path.clone();
+            artifact.sha256_checksum = hash.clone();
+            h.artifacts.insert(artifact);
+            h.storage.insert_content(hash, body.to_vec());
+            let uri = format!("/v2/myrepo/other/thing/manifests/sha256:{hex}");
+            let response = router()
+                .with_state(h.ctx.clone())
+                .oneshot(with_principal(
+                    HttpRequest::delete(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let still_present = h
+                .artifacts
+                .find_by_path(repo_id, &path)
+                .await
+                .unwrap()
+                .is_some();
+            (response.status(), still_present)
+        });
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(still_present);
     }
 
     /// The ORDERING invariant of the digest-DELETE path, driven from the
@@ -9856,7 +9951,7 @@ mod tests {
             let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
             let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
             let manifest_hex = hex::encode(Sha256::digest(&body));
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
 
             let router = router().with_state(h.ctx.clone());
             let put = router
@@ -9936,7 +10031,7 @@ mod tests {
             let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
             let body = build_manifest_json(&config_hash, std::slice::from_ref(&layer_hash));
             let manifest_hex = hex::encode(Sha256::digest(&body));
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
 
             let router = router().with_state(h.ctx.clone());
             let put = router
@@ -9997,7 +10092,7 @@ mod tests {
             let layer_hash = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer-bytes");
             let body = build_manifest_json(&config_hash, &[layer_hash]);
             let manifest_hex = hex::encode(Sha256::digest(&body));
-            let manifest_path = format!("manifests/sha256:{manifest_hex}");
+            let manifest_path = format!("manifests/library/nginx/sha256:{manifest_hex}");
 
             let router = router().with_state(h.ctx.clone());
             let put = router
@@ -10073,7 +10168,7 @@ mod tests {
             let hash: ContentHash = hex.parse().unwrap();
             let mut a = sample_artifact(QuarantineStatus::None);
             a.repository_id = repo_id;
-            a.path = format!("manifests/sha256:{hex}");
+            a.path = format!("manifests/library/nginx/sha256:{hex}");
             a.sha256_checksum = hash.clone();
             a.size_bytes = content.len() as i64;
             h.artifacts.insert(a);
@@ -10467,7 +10562,10 @@ mod tests {
                     serde_json::from_slice(&bytes).expect("an OCI error envelope is JSON");
                 let minted = h
                     .artifacts
-                    .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                    .find_by_path(
+                        repo_id,
+                        &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                    )
                     .await
                     .unwrap();
                 (status, envelope, minted.is_some())
@@ -10572,7 +10670,10 @@ mod tests {
                     serde_json::from_slice(&bytes).expect("an OCI error envelope is JSON");
                 let minted = h
                     .artifacts
-                    .find_by_path(repo_id, &format!("manifests/sha256:{manifest_hex}"))
+                    .find_by_path(
+                        repo_id,
+                        &format!("manifests/library/nginx/sha256:{manifest_hex}"),
+                    )
                     .await
                     .unwrap();
                 (status, envelope, minted.is_some())
@@ -10845,7 +10946,7 @@ mod tests {
         let hash: ContentHash = hex.parse().unwrap();
         let mut a = sample_artifact(QuarantineStatus::None);
         a.repository_id = repo_id;
-        a.path = format!("manifests/sha256:{hex}");
+        a.path = format!("manifests/library/nginx/sha256:{hex}");
         a.sha256_checksum = hash.clone();
         a.size_bytes = content.len() as i64;
         h.artifacts.insert(a);

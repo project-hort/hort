@@ -77,6 +77,7 @@ use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
 use hort_domain::events::{ApiActor, RejectionReason};
+use hort_domain::oci::{legacy_oci_artifact_path, OciArtifactRole};
 use hort_domain::ports::constituent_status::TerminalConstituent;
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::types::ContentHash;
@@ -231,7 +232,12 @@ pub(super) async fn serve(
     } else {
         match ctx
             .artifact_use_case
-            .find_visible_by_path(repo_key, &coords.path, actor)
+            .find_visible_by_path_with_fallback(
+                repo_key,
+                &coords.path,
+                &legacy_oci_artifact_path(OciArtifactRole::Manifest, &hash),
+                actor,
+            )
             .await
         {
             Ok((_repo, a)) => a,
@@ -2544,6 +2550,87 @@ mod tests {
             metadata.insert(meta);
         }
         (id, hash)
+    }
+
+    #[test]
+    fn scoped_manifest_digest_get_does_not_cross_names() {
+        use sha2::Digest;
+        let (same_name, other_name, tag_target, stored_path) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let body = b"{}";
+            let hex = hex::encode(sha2::Sha256::digest(body));
+            let (_, hash) = seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                body,
+                None,
+                QuarantineStatus::None,
+            );
+            let legacy = format!("manifests/sha256:{hex}");
+            let mut artifact = h
+                .artifacts
+                .find_by_path(repo_id, &legacy)
+                .await
+                .unwrap()
+                .unwrap();
+            artifact.path = oci_manifest_coords("library/nginx", &hash).path;
+            h.artifacts.insert(artifact);
+            seed_tag(&h.refs, repo_id, "other/thing", "v1", &hash);
+            let router = manifest_router(h.ctx.clone());
+            let same = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let other = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v2/myrepo/other/thing/manifests/sha256:{hex}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let tag = router
+                .oneshot(
+                    Request::get("/v2/myrepo/other/thing/manifests/v1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (
+                same.status(),
+                other.status(),
+                tag.status(),
+                h.artifacts
+                    .find_by_path(repo_id, &oci_manifest_coords("library/nginx", &hash).path)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .path,
+            )
+        });
+        assert_eq!(same_name, StatusCode::OK);
+        assert_eq!(other_name, StatusCode::NOT_FOUND);
+        assert_eq!(tag_target, StatusCode::NOT_FOUND);
+        assert_eq!(
+            stored_path,
+            format!(
+                "manifests/library/nginx/sha256:{}",
+                hex::encode(sha2::Sha256::digest(b"{}"))
+            )
+        );
     }
 
     fn seed_tag(
@@ -6008,7 +6095,10 @@ mod tests {
 
             let index_artifact_id = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("pulled-through index must be committed as an artifact")
@@ -6149,7 +6239,10 @@ mod tests {
                 .unwrap();
             let child_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{child_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{child_hex}"),
+                )
                 .await
                 .unwrap();
             (
@@ -6558,12 +6651,18 @@ mod tests {
 
             let config_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("blobs/sha256:{config_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{config_hex}"),
+                )
                 .await
                 .unwrap();
             let layer_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("blobs/sha256:{layer_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{layer_hex}"),
+                )
                 .await
                 .unwrap();
             (status, config_artifact, layer_artifact)
@@ -6660,12 +6759,18 @@ mod tests {
 
             let config_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("blobs/sha256:{config_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{config_hex}"),
+                )
                 .await
                 .unwrap();
             let layer_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("blobs/sha256:{layer_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{layer_hex}"),
+                )
                 .await
                 .unwrap();
             (status, config_artifact, layer_artifact)
@@ -6748,7 +6853,10 @@ mod tests {
 
             let manifest_artifact_id = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("pulled-through manifest must be committed as an artifact")
@@ -6865,7 +6973,10 @@ mod tests {
                 .len();
             let index_present = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -6938,7 +7049,10 @@ mod tests {
 
             let index = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("pulled-through index must be committed as an artifact");
@@ -7037,7 +7151,10 @@ mod tests {
                 .len();
             let index_present = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -7107,7 +7224,10 @@ mod tests {
 
             let index = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("pulled-through index must be committed as an artifact");
@@ -7211,7 +7331,10 @@ mod tests {
                 .len();
             let follower_rows = mocks
                 .artifacts
-                .find_by_path(follower_repo.id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    follower_repo.id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -7424,7 +7547,10 @@ mod tests {
             for (label, repo) in [("repo-a", &repo_a), ("repo-b", &repo_b)] {
                 let manifest_id = mocks
                     .artifacts
-                    .find_by_path(repo.id, &format!("manifests/sha256:{hex}"))
+                    .find_by_path(
+                        repo.id,
+                        &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                    )
                     .await
                     .unwrap()
                     .expect("each repo gets its own manifest row")

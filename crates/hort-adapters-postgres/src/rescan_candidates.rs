@@ -82,7 +82,7 @@
 //! one resolved policy".
 
 use chrono::{DateTime, Utc};
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 use uuid::Uuid;
 
 use hort_domain::error::{DomainError, DomainResult};
@@ -449,8 +449,8 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // rule, in which a composed image's verdict carried no
             // release authority.
             //
-            // **A manifest row is `path LIKE 'manifests/sha256:%'`** —
-            // the coords convention `hort-http-oci::coords` writes, and
+            // **A manifest row starts with the domain manifest role prefix** —
+            // both legacy and scoped paths share it, and
             // the same discrimination
             // `ArtifactRepository::find_oci_image_manifests_without_kind`
             // uses. `ArtifactKind` is not persisted, so the path is what
@@ -520,7 +520,8 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
             // and enqueueing a scan under it would contradict the
             // operator's own policy. Same in-flight exclusion, and the
             // same `a.deleted_at IS NULL` (`live_reads_exclude_deleted`).
-            let sql = r#"
+            let sql = format!(
+                r#"
                 SELECT a.id            AS artifact_id,
                        a.repository_id AS repository_id,
                        a.checksum_sha256 AS content_hash,
@@ -556,7 +557,7 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                 WHERE a.deleted_at IS NULL
                   AND (a.quarantine_status = 'released'
                        OR a.quarantine_status IS NULL)
-                  AND a.path LIKE 'manifests/sha256:%'
+                  AND a.path LIKE '{manifest_prefix}%'
                   AND COALESCE(cardinality(p.scan_backends), $2) > 0
                   AND NOT EXISTS (
                         SELECT 1 FROM composite_scan_observations o
@@ -581,9 +582,11 @@ impl RescanCandidatesRepository for PgRescanCandidatesRepository {
                           AND j.status IN ('pending', 'running')
                       )
                 LIMIT $1
-            "#;
+            "#,
+                manifest_prefix = hort_domain::oci::OCI_MANIFEST_PATH_PREFIX
+            );
 
-            let rows = sqlx::query(sql)
+            let rows = sqlx::query(AssertSqlSafe(sql))
                 .bind(i64::from(batch_size))
                 .bind(DefaultPolicy::block_on_critical_default_backends().len() as i32)
                 .bind(hort_domain::oci::OCI_IMAGE_INDEX_MEDIA_TYPE)

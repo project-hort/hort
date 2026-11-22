@@ -1,0 +1,65 @@
+# 464 — contract: rewrite the legacy paths and drop the fallback
+
+**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 5 of 5.
+**Ships one release after unit 460**, per ADR 0030's expand/contract policy. Do not bring it forward.
+
+## Why it is a separate release
+
+Unit 460 is the expand half: new writes use the name-carrying path, reads fall
+back to the legacy one. This unit removes the fallback and rewrites the rows. If
+both shipped together, a rolling upgrade would have the previous release's code
+building name-free paths against rewritten rows — it would miss, and mint a
+second artifact row for the same bytes. That hazard is already documented at
+`crates/hort-app/src/task_handlers/oci_index_child_ingest.rs:539-543`.
+
+## The rewrite is deterministic and lossless — measured
+
+- Every OCI artifact row carries its name: all four builder families set
+  `name: name.to_string()` on the coords, so `artifacts.name` is populated for
+  manifests and blobs alike.
+- The new path is a pure function of `(name, old path)`, so the migration is a
+  single `UPDATE` with no lookups.
+- **No schema change and no constraint change.** The uniqueness key stays
+  `artifacts_repository_id_path_key UNIQUE (repository_id, path)`
+  (`migrations/003_artifacts_cas.sql:105`, partial on `deleted_at IS NULL` since
+  `migrations/021_artifacts_soft_delete.sql`). Distinct old paths map to
+  distinct new paths, so the rewrite cannot collide — and because no identifier
+  is dropped, renamed or narrowed, `expand_contract_guard` has nothing to say
+  and `CONTRACTIONS.toml` needs no entry. **Verify that claim against the guard
+  rather than trusting this paragraph**: a data `UPDATE` is outside the guard's
+  corpus, and if it is not, the manifest is not the place to make it pass.
+
+One consequence is **not** lossless and belongs in the release notes rather than
+in a fix: an artifact that two names pushed exists as **one** row under the name
+of the first push, because the name-free key admitted only one. After the
+rewrite it is reachable under that name alone. That is the multi-naming
+limitation the model removes going forward, and the cross-name reachability it
+ends is the defect, not a feature — but a client that had been pulling a digest
+under a name it never pushed starts getting `404`.
+
+## What else this unit cleans up
+
+- Remove the legacy-path read fallback from unit 460, including from
+  `scan_kind` / `is_provenance_constituent` if they grew a legacy shape.
+- Remove the now-redundant `name` key from the `oci_subject` edge projection
+  (`subject_content_reference_claim`, `crates/hort-http-oci/src/manifests_write.rs`)
+  and bump `projection_version`. Identity carries the name; a projected copy is
+  a second source of truth for one fact. Leave `config_media_type` and
+  `annotations` alone — those are a cache of values derivable from the bytes and
+  stay.
+
+## Acceptance
+
+- A pre-migration row is reachable at its new path after the migration and
+  **not** at its old one.
+- The migration is idempotent: running it twice leaves the same paths.
+- A row whose name is empty or absent — if any exist, measure before assuming
+  none do — is handled by a stated rule, not by producing a path with an empty
+  segment.
+- No read path consults a legacy path afterwards; grep the diff for the removed
+  fallback rather than asserting it.
+- `projection_version` is bumped and a row at the previous version still reads
+  correctly, because the reader's miss path is what the version exists to drive.
+- One `CHANGELOG.md` entry, under the #459 entry, naming the client-visible
+  consequence in the upgrade terms an operator needs — not the mechanism.
+- The change adds no uncovered lines.

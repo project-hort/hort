@@ -68,19 +68,22 @@ The resolution key for an artifact row is `(repository_id, path)`
 (`ArtifactRepository::find_by_path`). The table is about what goes into `path`
 and into the namespace column beside it.
 
-| Surface | Today | Under this model |
+| Surface | Before this model | Under this model |
 |---|---|---|
-| Manifest | `manifests/sha256:<hex>`, name deliberately absent (`coords.rs`, `oci_manifest_path`) | identity is scoped to the name |
-| Blob | `blobs/sha256:<hex>`, name only on the row (`coords.rs`, `oci_blob_coords`) | identity is scoped to the name |
+| Manifest | `manifests/sha256:<hex>`, the name absent from the key | `manifests/<name>/sha256:<hex>` — identity is scoped to the name |
+| Blob | `blobs/sha256:<hex>`, the name only on the row | `blobs/<name>/sha256:<hex>` — identity is scoped to the name |
 | Tag | `mutable_refs (repository_id, namespace, ref_name)`, `namespace` = the name — **already scoped at the key** | unchanged at the key; its content-hash **target** must resolve inside that name |
 | Referrers | the list is assembled from `oci_subject` edges, which carry no namespace of their own | the list belongs to the name that was asked |
 | Mount `from=` | read as a hort repository key | an OCI namespace |
 
-Two consequences of the present shape are worth stating plainly, because they
-are what the model corrects: a digest-addressed manifest `GET` — and the
-digest-addressed `DELETE` — resolves across every name in one hort repository,
-and multi-naming of one artifact is unrepresentable, because an artifact row
-carries exactly one name (the one from the first push).
+Two consequences of the name-free shape are what the model corrects, and they
+are worth stating because they are the reason it exists: a digest-addressed
+manifest `GET` — and the digest-addressed `DELETE` — resolved across every name
+in one hort repository, and multi-naming of one artifact was unrepresentable,
+because an artifact row carried exactly one name (the one from the first push).
+Under this model the same bytes under two names are two artifact rows, and the
+role segment comes first so a row's role stays readable without parsing the
+name: `blobs` and `manifests` are both legal OCI image names.
 
 ## CAS is untouched — the bytes are not duplicated
 
@@ -113,14 +116,17 @@ it. The remedy for a namespace that matters is to push into it.
 The decision is recorded here ahead of the code; this section is the honest
 difference, and it is the part to update as units land (tracked by issue #459).
 
-**Held today:** the tag key carries the namespace (`mutable_refs`), and the
-referrers projection records the name on the `oci_subject` edge.
+**Held today:** new manifest and blob rows carry the name in the identity path
+(`manifests/<name>/sha256:<hex>` and `blobs/<name>/sha256:<hex>`). Digest
+GET/HEAD and digest DELETE resolve inside that name. A tag's key carries the
+name (`mutable_refs`), and its target resolves through the named manifest path
+for new rows. The referrers projection records the name on the `oci_subject`
+edge. During the expand window, reads fall back to name-free legacy rows;
+those rows still have unknown namespace and are not rewritten by a read.
 
-**Not yet held:** manifest identity, blob identity, the resolution of a tag's
-target within its name, the narrowing of a referrers list to the name that was
-asked, and the reading of a mount's `from` as an OCI namespace. Until those
-land, a digest-addressed manifest `GET`/`DELETE` crosses names inside one hort
-repository.
+**Not yet held:** the narrowing of a referrers list to the name that was asked,
+and the reading of a mount's `from` as an OCI namespace. Legacy name-free rows
+can still resolve through the temporary fallback until the contract step.
 
 ## What this model asks of other records
 

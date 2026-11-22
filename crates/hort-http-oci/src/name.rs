@@ -213,6 +213,54 @@ pub(crate) fn validate_oci_name(name: &str) -> DomainResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hort_domain::oci::{oci_artifact_path, parse_oci_artifact_path, OciArtifactRole};
+    use hort_domain::types::ContentHash;
+
+    #[test]
+    fn name_grammar_matches_artifact_identity_parser() {
+        let hash: ContentHash = "a".repeat(64).parse().expect("SHA-256 digest");
+        let over_byte_cap = "a".repeat(257);
+        let cases = [
+            ("library/nginx", true),         // A canonical two-component name.
+            ("nginx", true),                 // A single component is valid.
+            ("a_b", true),                   // One underscore separates two runs.
+            ("a__b", false),                 // Consecutive underscores are rejected by hort.
+            ("a--b", false),                 // Consecutive hyphens are rejected by hort.
+            ("a..b", false),                 // Consecutive dots are rejected by hort.
+            (".lead", false),                // A component cannot start with a separator.
+            ("trail.", false),               // A component cannot end with a separator.
+            ("UPPER", false),                // Image names use lowercase ASCII.
+            ("a//b", false),                 // An empty component is invalid.
+            ("a/b/c/d/e/f/g/h/i", false),    // Nine components exceed the cap.
+            (over_byte_cap.as_str(), false), // 257 bytes exceed the cap.
+            ("a:b", false),                  // A colon is not a name character.
+        ];
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for (name, expected) in cases {
+            let wire_accepts = validate_oci_name(name).is_ok();
+            assert_eq!(wire_accepts, expected, "wire grammar changed for {name:?}");
+            for role in [OciArtifactRole::Blob, OciArtifactRole::Manifest] {
+                let path = oci_artifact_path(role, name, &hash);
+                let stored_accepts = matches!(
+                    parse_oci_artifact_path(&path),
+                    Some(parsed) if parsed.role == role && parsed.name == Some(name)
+                );
+                assert_eq!(
+                    stored_accepts, wire_accepts,
+                    "path grammar differs for {name:?}"
+                );
+            }
+            if wire_accepts {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+        // Both verdicts are required: a constant verdict on either side
+        // must disagree with at least one case.
+        assert_eq!((accepted, rejected), (3, 10));
+    }
 
     // ---------------- Acceptance criteria coverage ------------------------
     //
