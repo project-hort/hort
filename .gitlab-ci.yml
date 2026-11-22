@@ -820,6 +820,18 @@ test:coverage:
 # database. Main / release / tags only, matching the GitHub CI gating.
 test:integration:
   stage: test
+  # The whole DB-backed suite in one job, and it has grown into its
+  # ceiling: measured 3160 s and 3496 s on `main` against the 3600 s
+  # default, then 3606 s and a `job_execution_timeout` on the release
+  # tag — which skips the image, chart and SBOM stages behind it, so a
+  # release publishes nothing. Declared here rather than left to the
+  # project default so the budget travels with the job definition and a
+  # frozen ref carries its own. 2 h is headroom for a suite that grows
+  # every week, NOT a target: an hour of real work is the thing to
+  # shorten, and shortening it means running the DB suite in parallel,
+  # which needs cross-process serialization first (the
+  # `#[serial(hort_pg_db)]` keys are process-local — see CLAUDE.md).
+  timeout: 2h
   # Pinned to the podman runner (issue #39). Its Postgres `services:` alias
   # resolves there now that `FF_NETWORK_PER_BUILD=true` is set on the runner
   # (gitlab-runner-podman!29): each build gets its own bridge network so the
