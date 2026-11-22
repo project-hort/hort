@@ -40,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A token revoked while a validation for it was already in flight is no longer
   served from the per-replica validation cache for the rest of the cache TTL
   (#458).
+- A cached federation JWKS is now bound to the issuer identity it was fetched
+  under, so repointing or recreating an OIDC issuer takes effect at once
+  instead of after the JWKS refresh interval (#458).
 
 ## [0.18.0] - 2026-11-21
 

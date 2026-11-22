@@ -26,14 +26,32 @@
 //! # Cache shape
 //!
 //! Per-issuer entries in a `RwLock<HashMap<issuer_name, JwksCacheEntry>>`.
-//! Each entry carries the current JWKS keyed by `kid` and the
+//! Each entry carries the current JWKS keyed by `kid`, the
 //! `last_refreshed` timestamp (UTC, wall-clock so cache lifetime is
-//! relative to the operator-declared interval, NOT the process uptime).
+//! relative to the operator-declared interval, NOT the process uptime),
+//! and the issuer identity the keys were fetched under.
 //!
-//! Refresh is lazy: on a `validate()` call, the validator checks
-//! `now - last_refreshed > issuer.jwks_refresh_interval`. Stale entries
-//! refresh inline; the refresh emits `hort_jwks_refresh_total{issuer=
-//! <issuer.name>, result=...}`.
+//! Refresh is lazy and has **two independent triggers**, classified
+//! together by [`classify_entry`] and never folded into one predicate:
+//!
+//! - **Age** — `now - last_refreshed > issuer.jwks_refresh_interval`
+//!   ([`is_stale`]).
+//! - **Identity** — the entry was fetched under a different
+//!   `OidcIssuer.id` or `issuer_url` than the row this validation
+//!   resolved ([`identity_matches`]). Unconditional, and deliberately
+//!   NOT age-bounded: the map key is the issuer *name*, and an operator
+//!   can repoint that name at a different IdP — or delete and recreate
+//!   it — while an entry is still well inside its interval. The
+//!   signature check binds the JWT's `iss` to the CURRENT `issuer_url`
+//!   (`validation.set_issuer`), so without this trigger a JWT claiming
+//!   the new URL would verify against the previous endpoint's keys for
+//!   up to one `jwks_refresh_interval`, and the holder of those keys
+//!   chooses the `iss` claim it presents.
+//!
+//! Stale or identity-superseded entries refresh inline; either way the
+//! refresh emits `hort_jwks_refresh_total{issuer=<issuer.name>,
+//! result=...}` — an identity-forced refresh is a refresh and reports
+//! as one.
 //!
 //! # HTTP client layering
 //!
@@ -62,6 +80,7 @@ use hort_domain::ports::BoxFuture;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+use uuid::Uuid;
 
 use crate::internal::{self, CappedBodyError};
 use crate::metrics::{emit_jwks_refresh, JwksRefreshResult};
@@ -99,7 +118,10 @@ const KID_MISS_REFRESH_COOLDOWN: Duration = Duration::from_secs(10);
 /// One instance per hort-server process; trusted-issuer rows are looked up
 /// fresh on each `validate()` call so apply-time changes (gitops apply)
 /// take effect immediately without bouncing the validator. The JWKS cache
-/// is per-process, keyed by issuer name.
+/// is per-process, keyed by issuer name, and every entry is bound to the
+/// issuer identity its keys were fetched under so a repointed or
+/// recreated name cannot keep serving the previous endpoint's keys (see
+/// the module's `# Cache shape`).
 ///
 /// Construction is fallible only via the underlying
 /// [`internal::build_http_client`] (extra-CA parsing). Once built, the
@@ -116,6 +138,16 @@ pub struct MultiIssuerJwksValidator {
     /// different issuer's refresh proceeds independently. This outer map
     /// is only ever locked briefly to get-or-insert the per-issuer
     /// `Arc<Mutex<()>>` — never held across a fetch `.await`.
+    ///
+    /// Keyed by name alone, and deliberately NOT by the issuer identity
+    /// the `caches` entries are bound to: this map is a concurrency
+    /// gate, not a trust decision. Nothing is ever read back out of it,
+    /// so sharing one gate across an identity change cannot hand a
+    /// stale key to anybody — each waiter re-classifies the cache
+    /// against the issuer row IT resolved once it holds the gate, and
+    /// refetches when that row disagrees. Keying it by identity too
+    /// would only add a never-collected map entry per repoint and let
+    /// two tasks fetch the same name concurrently.
     refresh_mutexes: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     body_max_bytes: usize,
     leeway_seconds: u64,
@@ -130,6 +162,30 @@ struct JwksCacheEntry {
     keys: HashMap<String, jsonwebtoken::jwk::Jwk>,
     /// Wall-clock UTC timestamp of the last successful refresh.
     last_refreshed: DateTime<Utc>,
+    /// `OidcIssuer.id` of the row these keys were fetched under.
+    ///
+    /// Paired with [`Self::fetched_under_issuer_url`], and both are
+    /// load-bearing because the cache map is keyed by `OidcIssuer.name`,
+    /// which two different trust anchors can wear over time: the URL
+    /// catches a **repoint** (the same named row aimed at a different
+    /// IdP), the id catches a **delete-and-recreate** under the same
+    /// name with the URL unchanged, which the URL alone cannot see
+    /// because a recreated row carries a fresh id. Either field alone
+    /// leaves one of the two windows open.
+    fetched_under_issuer_id: Uuid,
+    /// `OidcIssuer.issuer_url` of the row these keys were fetched under.
+    ///
+    /// Compared by exact string equality, matching how
+    /// `validation.set_issuer` compares the JWT's `iss` claim — the keys
+    /// are bound to the identity as the operator declared it.
+    ///
+    /// The *discovered* `jwks_uri` is deliberately not recorded or
+    /// compared here: recovering it costs a discovery request per
+    /// validation, which would defeat the cache this binding guards.
+    /// `issuer_url` is the identity the operator controls, it is already
+    /// in hand at the comparison, and `internal::check_jwks_uri_bound`
+    /// binds the discovered `jwks_uri` to it at fetch time.
+    fetched_under_issuer_url: String,
 }
 
 impl MultiIssuerJwksValidator {
@@ -369,21 +425,27 @@ impl MultiIssuerJwksValidator {
         {
             let guard = self.caches.read().await;
             if let Some(entry) = guard.get(&issuer.name) {
-                if !is_stale(entry, issuer.jwks_refresh_interval) {
-                    if let Some(jwk) = entry.keys.get(kid) {
-                        debug!(issuer = %issuer.name, %kid, "federation jwks cache hit");
-                        return Ok(jwk.clone());
+                match classify_entry(entry, issuer) {
+                    CacheUsability::Serviceable => {
+                        if let Some(jwk) = entry.keys.get(kid) {
+                            debug!(issuer = %issuer.name, %kid, "federation jwks cache hit");
+                            return Ok(jwk.clone());
+                        }
+                        // Fresh entry but missing kid: fall through to refresh.
+                        // Kid rotation could have produced a new signing key
+                        // that arrived between cache populations.
+                        debug!(
+                            issuer = %issuer.name,
+                            %kid,
+                            "federation jwks fresh but kid unknown — refreshing"
+                        );
                     }
-                    // Fresh entry but missing kid: fall through to refresh.
-                    // Kid rotation could have produced a new signing key
-                    // that arrived between cache populations.
-                    debug!(
-                        issuer = %issuer.name,
-                        %kid,
-                        "federation jwks fresh but kid unknown — refreshing"
-                    );
-                } else {
-                    debug!(issuer = %issuer.name, %kid, "federation jwks stale — refreshing");
+                    CacheUsability::IdentitySuperseded => {
+                        debug!(issuer = %issuer.name, %kid, "federation jwks identity superseded");
+                    }
+                    CacheUsability::AgeStale => {
+                        debug!(issuer = %issuer.name, %kid, "federation jwks stale — refreshing");
+                    }
                 }
             }
         }
@@ -398,18 +460,24 @@ impl MultiIssuerJwksValidator {
         let refresh_lock = self.issuer_refresh_lock(&issuer.name).await;
         let _refresh_permit = refresh_lock.lock().await;
 
-        let (is_fresh, cached, last_refreshed) = {
+        let (usability, cached, last_refreshed) = {
             let guard = self.caches.read().await;
             match guard.get(&issuer.name) {
                 Some(entry) => (
-                    !is_stale(entry, issuer.jwks_refresh_interval),
+                    Some(classify_entry(entry, issuer)),
                     entry.keys.get(kid).cloned(),
                     Some(entry.last_refreshed),
                 ),
-                None => (false, None, None),
+                // No entry under this name at all — nothing to serve and
+                // nothing for the cooldown below to throttle against.
+                None => (None, None, None),
             }
         };
-        if is_fresh {
+        // Only a serviceable entry may be served. An identity-superseded
+        // entry sits under this issuer's NAME but holds another trust
+        // anchor's keys, so it is not this issuer's cache at any age.
+        let serviceable = usability == Some(CacheUsability::Serviceable);
+        if serviceable {
             if let Some(jwk) = cached {
                 // Another task refreshed this issuer while we waited for
                 // the mutex.
@@ -424,8 +492,12 @@ impl MultiIssuerJwksValidator {
         // useless; a single last-refresh timestamp throttles the whole
         // class instead. Interval-driven staleness is NOT gated — it is
         // time-driven (at most one refresh per interval) and must stay
-        // live for legitimate rotation.
-        if is_fresh {
+        // live for legitimate rotation. An identity-superseded entry is
+        // likewise never gated (it is not `serviceable`): an operator
+        // repoint has to bite on the next validation, and the exemption
+        // is self-limiting because the refresh it forces rebinds the
+        // entry, so every kid miss after it is throttled normally.
+        if serviceable {
             if let Some(last) = last_refreshed {
                 if is_within_cooldown(last, self.kid_miss_cooldown) {
                     warn!(
@@ -449,6 +521,8 @@ impl MultiIssuerJwksValidator {
         let new_entry = JwksCacheEntry {
             keys: fresh_keys,
             last_refreshed: Utc::now(),
+            fetched_under_issuer_id: issuer.id,
+            fetched_under_issuer_url: issuer.issuer_url.clone(),
         };
         let resolved = new_entry.keys.get(kid).cloned();
         let mut guard = self.caches.write().await;
@@ -633,6 +707,8 @@ impl MultiIssuerJwksValidator {
         let new_entry = JwksCacheEntry {
             keys: fresh_keys,
             last_refreshed: Utc::now(),
+            fetched_under_issuer_id: issuer.id,
+            fetched_under_issuer_url: issuer.issuer_url.clone(),
         };
         let mut guard = self.caches.write().await;
         guard.insert(issuer.name.clone(), new_entry);
@@ -720,6 +796,53 @@ fn is_stale(entry: &JwksCacheEntry, refresh_interval: Duration) -> bool {
         Ok(d) => d > refresh_interval,
         Err(_) => false,
     }
+}
+
+/// Whether `issuer` is the same identity `entry`'s keys were fetched
+/// under — both `OidcIssuer.id` and `OidcIssuer.issuer_url`. See
+/// [`JwksCacheEntry::fetched_under_issuer_id`] for why neither half is
+/// sufficient alone.
+fn identity_matches(entry: &JwksCacheEntry, issuer: &OidcIssuer) -> bool {
+    entry.fetched_under_issuer_id == issuer.id
+        && entry.fetched_under_issuer_url == issuer.issuer_url
+}
+
+/// Whether a cache entry may serve a validation, and when it may not,
+/// which of the two independent refresh triggers fired.
+///
+/// The two are kept distinct rather than collapsed into one "refetch?"
+/// boolean because they are not interchangeable: age staleness is
+/// time-bounded and is additionally what gates the kid-miss refresh
+/// cooldown, while an identity mismatch is unconditional and must never
+/// be gated by it. A single boolean answers the refetch question
+/// correctly and loses which reason answered it, which is exactly the
+/// masking that lets one of the two quietly stop holding.
+#[derive(PartialEq, Eq)]
+enum CacheUsability {
+    /// Fetched under this exact issuer identity, and younger than
+    /// `jwks_refresh_interval`.
+    Serviceable,
+    /// Fetched under a different `OidcIssuer.id` / `issuer_url` than the
+    /// row this validation resolved. Forces a refresh at any age.
+    IdentitySuperseded,
+    /// Identity-bound, but older than `jwks_refresh_interval`.
+    AgeStale,
+}
+
+/// Classify `entry` against the issuer row the current validation holds.
+///
+/// Identity is tested FIRST and short-circuits: a superseded entry is
+/// unusable whatever its age, so letting the age test answer first would
+/// report a fresh entry holding another trust anchor's keys as
+/// serviceable.
+fn classify_entry(entry: &JwksCacheEntry, issuer: &OidcIssuer) -> CacheUsability {
+    if !identity_matches(entry, issuer) {
+        return CacheUsability::IdentitySuperseded;
+    }
+    if is_stale(entry, issuer.jwks_refresh_interval) {
+        return CacheUsability::AgeStale;
+    }
+    CacheUsability::Serviceable
 }
 
 /// Whether `last_refreshed` is within `cooldown` of now — the kid-miss
@@ -1015,6 +1138,13 @@ yDp6g/51WjALM10lhGCQasE=
             Arc::new(Self {
                 issuers: Mutex::new(issuers),
             })
+        }
+
+        /// Replace the trusted-issuer set in place, so a test can land
+        /// an operator config change between two validations the way a
+        /// gitops apply does (rows are re-read per `validate()` call).
+        fn replace(&self, issuers: Vec<OidcIssuer>) {
+            *self.issuers.lock().unwrap() = issuers;
         }
     }
 
@@ -1739,6 +1869,217 @@ FtBmFfStik03XAfEPVCRWBMc
         assert_eq!(jwks_hits, 1, "fresh cache must not re-fetch JWKS");
     }
 
+    // -- Cache identity binding --------------------------------------------
+
+    /// Modulus of a second RSA keypair, published by the IdP an issuer is
+    /// repointed AT. It shares `DEFAULT_KID` with the previous IdP's key
+    /// on purpose: the previous key's signature then reaches a real
+    /// signature check and fails it, rather than being refused earlier
+    /// as an unknown kid.
+    const REPOINTED_IDP_N: &str = "uocCdbx5B-bY9DqnN9Y70_G6YfSFBJShgVZ5PSB4xocP3kl0Gjhs2LV4uEKnhu\
+                                   GEsVTtyJHxrHUl6sSephBFnLN7_at3QApGI6VmYRSwCtTKrE_ve9FQZo6d0hMe\
+                                   8dwPwtB0JEsCtEcub3kDsbJuFYKldaAaOS2R-xB8agGdha3t3AF5X6sSQHg_M6\
+                                   sIVoMgdpulnXrHvwraQoxAXu9w2FYzXK4T9cYh_tjA1tV5cVRk0dOoQ6232DWL\
+                                   hnrfVnnHjanfPq-_jn2Uv0JlmBaZ9MYbcuzsY7-ukCUSybd--PIWKDuFCFYkh5\
+                                   ZKWyy5MkRn6UlOAIn0XrCCqM7dgkkoNQ";
+
+    /// Stand up an IdP publishing `n` under [`DEFAULT_KID`]. Returns the
+    /// mock (so the test can count requests) + its issuer URL.
+    async fn start_fed_idp_with_modulus(n: &str) -> (MockServer, String) {
+        let server = MockServer::start().await;
+        let base = server.uri();
+        Mock::given(method("GET"))
+            .and(path("/.well-known/openid-configuration"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "issuer": base,
+                "jwks_uri": format!("{base}/jwks"),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/jwks"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "keys": [
+                    {
+                        "kty": "RSA",
+                        "use": "sig",
+                        "alg": "RS256",
+                        "kid": DEFAULT_KID,
+                        "n": n,
+                        "e": TEST_E,
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+        (server, base)
+    }
+
+    async fn jwks_hits(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("recorded requests available")
+            .into_iter()
+            .filter(|r| r.url.path() == "/jwks")
+            .count()
+    }
+
+    /// Repointing a named issuer at a different IdP must take effect on
+    /// the NEXT validation, not after `jwks_refresh_interval`: the cache
+    /// is keyed by name, and the previous IdP's keys must not verify a
+    /// JWT whose `iss` names the new one — an `iss` the holder of those
+    /// keys picks freely.
+    #[tokio::test]
+    async fn repointing_issuer_url_refetches_a_fresh_entry_and_rejects_the_previous_key() {
+        let (server_old, base_old) = start_fed_idp_with_modulus(TEST_N).await;
+        let (server_new, base_new) = start_fed_idp_with_modulus(REPOINTED_IDP_N).await;
+
+        // One hour interval: the warm-up entry is nowhere near age-stale
+        // when the repoint lands, so only the identity binding can
+        // force the refetch below.
+        let mut old_row = issuer(
+            "shared-name",
+            &base_old,
+            vec!["hort-server"],
+            vec![JwtAlg::Rs256],
+        );
+        old_row.id = Uuid::new_v4();
+        let repo = StaticIssuerRepo::new(vec![old_row.clone()]);
+        let v = validator(repo.clone());
+
+        let warmup = sign_rs256(
+            &FederationTestClaims::defaults(&base_old, "hort-server"),
+            DEFAULT_KID,
+            TEST_PRIV_PEM,
+        );
+        v.validate_impl(&warmup).await.expect("warm-up ok");
+        assert_eq!(jwks_hits(&server_old).await, 1, "warm-up fetched once");
+
+        // The operator repoints the SAME named row — same id, new URL.
+        let mut new_row = old_row.clone();
+        new_row.issuer_url = base_new.clone();
+        repo.replace(vec![new_row]);
+
+        // A JWT only the PREVIOUS IdP can mint, claiming the NEW issuer
+        // URL. The signing key is the previous endpoint's.
+        let forged = sign_rs256(
+            &FederationTestClaims::defaults(&base_new, "hort-server"),
+            DEFAULT_KID,
+            TEST_PRIV_PEM,
+        );
+        let err = v.validate_impl(&forged).await.expect_err("must deny");
+        assert_eq!(
+            err,
+            FederationDenyReason::SignatureInvalid,
+            "keys cached under the previous issuer_url must not verify a JWT for the new one"
+        );
+
+        // The mechanism behind that rejection.
+        assert_eq!(
+            jwks_hits(&server_new).await,
+            1,
+            "the identity change must force a fetch from the new IdP"
+        );
+        assert_eq!(
+            jwks_hits(&server_old).await,
+            1,
+            "the previous IdP must not be consulted again"
+        );
+    }
+
+    /// Deleting an issuer and recreating it under the same name and the
+    /// same URL changes only `OidcIssuer.id` — which is why the id is
+    /// recorded beside the URL. A fresh entry from the previous row must
+    /// not serve the new one.
+    #[tokio::test]
+    async fn recreating_an_issuer_under_the_same_name_and_url_refetches_a_fresh_entry() {
+        let (server, base) = start_fed_idp_with_modulus(TEST_N).await;
+
+        let mut first_row = issuer(
+            "shared-name",
+            &base,
+            vec!["hort-server"],
+            vec![JwtAlg::Rs256],
+        );
+        first_row.id = Uuid::new_v4();
+        let repo = StaticIssuerRepo::new(vec![first_row.clone()]);
+        let v = validator(repo.clone());
+
+        let token = sign_rs256(
+            &FederationTestClaims::defaults(&base, "hort-server"),
+            DEFAULT_KID,
+            TEST_PRIV_PEM,
+        );
+        v.validate_impl(&token).await.expect("warm-up ok");
+        assert_eq!(jwks_hits(&server).await, 1, "warm-up fetched once");
+
+        // Same name, same URL, new row.
+        let mut recreated = first_row.clone();
+        recreated.id = Uuid::new_v4();
+        assert_ne!(recreated.id, first_row.id);
+        repo.replace(vec![recreated]);
+
+        // The IdP is unchanged here, so the token still validates — the
+        // property under test is that its keys were re-fetched for the
+        // new row rather than inherited from the old one.
+        v.validate_impl(&token)
+            .await
+            .expect("same IdP, so the token is still good");
+        assert_eq!(
+            jwks_hits(&server).await,
+            2,
+            "a new issuer id must force a refetch even with the URL unchanged"
+        );
+    }
+
+    /// The identity binding must not degrade into refetching on every
+    /// validation: an unchanged issuer with a fresh entry does no HTTP
+    /// at all.
+    #[tokio::test]
+    async fn unchanged_fresh_issuer_serves_from_cache_with_no_http_request() {
+        let (server, base) = start_fed_idp_with_modulus(TEST_N).await;
+
+        let mut row = issuer(
+            "shared-name",
+            &base,
+            vec!["hort-server"],
+            vec![JwtAlg::Rs256],
+        );
+        row.id = Uuid::new_v4();
+        let repo = StaticIssuerRepo::new(vec![row]);
+        let v = validator(repo);
+
+        let token = sign_rs256(
+            &FederationTestClaims::defaults(&base, "hort-server"),
+            DEFAULT_KID,
+            TEST_PRIV_PEM,
+        );
+        v.validate_impl(&token).await.expect("warm-up ok");
+
+        let after_warmup = server
+            .received_requests()
+            .await
+            .expect("recorded requests available")
+            .len();
+        assert_eq!(
+            after_warmup, 2,
+            "warm-up is one discovery + one jwks request"
+        );
+
+        v.validate_impl(&token).await.expect("second call ok");
+
+        let after_second = server
+            .received_requests()
+            .await
+            .expect("recorded requests available")
+            .len();
+        assert_eq!(
+            after_second, after_warmup,
+            "an unchanged issuer with a fresh entry must perform no HTTP request at all"
+        );
+    }
+
     // -- Refetch-throttle: fetch-outside-lock, per-issuer single-flight,
     // kid-miss cooldown -----------------------------------------------------
 
@@ -2118,21 +2459,37 @@ FtBmFfStik03XAfEPVCRWBMc
 
     // -- Helper unit tests -------------------------------------------------
 
+    /// A keyless cache entry bound to `issuer`, `last_refreshed` at
+    /// `now + skew` (so a negative skew ages it).
+    fn entry_for(issuer: &OidcIssuer, skew: chrono::Duration) -> JwksCacheEntry {
+        JwksCacheEntry {
+            keys: HashMap::new(),
+            last_refreshed: Utc::now() + skew,
+            fetched_under_issuer_id: issuer.id,
+            fetched_under_issuer_url: issuer.issuer_url.clone(),
+        }
+    }
+
+    fn any_issuer() -> OidcIssuer {
+        let mut row = issuer(
+            "shared-name",
+            "https://idp.example/realm",
+            vec!["hort-server"],
+            vec![JwtAlg::Rs256],
+        );
+        row.id = Uuid::new_v4();
+        row
+    }
+
     #[test]
     fn is_stale_returns_false_within_interval() {
-        let entry = JwksCacheEntry {
-            keys: HashMap::new(),
-            last_refreshed: Utc::now(),
-        };
+        let entry = entry_for(&any_issuer(), chrono::Duration::zero());
         assert!(!is_stale(&entry, Duration::from_secs(3600)));
     }
 
     #[test]
     fn is_stale_returns_true_after_interval() {
-        let entry = JwksCacheEntry {
-            keys: HashMap::new(),
-            last_refreshed: Utc::now() - chrono::Duration::seconds(5),
-        };
+        let entry = entry_for(&any_issuer(), -chrono::Duration::seconds(5));
         assert!(is_stale(&entry, Duration::from_secs(1)));
     }
 
@@ -2140,11 +2497,72 @@ FtBmFfStik03XAfEPVCRWBMc
     fn is_stale_returns_false_on_clock_skew_backwards() {
         // Wall clock jumped backwards — entry timestamp is "in the
         // future" relative to now. Treat as fresh, not stale.
-        let entry = JwksCacheEntry {
-            keys: HashMap::new(),
-            last_refreshed: Utc::now() + chrono::Duration::seconds(60),
-        };
+        let entry = entry_for(&any_issuer(), chrono::Duration::seconds(60));
         assert!(!is_stale(&entry, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn classify_entry_is_serviceable_when_identity_and_age_both_hold() {
+        let row = any_issuer();
+        let entry = entry_for(&row, chrono::Duration::zero());
+        assert!(matches!(
+            classify_entry(&entry, &row),
+            CacheUsability::Serviceable
+        ));
+    }
+
+    #[test]
+    fn classify_entry_is_age_stale_when_identity_holds_but_the_entry_is_old() {
+        let mut row = any_issuer();
+        row.jwks_refresh_interval = Duration::from_secs(1);
+        let entry = entry_for(&row, -chrono::Duration::seconds(5));
+        assert!(matches!(
+            classify_entry(&entry, &row),
+            CacheUsability::AgeStale
+        ));
+    }
+
+    #[test]
+    fn classify_entry_is_identity_superseded_on_a_url_change_even_when_fresh() {
+        let row = any_issuer();
+        let entry = entry_for(&row, chrono::Duration::zero());
+        let mut repointed = row.clone();
+        repointed.issuer_url = "https://other-idp.example/realm".into();
+        assert!(!identity_matches(&entry, &repointed));
+        assert!(matches!(
+            classify_entry(&entry, &repointed),
+            CacheUsability::IdentitySuperseded
+        ));
+    }
+
+    #[test]
+    fn classify_entry_is_identity_superseded_on_an_id_change_even_when_fresh() {
+        let row = any_issuer();
+        let entry = entry_for(&row, chrono::Duration::zero());
+        let mut recreated = row.clone();
+        recreated.id = Uuid::new_v4();
+        assert!(!identity_matches(&entry, &recreated));
+        assert!(matches!(
+            classify_entry(&entry, &recreated),
+            CacheUsability::IdentitySuperseded
+        ));
+    }
+
+    #[test]
+    fn classify_entry_is_identity_superseded_even_when_the_entry_is_also_age_stale() {
+        // Identity is tested first and short-circuits: an entry that is
+        // both superseded and old reports the unconditional reason, so
+        // the cooldown gate (which keys on serviceability) cannot
+        // throttle an operator's repoint.
+        let mut row = any_issuer();
+        row.jwks_refresh_interval = Duration::from_secs(1);
+        let entry = entry_for(&row, -chrono::Duration::seconds(5));
+        let mut repointed = row.clone();
+        repointed.issuer_url = "https://other-idp.example/realm".into();
+        assert!(matches!(
+            classify_entry(&entry, &repointed),
+            CacheUsability::IdentitySuperseded
+        ));
     }
 
     #[test]
