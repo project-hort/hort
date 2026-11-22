@@ -53,8 +53,11 @@ lifecycle. There is **no index-specific lifecycle** and no group-model overhaul.
 1. **Accept on PUT; validate children exist in-repo.** The hosted PUT path
    branches the blob parse by media type: an index yields its `manifests[*]`
    child-manifest hashes (bounded by the existing `MAX_BLOB_REFERENCES`), which
-   are resolved as **manifests** through the same same-repo existence check a
-   layer uses. A child absent from the repo → `MANIFEST_BLOB_UNKNOWN` (clients
+   are resolved as **manifests** through the same existence check a layer uses,
+   scoped to the OCI `<name>` the index is pushed under — the namespace of
+   artifact identity on every OCI surface, per
+   [the OCI namespace and identity reference](../architecture/reference/oci-namespace-and-identity.md).
+   A child absent from that name → `MANIFEST_BLOB_UNKNOWN` (clients
    push children before the index; this is the correct out-of-order-retry
    behavior). The index itself commits as a plain primary `manifest` group
    member — no config, no layer members. Single-image PUTs are byte-for-byte
@@ -464,6 +467,20 @@ manifest gives about its **own** status.
   (child digests), not runnable content, so serving it to the signer leaks no
   runnable bytes. This is what actually unblocks the operator's real flow for
   multi-arch pushes.
+
+- **An index binds only the children under its own OCI `<name>`.** The
+  existence check above is scoped to that name, so an index pushed under
+  `<name> = a` whose child manifests exist only under `<name> = b` answers
+  `MANIFEST_BLOB_UNKNOWN` — including when both names live in the same hort
+  repository, because the hort repository and the OCI `<name>` are different
+  scopes (glossary:
+  [OCI `<name>` (namespace)](../glossary.md#oci-name-namespace)). This is the
+  OCI model rather than a hort restriction: an index's `manifests[*]` are
+  digests within one name's namespace, so an index and its children pushed
+  under different names were pushed into different namespaces. A client that
+  splits them that way — a `skopeo copy --all` targeting one name for the
+  index and another for its children — must push each index under the name
+  its own children carry.
 
 - **Deferred enhancement — child-status rollup:** v1 does **not** gate the
   index's served visibility on its children's quarantine state (layer-level
