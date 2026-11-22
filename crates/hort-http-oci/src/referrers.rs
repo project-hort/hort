@@ -9,11 +9,13 @@
 //! 2. Parse `digest_str` into a [`ContentHash`]. Malformed → 400
 //!    `DIGEST_INVALID`; well-formed-but-unsupported (e.g. `sha512:`) →
 //!    400 `UNSUPPORTED`.
-//! 3. Call [`ContentReferenceIndex::find_by_target`] with `kind_filter =
-//!    Some("oci_subject")` so the SQL predicate excludes other reference
-//!    kinds at the adapter boundary.
+//! 3. Call [`ContentReferenceIndex::find_by_target`] with
+//!    `kind_filter = Some("oci_subject")` so the SQL predicate excludes
+//!    other reference kinds at the adapter boundary. The edge targets a
+//!    content hash; the subject need not have an artifact row.
 //! 4. Resolve each source artifact via
-//!    [`ArtifactRepository::find_by_id`] to recover `sha256` + `size`.
+//!    [`ArtifactRepository::find_by_id`] to recover `sha256` + `size` and
+//!    retain only referrers whose identity path belongs to the asked name.
 //!    Tombstoned source rows (NotFound) are skipped silently — the
 //!    referrers index is eventual; the artifact-DELETE path's
 //!    `delete_by_source` call eventually clears them.
@@ -98,6 +100,7 @@ use hort_app::use_cases::repository_access::AccessLevel;
 use hort_domain::entities::artifact::Artifact;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
+use hort_domain::oci::{parse_oci_artifact_path, OciArtifactRole};
 use hort_domain::ports::content_reference_index::ContentReference;
 use hort_domain::types::ContentHash;
 
@@ -221,6 +224,11 @@ pub async fn serve(
     //    clean place to emit the `not_found` metric. The repo handle
     //    returned by `find_by_visible_target` is discarded because
     //    step-1's `repo` is already in scope.
+    //
+    //    The edge's target is a content hash, never a namespaced subject
+    //    row, so the index cannot say which name holds that subject. A
+    //    referrer may be pushed before its subject exists here; checking
+    //    subject existence on this read would hide that accepted push.
     let rows = match ctx
         .content_reference_use_case
         .find_by_visible_target(repo_key, &target_hash, Some("oci_subject"), actor)
@@ -257,7 +265,8 @@ pub async fn serve(
     };
 
     // 4. For each row, resolve the source artifact for its
-    //    sha256 + size. Tombstoned sources (NotFound) drop silently —
+    //    sha256 + size and read its OCI identity path. Tombstoned sources
+    //    (NotFound) drop silently —
     //    the index is eventual and the artifact-DELETE path's
     //    `delete_by_source` is the authoritative cleanup.  Other
     //    errors (transient DB) abort the whole request as 500 because
@@ -297,6 +306,18 @@ pub async fn serve(
                 return OciError::Internal.into_response();
             }
         };
+
+        // `kind` is an indexed column on the edge and was filtered by SQL.
+        // The name is absent from that edge: its authority is the hydrated
+        // artifact's identity path, so this filter belongs after hydration.
+        // A legacy name-free path has unknown namespace and is deliberately
+        // listed under every asked name until the expand window closes.
+        let Some(path) = parse_oci_artifact_path(&artifact.path) else {
+            continue;
+        };
+        if path.role != OciArtifactRole::Manifest || path.name.is_some_and(|n| n != name) {
+            continue;
+        }
 
         // A terminal verdict means never, so the descriptor is not
         // minted. A hold (`Quarantined`) means "not yet" and stays
@@ -506,12 +527,6 @@ pub async fn serve(
         "mediaType": IMAGE_INDEX_MEDIA_TYPE,
         "manifests": manifests,
     });
-    // The OCI referrers response is spec-mandated NOT to echo `name` in
-    // the image-index body, so dropping it here is correct. The handler
-    // keeps the parameter because future pagination / Link-header work
-    // may need it.
-    let _ = name;
-
     emit_metric(&repo_label(&ctx, Some(&repo.key)), "success");
 
     let bytes = serde_json::to_vec(&body)
@@ -671,9 +686,26 @@ mod tests {
         SUBJECT_HEX.parse().unwrap()
     }
 
-    /// Seed a manifest artifact with a synthetic sha256 derived from
-    /// `seed`, plus a content-reference row that points at the path
-    /// digest and carries the supplied artifact_type / media_type
+    fn seed_subject(artifacts: &MockArtifactRepository, repo_id: Uuid, name: &str) {
+        let path = format!("manifests/{name}/sha256:{SUBJECT_HEX}");
+        if artifacts
+            .snapshot_all()
+            .into_iter()
+            .any(|a| a.repository_id == repo_id && a.path == path)
+        {
+            return;
+        }
+        let mut subject = sample_artifact(QuarantineStatus::None);
+        subject.repository_id = repo_id;
+        subject.name = name.to_string();
+        subject.sha256_checksum = subject_hash();
+        subject.path = path;
+        artifacts.insert(subject);
+    }
+
+    /// Seed a referrer with a synthetic sha256 derived from `seed` and a
+    /// content-reference row that points at the subject digest and carries
+    /// the supplied artifact_type / media_type
     /// metadata. Async because the [`ContentReferenceIndex::insert`]
     /// port returns a future — calling it from a sync helper would
     /// require nesting tokio runtimes (which panics).
@@ -897,6 +929,173 @@ mod tests {
             manifests[0]["artifactType"],
             "application/vnd.example.signature"
         );
+    }
+
+    #[test]
+    fn scoped_referrer_is_listed_only_under_its_path_name_and_filtered_empty_is_200() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (id, hash) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0xa1,
+                512,
+                None,
+                None,
+            )
+            .await;
+            let mut referrer = h.artifacts.get(id).unwrap();
+            referrer.path = format!("manifests/library/nginx/sha256:{}", hash.as_ref());
+            h.artifacts.insert(referrer);
+            seed_subject(&h.artifacts, repo_id, "other/thing");
+
+            let under_own_name = referrers_manifests(h.ctx.clone()).await;
+            assert_eq!(under_own_name.len(), 1);
+            assert_eq!(
+                under_own_name[0]["digest"],
+                format!("sha256:{}", hash.as_ref())
+            );
+            assert!(
+                referrers_manifests_for_name(h.ctx, "other/thing")
+                    .await
+                    .is_empty(),
+                "a list emptied by name filtering remains 200 with manifests: []"
+            );
+        });
+    }
+
+    #[test]
+    fn referrer_path_name_wins_over_artifact_name_and_projected_name() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (id, hash) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0xa2,
+                512,
+                None,
+                None,
+            )
+            .await;
+            let mut referrer = h.artifacts.get(id).unwrap();
+            referrer.path = format!("manifests/library/nginx/sha256:{}", hash.as_ref());
+            referrer.name = "stored/name".into();
+            h.artifacts.insert(referrer);
+            replace_referrer_metadata(
+                &h.content_references,
+                repo_id,
+                id,
+                serde_json::json!({
+                    "projection_version": 1,
+                    "name": "projected/name",
+                    "config_media_type": "application/vnd.oci.image.config.v1+json",
+                }),
+            )
+            .await;
+            seed_subject(&h.artifacts, repo_id, "projected/name");
+            seed_subject(&h.artifacts, repo_id, "stored/name");
+
+            let manifests = referrers_manifests(h.ctx.clone()).await;
+            assert_eq!(manifests.len(), 1);
+            assert_eq!(manifests[0]["digest"], format!("sha256:{}", hash.as_ref()));
+            assert!(referrers_manifests_for_name(h.ctx.clone(), "stored/name")
+                .await
+                .is_empty());
+            assert!(referrers_manifests_for_name(h.ctx, "projected/name")
+                .await
+                .is_empty());
+        });
+    }
+
+    #[test]
+    fn legacy_name_free_referrer_stays_listed_under_both_names_during_expand_window() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0xa3,
+                512,
+                None,
+                None,
+            )
+            .await;
+            seed_subject(&h.artifacts, repo_id, "other/thing");
+
+            assert_eq!(referrers_manifests(h.ctx.clone()).await.len(), 1);
+            assert_eq!(
+                referrers_manifests_for_name(h.ctx, "other/thing")
+                    .await
+                    .len(),
+                1,
+                "a legacy path has unknown namespace until rewritten"
+            );
+        });
+    }
+
+    /// A pushed referrer must be discoverable even when the subject has not
+    /// been pushed. Re-adding a subject-existence gate would hide a valid
+    /// referrer until its subject arrives, violating the OCI Referrers API.
+    #[test]
+    fn pushed_referrer_is_discoverable_without_subject_in_asked_name() {
+        run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let (id, hash) = seed_referrer(
+                &h.artifacts,
+                &h.content_references,
+                repo_id,
+                0xa4,
+                512,
+                None,
+                None,
+            )
+            .await;
+            let mut referrer = h.artifacts.get(id).unwrap();
+            referrer.path = format!("manifests/library/nginx/sha256:{}", hash.as_ref());
+            h.artifacts.insert(referrer);
+            assert!(h
+                .artifacts
+                .snapshot_all()
+                .iter()
+                .all(|artifact| artifact.sha256_checksum != subject_hash()));
+            let manifests = referrers_manifests(h.ctx.clone()).await;
+            assert_eq!(
+                manifests.len(),
+                1,
+                "a subject absent entirely cannot hide its referrer"
+            );
+            assert_eq!(manifests[0]["digest"], format!("sha256:{}", hash.as_ref()));
+
+            seed_subject(&h.artifacts, repo_id, "other/thing");
+            let manifests = referrers_manifests(h.ctx.clone()).await;
+            assert_eq!(
+                manifests.len(),
+                1,
+                "a subject under another name cannot hide its referrer"
+            );
+            assert_eq!(manifests[0]["digest"], format!("sha256:{}", hash.as_ref()));
+            assert!(
+                referrers_manifests_for_name(h.ctx, "other/thing")
+                    .await
+                    .is_empty(),
+                "the referrer itself has no identity under other/thing"
+            );
+        });
     }
 
     // -------------------- 3. Two referrers + artifactType filter --------------------
@@ -1417,8 +1616,8 @@ mod tests {
     ///
     /// A mutator rather than a `status` parameter on
     /// [`seed_referrer`]: that helper already carries seven arguments,
-    /// and the referrers fixture's shape (one artifact plus one
-    /// `oci_subject` row) is what the six existing callers want
+    /// and the referrers fixture's shape (subject, referrer, and one
+    /// `oci_subject` row) is what the existing callers want
     /// unchanged.
     fn set_status(artifacts: &MockArtifactRepository, id: Uuid, status: QuarantineStatus) {
         let mut artifact = artifacts.get(id).expect("the artifact was just seeded");
@@ -1494,11 +1693,14 @@ mod tests {
 
     /// Serve the referrers index for the shared subject and return the
     /// parsed `manifests` array.
-    async fn referrers_manifests(ctx: Arc<AppContext>) -> Vec<serde_json::Value> {
+    async fn referrers_manifests_for_name(
+        ctx: Arc<AppContext>,
+        name: &str,
+    ) -> Vec<serde_json::Value> {
         let resp = serve(
             ctx,
             "myrepo",
-            "library/nginx",
+            name,
             &format!("sha256:{SUBJECT_HEX}"),
             None,
             None,
@@ -1520,6 +1722,10 @@ mod tests {
             .as_array()
             .expect("the envelope carries a manifests array")
             .clone()
+    }
+
+    async fn referrers_manifests(ctx: Arc<AppContext>) -> Vec<serde_json::Value> {
+        referrers_manifests_for_name(ctx, "library/nginx").await
     }
 
     /// Ask the **manifest** route for `hex` directly and return
