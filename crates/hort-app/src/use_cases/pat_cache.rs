@@ -30,9 +30,37 @@
 //! ```
 //!
 //! The reverse index is the only mutable companion of the LRU. The two
-//! must stay consistent: every `insert` writes to both; every `evict`
-//! / `invalidate` removes from both. The `cache_dual_index_consistency`
-//! test pins this invariant.
+//! must stay consistent: every accepted `insert` writes to both; every
+//! `evict` / `invalidate` removes from both. The
+//! `cache_dual_index_consistency` test pins this invariant.
+//!
+//! # Write fence
+//!
+//! Insertion is **conditional on an invalidation epoch**. Every
+//! invalidation entry point bumps the epoch, [`PatCache::fence`]
+//! records it, and [`PatCache::insert`] stores the entry only if the
+//! epoch is still the one its fence recorded.
+//!
+//! The epoch, not the removal, is what closes the window: a caller
+//! takes its fence *before* reading the state it will later cache, so
+//! an invalidation delivered while that read and the work after it are
+//! still in flight finds no entry to remove — the entry does not exist
+//! yet — and the only thing that can keep the insert from landing
+//! behind it is the bump. For the validator that window spans the
+//! deliberately expensive Argon2 verify plus a user-row round trip,
+//! and the entry it would leave behind carries `revoked_at: None`,
+//! which is the very field [`PatCache::get`]'s consumer re-checks.
+//!
+//! Capacity- and TTL-eviction deliberately do **not** bump the epoch:
+//! both are derived from the cache's own bookkeeping rather than from
+//! new upstream state, so an insert they interleave with is not stale
+//! and refusing it would buy nothing but a miss.
+//!
+//! The epoch is **global, not per token**. Per-token precision would
+//! need a map of tombstones with a cleanup policy to stay bounded, and
+//! would buy only fewer benign misses: an invalidation is rare, so the
+//! cost of over-strictness is that a validation running concurrently
+//! with an unrelated invalidation re-reads its row once.
 
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -157,7 +185,36 @@ struct Inner {
     /// Reverse index: `token_id → CacheKey`. Kept consistent with
     /// `primary` on every mutation.
     reverse: HashMap<Uuid, CacheKey>,
+    /// Invalidation epoch — see the module's *Write fence* section.
+    /// Bumped by every invalidation entry point, read by
+    /// [`PatCache::fence`], compared by [`PatCache::insert`].
+    ///
+    /// It lives here rather than in a separate atomic because all four
+    /// of those already serialise on this one `Mutex`: an epoch beside
+    /// the lock would need its own ordering discipline against the
+    /// index mutations it exists to describe, and a fence read taken
+    /// under a different lock than the insert that compares it is the
+    /// same race one level down.
+    epoch: u64,
 }
+
+/// A snapshot of the cache's invalidation epoch, taken by
+/// [`PatCache::fence`] and handed back to [`PatCache::insert`], which
+/// stores the entry only while the epoch is unchanged.
+///
+/// The recorded epoch is unreachable from outside this module, so a
+/// fence that an insert accepts can only come from `fence()` — there
+/// is no way to synthesise one.
+///
+/// A fence taken while the cache mutex was poisoned records **no**
+/// epoch. `None` is unequal to `Some(_)` for every `u64`, so the
+/// refusal is a property of the type rather than of a reserved
+/// numeric value and no amount of counter arithmetic can make a
+/// poisoned fence collide with a live epoch: a poisoned cache stops
+/// caching rather than caching unfenced, which is the same
+/// fail-closed posture `get` and the invalidation paths already take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheFence(Option<u64>);
 
 /// In-process PAT validation cache. See module docs.
 pub struct PatCache {
@@ -186,6 +243,7 @@ impl PatCache {
             inner: Mutex::new(Inner {
                 primary: LruCache::new(cap),
                 reverse: HashMap::new(),
+                epoch: 0,
             }),
             ttl,
             clock,
@@ -227,12 +285,38 @@ impl PatCache {
             .map(|entry| entry.validation.clone())
     }
 
-    /// Insert (or replace) a cache entry. Updates both indices.
+    /// Record the current invalidation epoch, for a caller that is
+    /// about to read the state it will later
+    /// [`insert`](Self::insert). See the module's *Write fence*
+    /// section for why the fence belongs before that read.
+    ///
+    /// Takes the same `Mutex` `insert` does, so the epoch a caller
+    /// carries is one the cache actually held. Returns a fence no
+    /// insert can satisfy when the mutex is poisoned — see
+    /// [`CacheFence`].
+    pub fn fence(&self) -> CacheFence {
+        match self.inner.lock() {
+            Ok(guard) => CacheFence(Some(guard.epoch)),
+            Err(_) => CacheFence(None),
+        }
+    }
+
+    /// Insert (or replace) a cache entry, **unless an invalidation
+    /// landed since `fence` was taken**. Updates both indices.
     /// Capacity-eviction of the LRU's tail also cleans the reverse
     /// index — `lru::LruCache::push` returns the evicted `(key, value)`
     /// when it overflows, which we use to drop the matching reverse
     /// entry.
-    pub fn insert(&self, cache_key: CacheKey, validation: ApiTokenValidation) {
+    ///
+    /// The fence is compared and the entry written under **one** lock
+    /// acquisition. Comparing a fence, releasing the lock and taking it
+    /// again to write would reintroduce the very window the fence
+    /// exists to close.
+    ///
+    /// The fence is a parameter rather than a second `insert_fenced`
+    /// beside this one so that no unfenced entry point survives for a
+    /// future caller to reach for.
+    pub fn insert(&self, cache_key: CacheKey, validation: ApiTokenValidation, fence: CacheFence) {
         let now = self.clock.now();
         let Ok(mut guard) = self.inner.lock() else {
             // Poisoned mutex — a previous panic with the lock held.
@@ -240,6 +324,16 @@ impl PatCache {
             // see `None` for everything and refill from upstream.
             return;
         };
+        if fence != CacheFence(Some(guard.epoch)) {
+            // An invalidation landed after the caller took its fence,
+            // so `validation` describes a view of the token the cache
+            // has since been told to forget. Writing it would serve
+            // that view for the rest of the TTL with nothing to
+            // re-check it against, and the invalidation's own removal
+            // could not have prevented that: there was no entry to
+            // remove when it ran.
+            return;
+        }
         let token_id = validation.token_id;
 
         // If a different cache_key already maps to this token_id (e.g.
@@ -277,6 +371,12 @@ impl ApiTokenCacheInvalidator for PatCache {
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };
+        // Bump before the removal, and bump even when the removal
+        // finds nothing. An invalidation that arrives while a
+        // validation for that same token is still in flight has no
+        // entry to remove, so the epoch is the only thing that keeps
+        // that validation's `insert` from landing behind it.
+        guard.epoch = guard.epoch.wrapping_add(1);
         if let Some(cache_key) = guard.reverse.remove(&token_id) {
             guard.primary.pop(&cache_key);
         }
@@ -286,6 +386,11 @@ impl ApiTokenCacheInvalidator for PatCache {
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };
+        // Same reasoning as `invalidate_token`: a deactivation that
+        // overtakes an in-flight validation for one of that user's
+        // tokens has nothing to remove yet, and the bump is what
+        // refuses the insert behind it.
+        guard.epoch = guard.epoch.wrapping_add(1);
         // Walk the primary, collect matching keys, then drop. Two-pass
         // because `LruCache::iter` borrows immutably and the removals
         // must not invalidate the iterator.
@@ -305,6 +410,12 @@ impl ApiTokenCacheInvalidator for PatCache {
         let Ok(mut guard) = self.inner.lock() else {
             return;
         };
+        // The listener reaches for this when it cannot prove *which*
+        // tokens changed — a rebuilt `LISTEN` whose gap it cannot
+        // reconstruct. That is precisely the case where an in-flight
+        // validation's insert must not slip through behind the clear,
+        // so this path bumps the epoch like the targeted ones do.
+        guard.epoch = guard.epoch.wrapping_add(1);
         guard.primary.clear();
         guard.reverse.clear();
     }
@@ -379,6 +490,16 @@ mod tests {
         PatCache::new_with_clock(capacity, ttl, Box::new(clock))
     }
 
+    /// Insert with a fence taken immediately beforehand — the
+    /// "nothing invalidated in between" case, which is what every
+    /// test that is not about the fence itself wants. A test that
+    /// needs a stale fence takes one explicitly and invalidates
+    /// before inserting.
+    fn insert_fenced(cache: &PatCache, cache_key: CacheKey, validation: ApiTokenValidation) {
+        let fence = cache.fence();
+        cache.insert(cache_key, validation, fence);
+    }
+
     // -----------------------------------------------------------------
     // Acceptance tests
     // -----------------------------------------------------------------
@@ -395,7 +516,7 @@ mod tests {
         let clock = MockClock::new(t0());
         let cache = cache_with_clock(8, Duration::from_secs(300), clock);
         let v = validation(Uuid::new_v4(), Uuid::new_v4());
-        cache.insert(key(1), v.clone());
+        insert_fenced(&cache, key(1), v.clone());
         assert_eq!(cache.get(&key(1)), Some(v));
     }
 
@@ -408,9 +529,9 @@ mod tests {
         let v1 = validation(Uuid::new_v4(), Uuid::new_v4());
         let v2 = validation(Uuid::new_v4(), Uuid::new_v4());
         let v3 = validation(Uuid::new_v4(), Uuid::new_v4());
-        cache.insert(key(1), v1.clone());
-        cache.insert(key(2), v2.clone());
-        cache.insert(key(3), v3.clone());
+        insert_fenced(&cache, key(1), v1.clone());
+        insert_fenced(&cache, key(2), v2.clone());
+        insert_fenced(&cache, key(3), v3.clone());
         assert_eq!(cache.get(&key(1)), None, "oldest evicted");
         assert_eq!(cache.get(&key(2)), Some(v2));
         assert_eq!(cache.get(&key(3)), Some(v3));
@@ -421,7 +542,7 @@ mod tests {
         let clock = MockClock::new(t0());
         let cache = cache_with_clock(8, Duration::from_secs(300), clock.clone());
         let v = validation(Uuid::new_v4(), Uuid::new_v4());
-        cache.insert(key(1), v);
+        insert_fenced(&cache, key(1), v);
         clock.advance(Duration::from_secs(301));
         assert_eq!(cache.get(&key(1)), None, "5-min TTL + 1s expires");
     }
@@ -431,7 +552,7 @@ mod tests {
         let clock = MockClock::new(t0());
         let cache = cache_with_clock(8, Duration::from_secs(300), clock.clone());
         let v = validation(Uuid::new_v4(), Uuid::new_v4());
-        cache.insert(key(1), v.clone());
+        insert_fenced(&cache, key(1), v.clone());
         clock.advance(Duration::from_secs(299));
         assert_eq!(cache.get(&key(1)), Some(v));
     }
@@ -445,8 +566,8 @@ mod tests {
         let user = Uuid::new_v4();
         let va = validation(token_a, user);
         let vb = validation(token_b, user);
-        cache.insert(key(1), va);
-        cache.insert(key(2), vb.clone());
+        insert_fenced(&cache, key(1), va);
+        insert_fenced(&cache, key(2), vb.clone());
 
         cache.invalidate_token(token_a);
 
@@ -459,7 +580,7 @@ mod tests {
         let clock = MockClock::new(t0());
         let cache = cache_with_clock(8, Duration::from_secs(300), clock);
         let v = validation(Uuid::new_v4(), Uuid::new_v4());
-        cache.insert(key(1), v.clone());
+        insert_fenced(&cache, key(1), v.clone());
 
         cache.invalidate_token(Uuid::new_v4()); // unknown id
 
@@ -475,9 +596,9 @@ mod tests {
         let va1 = validation(Uuid::new_v4(), user_a);
         let va2 = validation(Uuid::new_v4(), user_a);
         let vb1 = validation(Uuid::new_v4(), user_b);
-        cache.insert(key(1), va1);
-        cache.insert(key(2), va2);
-        cache.insert(key(3), vb1.clone());
+        insert_fenced(&cache, key(1), va1);
+        insert_fenced(&cache, key(2), va2);
+        insert_fenced(&cache, key(3), vb1.clone());
 
         cache.invalidate_user(user_a);
 
@@ -490,8 +611,8 @@ mod tests {
     fn cache_drop_all_clears_everything() {
         let clock = MockClock::new(t0());
         let cache = cache_with_clock(8, Duration::from_secs(300), clock);
-        cache.insert(key(1), validation(Uuid::new_v4(), Uuid::new_v4()));
-        cache.insert(key(2), validation(Uuid::new_v4(), Uuid::new_v4()));
+        insert_fenced(&cache, key(1), validation(Uuid::new_v4(), Uuid::new_v4()));
+        insert_fenced(&cache, key(2), validation(Uuid::new_v4(), Uuid::new_v4()));
 
         cache.drop_all();
 
@@ -509,7 +630,7 @@ mod tests {
         let cache = cache_with_clock(8, Duration::from_secs(300), clock);
         let token_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
-        cache.insert(key(1), validation(token_id, user_id));
+        insert_fenced(&cache, key(1), validation(token_id, user_id));
 
         cache.invalidate_token(token_id);
 
@@ -524,7 +645,7 @@ mod tests {
 
         // Re-insert under a new key — the entry must be visible.
         let v2 = validation(token_id, user_id);
-        cache.insert(key(2), v2.clone());
+        insert_fenced(&cache, key(2), v2.clone());
         assert_eq!(cache.get(&key(2)), Some(v2));
     }
 
@@ -546,7 +667,7 @@ mod tests {
                     let token_id = Uuid::new_v4();
                     let user_id = Uuid::new_v4();
                     match op % 5 {
-                        0 => cache.insert(k, validation(token_id, user_id)),
+                        0 => insert_fenced(&cache, k, validation(token_id, user_id)),
                         1 => {
                             let _ = cache.get(&k);
                         }
@@ -562,7 +683,7 @@ mod tests {
         }
         // Still usable afterwards — final smoke insert/get round-trip.
         let v = validation(Uuid::new_v4(), Uuid::new_v4());
-        cache.insert(key(0xff), v.clone());
+        insert_fenced(&cache, key(0xff), v.clone());
         assert_eq!(cache.get(&key(0xff)), Some(v));
     }
 
@@ -590,14 +711,14 @@ mod tests {
         let token_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let v1 = validation(token_id, user_id);
-        cache.insert(key(1), v1);
+        insert_fenced(&cache, key(1), v1);
 
         clock.advance(Duration::from_secs(200));
         let v2 = ApiTokenValidation {
             revoked_at: Some(t0()),
             ..validation(token_id, user_id)
         };
-        cache.insert(key(1), v2.clone());
+        insert_fenced(&cache, key(1), v2.clone());
 
         // Step past where the original would have expired (>300s
         // total) but only 150s after the replacement.
@@ -620,9 +741,9 @@ mod tests {
         let cache = cache_with_clock(8, Duration::from_secs(300), clock);
         let token_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
-        cache.insert(key(1), validation(token_id, user_id));
+        insert_fenced(&cache, key(1), validation(token_id, user_id));
         let v2 = validation(token_id, user_id);
-        cache.insert(key(2), v2.clone());
+        insert_fenced(&cache, key(2), v2.clone());
 
         assert_eq!(cache.get(&key(1)), None, "old key dropped");
         assert_eq!(cache.get(&key(2)), Some(v2));
@@ -640,7 +761,7 @@ mod tests {
         let clock = MockClock::new(t0());
         let cache = cache_with_clock(8, Duration::from_secs(300), clock.clone());
         let v = validation(Uuid::new_v4(), Uuid::new_v4());
-        cache.insert(key(1), v.clone());
+        insert_fenced(&cache, key(1), v.clone());
         // Step backward by 1 hour.
         {
             let mut g = clock.now.lock().unwrap();
@@ -658,8 +779,8 @@ mod tests {
         let cache = cache_with_clock(0, Duration::from_secs(300), clock);
         let v1 = validation(Uuid::new_v4(), Uuid::new_v4());
         let v2 = validation(Uuid::new_v4(), Uuid::new_v4());
-        cache.insert(key(1), v1);
-        cache.insert(key(2), v2.clone());
+        insert_fenced(&cache, key(1), v1);
+        insert_fenced(&cache, key(2), v2.clone());
         assert_eq!(cache.get(&key(1)), None, "capacity=1 evicted");
         assert_eq!(cache.get(&key(2)), Some(v2));
     }
@@ -688,9 +809,9 @@ mod tests {
         let stale_id = Uuid::new_v4();
         let live_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
-        cache.insert(key(1), validation(stale_id, user_id));
+        insert_fenced(&cache, key(1), validation(stale_id, user_id));
         let v2 = validation(live_id, user_id);
-        cache.insert(key(2), v2.clone());
+        insert_fenced(&cache, key(2), v2.clone());
 
         // Stale entry's token_id no longer maps anywhere — invalidating
         // it must NOT touch key(2).
@@ -700,5 +821,155 @@ mod tests {
         let guard = cache.inner.lock().unwrap();
         assert!(!guard.reverse.contains_key(&stale_id));
         assert_eq!(guard.reverse.get(&live_id), Some(&key(2)));
+    }
+
+    // -----------------------------------------------------------------
+    // Write fence — an invalidation inside a caller's read-to-insert
+    // window must not be overwritten by the insert that follows it.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cache_insert_refused_when_invalidate_token_bumped_fence() {
+        // The production shape: the fence is taken, the caller does
+        // its (slow) work, the revocation for THAT token arrives with
+        // no entry yet to remove, and the insert must refuse. If the
+        // epoch were not consulted the entry would be served — with
+        // `revoked_at: None` — for the rest of the TTL.
+        let clock = MockClock::new(t0());
+        let cache = cache_with_clock(8, Duration::from_secs(300), clock);
+        let token_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+
+        let fence = cache.fence();
+        cache.invalidate_token(token_id);
+        cache.insert(key(1), validation(token_id, user_id), fence);
+
+        assert_eq!(cache.get(&key(1)), None, "stale insert refused");
+        let guard = cache.inner.lock().unwrap();
+        assert!(
+            !guard.reverse.contains_key(&token_id),
+            "a refused insert writes neither index"
+        );
+    }
+
+    #[test]
+    fn cache_insert_refused_when_invalidate_user_bumped_fence() {
+        let clock = MockClock::new(t0());
+        let cache = cache_with_clock(8, Duration::from_secs(300), clock);
+        let token_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+
+        let fence = cache.fence();
+        cache.invalidate_user(user_id);
+        cache.insert(key(1), validation(token_id, user_id), fence);
+
+        assert_eq!(cache.get(&key(1)), None, "stale insert refused");
+    }
+
+    #[test]
+    fn cache_insert_refused_when_drop_all_bumped_fence() {
+        // `drop_all` is the listener's "I cannot prove which tokens
+        // changed" path, so it is the one a stale insert must least be
+        // able to slip through.
+        let clock = MockClock::new(t0());
+        let cache = cache_with_clock(8, Duration::from_secs(300), clock);
+
+        let fence = cache.fence();
+        cache.drop_all();
+        cache.insert(key(1), validation(Uuid::new_v4(), Uuid::new_v4()), fence);
+
+        assert_eq!(cache.get(&key(1)), None, "stale insert refused");
+    }
+
+    #[test]
+    fn cache_insert_accepted_when_fence_is_current() {
+        // The honest path. Without this the fence could be compared
+        // the wrong way round and every insert would be a permanent
+        // miss while the three tests above still passed.
+        let clock = MockClock::new(t0());
+        let cache = cache_with_clock(8, Duration::from_secs(300), clock);
+        let v = validation(Uuid::new_v4(), Uuid::new_v4());
+
+        let fence = cache.fence();
+        cache.insert(key(1), v.clone(), fence);
+
+        assert_eq!(cache.get(&key(1)), Some(v), "unraced insert stored");
+    }
+
+    #[test]
+    fn cache_fence_changes_on_every_invalidation_path_and_only_then() {
+        // All three paths bump, so a future edit that drops the bump
+        // from one of them fails here as well as in that path's own
+        // race test.
+        let clock = MockClock::new(t0());
+        let cache = cache_with_clock(8, Duration::from_secs(300), clock);
+
+        let f0 = cache.fence();
+        assert_eq!(f0, cache.fence(), "a quiet cache holds its epoch");
+
+        cache.invalidate_token(Uuid::new_v4());
+        let f1 = cache.fence();
+        cache.invalidate_user(Uuid::new_v4());
+        let f2 = cache.fence();
+        cache.drop_all();
+        let f3 = cache.fence();
+
+        assert_ne!(f0, f1, "invalidate_token bumps");
+        assert_ne!(f1, f2, "invalidate_user bumps");
+        assert_ne!(f2, f3, "drop_all bumps");
+        assert_ne!(f0, f3, "the epoch does not return to an earlier value");
+
+        // An accepted insert is not an invalidation.
+        insert_fenced(&cache, key(1), validation(Uuid::new_v4(), Uuid::new_v4()));
+        assert_eq!(f3, cache.fence(), "insert does not bump");
+    }
+
+    #[test]
+    fn cache_insert_refuses_a_fence_that_records_no_epoch() {
+        // `CacheFence(None)` is what `fence()` hands back when it
+        // cannot take the lock. It has to be unsatisfiable on its own
+        // terms — not merely because a poisoned mutex also stops
+        // `insert` one line earlier, which `Mutex::clear_poison` could
+        // one day undo — so feed it to a healthy cache.
+        let clock = MockClock::new(t0());
+        let cache = cache_with_clock(8, Duration::from_secs(300), clock);
+
+        cache.insert(
+            key(1),
+            validation(Uuid::new_v4(), Uuid::new_v4()),
+            CacheFence(None),
+        );
+
+        assert_eq!(cache.get(&key(1)), None, "no epoch satisfies no fence");
+    }
+
+    #[test]
+    fn cache_fence_records_no_epoch_when_mutex_is_poisoned() {
+        // Poison the mutex the way production would: a panic with the
+        // lock held. `fence()` must then report a fence no insert can
+        // satisfy, so the cache stops caching rather than caching
+        // unfenced.
+        let clock = MockClock::new(t0());
+        let cache = cache_with_clock(8, Duration::from_secs(300), clock);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = cache.inner.lock().expect("lock is healthy here");
+            panic!("poison the cache mutex");
+        }));
+        assert!(poisoned.is_err(), "the closure must have unwound");
+
+        assert_eq!(cache.fence(), CacheFence(None));
+
+        // And the whole path stays fail-closed: nothing lands, and
+        // `get` cannot witness it, so read the index out of the
+        // poisoned guard.
+        cache.insert(
+            key(1),
+            validation(Uuid::new_v4(), Uuid::new_v4()),
+            cache.fence(),
+        );
+        let locked = cache.inner.lock();
+        assert!(locked.is_err(), "the mutex must still be poisoned");
+        let guard = locked.unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(guard.primary.peek(&key(1)).is_none(), "nothing cached");
     }
 }

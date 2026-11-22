@@ -32,6 +32,13 @@
 //!    then check `expires_at`, `revoked_at`, `user.is_active` in that
 //!    order, each with its own [`PatValidationError`] variant on miss.
 //!    f. All checks pass → cache the validation and return success.
+//!    The cache write is **fenced** on [`PatCache::fence`], taken
+//!    before step (c): an invalidation delivered while (c)–(e) were in
+//!    flight refuses the write, because the entry it would have
+//!    removed did not exist yet. The request itself still succeeds —
+//!    it authorised against the row it read — so no refusal shape and
+//!    no metric label changes; only the *next* request is kept off a
+//!    stale entry.
 //! 4. **Lockout bookkeeping** — every NON-`Success` outcome increments
 //!    the counter at `pat-attempt-counter:{bucket}`; once the counter
 //!    crosses [`PatLockoutConfig::threshold`] within
@@ -567,6 +574,18 @@ impl PatValidationUseCase {
         // 3. Cache miss — body prefix lookup + UNCONDITIONAL Argon2 verify.
         // ----------------------------------------------------------------
         let parsed = parse_pat_token_format(token_plaintext);
+        // Record the cache's invalidation epoch BEFORE the token row is
+        // read. Everything below — the row, the verify verdict, the
+        // user row — describes the token as of this instant, and the
+        // insert at the end of this function is refused if an
+        // invalidation has bumped the epoch since. The fence belongs
+        // here and not next to that insert: the window it closes is the
+        // one that opens when the row is read, and it spans the
+        // deliberately expensive Argon2 verify plus a user-row round
+        // trip. A revocation delivered inside it finds no entry to
+        // remove, so the epoch is the only thing that can stop the
+        // insert from writing a `revoked_at: None` entry behind it.
+        let fence = self.cache.fence();
         // Always run exactly ONE verify call, no matter the parse
         // outcome. Routing the parse-failure shape through the
         // sentinel branch keeps the verify path-length identical with
@@ -669,7 +688,16 @@ impl PatValidationUseCase {
             expires_at: token.expires_at,
             revoked_at: token.revoked_at,
         };
-        self.cache.insert(cache_key, validation.clone());
+        // A refused insert is NOT a failed validation, and that
+        // asymmetry is deliberate: this request authorised against a
+        // row that said the token was live, so it completes with `Ok`
+        // and the same `SuccessMiss` metric as any other miss. What the
+        // fence prevents is the *next* request being answered from an
+        // entry nothing will re-check — the cached `revoked_at` of a
+        // token revoked inside this window is `None`, which is the very
+        // field the cache-hit path consults. The cost of a refusal is
+        // one more row read on the next request.
+        self.cache.insert(cache_key, validation.clone(), fence);
         emit_validation_metric(ValidationMetric::SuccessMiss);
         Ok(validation)
     }
@@ -967,6 +995,7 @@ mod tests {
     use hort_domain::entities::rbac::Permission;
     use hort_domain::entities::user::{AuthProvider, User};
     use hort_domain::error::DomainResult;
+    use hort_domain::ports::api_token_cache_invalidator::ApiTokenCacheInvalidator;
     use hort_domain::ports::api_token_repository::ApiTokenRepository;
     use hort_domain::ports::ephemeral_store::EphemeralStore;
     use hort_domain::ports::user_repository::UserRepository;
@@ -1042,14 +1071,27 @@ mod tests {
     // Mock ApiTokenRepository
     // -----------------------------------------------------------------
 
+    /// A side effect to run *inside* a repository call, so a test can
+    /// land an invalidation inside the validator's read-to-insert
+    /// window deterministically — no sleep, no retry loop, no reliance
+    /// on thread interleaving.
+    type InWindowHook = Box<dyn Fn() + Send + Sync>;
+
     struct MockTokenRepo {
         by_prefix: Mutex<HashMap<String, ApiToken>>,
+        /// `find_by_prefix` call count. A validation served from the
+        /// cache does not reach the repository, so this is how a test
+        /// tells "cache hit" from "row re-read".
+        lookups: AtomicUsize,
+        on_lookup: Mutex<Option<InWindowHook>>,
     }
 
     impl MockTokenRepo {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 by_prefix: Mutex::new(HashMap::new()),
+                lookups: AtomicUsize::new(0),
+                on_lookup: Mutex::new(None),
             })
         }
         fn insert(&self, prefix: &str, token: ApiToken) {
@@ -1058,6 +1100,14 @@ mod tests {
                 .unwrap()
                 .insert(prefix.to_string(), token);
         }
+        fn lookups(&self) -> usize {
+            self.lookups.load(AtomicOrdering::SeqCst)
+        }
+        /// Run `f` on every subsequent `find_by_prefix`, after the row
+        /// is read and before the validator sees it.
+        fn on_lookup(&self, f: impl Fn() + Send + Sync + 'static) {
+            *self.on_lookup.lock().unwrap() = Some(Box::new(f));
+        }
     }
 
     impl ApiTokenRepository for MockTokenRepo {
@@ -1065,7 +1115,11 @@ mod tests {
             unreachable!("validator does not insert")
         }
         fn find_by_prefix(&self, prefix: &str) -> BoxFuture<'_, DomainResult<Option<ApiToken>>> {
+            self.lookups.fetch_add(1, AtomicOrdering::SeqCst);
             let result = self.by_prefix.lock().unwrap().get(prefix).cloned();
+            if let Some(hook) = self.on_lookup.lock().unwrap().as_ref() {
+                hook();
+            }
             Box::pin(async move { Ok(result) })
         }
         fn find_by_id(&self, _id: Uuid) -> BoxFuture<'_, DomainResult<ApiToken>> {
@@ -1089,16 +1143,25 @@ mod tests {
 
     struct MockUserRepo {
         users: Mutex<HashMap<Uuid, User>>,
+        on_find: Mutex<Option<InWindowHook>>,
     }
 
     impl MockUserRepo {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 users: Mutex::new(HashMap::new()),
+                on_find: Mutex::new(None),
             })
         }
         fn insert(&self, user: User) {
             self.users.lock().unwrap().insert(user.id, user);
+        }
+        /// Run `f` on every subsequent `find_by_id` — the *last* read
+        /// inside the validator's read-to-insert window, so a hook
+        /// here proves the fence covers the window's tail and not only
+        /// the row read that opens it.
+        fn on_find(&self, f: impl Fn() + Send + Sync + 'static) {
+            *self.on_find.lock().unwrap() = Some(Box::new(f));
         }
     }
 
@@ -1114,6 +1177,9 @@ mod tests {
                         entity: "User",
                         id: id.to_string(),
                     });
+            if let Some(hook) = self.on_find.lock().unwrap().as_ref() {
+                hook();
+            }
             Box::pin(async move { result })
         }
         fn find_by_username(&self, _username: &str) -> BoxFuture<'_, DomainResult<Option<User>>> {
@@ -1288,6 +1354,15 @@ mod tests {
         Arc<PatCache>,
         Arc<MockClock>,
     );
+
+    /// Plant a cache entry with a fence taken immediately beforehand
+    /// — nothing can have invalidated in between, so the entry is
+    /// stored. Tests that want to observe a *refused* insert drive the
+    /// validator instead; this is only for seeding a cache-hit state.
+    fn plant_cached(cache: &PatCache, cache_key: CacheKey, validation: ApiTokenValidation) {
+        let fence = cache.fence();
+        cache.insert(cache_key, validation, fence);
+    }
 
     /// All-in-one fixture builder — returns the use-case + the
     /// handles tests need to plant rows / inspect counters.
@@ -1744,6 +1819,156 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------
+    // Write fence — an invalidation delivered inside the validator's
+    // read-to-insert window must not be overwritten by the insert.
+    //
+    // Each of these lands the invalidation as a *side effect of a
+    // repository call the validator makes inside that window*, so the
+    // interleaving is deterministic: no sleep, no retry loop, no
+    // reliance on thread scheduling.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn revocation_inside_the_validation_window_is_not_cached() {
+        // The hazard in full: the row read says the token is live, the
+        // revocation arrives while the Argon2 verify runs, and its
+        // `invalidate_token` finds nothing to remove because the entry
+        // does not exist yet. An unfenced insert would then publish an
+        // entry whose `revoked_at` is `None` for the whole cache TTL.
+        let spy = CountingVerifier::new(true);
+        let (uc, tokens, users, _store, cache, _clock) = make_uc(spy as Arc<dyn Argon2Verifier>);
+        let user_id = Uuid::new_v4();
+        users.insert(fixture_user(user_id, true));
+        let token = fixture_token(user_id, "aaaaaaaa");
+        let token_id = token.id;
+        tokens.insert("aaaaaaaa", token);
+
+        let invalidator = Arc::clone(&cache);
+        tokens.on_lookup(move || invalidator.invalidate_token(token_id));
+
+        let key = compute_cache_key(VALID_TOKEN);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            uc.validate_pat(VALID_TOKEN, Some(ip()))
+                .await
+                .expect("the request already in flight still completes");
+            assert!(
+                cache.get(&key).is_none(),
+                "the entry the revocation could not remove must not be written"
+            );
+            assert_eq!(tokens.lookups(), 1);
+
+            uc.validate_pat(VALID_TOKEN, Some(ip()))
+                .await
+                .expect("second call succeeds too — this is not an error path");
+            assert_eq!(
+                tokens.lookups(),
+                2,
+                "the next request re-reads the row instead of being served a stale entry"
+            );
+        });
+    }
+
+    #[test]
+    fn revocation_inside_the_window_tail_is_not_cached() {
+        // Same hazard, landed on the LAST read inside the window
+        // (`users.find_by_id`) rather than the first. A fence captured
+        // after the verify instead of before the row read would still
+        // catch this one and miss the test above; both must hold.
+        let spy = CountingVerifier::new(true);
+        let (uc, tokens, users, _store, cache, _clock) = make_uc(spy as Arc<dyn Argon2Verifier>);
+        let user_id = Uuid::new_v4();
+        users.insert(fixture_user(user_id, true));
+        let token = fixture_token(user_id, "aaaaaaaa");
+        let token_id = token.id;
+        tokens.insert("aaaaaaaa", token);
+
+        let invalidator = Arc::clone(&cache);
+        users.on_find(move || invalidator.invalidate_token(token_id));
+
+        let key = compute_cache_key(VALID_TOKEN);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            uc.validate_pat(VALID_TOKEN, Some(ip()))
+                .await
+                .expect("the request already in flight still completes");
+            assert!(cache.get(&key).is_none(), "stale insert refused");
+            uc.validate_pat(VALID_TOKEN, Some(ip())).await.expect("ok");
+            assert_eq!(tokens.lookups(), 2, "no stale cache hit in between");
+        });
+    }
+
+    #[test]
+    fn user_deactivation_broadcast_inside_the_window_is_not_cached() {
+        // `invalidate_user` is the deactivation broadcast. The user row
+        // this validation read still says active, so the request
+        // succeeds — but the entry must not outlive it.
+        let spy = CountingVerifier::new(true);
+        let (uc, tokens, users, _store, cache, _clock) = make_uc(spy as Arc<dyn Argon2Verifier>);
+        let user_id = Uuid::new_v4();
+        users.insert(fixture_user(user_id, true));
+        tokens.insert("aaaaaaaa", fixture_token(user_id, "aaaaaaaa"));
+
+        let invalidator = Arc::clone(&cache);
+        tokens.on_lookup(move || invalidator.invalidate_user(user_id));
+
+        let key = compute_cache_key(VALID_TOKEN);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            uc.validate_pat(VALID_TOKEN, Some(ip()))
+                .await
+                .expect("the request already in flight still completes");
+            assert!(cache.get(&key).is_none(), "stale insert refused");
+            uc.validate_pat(VALID_TOKEN, Some(ip())).await.expect("ok");
+            assert_eq!(tokens.lookups(), 2, "no stale cache hit in between");
+        });
+    }
+
+    #[test]
+    fn listener_drop_all_inside_the_window_is_not_cached() {
+        // `drop_all` is the listener's reconnect path: it cannot prove
+        // which tokens changed, so an insert slipping through behind it
+        // is the worst case of the three — the one token whose state the
+        // replica has no way to re-derive is the one it would cache.
+        let spy = CountingVerifier::new(true);
+        let (uc, tokens, users, _store, cache, _clock) = make_uc(spy as Arc<dyn Argon2Verifier>);
+        let user_id = Uuid::new_v4();
+        users.insert(fixture_user(user_id, true));
+        tokens.insert("aaaaaaaa", fixture_token(user_id, "aaaaaaaa"));
+
+        let invalidator = Arc::clone(&cache);
+        tokens.on_lookup(move || invalidator.drop_all());
+
+        let key = compute_cache_key(VALID_TOKEN);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            uc.validate_pat(VALID_TOKEN, Some(ip()))
+                .await
+                .expect("the request already in flight still completes");
+            assert!(cache.get(&key).is_none(), "stale insert refused");
+            uc.validate_pat(VALID_TOKEN, Some(ip())).await.expect("ok");
+            assert_eq!(tokens.lookups(), 2, "no stale cache hit in between");
+        });
+    }
+
+    #[test]
+    fn an_uninterrupted_validation_still_caches() {
+        // The counterpart the three above cannot provide: with no
+        // invalidation in the window the insert must still land, so a
+        // fence compared the wrong way round turns every miss into a
+        // permanent one. The repository is consulted exactly once.
+        let spy = CountingVerifier::new(true);
+        let (uc, tokens, users, _store, cache, _clock) = make_uc(spy as Arc<dyn Argon2Verifier>);
+        let user_id = Uuid::new_v4();
+        users.insert(fixture_user(user_id, true));
+        tokens.insert("aaaaaaaa", fixture_token(user_id, "aaaaaaaa"));
+
+        let key = compute_cache_key(VALID_TOKEN);
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            uc.validate_pat(VALID_TOKEN, Some(ip())).await.expect("ok");
+            assert!(cache.get(&key).is_some(), "unraced insert stored");
+            uc.validate_pat(VALID_TOKEN, Some(ip())).await.expect("ok");
+            assert_eq!(tokens.lookups(), 1, "second call served from cache");
+        });
+    }
+
     // =================================================================
     // 5. Token-format parsing
     // =================================================================
@@ -1897,7 +2122,8 @@ mod tests {
         let user_id = Uuid::new_v4();
         users.insert(fixture_user(user_id, true));
         let key = compute_cache_key(VALID_TOKEN);
-        cache.insert(
+        plant_cached(
+            &cache,
             key,
             ApiTokenValidation {
                 token_id: Uuid::new_v4(),
@@ -1927,7 +2153,8 @@ mod tests {
         let user_id = Uuid::new_v4();
         users.insert(fixture_user(user_id, true));
         let key = compute_cache_key(VALID_TOKEN);
-        cache.insert(
+        plant_cached(
+            &cache,
             key,
             ApiTokenValidation {
                 token_id: Uuid::new_v4(),
@@ -1958,7 +2185,8 @@ mod tests {
         // User is deactivated AFTER the cache entry was inserted.
         users.insert(fixture_user(user_id, false));
         let key = compute_cache_key(VALID_TOKEN);
-        cache.insert(
+        plant_cached(
+            &cache,
             key,
             ApiTokenValidation {
                 token_id: Uuid::new_v4(),
@@ -1999,7 +2227,8 @@ mod tests {
         let user_id = Uuid::new_v4();
         users.insert(fixture_user(user_id, true));
         let key = compute_cache_key(VALID_TOKEN);
-        cache.insert(
+        plant_cached(
+            &cache,
             key,
             ApiTokenValidation {
                 token_id: Uuid::new_v4(),

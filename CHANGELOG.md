@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention stores every checkpoint mutably, which hort cannot detect —
   re-check an existing anchor bucket with
   `aws s3api get-object-lock-configuration` (#458).
+- A token revoked while a validation for it was already in flight is no longer
+  served from the per-replica validation cache for the rest of the cache TTL
+  (#458).
 
 ## [0.18.0] - 2026-11-21
 
