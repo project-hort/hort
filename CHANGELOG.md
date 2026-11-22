@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A proxied cargo sparse index no longer advertises a version whose upstream
   `cksum` is missing or malformed; such a version's download was always
   refused, so resolving to it broke the build (#458).
+- A Maven checksum sidecar for an unresolved `-SNAPSHOT` path now resolves to
+  the same timestamped build the file request resolves to, instead of
+  answering 404 and failing a client with a strict checksum policy (#458).
 
 ### Security
 
