@@ -1397,18 +1397,63 @@ mod tests {
     // ---------------------------------------------------------------
 
     /// `N` real-concurrent `ArtifactGroupUseCase::add_member` calls for
-    /// DISTINCT members of ONE already-existing group. Every call must
-    /// resolve with zero `Conflict` escaping to the caller — the
-    /// bounded read-decide-append retry inside `add_member` absorbs
-    /// the member-row races the concurrent `INSERT ... ON CONFLICT`
-    /// naturally produces. Asserts: every task returns `Ok(())`, every
-    /// member is present in the read-side projection, and the group's
-    /// event stream is version-consistent (contiguous `stream_position`
-    /// values, no gaps, no duplicates — exactly one event per landed
-    /// append).
+    /// DISTINCT members of ONE already-existing group, classified
+    /// against ADR 0060's append-conflict reaction contract.
+    ///
+    /// Each call resolves one of exactly two admissible ways:
+    ///
+    /// - **`Ok(())`** — the bounded read-decide-append cycle inside
+    ///   `add_member` either won its append or, on a retry's re-read,
+    ///   found its intent already true (ADR 0060 (b)/(c)).
+    /// - **`DomainError::Contended`** — the cycle spent its
+    ///   `EVENT_APPEND_RETRY_ATTEMPTS` budget losing the append race.
+    ///   ADR 0060 (d) requires exactly this retryable-busy outcome at
+    ///   exhaustion, and `N` contenders on one stream can outnumber a
+    ///   budget of five, so it is reachable by arithmetic rather than
+    ///   by a defect. Admitting it is the point: forbidding it would
+    ///   forbid an outcome the contract mandates.
+    ///
+    /// **`DomainError::Conflict` is the defect this test exists to
+    /// catch.** ADR 0060 makes a `Conflict` reaching the caller
+    /// evidence that step (b)'s re-read or step (c)'s rebuild-and-
+    /// re-append was skipped, so it fails the test — as does every
+    /// other error variant, none of which this call path can produce
+    /// without a regression.
+    ///
+    /// The state invariants are asserted over the OUTCOME, not over the
+    /// intent: the succeeded set, not the spawned set, is what the
+    /// projection and the event stream must agree with.
+    ///
+    /// - every member a call reported `Ok` for is in the read-side
+    ///   projection;
+    /// - no member is in the projection that no call reported `Ok` for
+    ///   — the direction that catches a commit whose error was
+    ///   mis-reported, since a contended call's transaction rolled back
+    ///   whole and must leave no member row behind;
+    /// - the event stream stays version-consistent: contiguous
+    ///   `stream_position` values, no gaps, no duplicates, exactly one
+    ///   event per landed append.
+    ///
+    /// **At least `min(N, EVENT_APPEND_RETRY_ATTEMPTS)` calls must
+    /// succeed.** The bound is derived, not observed. Every attempt
+    /// reads this stream's tail inside its own transaction and inserts
+    /// at tail + 1, so a losing attempt's `Conflict` is a `23505` on
+    /// `UNIQUE (stream_id, stream_position)` — which Postgres raises
+    /// only once the row holding that position is *committed*, by one
+    /// of these very callers, because nothing else writes this stream.
+    /// The next attempt opens a fresh transaction after that commit, so
+    /// its own tail read sees the winning row and it targets a strictly
+    /// higher position. A caller that exhausts a budget of `B`
+    /// therefore lost at `B` distinct, strictly increasing positions,
+    /// each held by a different successful caller's event — so `B`
+    /// successes exist whenever any caller is contended away, and all
+    /// `N` succeed when none is. A retry cycle that answered
+    /// `Contended` for every caller would satisfy a weaker
+    /// "at least one succeeded" floor while being a broken retry rather
+    /// than contention.
     #[tokio::test]
     #[serial(hort_pg_db)]
-    async fn concurrent_add_member_for_distinct_members_absorbs_all_conflicts() {
+    async fn concurrent_add_member_for_distinct_members_resolves_as_ok_or_contended() {
         let Some(pool) = maybe_pool().await else {
             return;
         };
@@ -1432,7 +1477,10 @@ mod tests {
         // Sequential first-placement: creates the group with a primary
         // "jar" member, out of band from the concurrency under test —
         // the GroupAlreadyExists create-race is a SEPARATE, already-
-        // tested sanctioned shape (see the test above).
+        // tested sanctioned shape (see the test above). It lands
+        // `ArtifactGroupInitiated` at stream_position 0 and its
+        // `ArtifactGroupMemberAdded` at 1, which is what the position
+        // arithmetic below is based on.
         let primary_artifact = seed_artifact(&pool, repo, "concurrent-race-primary.jar").await;
         uc.add_member(
             repo,
@@ -1451,7 +1499,18 @@ mod tests {
         .await
         .expect("sequential first-placement succeeds");
 
+        // Contenders on one stream. Keeping N above the retry budget is
+        // the point of the test: it is the only shape that exercises
+        // the full retry cycle, exhaustion included.
         const N: usize = 8;
+        // Mirrors `hort_app::use_cases::EVENT_APPEND_RETRY_ATTEMPTS`,
+        // which is `pub(crate)` to `hort-app` and so cannot be imported
+        // — the bound is restated here rather than read. Raising the
+        // real budget leaves this one merely conservative; lowering it
+        // makes the derived lower bound below stricter than the retry
+        // cycle can satisfy, and the test says so by failing.
+        const RETRY_BUDGET: usize = 5;
+
         let mut artifacts = Vec::with_capacity(N);
         for i in 0..N {
             artifacts.push(seed_artifact(&pool, repo, &format!("concurrent-race-{i}.jar")).await);
@@ -1480,39 +1539,78 @@ mod tests {
             }));
         }
 
-        for (i, handle) in handles.into_iter().enumerate() {
-            handle
-                .await
-                .expect("task did not panic")
-                .unwrap_or_else(|e| {
-                    panic!("add_member for layer-{i} must not surface Conflict: {e}")
-                });
+        // Three-way classification: satisfied, sanctioned-busy, defect.
+        let mut succeeded: Vec<Uuid> = Vec::new();
+        let mut contended = 0usize;
+        for ((i, artifact_id), handle) in artifacts.iter().copied().enumerate().zip(handles) {
+            match handle.await.expect("task did not panic") {
+                Ok(()) => succeeded.push(artifact_id),
+                // ADR 0060 (d): at exhaustion of the
+                // `EVENT_APPEND_RETRY_ATTEMPTS` budget the contract
+                // mandates a retryable-busy outcome, and `Contended` is
+                // the vocabulary it mandates it in — `503` +
+                // `Retry-After` at the HTTP edges that map it.
+                Err(hort_app::error::AppError::Domain(DomainError::Contended(_))) => {
+                    contended += 1;
+                }
+                // Everything else is a contract violation. A
+                // `DomainError::Conflict` specifically is evidence that
+                // the re-read (b) or the rebuild-and-re-append (c) was
+                // skipped; ADR 0060 calls it a defect by definition.
+                Err(e) => panic!(
+                    "add_member for layer-{i} resolved outside ADR 0060's contract — \
+                     only Ok and Contended are admissible, got: {e}"
+                ),
+            }
         }
 
-        // Every member landed — the primary plus all N concurrent
-        // additions.
+        assert!(
+            succeeded.len() >= N.min(RETRY_BUDGET),
+            "a caller can only exhaust its budget by losing to {RETRY_BUDGET} distinct \
+             committed appends, so at most N - {RETRY_BUDGET} callers can be contended \
+             away; got {} succeeded / {contended} contended out of {N}",
+            succeeded.len(),
+        );
+
+        // The projection must agree with the OUTCOME: the out-of-band
+        // primary plus exactly the members their own calls reported
+        // `Ok` for.
         let group = groups
             .find_by_coords(repo, &coords)
             .await
             .unwrap()
             .expect("group exists");
-        assert_eq!(
-            group.members.len(),
-            N + 1,
-            "primary + every concurrent member must be present, got {:?}",
+        let mut claimed: std::collections::HashSet<Uuid> = succeeded.iter().copied().collect();
+        claimed.insert(primary_artifact);
+        let present: std::collections::HashSet<Uuid> =
+            group.members.iter().map(|m| m.artifact_id).collect();
+
+        let missing: Vec<Uuid> = claimed.difference(&present).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "every member whose call returned Ok must be present in the projection; \
+             missing {missing:?} from {:?}",
             group.members
         );
-        for artifact_id in &artifacts {
-            assert!(
-                group.members.iter().any(|m| m.artifact_id == *artifact_id),
-                "artifact {artifact_id} missing from group membership"
-            );
-        }
+        let unclaimed: Vec<Uuid> = present.difference(&claimed).copied().collect();
+        assert!(
+            unclaimed.is_empty(),
+            "no member may be present that no call reported Ok for — a contended \
+             call's transaction rolls back whole; unexpected {unclaimed:?}"
+        );
+        assert_eq!(
+            group.members.len(),
+            claimed.len(),
+            "the projection must hold exactly one member row per landed append, got {:?}",
+            group.members
+        );
 
         // Stream version-consistency: contiguous stream_position values
         // with no gaps and no duplicates — the SAME invariant a real
         // `EventStore::append` under `ExpectedVersion::Any` guarantees
-        // is preserved end to end through the retry cycle.
+        // is preserved end to end through the retry cycle. Re-based on
+        // the succeeded set: a contended call appended nothing, because
+        // every attempt it lost rolled its transaction back whole.
         let stream_id = format!("artifact_group-{}", group.id);
         let positions: Vec<i64> = sqlx::query_scalar(
             "SELECT stream_position FROM events WHERE stream_id = $1 ORDER BY stream_position",
@@ -1521,7 +1619,9 @@ mod tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        let expected: Vec<i64> = (0..(N as i64 + 2)).collect(); // Initiated + (N+1) MemberAdded
+        // Initiated + the first-placement MemberAdded + one MemberAdded
+        // per succeeded contender.
+        let expected: Vec<i64> = (0..(succeeded.len() as i64 + 2)).collect();
         assert_eq!(
             positions, expected,
             "stream_position must be contiguous with no gaps or duplicates"
