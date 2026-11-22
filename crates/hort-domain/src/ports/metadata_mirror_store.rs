@@ -10,6 +10,7 @@
 use tokio::io::AsyncRead;
 
 use crate::error::DomainResult;
+use crate::types::ContentHash;
 
 use super::BoxFuture;
 
@@ -25,10 +26,15 @@ pub fn mirror_key(format: &str, mapping_id: &str, package: &str) -> String {
 /// Streaming, overwrite, logical-keyed blob store for raw upstream metadata.
 pub trait MetadataMirrorStore: Send + Sync {
     /// Stream `body` to `key`, replacing any prior value (overwrite).
+    /// `body_digest` is SHA-256 of the raw body, computed by the upstream
+    /// fetch while it writes the cache tempfile. Implementations verify it
+    /// before committing the in-band frame (ADR 0026); callers must supply
+    /// the digest of exactly the bytes in `body`.
     fn put(
         &self,
         key: &str,
         body: Box<dyn AsyncRead + Send + Unpin>,
+        body_digest: ContentHash,
     ) -> BoxFuture<'_, DomainResult<()>>;
 
     /// Stream the mirrored body back, or `Ok(None)` if absent.

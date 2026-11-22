@@ -3748,12 +3748,15 @@ where
     ));
     let result = stream_to_file(&path, bytes_stream, max_bytes, fetch_class).await;
     match result {
-        Ok(byte_length) => Ok(hort_domain::ports::upstream_proxy::CachedBodyHandle {
-            key,
-            path,
-            fetched_at: Utc::now(),
-            byte_length,
-        }),
+        Ok((byte_length, body_digest)) => {
+            Ok(hort_domain::ports::upstream_proxy::CachedBodyHandle {
+                key,
+                path,
+                fetched_at: Utc::now(),
+                byte_length,
+                body_digest,
+            })
+        }
         Err(e) => {
             // Best-effort cleanup of the partial write. Failures here
             // are swallowed — the storage backstop trip / network error
@@ -3770,11 +3773,12 @@ async fn stream_to_file<S>(
     mut bytes_stream: S,
     max_bytes: u64,
     fetch_class: FetchClass,
-) -> DomainResult<u64>
+) -> DomainResult<(u64, hort_domain::types::ContentHash)>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 {
     use futures::StreamExt;
+    use sha2::{Digest, Sha256};
     use tokio::io::AsyncWriteExt;
     // Tempfile mode 0600 (security invariant): create owner-rw only,
     // not the world-readable default `tokio::fs::File::create` yields.
@@ -3795,6 +3799,7 @@ where
         .await
         .map_err(|e| DomainError::Invariant(format!("create upstream temp file: {e}")))?;
     let mut bytes_read: u64 = 0;
+    let mut hasher = Sha256::new();
     while let Some(chunk_res) = bytes_stream.next().await {
         let chunk = chunk_res
             .map_err(|e| classified_error(UpstreamErrorKind::NetworkError, &e.to_string()))?;
@@ -3816,11 +3821,13 @@ where
         file.write_all(&chunk)
             .await
             .map_err(|e| DomainError::Invariant(format!("write upstream temp file: {e}")))?;
+        hasher.update(&chunk);
     }
     file.flush()
         .await
         .map_err(|e| DomainError::Invariant(format!("flush upstream temp file: {e}")))?;
-    Ok(bytes_read)
+    let digest = hex::encode(hasher.finalize()).parse()?;
+    Ok((bytes_read, digest))
 }
 
 /// Classify a response by status: success → pass through; non-2xx

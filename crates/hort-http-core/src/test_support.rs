@@ -867,6 +867,7 @@ impl MetadataMirrorStore for MockMetadataMirror {
         &self,
         key: &str,
         mut body: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        _body_digest: hort_domain::types::ContentHash,
     ) -> BoxFuture<'_, DomainResult<()>> {
         let key = key.to_string();
         Box::pin(async move {

@@ -903,9 +903,15 @@ mod tests {
         let path = hort_formats::cargo::index_path_for("serde");
         let raw = ndjson_entry("serde", "9.9.9", "feedface");
         let mkey = mirror_key("cargo", &mapping_id.to_string(), &path);
+        // The digest of exactly the bytes being written — what the
+        // production caller supplies with the body.
+        let digest: hort_domain::types::ContentHash = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(&raw)).parse().unwrap()
+        };
         mocks
             .metadata_mirror
-            .put(&mkey, Box::new(std::io::Cursor::new(raw)))
+            .put(&mkey, Box::new(std::io::Cursor::new(raw)), digest)
             .await
             .unwrap();
 

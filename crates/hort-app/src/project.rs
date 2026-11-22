@@ -24,6 +24,14 @@
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::metadata_mirror_store::MetadataMirrorStore;
 use hort_domain::ports::upstream_proxy::{CachedBodyHandle, MetadataProjector};
+use hort_domain::types::ContentHash;
+use sha2::{Digest, Sha256};
+
+fn body_digest(bytes: &[u8]) -> ContentHash {
+    hex::encode(Sha256::digest(bytes))
+        .parse()
+        .expect("SHA-256 is a valid content hash")
+}
 
 /// Write a buffered upstream body to a tempfile and return a
 /// [`CachedBodyHandle`] pointing at it. The production path streams the
@@ -52,6 +60,7 @@ pub fn cache_handle_from_bytes(bytes: &[u8], key: String) -> DomainResult<Cached
         path,
         fetched_at: chrono::Utc::now(),
         byte_length,
+        body_digest: body_digest(bytes),
     })
 }
 
@@ -186,7 +195,10 @@ pub async fn fetch_and_project<P: MetadataProjector>(
             handle.path.display()
         ))
     })?;
-    if let Err(e) = mirror.put(mirror_key, Box::new(file)).await {
+    if let Err(e) = mirror
+        .put(mirror_key, Box::new(file), handle.body_digest.clone())
+        .await
+    {
         tracing::warn!(error = %e, "metadata mirror put failed");
         return Err(e);
     }
@@ -210,6 +222,7 @@ mod tests {
             path,
             fetched_at: Utc::now(),
             byte_length: bytes.len() as u64,
+            body_digest: body_digest(bytes),
         }
     }
 
@@ -232,6 +245,7 @@ mod tests {
             path: std::path::PathBuf::from("/nonexistent/hort-init57-test/missing.bin"),
             fetched_at: Utc::now(),
             byte_length: 0,
+            body_digest: body_digest(b""),
         };
         let err = project_cached(&handle, IdentityProjector)
             .await
@@ -296,6 +310,7 @@ mod fetch_and_project_tests {
             &self,
             key: &str,
             mut body: Box<dyn AsyncRead + Send + Unpin>,
+            _body_digest: ContentHash,
         ) -> BoxFuture<'_, DomainResult<()>> {
             let key = key.to_string();
             Box::pin(async move {
@@ -330,6 +345,7 @@ mod fetch_and_project_tests {
             &self,
             _key: &str,
             _body: Box<dyn AsyncRead + Send + Unpin>,
+            _body_digest: ContentHash,
         ) -> BoxFuture<'_, DomainResult<()>> {
             Box::pin(async { Err(DomainError::Invariant("mirror down".into())) })
         }
@@ -355,6 +371,7 @@ mod fetch_and_project_tests {
             path,
             fetched_at: Utc::now(),
             byte_length: bytes.len() as u64,
+            body_digest: body_digest(bytes),
         }
     }
 

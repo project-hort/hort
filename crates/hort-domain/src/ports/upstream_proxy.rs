@@ -426,6 +426,9 @@ pub struct CachedBodyHandle {
     pub path: PathBuf,
     pub fetched_at: DateTime<Utc>,
     pub byte_length: u64,
+    /// SHA-256 of the raw upstream body, computed while the fetch writes
+    /// its tempfile. The mirror uses this to frame a streaming upload.
+    pub body_digest: crate::types::ContentHash,
 }
 
 /// Outcome of [`UpstreamProxy::fetch_metadata`]. No projection — the

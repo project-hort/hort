@@ -2606,6 +2606,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hex",
  "hort-app",
  "hort-config",
  "hort-domain",

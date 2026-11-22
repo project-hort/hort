@@ -43,14 +43,39 @@
 //! to live where the mirror lives. Raising that bar means recording the
 //! digest somewhere outside the store, which is a different decision with
 //! its own cost to the air-gapped path.
+//!
+//! # Why the digest arrives with the body
+//!
+//! `put` does not discover the digest — its caller supplies one, taken
+//! from the pass that already wrote the upstream body to its cache
+//! tempfile, and `put` verifies it against the bytes it actually writes
+//! before either backend commits them. Holding it before the first byte
+//! is what lets both backends write the frame header and then stream the
+//! body straight through in a single forward pass: no whole-body buffer,
+//! no second read, and on the filesystem no seek back over a reserved
+//! header slot.
+//!
+//! That is the point, not an incidental tidiness. The bodies reaching
+//! this port are raw upstream metadata documents, which reach tens of
+//! MiB (ADR 0026), and a `put` holding one costs that much resident
+//! memory for every refresh running concurrently. The 64 MiB cap the
+//! fetch applies is a bound on what may be *stored*, not on what may be
+//! resident.
+//!
+//! The verification is not a formality either. A digest the caller
+//! asserts and nobody checks would put a claim in the frame that the
+//! stored object does not support, and `get` would then refuse the body
+//! with no way to tell a store that corrupted it from a caller that
+//! mis-stated it. A mismatch is therefore a refused write, and the key
+//! keeps whatever it held before.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::StreamExt;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectStore, ObjectStoreExt, WriteMultipart};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio_util::io::StreamReader;
 
 use hort_domain::error::{DomainError, DomainResult};
@@ -95,6 +120,58 @@ const DIGEST_HEX_LEN: usize = 64;
 /// one `read_exact` and the body begins at a known offset.
 const FRAME_LEN: usize = FRAME_MAGIC.len() + DIGEST_HEX_LEN + 1;
 
+/// Bytes pulled from the body per read on the way to a backend. Matches
+/// the CAS adapter's read buffer: large enough to amortise the syscall,
+/// small enough that it is not a memory consideration at any
+/// concurrency.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Multipart part size for the object-store backend.
+///
+/// 5 MiB is the floor, not a tuning choice: S3-compatible stores reject
+/// a non-final part below it. It is also the whole memory cost of an
+/// object-store `put` — one part is buffered at a time (see
+/// [`MAX_PARTS_IN_FLIGHT`]) — so the resident bytes per concurrent
+/// refresh are this constant rather than the body's length.
+const UPLOAD_CHUNK_SIZE: usize = 5 * 1024 * 1024;
+
+/// Parts the object-store backend may have in flight at once.
+///
+/// One, which makes the upload serial: the body is read until a part is
+/// full, that part is awaited, and only then is more of the body read.
+/// It is the same shape as the CAS sibling's loop
+/// ([`ObjectStoreStorage::put`](super::object_store_backend)) and it is
+/// what keeps the bound in [`UPLOAD_CHUNK_SIZE`] a single part rather
+/// than a pipeline of them. The mirror refreshes metadata in the
+/// background, so there is no latency budget here worth trading memory
+/// for.
+const MAX_PARTS_IN_FLIGHT: usize = 1;
+
+/// An I/O failure while reading the body a caller handed `put`.
+///
+/// The three stage helpers here are named functions rather than inline
+/// closures so each message is written once, and each one is passed
+/// straight to `map_err` at its call sites. The messages name the mirror
+/// because the error surfaces to a caller that was refreshing upstream
+/// metadata and has several other reasons it could have failed; the
+/// `Display` bound is just what lets the three stages keep their own
+/// error types.
+fn mirror_read_err<E: std::fmt::Display>(e: E) -> DomainError {
+    DomainError::Invariant(format!("mirror read: {e}"))
+}
+
+/// An I/O failure while writing a staged mirror body — the frame header
+/// or the body bytes; the staged file is the same file either way.
+fn mirror_write_err<E: std::fmt::Display>(e: E) -> DomainError {
+    DomainError::Invariant(format!("mirror write: {e}"))
+}
+
+/// An object-store failure anywhere in a mirror upload: initiating the
+/// multipart, uploading a part, or committing it.
+fn mirror_upload_err<E: std::fmt::Display>(e: E) -> DomainError {
+    DomainError::Invariant(format!("mirror upload: {e}"))
+}
+
 /// The frame header for `digest_hex`, written ahead of the body bytes.
 ///
 /// The digest travels **in the same object as the bytes it describes**,
@@ -102,12 +179,12 @@ const FRAME_LEN: usize = FRAME_MAGIC.len() + DIGEST_HEX_LEN + 1;
 /// deliberate trade:
 ///
 /// - One object means one atomic write. The filesystem backend renames a
-///   single staged file; the object-store backend issues a single `put`
-///   (it has no rename at all). A body and a separately-stored digest
-///   cannot be committed together on either backend, and every ordering
-///   leaves a window where they describe different things — after which
-///   the key is unservable until its next refresh. For an air-gapped
-///   deployment there is no next refresh.
+///   single staged file; the object-store backend commits one multipart
+///   upload (it has no rename at all). A body and a separately-stored
+///   digest cannot be committed together on either backend, and every
+///   ordering leaves a window where they describe different things —
+///   after which the key is unservable until its next refresh. For an
+///   air-gapped deployment there is no next refresh.
 /// - It is consistent under concurrent writes. Two replicas refreshing
 ///   the same package land one whole frame or the other; a body and a
 ///   sidecar can interleave into a pair that never matched.
@@ -127,12 +204,33 @@ fn frame_header(digest_hex: &str) -> Vec<u8> {
     out
 }
 
-/// A placeholder frame of the right width, written before the body so the
-/// real digest — which is not knowable until the last byte has streamed
-/// through — can be patched into the slot afterwards without buffering
-/// the body (ADR 0026: metadata bodies reach tens of MiB).
-fn placeholder_frame_header() -> Vec<u8> {
-    frame_header(&"0".repeat(DIGEST_HEX_LEN))
+/// Refuse a body whose bytes do not hash to the digest supplied with
+/// them.
+///
+/// Both backends write the frame header from the supplied digest before
+/// the first body byte and hash the body as it streams past, so this is
+/// the last step of every `put`: either the claim in the header is one
+/// the bytes support, or nothing is committed. `actual_hex` is the
+/// lowercase-hex digest the write computed.
+///
+/// The message carries both digests because the refusal has two
+/// different causes an operator has to tell apart — a caller that hashed
+/// one body and streamed another, or a body that changed underneath the
+/// two passes — and neither is distinguishable from "they differ" alone.
+/// It needs no log of its own: every caller already reports a failed
+/// mirror put, and this is the error it reports.
+fn require_supplied_digest(
+    actual_hex: &str,
+    supplied: &ContentHash,
+    key: &str,
+) -> DomainResult<()> {
+    if actual_hex == supplied.as_ref() {
+        return Ok(());
+    }
+    Err(DomainError::Invariant(format!(
+        "metadata mirror body for {key} does not hash to the digest supplied with it: \
+         the bytes written hash to {actual_hex}, the caller supplied {supplied}"
+    )))
 }
 
 /// The digest recorded in `raw`, which must be exactly [`FRAME_LEN`]
@@ -224,7 +322,7 @@ async fn copy_hashing(
     file: &mut tokio::fs::File,
 ) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; READ_CHUNK];
     loop {
         let read = body.read(&mut buf).await?;
         if read == 0 {
@@ -244,6 +342,8 @@ async fn write_staged_frame(
     staged: &Path,
     path: &Path,
     body: &mut (dyn AsyncRead + Send + Unpin),
+    body_digest: &ContentHash,
+    key: &str,
 ) -> DomainResult<()> {
     // Create the staged file mode 0600 atomically with creation. The
     // rename below preserves the inode + mode, so the final mirror blob
@@ -263,21 +363,18 @@ async fn write_staged_frame(
         .await
         .map_err(|e| DomainError::Invariant(format!("mirror create: {e}")))?;
 
-    // Reserve the frame slot, stream the body past it, then patch the
-    // real digest in. The digest is only known at the last byte, and
-    // buffering the body to learn it first is what ADR 0026 forbids.
-    file.write_all(&placeholder_frame_header())
+    // Header first, from the digest the caller supplied, then the body
+    // streamed past it once. The hash computed on the way is not what
+    // fills the header in — it is the check that the caller's claim and
+    // the bytes agree, and a disagreement means this staged file is
+    // never renamed onto the key.
+    file.write_all(&frame_header(body_digest.as_ref()))
         .await
-        .map_err(|e| DomainError::Invariant(format!("mirror frame reserve: {e}")))?;
+        .map_err(mirror_write_err)?;
     let digest_hex = copy_hashing(body, &mut file)
         .await
-        .map_err(|e| DomainError::Invariant(format!("mirror write: {e}")))?;
-    file.seek(std::io::SeekFrom::Start(0))
-        .await
-        .map_err(|e| DomainError::Invariant(format!("mirror frame seek: {e}")))?;
-    file.write_all(&frame_header(&digest_hex))
-        .await
-        .map_err(|e| DomainError::Invariant(format!("mirror frame write: {e}")))?;
+        .map_err(mirror_write_err)?;
+    require_supplied_digest(&digest_hex, body_digest, key)?;
 
     // Flush to disk before rename for crash safety, raising the error
     // rather than discarding it — consistent with the CAS sibling
@@ -297,9 +394,11 @@ impl MetadataMirrorStore for FilesystemMetadataMirror {
         &self,
         key: &str,
         mut body: Box<dyn AsyncRead + Send + Unpin>,
+        body_digest: ContentHash,
     ) -> BoxFuture<'_, DomainResult<()>> {
         let path = self.resolve(key);
         let staged = self.staging_path();
+        let key = key.to_string();
         Box::pin(async move {
             let path = path?;
             if let Some(parent) = path.parent() {
@@ -313,7 +412,8 @@ impl MetadataMirrorStore for FilesystemMetadataMirror {
                     .map_err(|e| DomainError::Invariant(format!("mirror staging mkdir: {e}")))?;
             }
 
-            let outcome = write_staged_frame(&staged, &path, body.as_mut()).await;
+            let outcome =
+                write_staged_frame(&staged, &path, body.as_mut(), &body_digest, &key).await;
             if outcome.is_err() {
                 // The staged file is unreachable through the key
                 // interface, so leaving it behind is a disk leak rather
@@ -426,8 +526,9 @@ fn verified<R: AsyncRead + Send + Unpin + 'static>(
 
 /// Object-store-backed mirror (S3/GCS/Azure/in-memory). Holds the same
 /// `Arc<dyn ObjectStore>` the CAS [`ObjectStoreStorage`](super::object_store_backend)
-/// uses; the logical `key` maps directly to an `object_store` path. Overwrite
-/// is the object store's native put semantics (last write wins).
+/// uses; the logical `key` maps directly to an `object_store` path.
+/// Overwrite is the store's own last-write-wins replacement, committed
+/// by a multipart upload rather than by a rename — see `put`.
 pub struct ObjectStoreMetadataMirror {
     store: Arc<dyn ObjectStore>,
     backend: &'static str,
@@ -450,43 +551,100 @@ impl ObjectStoreMetadataMirror {
     }
 }
 
+/// Stream the frame header and then `body` into `writer`, hashing the
+/// body as it flows, and refuse the write if the bytes do not hash to
+/// `body_digest`.
+///
+/// Nothing here is proportional to the body: the header is written from
+/// the supplied digest before the first body byte, each
+/// [`READ_CHUNK`]-sized read is handed straight to the multipart writer,
+/// and the writer holds at most one [`UPLOAD_CHUNK_SIZE`] part (see
+/// [`MAX_PARTS_IN_FLIGHT`], awaited through `wait_for_capacity` before
+/// the next read). An object store has no API that takes a partial
+/// payload outside a multipart upload, so the single-shot `put` this
+/// replaced could not have been anything but a whole-body buffer — which
+/// is the memory profile ADR 0026 rejected.
+///
+/// Returning `Err` leaves the multipart uncommitted; aborting it is the
+/// caller's job, since the caller owns the writer.
+async fn stream_framed(
+    writer: &mut WriteMultipart,
+    body: &mut (dyn AsyncRead + Send + Unpin),
+    body_digest: &ContentHash,
+    key: &str,
+) -> DomainResult<()> {
+    writer.write(&frame_header(body_digest.as_ref()));
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; READ_CHUNK];
+    loop {
+        // Before reading more, not after: a part failure surfaces here,
+        // and a read that ran first would have pulled bytes the upload
+        // can no longer take.
+        writer
+            .wait_for_capacity(MAX_PARTS_IN_FLIGHT)
+            .await
+            .map_err(mirror_upload_err)?;
+        let read = body.read(&mut buf).await.map_err(mirror_read_err)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+        writer.write(&buf[..read]);
+    }
+    require_supplied_digest(&hex::encode(hasher.finalize()), body_digest, key)
+}
+
 impl MetadataMirrorStore for ObjectStoreMetadataMirror {
     fn put(
         &self,
         key: &str,
         mut body: Box<dyn AsyncRead + Send + Unpin>,
+        body_digest: ContentHash,
     ) -> BoxFuture<'_, DomainResult<()>> {
         let path = self.resolve(key);
+        let key = key.to_string();
         Box::pin(async move {
             let path = path?;
-            // BOUNDED-BODY ASSUMPTION: the body handed to this port is the
-            // small, already-capped upstream metadata projection's source
-            // (npm packument / PyPI simple-index / cargo index — bounded by
-            // the per-value + whole-body projector caps upstream of here),
-            // NOT the unbounded raw artifact bytes. Buffer-then-`put` keeps
-            // overwrite atomic (object stores have no rename) without the
-            // multipart staging the CAS path needs for multi-GB artifacts.
-            // If a future caller ever routes the raw artifact stream through
-            // this port, this `Vec` buffer becomes a memory hazard (a 2 GB
-            // artifact = 2 GB resident) — that caller MUST switch to
-            // `store.put_multipart` (as `ObjectStoreStorage::put` does) and
-            // stream, not buffer.
+            // Overwrite is atomic without a staging key: a multipart
+            // upload makes the object visible only at `complete()`, so
+            // the live key holds its previous body for the whole write
+            // and switches in one step. The CAS sibling
+            // `ObjectStoreStorage::put` (object_store_backend.rs) stages
+            // under `.staging/<uuid>` and copies because its final path
+            // is the content hash, which it cannot know until the last
+            // byte has been read; here the key is an argument, so there
+            // is nothing to stage for.
             //
-            // The frame is reserved up front and patched after hashing so
-            // the object is written once, exactly as the filesystem
-            // backend does it — prepending afterwards would move the whole
-            // body.
-            let mut buf = placeholder_frame_header();
-            tokio::io::copy(&mut body, &mut buf)
+            // What a crash mid-write leaves is an uncommitted multipart:
+            // parts no `complete()` ever claims, and the live key exactly
+            // as it was. Every failure reachable once the upload exists
+            // aborts it, so those parts are released immediately — the
+            // streaming arm below explicitly, a failed commit inside
+            // `WriteMultipart::finish` itself. What no code can abort is
+            // a process that dies, or a dropped future: those leave the
+            // parts for the bucket's own incomplete-multipart lifecycle
+            // rule, which is the residue the CAS path's abandoned uploads
+            // already leave and not a new class of it.
+            let upload = self
+                .store
+                .put_multipart(&path)
                 .await
-                .map_err(|e| DomainError::Invariant(format!("mirror read: {e}")))?;
-            let digest_hex = hex::encode(Sha256::digest(&buf[FRAME_LEN..]));
-            buf[..FRAME_LEN].copy_from_slice(&frame_header(&digest_hex));
-            self.store
-                .put(&path, bytes::Bytes::from(buf).into())
-                .await
-                .map_err(|e| DomainError::Invariant(format!("mirror put: {e}")))?;
-            Ok(())
+                .map_err(mirror_upload_err)?;
+            let mut writer = WriteMultipart::new_with_chunk_size(upload, UPLOAD_CHUNK_SIZE);
+            match stream_framed(&mut writer, body.as_mut(), &body_digest, &key).await {
+                Ok(()) => writer.finish().await.map(|_| ()).map_err(mirror_upload_err),
+                Err(e) => {
+                    // Release the parts already uploaded. The error from
+                    // the abort is dropped on purpose — the write failure
+                    // in `e` is the one the caller can act on, and an
+                    // abort that itself fails leaves the same residue a
+                    // crash would, which the lifecycle rule collects.
+                    // Same disposition as the CAS sibling's dedup and
+                    // timeout paths.
+                    let _ = writer.abort().await;
+                    Err(e)
+                }
+            }
         })
     }
 
@@ -542,7 +700,6 @@ mod tests {
     #[test]
     fn the_frame_header_is_exactly_frame_len_bytes() {
         assert_eq!(frame_header(HELLO_WORLD_SHA256).len(), FRAME_LEN);
-        assert_eq!(placeholder_frame_header().len(), FRAME_LEN);
     }
 
     /// A header round-trips to the digest it recorded.
@@ -551,17 +708,6 @@ mod tests {
         let raw = frame_header(HELLO_WORLD_SHA256);
         let parsed = parse_frame_header(&raw, "k").expect("round-trip");
         assert_eq!(parsed.as_ref(), HELLO_WORLD_SHA256);
-    }
-
-    /// The placeholder is a well-formed header carrying a digest no body
-    /// can hash to, so a body whose write died between reserving the slot
-    /// and patching it reads as a mismatch rather than as a valid frame.
-    /// (That body is unreachable anyway — it never left staging — but the
-    /// placeholder must not be a frame that *passes*.)
-    #[test]
-    fn the_placeholder_digest_is_not_a_digest_any_body_has() {
-        let parsed = parse_frame_header(&placeholder_frame_header(), "k").expect("well-formed");
-        assert_eq!(parsed.as_ref(), "0".repeat(DIGEST_HEX_LEN));
     }
 
     /// Bytes that are not a frame have no recorded digest.
@@ -651,5 +797,231 @@ mod tests {
             .join(STAGING_SUBDIR);
         assert!(a.starts_with(&reserved), "{a:?} must be under {reserved:?}");
         assert!(b.starts_with(&reserved));
+    }
+
+    // -----------------------------------------------------------------
+    // The supplied digest is verified against the bytes actually written
+    // -----------------------------------------------------------------
+
+    /// A realistic mirror key, so the staged-write and object-path
+    /// resolution both run over the shape production uses.
+    fn test_key() -> String {
+        hort_domain::ports::metadata_mirror_store::mirror_key(
+            "npm",
+            "11111111-1111-1111-1111-111111111111",
+            "express",
+        )
+    }
+
+    /// SHA-256 of `body`, as a caller computes it on the pass that wrote
+    /// the upstream cache tempfile.
+    fn digest_of(body: &[u8]) -> ContentHash {
+        hex::encode(Sha256::digest(body))
+            .parse()
+            .expect("SHA-256 is a valid content hash")
+    }
+
+    /// A body that yields `prefix` and then fails, standing in for a
+    /// cache tempfile that disappears or errors part-way through the
+    /// mirror write.
+    fn failing_body(prefix: &'static [u8]) -> Box<dyn AsyncRead + Send + Unpin> {
+        Box::new(StreamReader::new(futures::stream::iter(vec![
+            Ok(bytes::Bytes::from_static(prefix)),
+            Err(std::io::Error::other("body vanished mid-read")),
+        ])))
+    }
+
+    async fn read_back(store: &dyn MetadataMirrorStore, key: &str) -> Option<Vec<u8>> {
+        let reader = store.get(key).await.expect("get must not fail")?;
+        let mut out = Vec::new();
+        let mut reader = reader;
+        reader.read_to_end(&mut out).await.expect("verified read");
+        Some(out)
+    }
+
+    /// Both backends, constructed over `root`, so each assertion below
+    /// runs against the same pair the conformance suite uses.
+    fn backends(root: &Path) -> Vec<(&'static str, Box<dyn MetadataMirrorStore>)> {
+        vec![
+            (
+                values::BACKEND_FILESYSTEM,
+                Box::new(FilesystemMetadataMirror::new(root.to_path_buf())) as Box<_>,
+            ),
+            (
+                values::BACKEND_MEMORY,
+                Box::new(ObjectStoreMetadataMirror::new(
+                    Arc::new(object_store::memory::InMemory::new()),
+                    values::BACKEND_MEMORY,
+                )) as Box<_>,
+            ),
+        ]
+    }
+
+    /// The header both backends write is the digest the caller supplied,
+    /// and the body behind it reads back through the verifying path. The
+    /// write is one forward pass in both, so this is also the assertion
+    /// that nothing is left un-patched where the old reserve-and-seek
+    /// shape used to fill the slot in afterwards.
+    #[tokio::test]
+    async fn a_put_frames_the_supplied_digest_and_the_body_reads_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+        // Longer than one `READ_CHUNK`, so the streaming loop runs more
+        // than one iteration and the hash is genuinely incremental.
+        let body: Vec<u8> = (0..READ_CHUNK * 2 + 17).map(|i| (i % 251) as u8).collect();
+
+        for (name, store) in backends(dir.path()) {
+            store
+                .put(
+                    &key,
+                    Box::new(std::io::Cursor::new(body.clone())),
+                    digest_of(&body),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{name}: put must succeed: {e:?}"));
+            assert_eq!(
+                read_back(store.as_ref(), &key).await.expect("key exists"),
+                body,
+                "{name}: the body must read back byte-for-byte"
+            );
+        }
+    }
+
+    /// **The new contract.** A `put` whose supplied digest does not
+    /// describe the bytes is refused, on both backends — and the key
+    /// keeps the body it already held. A committed object carrying a
+    /// digest its own bytes do not support would be refused by every
+    /// later `get`, which is an unservable key rather than a detected
+    /// one, and an air-gapped deployment has no refresh to repair it.
+    #[tokio::test]
+    async fn a_put_whose_digest_does_not_match_the_bytes_is_refused_on_both_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+        let committed = b"the body the key already holds".to_vec();
+
+        for (name, store) in backends(dir.path()) {
+            store
+                .put(
+                    &key,
+                    Box::new(std::io::Cursor::new(committed.clone())),
+                    digest_of(&committed),
+                )
+                .await
+                .unwrap();
+
+            // A digest of different bytes — the shape a caller that
+            // hashed one body and streamed another produces.
+            let err = store
+                .put(
+                    &key,
+                    Box::new(std::io::Cursor::new(b"different bytes entirely".to_vec())),
+                    digest_of(b"not what follows"),
+                )
+                .await
+                .expect_err("a mis-stated digest must be refused");
+            assert!(
+                matches!(&err, DomainError::Invariant(m) if m.contains("does not hash to")),
+                "{name}: the error must name the mismatch; got: {err:?}"
+            );
+            assert_eq!(
+                read_back(store.as_ref(), &key).await.expect("key survives"),
+                committed,
+                "{name}: a refused write must leave the committed body in place"
+            );
+        }
+    }
+
+    /// A first write that is refused commits nothing at all: the key is
+    /// still absent afterwards, rather than holding a partial object the
+    /// next `get` would refuse.
+    #[tokio::test]
+    async fn a_refused_first_put_leaves_the_key_absent_on_both_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+
+        for (name, store) in backends(dir.path()) {
+            store
+                .put(
+                    &key,
+                    Box::new(std::io::Cursor::new(b"body".to_vec())),
+                    digest_of(b"a digest of something else"),
+                )
+                .await
+                .expect_err("refused");
+            assert!(
+                store.get(&key).await.unwrap().is_none(),
+                "{name}: nothing may be committed under a refused key"
+            );
+        }
+    }
+
+    /// A body that fails part-way is reported, not committed. On the
+    /// object-store backend the failure arrives while a multipart upload
+    /// is open, which is the path that must abort it rather than
+    /// completing a truncated object.
+    #[tokio::test]
+    async fn a_body_that_fails_mid_read_is_reported_on_both_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+
+        for (name, store) in backends(dir.path()) {
+            let err = store
+                .put(&key, failing_body(b"a prefix"), digest_of(b"a prefix"))
+                .await
+                .expect_err("a failing body must not report success");
+            assert!(
+                matches!(&err, DomainError::Invariant(m) if m.contains("vanished mid-read")),
+                "{name}: the error must carry the I/O cause; got: {err:?}"
+            );
+            assert!(
+                store.get(&key).await.unwrap().is_none(),
+                "{name}: a failed write may not leave the key readable"
+            );
+        }
+    }
+
+    /// An empty body is a digest-bearing frame and nothing else, and
+    /// that is a state `put` writes and `get` accepts — the write loop
+    /// must not mistake "no bytes" for "nothing to commit".
+    #[tokio::test]
+    async fn an_empty_body_is_framed_and_committed_on_both_backends() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = test_key();
+
+        for (name, store) in backends(dir.path()) {
+            store
+                .put(
+                    &key,
+                    Box::new(std::io::Cursor::new(Vec::new())),
+                    digest_of(b""),
+                )
+                .await
+                .unwrap();
+            assert!(
+                read_back(store.as_ref(), &key)
+                    .await
+                    .expect("key exists")
+                    .is_empty(),
+                "{name}: an empty body round-trips"
+            );
+        }
+    }
+
+    /// A backend failure anywhere in an upload reaches the caller as an
+    /// invariant violation naming the mirror. The three call sites —
+    /// initiating the multipart, awaiting a part, committing it — share
+    /// this mapping precisely so an operator does not have to tell them
+    /// apart to know which subsystem failed.
+    #[test]
+    fn a_backend_upload_failure_is_reported_as_a_mirror_error() {
+        let err = mirror_upload_err(object_store::Error::Generic {
+            store: "memory",
+            source: "the bucket said no".into(),
+        });
+        assert!(
+            matches!(&err, DomainError::Invariant(m) if m.contains("mirror upload")
+                && m.contains("the bucket said no")),
+            "got: {err:?}"
+        );
     }
 }
