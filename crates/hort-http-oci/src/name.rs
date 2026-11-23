@@ -66,6 +66,36 @@ pub(crate) const OCI_NAME_MAX_BYTES: usize = 256;
 /// that pass per-component grammar — see module head).
 pub(crate) const OCI_NAME_MAX_COMPONENTS: usize = 8;
 
+/// Split an OCI namespace into the hort repository key (first segment)
+/// and its image name (all remaining segments). The image-name grammar
+/// is checked separately by [`validate_oci_name`] after source-repo
+/// authorization.
+pub(crate) fn split_oci_namespace(namespace: &str) -> Option<(&str, &str)> {
+    let (repo_key, name) = namespace.split_once('/')?;
+    (!repo_key.is_empty() && !name.is_empty()).then_some((repo_key, name))
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::split_oci_namespace;
+
+    #[test]
+    fn splits_first_segment_and_preserves_nested_name() {
+        assert_eq!(
+            split_oci_namespace("private-repo/library/nginx"),
+            Some(("private-repo", "library/nginx"))
+        );
+        assert_eq!(split_oci_namespace("repo/nginx"), Some(("repo", "nginx")));
+    }
+
+    #[test]
+    fn rejects_missing_repository_or_name() {
+        for namespace in ["", "repo", "/nginx", "repo/"] {
+            assert_eq!(split_oci_namespace(namespace), None, "{namespace:?}");
+        }
+    }
+}
+
 /// Validate `name` against the OCI Distribution Spec name grammar +
 /// the hort byte and component-count caps.
 ///

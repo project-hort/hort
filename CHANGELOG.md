@@ -40,6 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hort repository; a child under a different name answers
   `MANIFEST_BLOB_UNKNOWN`, and pushing it under the index's own name resolves
   it (#459).
+- An OCI cross-repository blob mount now reads `from=` as an image namespace
+  (`<repository>/<image name>`) rather than as a bare hort repository key, so a
+  mount between two image names inside one repository works and a blob held
+  only under a different name is no longer mounted; an unmountable source still
+  falls back to a normal upload (#459).
 
 ### Security
 
