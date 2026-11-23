@@ -194,6 +194,35 @@ everything, refuse per leaf, everywhere. Rejected: it is the posture the index
 pipeline's default exists to avoid, and it makes every resolution a gamble the
 client pays for at download time.
 
+**Known deviation from the OCI Distribution Specification (2026-11-23).** For
+the referrers list, the alternative rejected above is not merely an
+alternative — it is what the specification requires. *Enabling the Referrers
+API*, point 3:
+
+> After the referrers API is enabled, Registries **MUST** include all newly
+> pushed image manifests with a valid `subject` field in the referrers API
+> response.
+
+The specification carries **no** clause permitting a registry to omit or filter
+entries — not for policy, not for access control, not for availability — and
+point 3 carries exactly one qualification, *"valid `subject` field"*. A pushed
+manifest later rejected was a newly pushed one with a valid `subject`, so the
+omission stands against an unqualified `MUST`.
+
+ADR 0011 places the specification above this record, which is why this is a
+recorded decision rather than an implementation detail or a reading: the
+maintainer decided (2026-11-23) for **consistency** — hort does not list
+blocked artifacts in documents that give a client the impression the artifact
+is retrievable. The reasoning is the rule's own: a guarantee that holds across
+formats loses its worth when one format abandons it, and the omission reaches
+only a **terminal** verdict, whose outcome no passage of time changes. A
+**hold** stays listed, because its per-leaf `503` with `Retry-After` promises
+"later" and that promise comes true.
+
+What this costs, stated rather than left to be discovered: a conformance test
+against point 3 fails, and a client trying to discover a rejected signature
+through the list will not find it. Both were known when it was decided.
+
 **Treat a hold like a verdict and refuse both.** Rejected: it answers "never"
 to a question whose answer is "not yet", and it withdraws the one read the
 write-authorized hold-read exists for — a publisher resolving what it has just
