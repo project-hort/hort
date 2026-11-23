@@ -136,8 +136,31 @@ digest reads fall back to name-free legacy rows; those rows still have unknown
 namespace and are not rewritten by a read, so a legacy referrer remains listed
 under every asked name.
 
-**Not yet held:** reading a mount's `from` as an OCI namespace. Legacy name-free
-rows can still resolve through the temporary fallback until the contract step.
+A blob mount's `from` is read as an OCI namespace, `<repository>/<name>`: a
+`from` with no `/`, or whose name half fails the wire grammar, falls through to
+an ordinary upload rather than mounting, and a blob held only under a different
+name in the source repository is not mounted. Manifest admission resolves a
+child manifest, and a single-image manifest's config and layer blobs, inside
+the pushing name. A pull-through resolves the row for the bytes it just fetched
+inside the asked name, so it mints that name's own row rather than serving
+another name's.
+
+Every one of those reads tries the scoped path first and the name-free legacy
+path on a miss, including the mount's source lookup. A legacy row admitted
+through a fallback is admitted with its namespace **unknown**, never as a row
+belonging to the asked name — so the fallback widens what is reachable by one
+case (a row with no name) and never by the case the model exists to close (a
+row with a different name).
+
+**Not yet held:** nothing on the read side. What remains is the contract step,
+which removes the fallbacks and drops the projected name key.
+
+**Open, and deliberately not settled here:** what the contract step does with
+the legacy rows themselves. *Legacy data is documented, not backfilled* above
+says they are not migrated; `backlog/464` plans a deterministic rewrite. Those
+two cannot both stand, the choice changes what a client can still reach, and it
+is the maintainer's. Until it is answered, this section records the
+disagreement rather than picking a side.
 
 ## What this model asks of other records
 
