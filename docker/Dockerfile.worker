@@ -249,7 +249,7 @@ RUN apt-get update && \
 # subprocesses pick up the same bundle via `SSL_CERT_FILE` at
 # spawn-time.
 # Digest-pinned (B10/INFRA-7).
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cb87acc574abe719b6e5c547384defa2f7b1f24af9605d3f618cf852495d8be2 AS runtime
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:532c7a94f9e96ba9db75eb9388f4227751131c7cb0a411d1a8521af4096135de AS runtime
 
 # OCI Image Spec v1.1 labels. The two below are static; CI passes the
 # rest (`source`, `revision`, `version`, `created`) via `--label` on
