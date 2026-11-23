@@ -3,6 +3,13 @@
 **Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 7 of 7.
 **Ships one release after unit 460**, per ADR 0030's expand/contract policy. Do not bring it forward.
 
+**The rewrite half is decided** (maintainer, 2026-11-23): the legacy paths are
+rewritten rather than left name-free forever. The alternative — keep them
+name-free and keep the fallbacks permanently — was the reading
+`docs/architecture/reference/oci-namespace-and-identity.md` carried until that
+answer, and it is now closed. **The decision is about direction, not timing:**
+this unit still ships one release after 460 and is not to be brought forward.
+
 ## Why it is a separate release
 
 Unit 460 is the expand half: new writes use the name-carrying path, reads fall
