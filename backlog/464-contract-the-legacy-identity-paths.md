@@ -1,6 +1,6 @@
 # 464 — contract: rewrite the legacy paths and drop the fallback
 
-**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 5 of 5.
+**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 6 of 6.
 **Ships one release after unit 460**, per ADR 0030's expand/contract policy. Do not bring it forward.
 
 ## Why it is a separate release
@@ -63,3 +63,19 @@ under a name it never pushed starts getting `404`.
 - One `CHANGELOG.md` entry, under the #459 entry, naming the client-visible
   consequence in the upgrade terms an operator needs — not the mechanism.
 - The change adds no uncovered lines.
+
+## What unit 462 left for you, measured 2026-11-23
+
+**`oci_manifest_path` (`crates/hort-http-oci/src/coords.rs:92`) has no
+production caller any more.** Unit 462 moved the index-child admission lookup
+onto `oci_manifest_coords(name, …)` with a domain-level
+`legacy_oci_artifact_path` fallback, so the helper survives only in test
+fixtures — the `SeededIndexChild` seeder uses it to seed a legacy-shape row
+(`manifests_write.rs:3561`, inside the `#[cfg(test)]` module that starts at
+`:3294`) and one assertion reads it (`:9166`), plus `coords.rs`'s own tests.
+
+That is its proper remaining role during the expand window: the thing that
+builds the old shape so a test can prove the fallback works. Removing it is
+therefore **part of removing the fallback**, not a separate cleanup — and the
+fixtures that call it are the tests whose expectations change when the fallback
+goes.

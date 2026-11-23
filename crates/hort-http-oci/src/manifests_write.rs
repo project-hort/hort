@@ -147,7 +147,9 @@ use hort_http_core::authz::{DeleteRepoAccess, WriteRepoAccess};
 use hort_http_core::context::AppContext;
 use hort_http_core::limits::BoundedPath;
 
-use super::coords::{oci_group_coords, oci_manifest_coords, oci_manifest_path};
+#[cfg(test)]
+use super::coords::oci_manifest_path;
+use super::coords::{oci_group_coords, oci_manifest_coords};
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::name::validate_oci_name;
@@ -1179,12 +1181,13 @@ struct ResolvedReferenceSet {
 async fn resolve_and_check_referenced_blobs(
     ctx: &AppContext,
     repo_id: Uuid,
+    name: &str,
     referenced: &[ReferencedBlob],
     media_type_is_index: bool,
     manifest_digest: &ContentHash,
     body_bytes: &[u8],
 ) -> Result<ResolvedReferences, Box<Response>> {
-    let resolution = resolve_referenced_blobs(ctx, repo_id, referenced, manifest_digest)
+    let resolution = resolve_referenced_blobs(ctx, repo_id, name, referenced, manifest_digest)
         .await
         .inspect_err(|_| {
             tracing::error!("infrastructure error during blob resolution");
@@ -1863,6 +1866,7 @@ async fn put_manifest_dispatch_inner(
     let resolved = resolve_and_check_referenced_blobs(
         ctx,
         repo_id,
+        &name,
         &referenced,
         media_type_is_index,
         &hashes.computed_hash,
@@ -2227,9 +2231,10 @@ pub(crate) enum BlobRole {
     Config,
     Layer,
     /// A child manifest referenced by an image index / manifest list via
-    /// `manifests[*].digest`. Resolved by the same same-repo existence
-    /// path a layer uses (a missing child → `MANIFEST_BLOB_UNKNOWN`), but
-    /// not attached as a group member — the index lands as a plain
+    /// `manifests[*].digest`. A missing child gets the same
+    /// `MANIFEST_BLOB_UNKNOWN` outcome as a missing layer, but it resolves
+    /// by manifest path within the index's name. It is not attached as a
+    /// group member — the index lands as a plain
     /// primary `manifest` member; the index→child linkage is an
     /// `oci_index_member` content-reference edge, not a group role.
     ///
@@ -2559,9 +2564,9 @@ struct ReferenceResolution {
 /// **Which lookup depends on what the reference is**, and the loop body
 /// records why: a config / layer reference is about bytes and takes
 /// `find_in_repo_by_hash`; an index child is about a *document* and
-/// takes `find_in_repo_by_path` over the legacy name-free manifest path.
-/// This existence check has not yet narrowed to the parent's name; a
-/// child with no row at that path is absent for this admission check.
+/// takes `find_in_repo_by_path` at the parent index's name. During the
+/// expand window, a missing scoped row falls back to the legacy name-free
+/// manifest path, as the child GET does.
 ///
 /// **A row is not enough: a terminal verdict against those bytes decides
 /// too, and it decides which of two refusals the push gets.** A
@@ -2622,6 +2627,7 @@ struct ReferenceResolution {
 async fn resolve_referenced_blobs(
     ctx: &AppContext,
     repo: Uuid,
+    name: &str,
     refs: &[ReferencedBlob],
     manifest_digest: &ContentHash,
 ) -> Result<ReferenceResolution, Box<Response>> {
@@ -2668,10 +2674,9 @@ async fn resolve_referenced_blobs(
         // whatever row holds them, so "some live row in this repository
         // for this hash" is exactly the question. An index child is a
         // *document*, and the client's next request for it is
-        // `GET …/manifests/sha256:<hex>`. This check still resolves the
-        // legacy name-free manifest row until it carries the parent's
-        // requested name. Asking the hash-keyed question for it
-        // admitted an index over a row that is not a manifest at all:
+        // `GET …/manifests/sha256:<hex>`. This check resolves the
+        // manifest row under the index's own name. Asking the hash-keyed
+        // question for it admitted an index over a row that is not a manifest at all:
         // arbitrary bytes pushed through the blob route leave a live row
         // under the same hash, the index committed, and the child `GET`
         // then answered `MANIFEST_UNKNOWN` — an advertised child this
@@ -2679,8 +2684,9 @@ async fn resolve_referenced_blobs(
         //
         // The row's own layout is the fact in question and the only one
         // consulted: the manifest role prefix separates the two kinds
-        // of row, and `(repository_id, path)` is unique. This legacy
-        // path resolves one old row, while the hash-keyed lookup is a `LIMIT 1` with
+        // of row, and `(repository_id, path)` is unique. The
+        // scoped path resolves one row (with a legacy fallback during the
+        // expand window), while the hash-keyed lookup is a `LIMIT 1` with
         // no `ORDER BY` over a set a repository may legitimately hold
         // more than one member of. Nothing here reads the child's bytes;
         // a parse would be a second, weaker definition of "is this a
@@ -2688,14 +2694,26 @@ async fn resolve_referenced_blobs(
         //
         // A child with no manifest row therefore joins `absent`, which
         // is the answer that was already true and already correct for
-        // it: this repository does not hold that child manifest, the
+        // it: this name does not resolve that child manifest, the
         // refusal names the digest to send, and the push-then-retry path
         // reconciles once the child is pushed as a manifest.
         let lookup = match r.role {
             BlobRole::ChildManifest { .. } => {
-                ctx.artifact_use_case
-                    .find_in_repo_by_path(repo, &oci_manifest_path(&r.hash))
-                    .await
+                let scoped = ctx
+                    .artifact_use_case
+                    .find_in_repo_by_path(repo, &oci_manifest_coords(name, &r.hash).path)
+                    .await;
+                match scoped {
+                    Ok(None) => {
+                        ctx.artifact_use_case
+                            .find_in_repo_by_path(
+                                repo,
+                                &legacy_oci_artifact_path(OciArtifactRole::Manifest, &r.hash),
+                            )
+                            .await
+                    }
+                    other => other,
+                }
             }
             BlobRole::Config | BlobRole::Layer => {
                 ctx.artifact_use_case
@@ -3002,7 +3020,8 @@ async fn terminal_verdict_for(
 /// **`mediaType`**: deliberately NOT compared — and the question it looks
 /// like it would answer is answered one step earlier instead. *Whether the
 /// child is a manifest at all* is settled by the resolution that produced
-/// `stored`: an index child is looked up at the legacy manifest path, so a
+/// `stored`: an index child is looked up at the scoped manifest path (or its
+/// expand-window legacy fallback), so a
 /// row reaching here is a manifest row by construction. What a
 /// `mediaType` comparison would add on top is the *finer* distinction — index
 /// versus single image, OCI versus Docker schema — and its apparent
@@ -3455,8 +3474,8 @@ mod tests {
     /// `MANIFEST_UNKNOWN` for. A fixture that keeps passing after admission
     /// starts asking the delivery question has not demonstrated the fix.
     ///
-    /// - The **row at `manifests/sha256:<hex>`** is what this legacy
-    ///   admission lookup resolves.
+    /// - The **row at `manifests/sha256:<hex>`** exercises the legacy
+    ///   fallback in admission during the expand window.
     /// - The **parseable manifest body** is what the closure walk reads to
     ///   learn the child's own constituents. Opaque bytes are a legal state
     ///   (the walk warns and judges the child alone), but a corpus made
@@ -3495,6 +3514,24 @@ mod tests {
         )
     }
 
+    fn seed_scoped_index_child(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        name: &str,
+        label: &[u8],
+    ) -> SeededIndexChild {
+        let config = seed_blob(artifacts, storage, repo_id, &[label, b"-config"].concat());
+        seed_child_manifest_at_path(
+            artifacts,
+            storage,
+            repo_id,
+            &build_manifest_json(&config, &[]),
+            QuarantineStatus::None,
+            Some(name),
+        )
+    }
+
     /// The one seeding site for a child manifest: a row at the **manifest**
     /// path carrying `status`, and `body` in CAS under the same hash.
     fn seed_child_manifest(
@@ -3504,11 +3541,25 @@ mod tests {
         body: &[u8],
         status: QuarantineStatus,
     ) -> SeededIndexChild {
+        seed_child_manifest_at_path(artifacts, storage, repo_id, body, status, None)
+    }
+
+    fn seed_child_manifest_at_path(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        body: &[u8],
+        status: QuarantineStatus,
+        name: Option<&str>,
+    ) -> SeededIndexChild {
         let hex = hex::encode(Sha256::digest(body));
         let hash: ContentHash = hex.parse().unwrap();
         let mut a = sample_artifact(status);
         a.repository_id = repo_id;
-        a.path = oci_manifest_path(&hash);
+        a.path = match name {
+            Some(name) => oci_manifest_coords(name, &hash).path,
+            None => oci_manifest_path(&hash),
+        };
         a.sha256_checksum = hash.clone();
         a.size_bytes = body.len() as i64;
         artifacts.insert(a);
@@ -6839,9 +6890,15 @@ mod tests {
                 // The document digest is only the axis-recovery log's
                 // label here; these configs are deliverable, so nothing
                 // reads it.
-                let resolution = resolve_referenced_blobs(&h.ctx, repo_id, &refs, &first.clone())
-                    .await
-                    .expect("both configs resolve; this is not an infrastructure failure");
+                let resolution = resolve_referenced_blobs(
+                    &h.ctx,
+                    repo_id,
+                    "library/nginx",
+                    &refs,
+                    &first.clone(),
+                )
+                .await
+                .expect("both configs resolve; this is not an infrastructure failure");
                 (
                     resolution
                         .config
@@ -8100,6 +8157,114 @@ mod tests {
         );
     }
 
+    /// A scoped child is admitted only under the parent index's name. The
+    /// unknown-blob detail identifies the second descriptor by its digest.
+    #[test]
+    fn index_child_scoped_to_another_name_is_unknown_at_its_descriptor() {
+        let config_hash: ContentHash = hex::encode(Sha256::digest(b"other-name-child-config"))
+            .parse()
+            .unwrap();
+        let child_body = build_manifest_json(&config_hash, &[]);
+        let child_digest = format!("sha256:{}", hex::encode(Sha256::digest(child_body)));
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let same_name = seed_scoped_index_child(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    "library/nginx",
+                    b"same-name-child",
+                );
+                let child = seed_scoped_index_child(
+                    &h.artifacts,
+                    &h.storage,
+                    repo_id,
+                    "another/name",
+                    b"other-name-child",
+                );
+                build_index_json(
+                    &[same_name, child],
+                    "application/vnd.oci.image.index.v1+json",
+                )
+            })
+        });
+        assert_eq!(out.status, StatusCode::BAD_REQUEST, "{}", out.rendered());
+        assert_eq!(envelope_code(&out.body), "MANIFEST_BLOB_UNKNOWN");
+        assert_eq!(
+            out.envelope()["detail"]["blobs"],
+            serde_json::json!([child_digest]),
+        );
+    }
+
+    /// A legacy name-free child remains resolvable during the expand window.
+    #[test]
+    fn index_admits_legacy_name_free_child_during_expand_window() {
+        let out = push_index_with(|h, repo_id| {
+            Box::pin(async move {
+                let child = seed_index_child(&h.artifacts, &h.storage, repo_id, b"legacy-child");
+                build_index_json(
+                    std::slice::from_ref(&child),
+                    "application/vnd.oci.image.index.v1+json",
+                )
+            })
+        });
+        assert_eq!(out.status, StatusCode::CREATED, "{}", out.rendered());
+    }
+
+    /// An out-of-order index push commits the index for retry. Publishing its
+    /// child under the same name then turns that retry into an admitted push.
+    #[test]
+    fn index_retry_succeeds_after_scoped_child_is_pushed() {
+        let (first_status, first_body, retry_status) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"retry-config");
+            let child_body = build_manifest_json(&config, &[]);
+            let child = SeededIndexChild {
+                hash: hex::encode(Sha256::digest(&child_body)).parse().unwrap(),
+                size: child_body.len() as i64,
+            };
+            let body = build_index_json(
+                std::slice::from_ref(&child),
+                "application/vnd.oci.image.index.v1+json",
+            );
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let media = "application/vnd.oci.image.index.v1+json";
+            let first = router()
+                .with_state(h.ctx.clone())
+                .oneshot(put_index_request(uri, body.clone(), media))
+                .await
+                .unwrap();
+            let first_status = first.status();
+            let first_body = to_bytes(first.into_body(), 4 * 1024)
+                .await
+                .unwrap()
+                .to_vec();
+            let seeded = seed_child_manifest_at_path(
+                &h.artifacts,
+                &h.storage,
+                repo_id,
+                &child_body,
+                QuarantineStatus::None,
+                Some("library/nginx"),
+            );
+            assert_eq!(seeded.hash, child.hash);
+            let retry_status = router()
+                .with_state(h.ctx.clone())
+                .oneshot(put_index_request(uri, body, media))
+                .await
+                .unwrap()
+                .status();
+            (first_status, first_body, retry_status)
+        });
+        assert_eq!(first_status, StatusCode::BAD_REQUEST);
+        let first: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+        assert_eq!(retry_status, StatusCode::CREATED);
+    }
+
     /// An index referencing a child manifest that is NOT present in-repo
     /// → 400 `MANIFEST_BLOB_UNKNOWN` (mirroring a missing layer). The
     /// index artifact stays committed for client retry; the group is not
@@ -8166,7 +8331,7 @@ mod tests {
     }
 
     /// A cross-repo child manifest counts as missing (same-repo isolation,
-    /// via `find_in_repo_by_hash`) → `MANIFEST_BLOB_UNKNOWN`.
+    /// via the path lookup) → `MANIFEST_BLOB_UNKNOWN`.
     #[test]
     fn put_image_index_with_foreign_repo_child_returns_400_manifest_blob_unknown() {
         let status = run(async {

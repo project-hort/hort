@@ -84,10 +84,11 @@ pub fn oci_manifest_coords(name: &str, digest: &ContentHash) -> ArtifactCoords {
     }
 }
 
-/// Legacy name-free manifest path, retained for index-child admission during
-/// the expand window. Admission asks for the manifest row by path rather than
-/// for some row holding these bytes: a repository may legitimately hold a
-/// blob and a manifest at the same digest.
+/// Legacy name-free manifest path, retained for tests that seed expand-window
+/// rows. Production admission builds the scoped path first and falls back to
+/// the domain's legacy builder. It asks for a manifest row by path rather than
+/// for some row holding these bytes: a repository may legitimately hold a blob
+/// and a manifest at the same digest.
 pub fn oci_manifest_path(digest: &ContentHash) -> String {
     legacy_oci_artifact_path(OciArtifactRole::Manifest, digest)
 }
