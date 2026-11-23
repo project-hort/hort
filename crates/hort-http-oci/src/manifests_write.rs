@@ -36,11 +36,10 @@
 //!    each one repo-scoped (cross-repo isolation) and require that the
 //!    resolved row's quarantine status is not terminal (a row the blob
 //!    read would refuse is not a satisfied reference). A config / layer
-//!    reference resolves by checksum, because the `GET` that serves
-//!    those bytes does; an index child resolves by the **manifest
-//!    path**, because that is what the child's own `GET` resolves and an
-//!    index may not name a child this registry would not serve as a
-//!    manifest.
+//!    reference resolves by the **blob path** under the pushing name,
+//!    with a legacy name-free fallback; an index child resolves by the
+//!    **manifest path** under that name. Those are the paths their own
+//!    `GET` routes resolve, and the roles can share a digest.
 //!
 //!    For an index, then the **transitive** question
 //!    ([`refuse_undeliverable_closure`]): the read path refuses a
@@ -149,7 +148,7 @@ use hort_http_core::limits::BoundedPath;
 
 #[cfg(test)]
 use super::coords::oci_manifest_path;
-use super::coords::{oci_group_coords, oci_manifest_coords};
+use super::coords::{oci_blob_coords, oci_group_coords, oci_manifest_coords};
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
 use super::name::validate_oci_name;
@@ -206,7 +205,7 @@ const MANIFEST_BODY_MAX_BYTES: usize = 1024 * 1024;
 ///
 /// So this is a **reference to one declaration**, not a number. The write
 /// path used to carry a `MAX_BLOB_REFERENCES = 1024` of its own, chosen
-/// against a different cost — N `find_in_repo_by_hash` lookups in
+/// against a different cost — N repository lookups in
 /// [`resolve_referenced_blobs`] — and noting only that "a real-world OCI
 /// image carries tens of layers; 1024 is two orders of magnitude past
 /// observed maxima". It said nothing about assessability, and it admitted
@@ -1849,7 +1848,7 @@ async fn put_manifest_dispatch_inner(
     );
 
     // Parse and resolve the declared references BEFORE the mint. Both are
-    // reads over data already in hand (the body, and `find_in_repo_by_hash`)
+    // reads over data already in hand (the body, and repository lookups)
     // and both only ever used the manifest's id as a log field, so neither
     // needs the artifact to exist. Running them here is what puts the
     // membership claims in the ingest's hands: a `content_references` row is
@@ -2562,11 +2561,10 @@ struct ReferenceResolution {
 /// a candidate.
 ///
 /// **Which lookup depends on what the reference is**, and the loop body
-/// records why: a config / layer reference is about bytes and takes
-/// `find_in_repo_by_hash`; an index child is about a *document* and
-/// takes `find_in_repo_by_path` at the parent index's name. During the
-/// expand window, a missing scoped row falls back to the legacy name-free
-/// manifest path, as the child GET does.
+/// records why: a config / layer reference asks for a blob row under the
+/// pushing name, while an index child asks for a manifest row under that
+/// same name. Both take `find_in_repo_by_path`, with a role-specific legacy
+/// fallback during the expand window, as their respective GET routes do.
 ///
 /// **A row is not enough: a terminal verdict against those bytes decides
 /// too, and it decides which of two refusals the push gets.** A
@@ -2589,13 +2587,15 @@ struct ReferenceResolution {
 /// caller's search (ADR 0055).
 ///
 /// **And the verdict on a blob constituent is not read off the row the
-/// hash lookup returned**, because that lookup does not answer this
+/// path lookup returned**, because that lookup does not answer this
 /// question. `artifacts` is unique on `(repository_id, path)` and not on
 /// the checksum, so a repository legitimately holds a blob row and a
 /// manifest row for one set of bytes with **independent** statuses, and
 /// `find_in_repo_by_hash` is a `LIMIT 1` with no `ORDER BY` over them: it
-/// answers "some row for these bytes". With the blob row refused and its
-/// manifest twin released, one selection admitted the push and the other
+/// answers "some row for these bytes". The path lookup below selects the
+/// blob row for attachment, but its single status cannot replace the
+/// pre-check over all rows carrying those bytes. With the blob row refused
+/// and its manifest twin released, one selection admitted the push and the other
 /// refused it, and the admitted manifest was one every read of it
 /// refuses — an accepted document this registry cannot deliver (ADR
 /// 0062). So the verdict comes from
@@ -2669,14 +2669,10 @@ async fn resolve_referenced_blobs(
             continue;
         }
         // **A child manifest is resolved by a manifest path,
-        // and that is not the same lookup a blob takes.** A blob
-        // reference asks about bytes: the config / layer `GET` serves
-        // whatever row holds them, so "some live row in this repository
-        // for this hash" is exactly the question. An index child is a
-        // *document*, and the client's next request for it is
-        // `GET …/manifests/sha256:<hex>`. This check resolves the
-        // manifest row under the index's own name. Asking the hash-keyed
-        // question for it admitted an index over a row that is not a manifest at all:
+        // and a config / layer by a blob path.** Both use the pushing
+        // name, but the roles are distinct: a repository can hold a
+        // blob and a manifest at the same digest. Asking the hash-keyed
+        // question for a child admitted an index over a row that is not a manifest at all:
         // arbitrary bytes pushed through the blob route leave a live row
         // under the same hash, the index committed, and the child `GET`
         // then answered `MANIFEST_UNKNOWN` — an advertised child this
@@ -2716,9 +2712,21 @@ async fn resolve_referenced_blobs(
                 }
             }
             BlobRole::Config | BlobRole::Layer => {
-                ctx.artifact_use_case
-                    .find_in_repo_by_hash(repo, &r.hash)
-                    .await
+                let scoped = ctx
+                    .artifact_use_case
+                    .find_in_repo_by_path(repo, &oci_blob_coords(name, &r.hash).path)
+                    .await;
+                match scoped {
+                    Ok(None) => {
+                        ctx.artifact_use_case
+                            .find_in_repo_by_path(
+                                repo,
+                                &legacy_oci_artifact_path(OciArtifactRole::Blob, &r.hash),
+                            )
+                            .await
+                    }
+                    other => other,
+                }
             }
         };
         let hit = match lookup {
@@ -2729,11 +2737,9 @@ async fn resolve_referenced_blobs(
             }
         };
         match hit {
-            // The use case already enforces `repository_id == repo`
-            // at the port boundary; no post-filter needed. Clients
-            // cross-mount explicitly via
-            // `POST …/blobs/uploads/?mount=<digest>&from=<src_repo>`
-            // before pushing the manifest.
+            // The use case scopes each path lookup to `repo`; clients
+            // cross-mount a blob into this name before pushing a manifest
+            // that references it.
             //
             // Exhaustive on the status with no wildcard arm, so a sixth
             // `QuarantineStatus` variant is a compile error here rather
@@ -3439,6 +3445,24 @@ mod tests {
         status: QuarantineStatus,
     ) -> ContentHash {
         let hash = seed_blob_row_without_content(artifacts, repo_id, content, status);
+        storage.insert_content(hash.clone(), content.to_vec());
+        hash
+    }
+
+    fn seed_scoped_blob(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        name: &str,
+        content: &[u8],
+    ) -> ContentHash {
+        let hash: ContentHash = hex::encode(Sha256::digest(content)).parse().unwrap();
+        let mut artifact = sample_artifact(QuarantineStatus::None);
+        artifact.repository_id = repo_id;
+        artifact.path = oci_blob_coords(name, &hash).path;
+        artifact.sha256_checksum = hash.clone();
+        artifact.size_bytes = content.len() as i64;
+        artifacts.insert(artifact);
         storage.insert_content(hash.clone(), content.to_vec());
         hash
     }
@@ -5770,6 +5794,200 @@ mod tests {
     // -------------------- PUT — missing blob --------------------
 
     #[test]
+    fn manifest_admits_config_and_layer_blobs_scoped_to_its_name() {
+        let (status, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            h.repositories.insert(repo.clone());
+            let config = seed_scoped_blob(
+                &h.artifacts,
+                &h.storage,
+                repo.id,
+                "library/nginx",
+                b"scoped-config",
+            );
+            let layer = seed_scoped_blob(
+                &h.artifacts,
+                &h.storage,
+                repo.id,
+                "library/nginx",
+                b"scoped-layer",
+            );
+            let response = router()
+                .with_state(h.ctx)
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    build_manifest_json(&config, &[layer]),
+                ))
+                .await
+                .unwrap();
+            (
+                response.status(),
+                to_bytes(response.into_body(), 4096).await.unwrap(),
+            )
+        });
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[test]
+    fn manifest_refuses_config_blob_scoped_only_to_another_name() {
+        let (status, body, digest) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            h.repositories.insert(repo.clone());
+            let config = seed_scoped_blob(
+                &h.artifacts,
+                &h.storage,
+                repo.id,
+                "another/name",
+                b"other-name-config",
+            );
+            let response = router()
+                .with_state(h.ctx)
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    build_manifest_json(&config, &[]),
+                ))
+                .await
+                .unwrap();
+            (
+                response.status(),
+                to_bytes(response.into_body(), 4096).await.unwrap(),
+                format!("sha256:{config}"),
+            )
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+        assert_eq!(
+            envelope["errors"][0]["detail"],
+            serde_json::json!({"blobs": [digest]})
+        );
+    }
+
+    #[test]
+    fn manifest_refuses_layer_blob_scoped_only_to_another_name() {
+        let (status, body, digest) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            h.repositories.insert(repo.clone());
+            let config = seed_scoped_blob(
+                &h.artifacts,
+                &h.storage,
+                repo.id,
+                "library/nginx",
+                b"same-name-config",
+            );
+            let layer = seed_scoped_blob(
+                &h.artifacts,
+                &h.storage,
+                repo.id,
+                "another/name",
+                b"other-name-layer",
+            );
+            let response = router()
+                .with_state(h.ctx)
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    build_manifest_json(&config, std::slice::from_ref(&layer)),
+                ))
+                .await
+                .unwrap();
+            (
+                response.status(),
+                to_bytes(response.into_body(), 4096).await.unwrap(),
+                format!("sha256:{layer}"),
+            )
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let envelope: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(envelope["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+        assert_eq!(
+            envelope["errors"][0]["detail"],
+            serde_json::json!({"blobs": [digest]})
+        );
+    }
+
+    #[test]
+    fn manifest_retry_succeeds_after_layer_is_pushed_under_its_name() {
+        let (first_status, first_body, retry_status) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            h.repositories.insert(repo.clone());
+            let config = seed_scoped_blob(
+                &h.artifacts,
+                &h.storage,
+                repo.id,
+                "library/nginx",
+                b"retry-config",
+            );
+            let layer: ContentHash = hex::encode(Sha256::digest(b"retry-layer")).parse().unwrap();
+            let body = build_manifest_json(&config, std::slice::from_ref(&layer));
+            let uri = "/v2/myrepo/library/nginx/manifests/v1";
+            let first = router()
+                .with_state(h.ctx.clone())
+                .oneshot(put_request(uri, body.clone()))
+                .await
+                .unwrap();
+            let first_status = first.status();
+            let first_body = to_bytes(first.into_body(), 4096).await.unwrap();
+            let seeded = seed_scoped_blob(
+                &h.artifacts,
+                &h.storage,
+                repo.id,
+                "library/nginx",
+                b"retry-layer",
+            );
+            assert_eq!(seeded, layer);
+            let retry_status = router()
+                .with_state(h.ctx)
+                .oneshot(put_request(uri, body))
+                .await
+                .unwrap()
+                .status();
+            (first_status, first_body, retry_status)
+        });
+        assert_eq!(first_status, StatusCode::BAD_REQUEST);
+        let first: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+        assert_eq!(first["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+        assert_eq!(retry_status, StatusCode::CREATED);
+    }
+
+    #[test]
+    fn manifest_admits_legacy_name_free_blob_during_expand_window() {
+        let (status, body) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            h.repositories.insert(repo.clone());
+            let config = seed_blob(&h.artifacts, &h.storage, repo.id, b"legacy-config");
+            let layer = seed_blob(&h.artifacts, &h.storage, repo.id, b"legacy-layer");
+            let response = router()
+                .with_state(h.ctx)
+                .oneshot(put_request(
+                    "/v2/myrepo/library/nginx/manifests/v1",
+                    build_manifest_json(&config, &[layer]),
+                ))
+                .await
+                .unwrap();
+            (
+                response.status(),
+                to_bytes(response.into_body(), 4096).await.unwrap(),
+            )
+        });
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[test]
     fn put_with_missing_blob_returns_400_manifest_blob_unknown() {
         let (status, body, group_count) = run(async {
             let h = harness();
@@ -5857,8 +6075,8 @@ mod tests {
     /// returns rows in adapter-defined order — if the foreign-repo row
     /// comes first, the filter spuriously rejects a same-repo-present blob
     /// as `MANIFEST_BLOB_UNKNOWN`. The correct path routes through
-    /// `ArtifactUseCase::find_in_repo_by_hash` which scopes the SQL
-    /// query to the target repo at the port boundary.
+    /// `ArtifactUseCase::find_in_repo_by_path` which scopes the SQL
+    /// query to the target repo and blob path at the port boundary.
     ///
     /// Test shape: seed identical SHA in repo_a (config + layer) AND
     /// repo_b (layer only — different artifact rows, same hash).
@@ -9721,9 +9939,8 @@ mod tests {
     /// **The reference resolution's own lookup fails.** A failed catalog
     /// read must not read as "no such row", which would answer
     /// `MANIFEST_BLOB_UNKNOWN` and send the publisher to push bytes this
-    /// repository may already hold. Asserted on **both** lookups, because
-    /// a child and a blob now take different ones: a child resolves by
-    /// the manifest path, a config/layer by checksum.
+    /// repository may already hold. Asserted on **both** path roles: a child
+    /// resolves by the manifest path, a config/layer by the blob path.
     #[test]
     fn a_failed_reference_lookup_refuses_the_push_rather_than_reading_as_absent() {
         for (label, is_index) in [("index child", true), ("manifest layer", false)] {
@@ -9744,10 +9961,10 @@ mod tests {
                     } else {
                         let config = seed_blob(&h.artifacts, &h.storage, repo_id, b"config");
                         let layer = seed_blob(&h.artifacts, &h.storage, repo_id, b"layer");
-                        h.artifacts
-                            .fail_next_find_by_repo_and_checksum(DomainError::Invariant(
-                                "catalog down".into(),
-                            ));
+                        h.artifacts.fail_find_by_path_at(
+                            oci_blob_coords("library/nginx", &layer).path,
+                            DomainError::Invariant("catalog down".into()),
+                        );
                         build_manifest_json(&config, std::slice::from_ref(&layer))
                     };
                     let media = if is_index {
@@ -10467,7 +10684,7 @@ mod tests {
     //
     // The gate is also spent before anything is collected, which is what
     // the retired cap's "at parse time" note protected: the per-reference
-    // `find_in_repo_by_hash` loop in `resolve_referenced_blobs` is never
+    // repository lookup loop in `resolve_referenced_blobs` is never
     // entered for a manifest hort is going to refuse.
 
     /// Build a manifest JSON with `n` distinct synthetic layer digests

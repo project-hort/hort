@@ -1,6 +1,6 @@
 # 465 — manifest admission resolves config and layer blobs inside the name
 
-**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 5 of 6.
+**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 5 of 7.
 **Found 2026-11-23**, while re-measuring unit 462 against `develop` at
 `524b49bc`. It answers the one question the specification left open about
 itself.

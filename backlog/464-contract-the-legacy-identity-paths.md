@@ -1,6 +1,6 @@
 # 464 — contract: rewrite the legacy paths and drop the fallback
 
-**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 6 of 6.
+**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 7 of 7.
 **Ships one release after unit 460**, per ADR 0030's expand/contract policy. Do not bring it forward.
 
 ## Why it is a separate release

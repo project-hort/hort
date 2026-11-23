@@ -1,6 +1,6 @@
 # 463 — `from=` on a blob mount is an OCI namespace, not a repository key
 
-**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 4 of 6.
+**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 4 of 7.
 **Security-relevant**: the site carries a documented privilege-escalation control. Read the whole doc comment before changing a line of it.
 
 ## The site and the control
