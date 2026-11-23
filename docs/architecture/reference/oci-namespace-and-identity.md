@@ -111,12 +111,23 @@ there means *not cached*, and the reader reads through. A missing `name` means
 invert the specification's `artifactType` fallback, which turns on
 empty-or-missing versus present.
 
-## Legacy data is documented, not backfilled
+## Legacy data is readable now and rewritten at the contract step
 
-Rows written before this model are name-independent and are **not** migrated
-(maintainer decision, 2026-11-21). A reader of such a row learns that its
-namespace is unknown, not that it has none, and no same-digest re-push upgrades
-it. The remedy for a namespace that matters is to push into it.
+Rows written before this model are name-independent. A reader of such a row
+learns that its namespace is **unknown**, not that it has none, and **no read
+upgrades it** — not a same-digest re-push, not a fallback that resolved it. The
+remedy for a namespace that matters before the contract step is to push into
+it.
+
+**The contract step rewrites those paths** (maintainer decision, 2026-11-23).
+The rewrite is a pure function of `(name, old path)`, so it is a single
+`UPDATE` with no lookups. One consequence is not lossless and belongs in the
+release notes rather than in a fix: an artifact that two names pushed exists as
+**one** row under the name of the first push, because the name-free key
+admitted only one. After the rewrite it is reachable under that name alone, so
+a client that had been pulling a digest under a name it never pushed starts
+getting `404`. That cross-name reachability is the defect this model closes,
+not a feature being withdrawn.
 
 ## Conformance
 
@@ -155,12 +166,10 @@ row with a different name).
 **Not yet held:** nothing on the read side. What remains is the contract step,
 which removes the fallbacks and drops the projected name key.
 
-**Open, and deliberately not settled here:** what the contract step does with
-the legacy rows themselves. *Legacy data is documented, not backfilled* above
-says they are not migrated; `backlog/464` plans a deterministic rewrite. Those
-two cannot both stand, the choice changes what a client can still reach, and it
-is the maintainer's. Until it is answered, this section records the
-disagreement rather than picking a side.
+The contract step is **not due yet** and is not scheduled here: per ADR 0030 it
+ships one release after unit 460, which ships in 0.18.1. Expand and contract are
+separated by a release so a rolling upgrade never has the previous release's
+code building name-free paths against rewritten rows.
 
 ## What this model asks of other records
 
