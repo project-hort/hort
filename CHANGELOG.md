@@ -43,8 +43,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An OCI cross-repository blob mount now reads `from=` as an image namespace
   (`<repository>/<image name>`) rather than as a bare hort repository key, so a
   mount between two image names inside one repository works and a blob held
-  only under a different name is no longer mounted; an unmountable source still
-  falls back to a normal upload (#459).
+  only under a different name is no longer mounted; a source written by an
+  earlier release still mounts, and an unmountable source still falls back to a
+  normal upload (#459).
 - An OCI manifest is now accepted only when its config and layer blobs exist
   under the image name it is pushed under; a blob held only under a different
   name answers `MANIFEST_BLOB_UNKNOWN`, and uploading or cross-mounting it into

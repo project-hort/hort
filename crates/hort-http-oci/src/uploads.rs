@@ -41,6 +41,7 @@ use hort_app::use_cases::repository_access::AccessLevel;
 use hort_domain::entities::repository::RepositoryFormat;
 use hort_domain::error::DomainError;
 use hort_domain::events::ApiActor;
+use hort_domain::oci::{legacy_oci_artifact_path, OciArtifactRole};
 use hort_domain::types::ContentHash;
 use hort_formats::oci::OciFormatHandler;
 
@@ -343,26 +344,40 @@ async fn handle_cross_mount(
     if validate_oci_name(src_name).is_err() {
         return initiate().await;
     }
-    // This lookup is the ONLY thing that scopes the mount to `src_name`,
-    // and it reads redundant beside `register_by_hash`'s own gate — which
-    // re-checks the terminal status at registration time, so the status half
-    // genuinely is checked twice. The NAME half is not: `register_by_hash`
-    // resolves `find_by_repo_and_checksum`, which is repo-scoped and
+    // The scoped arm of this lookup is the ONLY thing that scopes the mount
+    // to `src_name`; the legacy arm admits a name-free row whose name is
+    // unknown during the expand window. The lookup reads redundant beside
+    // `register_by_hash`'s own gate — which re-checks the terminal status
+    // at registration time, so the status half genuinely is checked twice.
+    // The NAME half is not: `register_by_hash` resolves
+    // `find_by_repo_and_checksum`, which is repo-scoped and
     // name-blind, so deleting this as a duplicate silently restores mounting
     // a blob that lives under a different name in the source repository.
     //
-    // The window between this check and that registration is therefore
-    // name-only, and it costs nothing: passing the `Read` resolve above
-    // grants the caller every name in the source repository, so a mount
-    // resolved from a sibling name is one they could have asked for directly
+    // For scoped rows, the window between this check and that registration
+    // is therefore name-only, and it costs nothing: passing the `Read`
+    // resolve above grants the caller every name in the source repository,
+    // so a mount resolved from a sibling name is one they could have
+    // asked for directly
     // — while the anti-laundering refusal is re-evaluated against whatever
     // row registration actually uses.
-    let source_path = oci_blob_coords(src_name, &hash).path;
-    match ctx
+    let scoped_path = oci_blob_coords(src_name, &hash).path;
+    let source = match ctx
         .artifact_use_case
-        .find_in_repo_by_path(src_repo.id, &source_path)
+        .find_in_repo_by_path(src_repo.id, &scoped_path)
         .await
     {
+        Ok(None) => {
+            ctx.artifact_use_case
+                .find_in_repo_by_path(
+                    src_repo.id,
+                    &legacy_oci_artifact_path(OciArtifactRole::Blob, &hash),
+                )
+                .await
+        }
+        other => other,
+    };
+    match source {
         Ok(Some(artifact)) if !artifact.quarantine_status.is_terminal() => {}
         Ok(_) => return initiate().await,
         Err(e) => {
@@ -1329,8 +1344,7 @@ mod tests {
     }
 
     /// [`seed_blob`] variant that lets the caller pin the seeded row's
-    /// `quarantine_status` — the #107 Item 2 mount-source-refusal handler
-    /// test needs a `Rejected` source.
+    /// `quarantine_status` for the mount-source refusal check.
     fn seed_blob_with_status(
         artifacts: &MockArtifactRepository,
         storage: &MockStoragePort,
@@ -1339,10 +1353,30 @@ mod tests {
         content: &[u8],
         status: QuarantineStatus,
     ) {
+        seed_blob_at_path_with_status(
+            artifacts,
+            storage,
+            repo_id,
+            &format!("blobs/nginx/sha256:{hex}"),
+            hex,
+            content,
+            status,
+        );
+    }
+
+    fn seed_blob_at_path_with_status(
+        artifacts: &MockArtifactRepository,
+        storage: &MockStoragePort,
+        repo_id: Uuid,
+        path: &str,
+        hex: &str,
+        content: &[u8],
+        status: QuarantineStatus,
+    ) {
         let hash: ContentHash = hex.parse().unwrap();
         let mut a = sample_artifact(status);
         a.repository_id = repo_id;
-        a.path = format!("blobs/nginx/sha256:{hex}");
+        a.path = path.to_string();
         a.sha256_checksum = hash.clone();
         a.size_bytes = content.len() as i64;
         a.created_at = Utc::now();
@@ -1897,6 +1931,87 @@ mod tests {
         });
         assert_eq!(response.0, StatusCode::ACCEPTED);
         assert!(response.2.is_empty());
+        assert_eq!(artifact_count, 1);
+    }
+
+    #[test]
+    fn cross_mount_legacy_name_free_source_answers_201_during_expand_window() {
+        let content = b"legacy mount source".to_vec();
+        let hex = sha256_of(&content);
+        let (status, target_path) = run(async {
+            let h = harness();
+            let src = oci_repo("src-repo");
+            let src_id = src.id;
+            h.repositories.insert(src);
+            let target = oci_repo("target-repo");
+            let target_id = target.id;
+            h.repositories.insert(target);
+            seed_blob_at_path_with_status(
+                &h.artifacts,
+                &h.storage,
+                src_id,
+                &format!("blobs/sha256:{hex}"),
+                &hex,
+                &content,
+                QuarantineStatus::None,
+            );
+
+            let uri = format!(
+                "/v2/target-repo/other/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx"
+            );
+            let resp = router()
+                .with_state(h.ctx)
+                .oneshot(with_principal(
+                    HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let target_path = format!("blobs/other/sha256:{hex}");
+            (
+                resp.status(),
+                h.artifacts
+                    .find_by_path(target_id, &target_path)
+                    .await
+                    .unwrap(),
+            )
+        });
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(target_path.is_some());
+    }
+
+    #[test]
+    fn cross_mount_terminal_legacy_name_free_source_falls_through() {
+        let content = b"rejected legacy mount source".to_vec();
+        let hex = sha256_of(&content);
+        let (status, artifact_count) = run(async {
+            let h = harness();
+            let src = oci_repo("src-repo");
+            let src_id = src.id;
+            h.repositories.insert(src);
+            h.repositories.insert(oci_repo("target-repo"));
+            seed_blob_at_path_with_status(
+                &h.artifacts,
+                &h.storage,
+                src_id,
+                &format!("blobs/sha256:{hex}"),
+                &hex,
+                &content,
+                QuarantineStatus::Rejected,
+            );
+
+            let uri = format!(
+                "/v2/target-repo/other/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx"
+            );
+            let resp = router()
+                .with_state(h.ctx)
+                .oneshot(with_principal(
+                    HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            (resp.status(), h.artifacts.snapshot_all().len())
+        });
+        assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(artifact_count, 1);
     }
 
