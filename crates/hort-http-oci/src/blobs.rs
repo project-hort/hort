@@ -936,6 +936,30 @@ pub(crate) enum UpstreamPullOutcome {
     Internal,
 }
 
+async fn find_post_coalesce_blob(
+    ctx: &Arc<AppContext>,
+    repo_id: Uuid,
+    name: &str,
+    content_hash: &ContentHash,
+) -> Result<Option<Artifact>, AppError> {
+    let scoped_path = oci_blob_coords(name, content_hash).path;
+    match ctx
+        .artifact_use_case
+        .find_in_repo_by_path(repo_id, &scoped_path)
+        .await?
+    {
+        Some(artifact) => Ok(Some(artifact)),
+        None => {
+            ctx.artifact_use_case
+                .find_in_repo_by_path(
+                    repo_id,
+                    &legacy_oci_artifact_path(OciArtifactRole::Blob, content_hash),
+                )
+                .await
+        }
+    }
+}
+
 /// On local CAS miss, attempt to fetch the blob from a configured
 /// upstream and ingest it locally. Returns
 /// [`UpstreamPullOutcome::NotConfigured`] when the repository has no
@@ -1146,29 +1170,26 @@ pub(crate) async fn try_upstream_blob_pull(
         }
     };
 
-    // 5. Post-coalesce read: both leader and follower re-resolve the
-    //    artifact row by content hash. The leader's `ingest_verified`
-    //    (inside the closure) wrote the row; the follower reads it.
-    //    `ctx.artifacts` is `pub(crate)` (ADR 0008); format crates take
-    //    artifact rows off the use-case (`find_in_repo_by_hash`) rather
-    //    than the raw repository.
-    match ctx
-        .artifact_use_case
-        .find_in_repo_by_hash(repo.id, &content_hash)
-        .await
-    {
+    finalise_blob_pull(ctx, repo, name, content_hash).await
+}
+
+async fn finalise_blob_pull(
+    ctx: &Arc<AppContext>,
+    repo: &Repository,
+    name: &str,
+    content_hash: ContentHash,
+) -> UpstreamPullOutcome {
+    // Both leader and follower re-resolve the requested name's row.
+    // `find_in_repo_by_path` hydrates its quarantine deadline before
+    // the handler serves it.
+    match find_post_coalesce_blob(ctx, repo.id, name, &content_hash).await {
         Ok(Some(artifact)) => UpstreamPullOutcome::Ingested(Box::new(artifact)),
         Ok(None) => {
-            // `blob_by_hash` is cross-repo, so a follower that joined
-            // a window whose leader ingested into a DIFFERENT repo has
-            // no row in `repo.id`. The blob is already CAS-present and
-            // upstream-verified (ADR 0006); the follower idempotently
-            // registers its OWN per-repo row via
-            // `register_existing_cas_blob` (coords reconstructed
-            // deterministically from `(name, hash)` exactly as the
-            // leader's closure did; no re-fetch, no re-`storage.put`;
-            // same `ArtifactIngested` event the leader's non-concurrent
-            // cross-repo dedup emits) instead of failing closed.
+            // A follower can miss because its leader ingested into a
+            // different repository, or because this repository only
+            // holds the bytes under another image name. In both cases
+            // CAS already holds upstream-verified bytes (ADR 0006).
+            // Register this name's own row without another fetch or put.
             match ctx
                 .ingest_use_case
                 .register_existing_cas_blob(
@@ -1183,17 +1204,9 @@ pub(crate) async fn try_upstream_blob_pull(
                             "oci_source": "upstream_coalesced_follower",
                         }),
                         content_hash: content_hash.clone(),
-                        // Coalesced-follower path is not a seed-import;
-                        // this follower's OWN target-repo row resolves
-                        // its OWN quarantine gate inside the shared
-                        // `register_by_hash_inner` tail (issue #107 Item
-                        // 1) — it is NOT inherited from the leader's
-                        // `ingest_verified`, which only ever gated the
-                        // leader's own (possibly different) repo's row.
-                        // `quarantine_status` is a per-repo-row column;
-                        // before #107 Item 1 this follower row minted
-                        // `None`/immediately-downloadable with no gate at
-                        // all.
+                        // The shared registration tail resolves this row's
+                        // quarantine gate; the leader's row may belong
+                        // to another repository and cannot supply it.
                         seed_import_quarantine_anchor: None,
                         // A pulled-through FILE / blob claims only its own
                         // content; the mint derives that edge itself. Only a
@@ -1210,7 +1223,7 @@ pub(crate) async fn try_upstream_blob_pull(
                         repo_key = %repo.key,
                         hash = %content_hash,
                         error = %err,
-                        "OCI upstream blob: cross-repo follower register_existing_cas_blob failed"
+                        "OCI upstream blob: register_existing_cas_blob failed"
                     );
                     UpstreamPullOutcome::Internal
                 }
@@ -5460,6 +5473,135 @@ mod tests {
         });
     }
 
+    #[test]
+    fn pull_through_blob_mints_requested_name_beside_same_hash_row_and_sticks() {
+        use hort_domain::ports::artifact_repository::ArtifactRepository;
+        use sha2::Digest;
+
+        run(async {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = oci_repo("myrepo");
+            mocks.repositories.insert(repo.clone());
+            seed_dockerhub_mapping(&mocks, repo.id);
+
+            let content = b"shared-blob-under-two-image-names".to_vec();
+            let hex = hex::encode(sha2::Sha256::digest(&content));
+            let hash: ContentHash = hex.parse().unwrap();
+            let digest = format!("sha256:{hex}");
+            let other_path = format!("blobs/dockerhub/library/other/sha256:{hex}");
+            let asked_path = format!("blobs/dockerhub/library/nginx/sha256:{hex}");
+            let mut other = sample_artifact(QuarantineStatus::None);
+            other.repository_id = repo.id;
+            other.path = other_path.clone();
+            other.sha256_checksum = hash.clone();
+            other.size_bytes = content.len() as i64;
+            let other_id = other.id;
+            mocks.artifacts.insert(other.clone());
+            mocks.storage.insert_content(hash.clone(), content.clone());
+            mocks.upstream_proxy.insert_blob(
+                "dockerhub/",
+                "library/other",
+                &digest,
+                content.clone(),
+                Some(digest.clone()),
+            );
+
+            // The other name owns the just-completed coalesce window.
+            let leader =
+                try_upstream_blob_pull(&ctx, &repo, "dockerhub/library/other", &hash).await;
+            assert!(matches!(leader, UpstreamPullOutcome::Ingested(_)));
+            let follower = finalise_blob_pull(&ctx, &repo, "dockerhub/library/nginx", hash).await;
+            assert!(matches!(
+                follower,
+                UpstreamPullOutcome::Ingested(artifact) if artifact.path == asked_path
+            ));
+
+            let other_after = mocks
+                .artifacts
+                .find_by_path(repo.id, &other_path)
+                .await
+                .unwrap()
+                .expect("other image row remains at its literal path");
+            let asked_after = mocks
+                .artifacts
+                .find_by_path(repo.id, &asked_path)
+                .await
+                .unwrap()
+                .expect("asked image gets its own row at its literal path");
+            assert_eq!(other_after.id, other_id);
+            assert_eq!(other_after, other);
+            assert_ne!(asked_after.id, other_id);
+            assert_eq!(other_after.path, other_path);
+            assert_eq!(asked_after.path, asked_path);
+
+            let router = blob_router(ctx);
+            let uri = format!("/v2/myrepo/dockerhub/library/nginx/blobs/{digest}");
+            for _ in 0..2 {
+                let response = router
+                    .clone()
+                    .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), content);
+            }
+
+            assert_eq!(mocks.upstream_proxy.blob_fetches(), vec![digest]);
+        });
+    }
+
+    #[test]
+    fn legacy_name_free_blob_row_satisfies_post_coalesce_read() {
+        use hort_domain::ports::artifact_repository::ArtifactRepository;
+        use sha2::Digest;
+
+        run(async {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = oci_repo("myrepo");
+            mocks.repositories.insert(repo.clone());
+            let hex = hex::encode(sha2::Sha256::digest(b"legacy-blob"));
+            let hash: ContentHash = hex.parse().unwrap();
+            let legacy_path = format!("blobs/sha256:{hex}");
+            let mut legacy = sample_artifact(QuarantineStatus::None);
+            legacy.repository_id = repo.id;
+            legacy.path = legacy_path.clone();
+            legacy.sha256_checksum = hash.clone();
+            let legacy_id = legacy.id;
+            mocks.artifacts.insert(legacy);
+
+            let found = find_post_coalesce_blob(&ctx, repo.id, "dockerhub/library/nginx", &hash)
+                .await
+                .unwrap()
+                .expect("legacy row remains readable after coalesce");
+            assert_eq!(found.id, legacy_id);
+            assert_eq!(found.path, legacy_path);
+            assert!(mocks
+                .artifacts
+                .find_by_path(
+                    repo.id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{hex}")
+                )
+                .await
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn post_coalesce_blob_registration_refuses_missing_cas_bytes() {
+        use sha2::Digest;
+
+        run(async {
+            let (ctx, mocks) = build_mock_ctx(handle());
+            let repo = oci_repo("myrepo");
+            mocks.repositories.insert(repo.clone());
+            let hex = hex::encode(sha2::Sha256::digest(b"missing-cas-blob"));
+            let hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_blob_pull(&ctx, &repo, "dockerhub/library/nginx", hash).await;
+            assert!(matches!(outcome, UpstreamPullOutcome::Internal));
+        });
+    }
+
     /// Concurrent-coalesce test: spawn two `tokio::spawn` requests
     /// against the same OCI blob (the
     /// `try_upstream_blob_pull` `fetch_blob + ingest_verified` pair).
@@ -5516,7 +5658,7 @@ mod tests {
             let r2 = h2.await.unwrap();
             // Both callers must see a successful Ingested outcome
             // regardless of which one was elected leader vs follower
-            // — the post-coalesce `find_in_repo_by_hash` resolves the
+            // — the post-coalesce path lookup resolves the
             // row the leader's ingest wrote. `UpstreamPullOutcome`
             // intentionally does not derive `Debug` (the variants
             // hold sensitive `Artifact` rows); render the failure
