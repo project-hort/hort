@@ -7776,6 +7776,9 @@ pub struct MockUpstreamProxy {
     /// from "they all were".
     blob_fetch_log: Mutex<Vec<String>>,
     manifests: Mutex<HashMap<(String, String, String), ManifestFetch>>,
+    /// Every `fetch_manifest` reference, in call order. Lets a test
+    /// distinguish a manifest served from its row from one fetched again.
+    manifest_fetch_log: Mutex<Vec<String>>,
     /// One-shot failure for the next `fetch_manifest` call. Drained on
     /// consumption. Used to drive the `UpstreamUnavailable` path
     /// without bringing up an actual upstream — the helper classifies
@@ -7862,6 +7865,7 @@ impl MockUpstreamProxy {
             blob_errors: Mutex::new(HashMap::new()),
             blob_fetch_log: Mutex::new(Vec::new()),
             manifests: Mutex::new(HashMap::new()),
+            manifest_fetch_log: Mutex::new(Vec::new()),
             next_manifest_error: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
             next_metadata_error: Mutex::new(None),
@@ -8080,6 +8084,10 @@ impl MockUpstreamProxy {
         self.blob_fetch_log.lock().unwrap().clone()
     }
 
+    pub fn manifest_fetches(&self) -> Vec<String> {
+        self.manifest_fetch_log.lock().unwrap().clone()
+    }
+
     /// Seed a one-shot failure on the next
     /// `fetch_referrers` call. Cleared on consumption. Mirrors
     /// [`Self::fail_next_manifest_with`] / [`Self::fail_next_metadata_with`].
@@ -8174,6 +8182,10 @@ impl UpstreamProxy for MockUpstreamProxy {
         reference: String,
         _accept: Vec<String>,
     ) -> BoxFuture<'_, DomainResult<ManifestFetchOutcome>> {
+        self.manifest_fetch_log
+            .lock()
+            .unwrap()
+            .push(reference.clone());
         // The mock keys on (path_prefix, upstream_name, reference)
         // and ignores Accept — production tests don't currently
         // assert on Accept negotiation. Mocks accept the parameter

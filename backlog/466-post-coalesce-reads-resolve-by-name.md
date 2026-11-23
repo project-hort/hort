@@ -94,3 +94,30 @@ about whether an OCI identity or the bytes are the subject:
 - **`provenance_cascade.rs:323,843`** select the clearance root and
   constituents by repository/hash, with the same question about what a
   clearance event is about.
+
+## Correction 2026-11-23 — the two consequences do not have the same reach
+
+The implementing unit disputed the item's framing and was right. The section
+*"What goes wrong, in order"* above presents both consequences as one sequence;
+they are reachable on different paths.
+
+- **Serving the asked name from another name's row** reaches **any**
+  post-coalesce read once two rows exist for `(repository_id, hash)`. The
+  query behind `find_in_repo_by_hash` is
+  `WHERE repository_id = $1 AND checksum_sha256 = $2 AND deleted_at IS NULL
+  LIMIT 1` with **no `ORDER BY`**
+  (`crates/hort-adapters-postgres/src/artifact_repo.rs:161-163`), so which of
+  the two rows comes back is unspecified — a leader can be handed the other
+  name's row just as a follower can.
+- **The pull never sticking** needs a **coalescing follower**. A leader's own
+  `ingest_verified` runs inside the closure and writes the asked name's row
+  before the post-coalesce read (`blobs.rs:1080`, `manifests.rs:1468`), so a
+  leader's pull sticks even when the read hands back the wrong row. The
+  non-sticking case is a request that joins a window whose leader ingested the
+  same bytes under a **different name in the same repository**: the follower's
+  read finds the leader's row by hash, returns it, and the `Ok(None)` arm that
+  would have minted this name's row never runs.
+
+Both are fixed by the same narrowing, and the fix is unchanged. What changes is
+the impact statement: the cross-name serve is the broad half, and it is the
+security-relevant one.

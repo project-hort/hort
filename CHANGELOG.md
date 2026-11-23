@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   under the image name it is pushed under; a blob held only under a different
   name answers `MANIFEST_BLOB_UNKNOWN`, and uploading or cross-mounting it into
   that name resolves it (#459).
+- An OCI pull-through for an image name whose bytes another name in the same
+  repository already holds now stores and serves that name's own row, instead
+  of answering from the other name's row and re-fetching from the upstream on
+  every request (#459).
 
 ### Security
 
