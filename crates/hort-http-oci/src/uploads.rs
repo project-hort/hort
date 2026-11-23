@@ -4,7 +4,7 @@
 //!
 //! | Query params                       | Semantics                       |
 //! |-----------------------------------|---------------------------------|
-//! | `?mount=<digest>&from=<src-key>`  | Cross-repo mount (zero-copy)    |
+//! | `?mount=<digest>&from=<src-name>` | Cross-repo mount (zero-copy)    |
 //! | `?digest=<digest>` + request body | Monolithic single-request push  |
 //! | (none)                            | Three-phase initiate            |
 //!
@@ -51,7 +51,7 @@ use hort_http_core::limits::BoundedPath;
 use super::coords::oci_blob_coords;
 use super::digest::{parse_digest, DigestParse, UNSUPPORTED_DIGEST_ALGORITHM_MESSAGE};
 use super::error::OciError;
-use super::name::validate_oci_name;
+use super::name::{split_oci_namespace, validate_oci_name};
 use super::upload_session::{
     append_chunk, append_chunk_streaming, finalize, ContentRange, InitiateResult, TrailingBody,
 };
@@ -250,25 +250,23 @@ pub(crate) async fn post_upload_dispatch(
 // Cross-mount
 // ---------------------------------------------------------------------------
 
-/// Cross-repo blob mount (`?mount=<digest>&from=<src>`).
+/// Cross-repo blob mount (`?mount=<digest>&from=<src-repo>/<src-name>`).
 ///
 /// Resolves the source repo (with Read authz on the actor — ADR 0008),
-/// validates the digest, then calls
-/// [`IngestUseCase::register_by_hash`] — zero-copy. On the register
-/// `NotFound` surfaces as `BLOB_UNKNOWN` (the hash isn't in the source
-/// repo).
+/// checks that the blob lives under the requested name, then calls
+/// [`IngestUseCase::register_by_hash`] — zero-copy. An unmountable
+/// source falls through to normal upload initiation.
 ///
 /// Without the authz check on the source repo, any caller with `Write`
 /// on `target-repo` could clone any blob from any other repo in the
 /// registry — even a private one they had no `Read` grant on — by
-/// submitting `?mount=<sha>&from=<other-repo>`. The fix routes through
+/// submitting `?mount=<sha>&from=<other-repo>/<name>`. The fix routes through
 /// [`RepositoryAccessUseCase::resolve`] with `AccessLevel::Read` on
 /// the source. If the actor cannot read the source, the use case
 /// returns `NotFound` (anti-enumeration); we fall through to
-/// "initiate a normal blob upload" per OCI §2.3, which says: "If a
-/// registry does not support cross-repository mounting … it MUST fall
-/// back to the standard upload behavior and return a `202 Accepted`
-/// …". A 4xx here would break docker / skopeo retry loops; the spec's
+/// "initiate a normal blob upload" per OCI §2.3, which says a registry
+/// unable to mount the requested blob SHOULD return `202 Accepted`.
+/// A 4xx here would break docker / skopeo retry loops; the spec's
 /// fallback path is the correct reaction.
 #[allow(clippy::too_many_arguments)]
 async fn handle_cross_mount(
@@ -299,12 +297,27 @@ async fn handle_cross_mount(
         }
     };
 
+    let initiate = || {
+        handle_initiate(
+            ctx.clone(),
+            repo_key,
+            name,
+            target_repo_id,
+            actor.clone(),
+            max_sessions_per_principal,
+            session_max_age,
+        )
+    };
+    let Some((src_repo_key, src_name)) = split_oci_namespace(from) else {
+        return initiate().await;
+    };
+
     // Read-authz check on the source repo (ADR 0008). NotFound
-    // (missing OR invisible) collapses to "fall through to initiate"
-    // per the OCI spec. Any other error surfaces as 500.
+    // (missing OR invisible) collapses to "fall through to initiate".
+    // This must precede the narrower source-name lookup.
     let src_repo = match ctx
         .repository_access_use_case
-        .resolve(from, Some(principal), AccessLevel::Read)
+        .resolve(src_repo_key, Some(principal), AccessLevel::Read)
         .await
     {
         Ok(r) => r,
@@ -315,16 +328,7 @@ async fn handle_cross_mount(
                 actor = %principal.external_id,
                 "OCI cross-mount denied (source missing or invisible) — falling through to initiate per OCI spec"
             );
-            return handle_initiate(
-                ctx,
-                repo_key,
-                name,
-                target_repo_id,
-                actor,
-                max_sessions_per_principal,
-                session_max_age,
-            )
-            .await;
+            return initiate().await;
         }
         Err(e) => {
             tracing::error!(
@@ -336,6 +340,37 @@ async fn handle_cross_mount(
         }
     };
 
+    if validate_oci_name(src_name).is_err() {
+        return initiate().await;
+    }
+    // This lookup is the ONLY thing that scopes the mount to `src_name`,
+    // and it reads redundant beside `register_by_hash`'s own gate — which
+    // re-checks the terminal status at registration time, so the status half
+    // genuinely is checked twice. The NAME half is not: `register_by_hash`
+    // resolves `find_by_repo_and_checksum`, which is repo-scoped and
+    // name-blind, so deleting this as a duplicate silently restores mounting
+    // a blob that lives under a different name in the source repository.
+    //
+    // The window between this check and that registration is therefore
+    // name-only, and it costs nothing: passing the `Read` resolve above
+    // grants the caller every name in the source repository, so a mount
+    // resolved from a sibling name is one they could have asked for directly
+    // — while the anti-laundering refusal is re-evaluated against whatever
+    // row registration actually uses.
+    let source_path = oci_blob_coords(src_name, &hash).path;
+    match ctx
+        .artifact_use_case
+        .find_in_repo_by_path(src_repo.id, &source_path)
+        .await
+    {
+        Ok(Some(artifact)) if !artifact.quarantine_status.is_terminal() => {}
+        Ok(_) => return initiate().await,
+        Err(e) => {
+            tracing::error!(error = %e, "source blob lookup failed during OCI mount");
+            return OciError::Internal.into_response();
+        }
+    }
+
     let req = IngestRequest {
         repository_id: target_repo_id,
         coords: oci_blob_coords(name, &hash),
@@ -343,7 +378,7 @@ async fn handle_cross_mount(
         // OCI cross-repo blob mount is not a seed-import; the
         // anchor override field stays `None`.
         quarantine_anchor_override: None,
-        actor,
+        actor: actor.clone(),
         legacy_sha1: None,
         legacy_md5: None,
         declared_sha256: None,
@@ -360,16 +395,13 @@ async fn handle_cross_mount(
         .await
     {
         Ok(_outcome) => created_blob_response(repo_key, name, &hash),
-        Err(err) => map_register_error(err, &hash),
+        Err(AppError::Domain(DomainError::NotFound { .. })) => initiate().await,
+        Err(err) => map_register_error(err),
     }
 }
 
-fn map_register_error(err: AppError, hash: &ContentHash) -> Response {
+fn map_register_error(err: AppError) -> Response {
     match err {
-        AppError::Domain(DomainError::NotFound { .. }) => OciError::BlobUnknown {
-            digest: format!("sha256:{}", hash.as_ref()),
-        }
-        .into_response(),
         AppError::Domain(DomainError::Conflict(_)) => OciError::DigestInvalid {
             message: "digest conflict at target path".into(),
         }
@@ -1278,7 +1310,7 @@ mod tests {
         req
     }
 
-    /// Seed an artifact at `blobs/sha256:<hex>` with CAS content.
+    /// Seed an artifact at `blobs/nginx/sha256:<hex>` with CAS content.
     fn seed_blob(
         artifacts: &MockArtifactRepository,
         storage: &MockStoragePort,
@@ -1310,7 +1342,7 @@ mod tests {
         let hash: ContentHash = hex.parse().unwrap();
         let mut a = sample_artifact(status);
         a.repository_id = repo_id;
-        a.path = format!("blobs/sha256:{hex}");
+        a.path = format!("blobs/nginx/sha256:{hex}");
         a.sha256_checksum = hash.clone();
         a.size_bytes = content.len() as i64;
         a.created_at = Utc::now();
@@ -1777,6 +1809,215 @@ mod tests {
         hex::encode(sha2::Sha256::digest(content))
     }
 
+    async fn initiate_wire_shape(resp: Response) -> (StatusCode, Vec<(String, String)>, Vec<u8>) {
+        let status = resp.status();
+        let session_id = resp
+            .headers()
+            .get("docker-upload-uuid")
+            .expect("initiate must emit a session id")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let mut headers: Vec<_> = resp
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.to_string(),
+                    value
+                        .to_str()
+                        .unwrap()
+                        .replace(&session_id, "<fresh-session>"),
+                )
+            })
+            .collect();
+        headers.sort();
+        let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
+        (status, headers, body)
+    }
+
+    #[test]
+    fn cross_mount_between_names_in_one_repository() {
+        let content = b"same repository, distinct names".to_vec();
+        let hex = sha256_of(&content);
+        let (status, target_path) = run(async {
+            let h = harness();
+            let repo = oci_repo("shared-repo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            seed_blob(&h.artifacts, &h.storage, repo_id, &hex, &content);
+            let uri = format!(
+                "/v2/shared-repo/other/blobs/uploads/?mount=sha256:{hex}&from=shared-repo/nginx"
+            );
+            let resp = router()
+                .with_state(h.ctx)
+                .oneshot(with_principal(
+                    HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            let target_path = format!("blobs/other/sha256:{hex}");
+            (
+                resp.status(),
+                h.artifacts
+                    .find_by_path(repo_id, &target_path)
+                    .await
+                    .unwrap(),
+            )
+        });
+        assert_eq!(status, StatusCode::CREATED);
+        assert!(target_path.is_some());
+    }
+
+    #[test]
+    fn cross_mount_blob_under_another_source_name_falls_through() {
+        let content = b"blob in another namespace".to_vec();
+        let hex = sha256_of(&content);
+        let (response, artifact_count) = run(async {
+            let h = harness();
+            let src = oci_repo("src-repo");
+            let src_id = src.id;
+            h.repositories.insert(src);
+            h.repositories.insert(oci_repo("target-repo"));
+            seed_blob(&h.artifacts, &h.storage, src_id, &hex, &content);
+            let uri = format!(
+                "/v2/target-repo/other/blobs/uploads/?mount=sha256:{hex}&from=src-repo/another"
+            );
+            let resp = router()
+                .with_state(h.ctx)
+                .oneshot(with_principal(
+                    HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            (
+                initiate_wire_shape(resp).await,
+                h.artifacts.snapshot_all().len(),
+            )
+        });
+        assert_eq!(response.0, StatusCode::ACCEPTED);
+        assert!(response.2.is_empty());
+        assert_eq!(artifact_count, 1);
+    }
+
+    #[test]
+    fn cross_mount_unparseable_from_falls_through() {
+        let hex = sha256_of(b"x");
+        for from in ["src-repo", "/nginx", "src-repo/", "src-repo/BadName"] {
+            let (status, body) = run(async {
+                let h = harness();
+                h.repositories.insert(oci_repo("target-repo"));
+                h.repositories.insert(oci_repo("src-repo"));
+                let uri =
+                    format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from={from}");
+                let resp = router()
+                    .with_state(h.ctx)
+                    .oneshot(with_principal(
+                        HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                    ))
+                    .await
+                    .unwrap();
+                (
+                    resp.status(),
+                    to_bytes(resp.into_body(), 4 * 1024).await.unwrap(),
+                )
+            });
+            assert_eq!(status, StatusCode::ACCEPTED, "{from}");
+            assert!(body.is_empty(), "{from}");
+        }
+    }
+
+    #[test]
+    fn cross_mount_source_lookup_failure_is_internal() {
+        let hex = sha256_of(b"source lookup failure");
+        let status = run(async {
+            let h = harness();
+            h.repositories.insert(oci_repo("src-repo"));
+            h.repositories.insert(oci_repo("target-repo"));
+            h.artifacts
+                .fail_next_find_by_path(DomainError::Invariant("lookup failed".into()));
+            let uri = format!(
+                "/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx"
+            );
+            router()
+                .with_state(h.ctx)
+                .oneshot(with_principal(
+                    HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap()
+                .status()
+        });
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn cross_mount_source_missing_at_registration_falls_through() {
+        let content = b"source registration race".to_vec();
+        let hex = sha256_of(&content);
+        let (status, artifact_count) = run(async {
+            let h = harness();
+            let src = oci_repo("src-repo");
+            let src_id = src.id;
+            h.repositories.insert(src);
+            h.repositories.insert(oci_repo("target-repo"));
+            seed_blob(&h.artifacts, &h.storage, src_id, &hex, &content);
+            h.artifacts
+                .fail_next_find_by_repo_and_checksum(DomainError::NotFound {
+                    entity: "Artifact",
+                    id: hex.clone(),
+                });
+            let uri = format!(
+                "/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx"
+            );
+            let resp = router()
+                .with_state(h.ctx)
+                .oneshot(with_principal(
+                    HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap();
+            (resp.status(), h.artifacts.snapshot_all().len())
+        });
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert_eq!(artifact_count, 1);
+    }
+
+    #[test]
+    fn cross_mount_target_path_conflict_is_digest_invalid() {
+        let content = b"source content".to_vec();
+        let hex = sha256_of(&content);
+        let status = run(async {
+            let h = harness();
+            let src = oci_repo("src-repo");
+            let src_id = src.id;
+            h.repositories.insert(src);
+            let target = oci_repo("target-repo");
+            let target_id = target.id;
+            h.repositories.insert(target);
+            seed_blob(&h.artifacts, &h.storage, src_id, &hex, &content);
+            let other = b"different target bytes";
+            let other_hex = sha256_of(other);
+            let mut existing = sample_artifact(QuarantineStatus::None);
+            existing.repository_id = target_id;
+            existing.path = format!("blobs/nginx/sha256:{hex}");
+            existing.sha256_checksum = other_hex.parse().unwrap();
+            h.artifacts.insert(existing);
+            let uri = format!(
+                "/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx"
+            );
+            router()
+                .with_state(h.ctx)
+                .oneshot(with_principal(
+                    HttpRequest::post(&uri).body(Body::empty()).unwrap(),
+                ))
+                .await
+                .unwrap()
+                .status()
+        });
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
     #[test]
     fn cross_mount_happy_path_zero_copy_and_returns_201() {
         let content = b"cross-mount content".to_vec();
@@ -1793,7 +2034,7 @@ mod tests {
             let puts_before = h.storage.put_call_count();
             let router = router().with_state(h.ctx);
             let uri = format!(
-                "/v2/target-repo/library/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo"
+                "/v2/target-repo/library/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx"
             );
             let resp = router
                 .oneshot(with_principal(
@@ -1842,8 +2083,9 @@ mod tests {
             // returns NotFound, which the cross-mount handler treats
             // as "fall through to initiate" per the OCI spec.
             let router = router().with_state(h.ctx);
-            let uri =
-                format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=ghost-src");
+            let uri = format!(
+                "/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=ghost-src/nginx"
+            );
             let resp = router
                 .oneshot(with_principal(
                     HttpRequest::post(&uri).body(Body::empty()).unwrap(),
@@ -1866,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_mount_source_repo_missing_digest_returns_404_blob_unknown() {
+    fn cross_mount_source_repo_missing_digest_falls_through() {
         let hex = sha256_of(b"some bytes");
         let (status, body) = run(async {
             let h = harness();
@@ -1876,8 +2118,9 @@ mod tests {
             // No artifact seeded — src-repo exists but the hash isn't in it.
 
             let router = router().with_state(h.ctx);
-            let uri =
-                format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo");
+            let uri = format!(
+                "/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx"
+            );
             let resp = router
                 .oneshot(with_principal(
                     HttpRequest::post(&uri).body(Body::empty()).unwrap(),
@@ -1888,13 +2131,12 @@ mod tests {
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             (status, body)
         });
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.is_empty());
     }
 
     #[test]
-    fn cross_mount_foreign_repo_hash_returns_404_blob_unknown() {
+    fn cross_mount_foreign_repo_hash_falls_through() {
         // The hash exists in repo A; caller asks to mount it from repo B
         // (same system, different repo).  `register_by_hash` scopes its
         // lookup to `from` repo and returns NotFound, which surfaces as
@@ -1913,7 +2155,7 @@ mod tests {
 
             let router = router().with_state(h.ctx);
             let uri = format!(
-                "/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=empty-src-repo"
+                "/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=empty-src-repo/nginx"
             );
             let resp = router
                 .oneshot(with_principal(
@@ -1925,27 +2167,15 @@ mod tests {
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             (status, body)
         });
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.is_empty());
     }
 
-    /// Mount of a `Rejected` source (issue #107 Item 2, design §2 D2):
-    /// `register_by_hash_inner`'s new source-status refusal collapses to
-    /// the SAME `DomainError::NotFound` the two tests above already
-    /// exercise for "no such blob in source repo" — anti-enumeration
-    /// means the handler CANNOT distinguish "missing" from "terminally
-    /// blocked", so it must (and does, unmodified) map BOTH through the
-    /// same `map_register_error` `NotFound` arm to 404 `BLOB_UNKNOWN`. No
-    /// row is minted in `target-repo` from the rejected source. This is
-    /// distinct from the source-REPO-not-visible fallback
-    /// (`cross_mount_unknown_source_repo_falls_through_to_initiate` /
-    /// `cross_mount_without_source_read_falls_through_to_initiate` below)
-    /// — that 202-initiate path fires at `repository_access_use_case
-    /// .resolve` on the source REPO itself, one step earlier than
-    /// `register_by_hash`'s own per-blob NotFound this test pins.
+    /// A terminally blocked source is unmountable. It takes the same
+    /// standard-upload fallback as an absent blob and cannot mint a
+    /// target row.
     #[test]
-    fn cross_mount_rejected_source_returns_404_blob_unknown_no_row_minted() {
+    fn cross_mount_rejected_source_falls_through_without_minting_row() {
         let content = b"known-bad bytes".to_vec();
         let hex = sha256_of(&content);
         let (status, body, artifact_count_after) = run(async {
@@ -1964,8 +2194,9 @@ mod tests {
             );
 
             let router = router().with_state(h.ctx.clone());
-            let uri =
-                format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo");
+            let uri = format!(
+                "/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx"
+            );
             let resp = router
                 .oneshot(with_principal(
                     HttpRequest::post(&uri).body(Body::empty()).unwrap(),
@@ -1976,9 +2207,8 @@ mod tests {
             let body = to_bytes(resp.into_body(), 4 * 1024).await.unwrap().to_vec();
             (status, body, h.artifacts.snapshot_all().len())
         });
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+        assert_eq!(status, StatusCode::ACCEPTED);
+        assert!(body.is_empty());
         // Exactly the ONE pre-seeded Rejected source row — no target-repo
         // row was minted from it.
         assert_eq!(
@@ -2019,7 +2249,7 @@ mod tests {
 
         let content = b"private blob".to_vec();
         let hex = sha256_of(&content);
-        let (status, location, puts_after) = run(async {
+        let (denied, unknown, artifact_count, puts_before, puts_after) = run(async {
             let h = harness();
 
             // Source repo: PRIVATE, has the blob.
@@ -2091,41 +2321,44 @@ mod tests {
             let puts_before = h.storage.put_call_count();
             let router = router().with_state(ctx);
             let uri = format!(
-                "/v2/target-repo/library/nginx/blobs/uploads/?mount=sha256:{hex}&from=source-repo"
+                "/v2/target-repo/library/nginx/blobs/uploads/?mount=sha256:{hex}&from=source-repo/nginx"
             );
             let mut req = HttpRequest::post(&uri).body(Body::empty()).unwrap();
             // Wrap in `AuthenticatedPrincipal` via the test-support
             // helper.
             hort_http_core::middleware::auth::test_support::inject_principal(&mut req, principal);
-            let resp = router.oneshot(req).await.unwrap();
-            let status = resp.status();
-            let location = resp
-                .headers()
-                .get(LOCATION)
-                .map(|v| v.to_str().unwrap().to_string());
+            let denied = initiate_wire_shape(router.clone().oneshot(req).await.unwrap()).await;
+            let unknown_uri = format!(
+                "/v2/target-repo/library/nginx/blobs/uploads/?mount=sha256:{hex}&from=ghost-repo/nginx"
+            );
+            let mut unknown_req = HttpRequest::post(&unknown_uri).body(Body::empty()).unwrap();
+            hort_http_core::middleware::auth::test_support::inject_principal(&mut unknown_req, {
+                let mut principal = test_principal();
+                principal.claims = vec!["dev".into()];
+                principal
+            });
+            let unknown = initiate_wire_shape(router.oneshot(unknown_req).await.unwrap()).await;
             let puts_after = h.storage.put_call_count();
-            // Confirm cross-mount didn't write to storage (zero-copy
-            // register did not fire).
-            let _ = puts_before;
-            (status, location, puts_after)
+            (
+                denied,
+                unknown,
+                h.artifacts.snapshot_all().len(),
+                puts_before,
+                puts_after,
+            )
         });
 
         // Initiate fallback: 202 Accepted with a Location pointing at
         // a fresh upload session inside the target repo.
         assert_eq!(
-            status,
+            denied.0,
             StatusCode::ACCEPTED,
             "cross-mount denied on source-repo Read MUST fall through to 202 initiate per OCI §2.3"
         );
-        let location = location.expect("initiate must emit Location");
-        assert!(
-            location.contains("/v2/target-repo/library/nginx/blobs/uploads/"),
-            "Location must point at fresh target-repo upload session: {location}"
-        );
-        // Initiate path does not register the source blob at the
-        // target — `puts_after` is incidental but should be the same
-        // pre/post (no mount happened).
-        let _ = puts_after;
+        assert_eq!(denied, unknown, "missing and unreadable sources must have identical wire shape after replacing their fresh session IDs");
+        assert!(denied.2.is_empty());
+        assert_eq!(artifact_count, 1, "neither request mounts the private blob");
+        assert_eq!(puts_before, puts_after, "neither request writes content");
     }
 
     #[test]
