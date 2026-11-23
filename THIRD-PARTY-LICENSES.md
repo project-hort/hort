@@ -116,7 +116,7 @@ the result instead.
 | regex-syntax | 0.8.12 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.2 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.29.2 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.29.3 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -6820,7 +6820,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.29.2 — MIT
+### uuid 1.29.3 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
