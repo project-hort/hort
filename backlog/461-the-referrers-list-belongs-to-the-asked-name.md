@@ -1,6 +1,6 @@
 # 461 — the referrers list belongs to the name that was asked
 
-**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 2 of 5.
+**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 2 of 6.
 **Supersedes** `backlog/428-the-list-belongs-to-the-name-that-was-asked.md`, which asked the question before the namespace was decided.
 
 ## Why unit 460 does not already fix this

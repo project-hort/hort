@@ -35,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that was asked for, as the Distribution Spec requires; referrers written by
   earlier releases carry no name and stay listed under every name until they
   are rewritten (#459).
+- An OCI image index is now accepted only when its child manifests exist under
+  the same image name the index is pushed under, instead of anywhere in the
+  hort repository; a child under a different name answers
+  `MANIFEST_BLOB_UNKNOWN`, and pushing it under the index's own name resolves
+  it (#459).
 
 ### Security
 
