@@ -1,6 +1,6 @@
 # 462 — an index's children must exist under the same name
 
-**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 3 of 6.
+**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 3 of 7.
 **Unblocked 2026-11-23.** The ADR 0043 wording change landed as !1001 and the
 maintainer merged it himself, so the record is already in place and this unit
 is **code-only**. ADR 0043 decision point 1 now reads *"resolved as **manifests**

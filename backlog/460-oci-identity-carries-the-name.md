@@ -1,6 +1,6 @@
 # 460 — the OCI identity path carries the name
 
-**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 1 of 6 — the expand half.
+**Issue:** #459 · **Branch:** `agent/459-oci-namespace-identity` · Unit 1 of 7 — the expand half.
 
 ## What is decided before this unit starts
 

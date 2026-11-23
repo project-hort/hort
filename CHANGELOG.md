@@ -45,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mount between two image names inside one repository works and a blob held
   only under a different name is no longer mounted; an unmountable source still
   falls back to a normal upload (#459).
+- An OCI manifest is now accepted only when its config and layer blobs exist
+  under the image name it is pushed under; a blob held only under a different
+  name answers `MANIFEST_BLOB_UNKNOWN`, and uploading or cross-mounting it into
+  that name resolves it (#459).
 
 ### Security
 
