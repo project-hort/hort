@@ -357,7 +357,7 @@ the result instead.
 | crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.19.1 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.19.2 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -420,7 +420,7 @@ the result instead.
 | async-recursion | 1.1.1 | MIT | https://github.com/dcchut/async-recursion |
 | rsa | 0.9.10 | MIT | https://github.com/RustCrypto/RSA |
 | adler2 | 2.0.1 | MIT | https://github.com/oyvindln/adler2 |
-| anyhow | 1.0.104 | MIT | https://github.com/dtolnay/anyhow |
+| anyhow | 1.0.105 | MIT | https://github.com/dtolnay/anyhow |
 | async-trait | 0.1.92 | MIT | https://github.com/dtolnay/async-trait |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
 | curve25519-dalek-derive | 0.1.1 | MIT | https://github.com/dalek-cryptography/curve25519-dalek |
@@ -14399,7 +14399,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.19.1 — MIT
+### lru 0.19.2 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
@@ -16131,7 +16131,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### anyhow 1.0.104 — MIT
+### anyhow 1.0.105 — MIT
 
 Repository: https://github.com/dtolnay/anyhow
 
