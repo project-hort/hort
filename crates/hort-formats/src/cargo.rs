@@ -66,10 +66,10 @@ const CARGO_CRATE_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// from a `.crate` (the body [`parse_cargo_toml_runtime_dependencies`]
 /// parses — NOT the `.crate`, NOT the sparse-index page). A memory-safety
 /// bound generous over real manifests (typically < 16 KiB) but tight enough
-/// to reject a pathological manifest. Decoupled from the publish-side
-/// sparse-index per-entry cap so retuning one cannot move the other. The
-/// archive-level decompression-bomb guard is `archive_bounds`' job, not this
-/// cap.
+/// to reject a pathological manifest. The Cargo publish JSON segment has a
+/// separate parse-input limit in `hort-http-core::limits`; it does not bound
+/// this extracted manifest. The archive-level decompression-bomb guard is
+/// `archive_bounds`' job, not this cap.
 const CARGO_MANIFEST_MAX_BYTES: usize = 1024 * 1024;
 
 /// Parser-input sanity cap for the sparse-registry index `config.json`
@@ -359,30 +359,15 @@ impl FormatHandler for CargoFormatHandler {
         Some(cargo_collision_key(name))
     }
 
-    /// Upload-payload metadata cap for cargo — 8 MiB.
+    /// Cap serialised upload-payload metadata at 8 MiB after projection.
+    /// `IngestUseCase::effective_metadata_cap` uses this as the fallback for
+    /// `payload_metadata` on Cargo upstream-pull ingest paths; its current
+    /// `{source, upstream_url}` payload is small. Removing the override would
+    /// select the trait's 64 KiB default for that output instead.
     ///
-    /// **No longer the upstream-body cap.** The streaming
-    /// `parse_upstream_checksum` / `extract_upstream_versions` methods cap
-    /// at the streaming plausibility ceiling
-    /// ([`STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES`](crate::stream_helpers::STREAMING_METADATA_PLAUSIBILITY_MAX_BYTES))
-    /// per the cap taxonomy — a streamed path's cap is the plausibility /
-    /// storage bound, not this small in-memory ceiling. This override
-    /// survives because it is still a LIVE non-test caller's input: the
-    /// upload-payload metadata cap model reads it via
-    /// `IngestUseCase::effective_metadata_cap` (dynamic dispatch on
-    /// `&dyn FormatHandler`) as the fallback ceiling for the
-    /// `payload_metadata` carried on the cargo upstream-pull ingest paths
-    /// (`hort-http-cargo::upstream_pull`). That payload is presently tiny
-    /// (a `{source, upstream_url}` object), so the value is non-load-
-    /// bearing in practice, but removing the override would silently drop
-    /// cargo's upload-metadata cap to the 64 KiB trait default — a change
-    /// to a different axis from this fix.
-    ///
-    /// 8 MiB was calibrated from a pessimistic 1000 versions × ~5 KiB per
-    /// entry = ~5 MiB, plus headroom. The 64 KiB value lives only in
-    /// `parse_publish_body` as `PUBLISH_META_CAP`, where the per-entry
-    /// sizing is correct (the publish frame carries one version's metadata,
-    /// structurally comparable to a single sparse-index entry).
+    /// The streamed upstream body has a separate 64 MiB plausibility cap in
+    /// `stream_helpers`. Cargo publish JSON has its own 1 MiB parse-input
+    /// limit in `hort-http-core::limits`; neither is this output cap.
     fn metadata_expected_max_bytes(&self) -> usize {
         8 * 1024 * 1024
     }
