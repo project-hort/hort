@@ -52,6 +52,12 @@ pub const DEFAULT_PUBLISH_BODY_LIMIT: usize = 300 * 1024 * 1024;
 /// reaches `DefaultBodyLimit`.
 pub const CARGO_PUBLISH_BODY_LIMIT: usize = 200 * 1024 * 1024;
 
+/// Fixed input limit for Cargo's publish metadata JSON segment before parsing.
+/// `DefaultBodyLimit` bounds the buffered request body separately. Parsing
+/// retained dependencies and features, then projecting them, allocates more
+/// memory; this input bound reduces that exposure without bounding its peak.
+pub const CARGO_PUBLISH_METADATA_LIMIT: usize = 1024 * 1024;
+
 /// Resolve Cargo's effective publish body limit from the shared
 /// effective limit — the parsed `HORT_PUBLISH_BODY_MAX_SIZE`, or
 /// [`DEFAULT_PUBLISH_BODY_LIMIT`] when the operator set nothing.

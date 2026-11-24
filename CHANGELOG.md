@@ -55,6 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of answering from the other name's row and re-fetching from the upstream on
   every request (#459).
 
+- A `cargo publish` whose metadata JSON exceeds 64 KiB is no longer refused:
+  the bound is now 1 MiB, which admits crates with long READMEs that were
+  previously rejected outright, and the refusal is returned in cargo's own
+  error envelope so the publisher actually sees the reason (#458).
+
 ### Security
 
 - Discovery now answers 404 instead of 403 for repositories the caller cannot

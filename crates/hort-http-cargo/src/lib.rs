@@ -34,7 +34,7 @@ use hort_http_core::context::AppContext;
 use hort_http_core::error::ApiError;
 use hort_http_core::limits::{
     publish_disabled_response, refuse_publishes_when_disabled, BoundedPath,
-    CARGO_PUBLISH_BODY_LIMIT,
+    CARGO_PUBLISH_BODY_LIMIT, CARGO_PUBLISH_METADATA_LIMIT,
 };
 use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 use hort_http_core::middleware::trust::RequestTrust;
@@ -125,7 +125,7 @@ pub fn cargo_routes_with_publish_limit(limit: usize) -> Router<Arc<AppContext>> 
         )
         .route(
             "/{repo_key}/api/v1/crates/new",
-            put(publish).layer(DefaultBodyLimit::max(limit)),
+            put(publish).layer::<_, std::convert::Infallible>(DefaultBodyLimit::max(limit)),
         )
         .route("/{repo_key}/1/{crate_name}", get(sparse_index))
         .route("/{repo_key}/2/{crate_name}", get(sparse_index))
@@ -670,7 +670,10 @@ async fn publish(
     // caller without Write still sees the stable 403, not a repo-type oracle.
     reject_write_to_virtual(&repo)?;
 
-    let (metadata_bytes, crate_bytes) = parse_publish_body(&body)?;
+    let (metadata_bytes, crate_bytes) = match parse_publish_body(&body) {
+        Ok(parts) => parts,
+        Err(response) => return Ok(*response),
+    };
 
     // The WHOLE metadata object is parsed, not just `name`/`vers`: the
     // served sparse-index entry is built from the publish body's
@@ -708,7 +711,7 @@ async fn publish(
     match read_declared_crate_identity(body.slice_ref(crate_bytes)).await {
         Ok(declared) => {
             if let Some(divergence) = declared.check(&metadata.name, &metadata.vers).divergence() {
-                return Ok(identity_refusal(&divergence.message("cargo .crate")));
+                return Ok(cargo_publish_refusal(&divergence.message("cargo .crate")));
             }
         }
         Err(refusal) => return Ok(*refusal),
@@ -837,22 +840,21 @@ async fn read_declared_crate_identity(
     // established is not an identity that agreed — cargo's `.crate` format
     // requires a top-level `{name}-{version}/Cargo.toml`, so its absence or
     // corruption is a malformed publish, not a fact to wave through.
-    joined.map_err(|domain_err| Box::new(identity_refusal(&domain_err.to_string())))
+    joined.map_err(|domain_err| Box::new(cargo_publish_refusal(&domain_err.to_string())))
 }
 
-/// The cargo-shaped refusal for a publish whose archive disagrees with its
-/// coordinates.
+/// The cargo-shaped refusal for a publish rejected before ingest.
 ///
 /// **400 + `{"errors":[{"detail": "<message>"}]}`.** The Cargo Book's
 /// *Registry Web API* specifies that a registry reports a failure with an
 /// `errors` array of objects carrying a `detail` string, and that cargo
 /// displays each `detail` to the user. A `{"error": …}` body — the shape
-/// every other rejection on this handler emits through `ApiError` — is not
+/// generic validation errors on this handler emit through `ApiError` — is not
 /// that envelope, so cargo falls back to printing the raw body with a
 /// generic "the remote server responded with an error" line and the reason
 /// never reaches the publisher legibly. The specification outranks the
 /// convenience of a uniform shape.
-fn identity_refusal(message: &str) -> Response {
+fn cargo_publish_refusal(message: &str) -> Response {
     (
         StatusCode::BAD_REQUEST,
         [(CONTENT_TYPE, "application/json")],
@@ -871,40 +873,45 @@ fn errors_envelope(message: &str) -> String {
 /// `[u32 LE metadata_len][metadata JSON][u32 LE crate_len][crate bytes]`.
 ///
 /// Returns `(metadata_bytes, crate_bytes)` as sub-slices of the input buffer,
-/// or a 400-mapped `ApiError` on truncation or length overflow.
-fn parse_publish_body(body: &[u8]) -> Result<(&[u8], &[u8]), ApiError> {
-    // The cargo publish frame's `meta_len` is attacker-supplied; cap it
-    // before any slice so a bogus declaration cannot push the parser to
-    // allocate or scan multi-MiB buffers. Publish metadata in practice
-    // carries a single version's metadata, which is structurally
-    // comparable to a sparse-index entry — well under 64 KiB, measured
-    // per entry when this cap was chosen.
-    // Decoupled from `CargoFormatHandler::metadata_expected_max_bytes()`
-    // (the upstream-body cap, 8 MiB; see `hort-formats/src/cargo.rs`).
-    // Diagnostic carries the cap word but no body bytes.
-    const PUBLISH_META_CAP: usize = 64 * 1024;
+/// or a 400 response on truncation, length overflow, or oversized metadata.
+fn parse_publish_body(body: &[u8]) -> Result<(&[u8], &[u8]), Box<Response>> {
+    // `DefaultBodyLimit` bounds the `Bytes` buffer. The metadata limit bounds
+    // the next step, `serde_json::from_slice`, which allocates retained deps
+    // and features on top of that buffer. The length prefix itself drives no
+    // allocation: the checked split first rejects declarations past the body.
 
     let (meta_len_bytes, rest) = body.split_at_checked(4).ok_or_else(|| {
-        validation_error("publish body truncated: missing metadata length prefix")
+        Box::new(
+            validation_error("publish body truncated: missing metadata length prefix")
+                .into_response(),
+        )
     })?;
     let meta_len = u32::from_le_bytes(meta_len_bytes.try_into().unwrap()) as usize;
 
-    if meta_len > PUBLISH_META_CAP {
-        return Err(validation_error("publish metadata exceeds 64 KB cap"));
+    let (metadata, rest) = rest.split_at_checked(meta_len).ok_or_else(|| {
+        Box::new(
+            validation_error("publish body truncated: metadata shorter than declared")
+                .into_response(),
+        )
+    })?;
+    if metadata.len() > CARGO_PUBLISH_METADATA_LIMIT {
+        return Err(Box::new(cargo_publish_refusal(&format!(
+            "publish metadata JSON segment exceeds the {CARGO_PUBLISH_METADATA_LIMIT} byte limit (for example, a large README can cause this)"
+        ))));
     }
 
-    let (metadata, rest) = rest.split_at_checked(meta_len).ok_or_else(|| {
-        validation_error("publish body truncated: metadata shorter than declared")
+    let (crate_len_bytes, rest) = rest.split_at_checked(4).ok_or_else(|| {
+        Box::new(
+            validation_error("publish body truncated: missing crate length prefix").into_response(),
+        )
     })?;
-
-    let (crate_len_bytes, rest) = rest
-        .split_at_checked(4)
-        .ok_or_else(|| validation_error("publish body truncated: missing crate length prefix"))?;
     let crate_len = u32::from_le_bytes(crate_len_bytes.try_into().unwrap()) as usize;
 
-    let crate_bytes = rest
-        .get(..crate_len)
-        .ok_or_else(|| validation_error("publish body truncated: crate shorter than declared"))?;
+    let crate_bytes = rest.get(..crate_len).ok_or_else(|| {
+        Box::new(
+            validation_error("publish body truncated: crate shorter than declared").into_response(),
+        )
+    })?;
 
     Ok((metadata, crate_bytes))
 }
@@ -4236,78 +4243,128 @@ mod tests {
         }
     }
 
-    // -- parse_publish_body metadata-length cap --------------------------------
-    //
-    // The cargo publish frame is `[u32 LE meta_len][meta][u32 LE crate_len][crate]`.
-    // `meta_len` is attacker-supplied; if uncapped, an attacker could
-    // declare a multi-MiB metadata segment to amplify allocator/parser
-    // pressure even though publish metadata in practice is one
-    // version's metadata only (structurally comparable to a single
-    // sparse-index entry, well under 64 KiB, measured per entry when
-    // this cap was chosen).
-    //
-    // The cap fires before the slice and the diagnostic carries no
-    // input bytes.
+    // -- cargo publish frame boundaries --------------------------------------
 
-    /// Build a publish frame whose declared `meta_len` is `meta_len_decl`
-    /// and whose metadata segment is `meta_len_decl` bytes of ASCII
-    /// space — `parse_publish_body` does not parse the metadata, so any
-    /// byte sequence of the declared length suffices for boundary
-    /// checks. The crate segment is empty.
-    fn build_publish_body_with_meta_len(meta_len_decl: u32) -> Vec<u8> {
-        let meta_len = meta_len_decl as usize;
-        let mut body = Vec::with_capacity(8 + meta_len);
-        body.extend_from_slice(&meta_len_decl.to_le_bytes());
-        body.extend(std::iter::repeat_n(b' ', meta_len));
-        body.extend_from_slice(&0u32.to_le_bytes());
-        body
+    async fn assert_publish_metadata_size_accepted(metadata_len: usize) {
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let empty = br#"{"name":"mycrate","vers":"0.1.0","readme":""}"#;
+        let readme = "a".repeat(metadata_len - empty.len());
+        let metadata = format!(r#"{{"name":"mycrate","vers":"0.1.0","readme":"{readme}"}}"#);
+        assert_eq!(metadata.len(), metadata_len);
+        let body = build_publish_body(metadata.as_bytes(), &crate_for("mycrate", "0.1.0"));
+
+        let response = router(h.ctx.clone())
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
-    #[test]
-    fn parse_publish_body_accepts_meta_len_one_byte_under_cap() {
-        // Just-under-cap meta_len (64 KiB - 1) parses successfully —
-        // the slice resolves the metadata segment without firing the
-        // PUBLISH_META_CAP gate.
-        const PUBLISH_META_CAP: usize = 64 * 1024;
-        let meta_len_decl = (PUBLISH_META_CAP - 1) as u32;
-        let body = build_publish_body_with_meta_len(meta_len_decl);
-        let Ok((metadata, crate_bytes)) = parse_publish_body(&body) else {
-            panic!("just-under-cap publish frame must parse");
-        };
-        assert_eq!(metadata.len(), PUBLISH_META_CAP - 1);
-        assert!(crate_bytes.is_empty());
+    #[tokio::test]
+    async fn publish_accepts_metadata_at_serde_saphyr_readme_size() {
+        // serde-saphyr 2.2.0 has a 78,445-byte JSON-encoded README.
+        assert_publish_metadata_size_accepted(78_445).await;
     }
 
-    #[test]
-    fn parse_publish_body_rejects_meta_len_one_byte_over_cap() {
-        // Just-over-cap meta_len (64 KiB + 1) is rejected by the cap
-        // gate before any slice. Diagnostic names the cap (in KB) but
-        // does not echo the body bytes.
-        const PUBLISH_META_CAP: usize = 64 * 1024;
-        let meta_len_decl = (PUBLISH_META_CAP + 1) as u32;
-        let body = build_publish_body_with_meta_len(meta_len_decl);
-        let Err(api_err) = parse_publish_body(&body) else {
-            panic!("just-over-cap publish frame must reject");
-        };
-        let hort_app::error::AppError::Domain(hort_domain::error::DomainError::Validation(
-            domain_msg,
-        )) = api_err.0
-        else {
-            panic!("expected Validation error variant");
-        };
-        assert!(
-            domain_msg.contains("publish metadata exceeds 64 KB cap"),
-            "publish-cap diagnostic missing: {domain_msg}"
+    #[tokio::test]
+    async fn publish_accepts_metadata_at_cargo_make_readme_size() {
+        // cargo-make 0.37.24 has a 169,436-byte JSON-encoded README.
+        assert_publish_metadata_size_accepted(169_436).await;
+    }
+
+    #[tokio::test]
+    async fn publish_refuses_metadata_just_over_default_parse_limit() {
+        let limit = CARGO_PUBLISH_METADATA_LIMIT;
+        let metadata = format!(
+            "{{\"name\":\"mycrate\",\"vers\":\"0.1.0\",\"readme\":\"{}\"}}",
+            "a".repeat(limit + 1 - br#"{"name":"mycrate","vers":"0.1.0","readme":""}"#.len())
         );
-        // No body bytes echoed — the metadata segment in our test body
-        // is all ASCII spaces; the diagnostic must not contain the
-        // attacker-supplied byte length verbatim either, so we pin a
-        // stricter check: it must not contain the exact `meta_len_decl`
-        // string. The 64 KiB cap value (65536 / "64 KB") is fine; the
-        // OBSERVED length (65537) is NOT echoed.
-        assert!(
-            !domain_msg.contains(&meta_len_decl.to_string()),
-            "diagnostic must not echo attacker-declared length: {domain_msg}"
+        assert_eq!(metadata.len(), limit + 1);
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let response = router(h.ctx.clone())
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(build_publish_body(metadata.as_bytes(), b"")))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({"errors": [{"detail": format!(
+                "publish metadata JSON segment exceeds the {limit} byte limit (for example, a large README can cause this)"
+            )}]})
         );
+    }
+
+    async fn assert_publish_validation(body: Vec<u8>, expected_message: &str) {
+        let h = harness();
+        insert_repo(&h, "cargo-test");
+        let response = router(h.ctx.clone())
+            .oneshot(
+                Request::put("/cargo/cargo-test/api/v1/crates/new")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            envelope,
+            serde_json::json!({"error": format!("validation: {expected_message}")})
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_frame_refusals_keep_exact_validation_messages() {
+        assert_publish_validation(
+            Vec::new(),
+            "publish body truncated: missing metadata length prefix",
+        )
+        .await;
+        assert_publish_validation(
+            build_publish_body(b"nope", b""),
+            "invalid publish metadata JSON: expected ident at line 1 column 2",
+        )
+        .await;
+        assert_publish_validation(
+            build_publish_body(br#"{"vers":"1.0.0"}"#, b""),
+            "invalid publish metadata JSON: missing field `name` at line 1 column 16",
+        )
+        .await;
+        // The checked split rejects an impossible declaration without panicking.
+        assert_publish_validation(
+            u32::MAX.to_le_bytes().to_vec(),
+            "publish body truncated: metadata shorter than declared",
+        )
+        .await;
+        let metadata = br#"{}"#;
+        let mut missing_crate_prefix = Vec::new();
+        missing_crate_prefix.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+        missing_crate_prefix.extend_from_slice(metadata);
+        assert_publish_validation(
+            missing_crate_prefix,
+            "publish body truncated: missing crate length prefix",
+        )
+        .await;
+        let mut short_crate = build_publish_body(metadata, b"");
+        let crate_length_offset = short_crate.len() - 4;
+        short_crate[crate_length_offset] = 1;
+        assert_publish_validation(
+            short_crate,
+            "publish body truncated: crate shorter than declared",
+        )
+        .await;
     }
 }
