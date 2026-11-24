@@ -52,8 +52,40 @@ a project that inlines API documentation or a changelog, and crates.io accepts
 it, so this is a hort-specific rejection of a legitimate publish rather than a
 protocol limit a client already expects.
 
-**Not measured here:** how many real crates exceed it. The claim above is
-about reachability and the refusal's wording, not about frequency.
+## Measured 2026-11-24 — two real crates, one of them hort's own dependency
+
+98 crates sampled: all **66 of hort's direct `[workspace.dependencies]`** plus
+32 targeted candidates picked for long documentation. For each, the highest
+stable version's `.crate` was fetched from `static.crates.io`, the **`readme`
+field declared in its `Cargo.toml`** was resolved, and that file was measured
+both raw and JSON-encoded — the encoded length being what the publish body
+actually carries.
+
+| crate | declared readme | raw | JSON-encoded | vs the 65 536 cap |
+|---|---|---:|---:|---|
+| **`serde-saphyr 2.2.0`** | `README.md` | 76 578 | **78 445** | **over by 12 909 (1.2×)** |
+| **`cargo-make 0.37.24`** | `README.md` | 163 309 | **169 436** | **over by 103 900 (2.6×)** |
+
+**`serde-saphyr` is one of hort's own direct dependencies.** hort could not
+accept a publish of a crate it itself depends on.
+
+**The JSON-encoded README is a lower bound on the publish body**, not the whole
+of it: the other publish fields (`description`, `keywords`, `categories`,
+`deps`, `features`, …) add more, so both rows understate the margin.
+
+**A false positive the method caught, worth keeping as a warning:** `just
+1.59.0`'s repository README is 162 532 bytes, but it declares
+`readme = "etc/crates-io-readme.md"` — a **585-byte** crates.io-specific file.
+So it is comfortably **under** the cap. Measuring repository READMEs rather
+than the declared field overcounts, and the declared field is the only correct
+source.
+
+**What this is not:** a frequency estimate for the registry. Two of 98 sampled
+crates exceed it, on a sample deliberately biased toward long documentation.
+
+**Not affected:** hort's own crates — none declares a `readme` field and the
+largest README anywhere under `crates/` is 6 287 bytes — and the proxy /
+pull-through path, which fetches the `.crate` and never sees a publish body.
 
 ## What this unit should decide and do
 
