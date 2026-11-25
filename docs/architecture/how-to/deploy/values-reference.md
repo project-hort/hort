@@ -86,9 +86,8 @@ Four caveats:
   disabled path. There is no `basic` provider value.
 - `HORT_TRUSTED_PROXY_CIDRS` is
   exposed as `trustedProxyCidrs`. It predates the HTTPS hardening, which
-  made it a
-  precondition for `HORT_REQUIRE_HTTPS=true` to start without an
-  `https://` `publicBaseUrl`. It is also the **sole** input to client-IP
+  made it a way for `HORT_REQUIRE_HTTPS=true` to start with an explicit
+  `http://` `publicBaseUrl`. It is also the **sole** input to client-IP
   attribution: with it empty, every request is attributed to its TCP
   peer, which in a Kubernetes install is the ingress or LB for every
   caller — collapsing the PAT brute-force lockout, the auth-failure
@@ -200,8 +199,8 @@ image:
 - **Default:** `""` (chart fails install — schema rule 1)
 - **Required:** yes
 - **Description:** Canonical URL the operator's edge terminates as.
-  Drives `Strict-Transport-Security` emission
-  (HSTS only fires when this URL's scheme is `https`) and the OCI
+  Qualifies `Strict-Transport-Security` emission together with per-request
+  TLS evidence (HSTS needs both) and drives the OCI
   `WWW-Authenticate: Bearer realm=...` value.
 - **Example:** `https://hort.example.com`
 - **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HTTPS-only realm + upstream URL scheme, HSTS.
@@ -231,11 +230,11 @@ image:
 - **Default:** `true`
 - **Required:** no
 - **Description:** Maps to `HORT_REQUIRE_HTTPS`. When `true`, the binary
-  refuses to start unless **either** `publicBaseUrl` is `https://...`
-  **or** `trustedProxyCidrs` is non-empty (positive evidence of a
-  TLS-terminating proxy in front). The AND-condition is deliberate:
-  only the "neither pinned nor proxied" case fails. The chart default
-  diverges from the binary default (`false`) on the principle that
+  refuses to start if `publicBaseUrl` is explicitly `http://...` and
+  `trustedProxyCidrs` is empty. The binary also permits an unset
+  base URL; the chart schema requires `publicBaseUrl` for chart installs.
+  This is configuration consistency, never request TLS evidence. The chart
+  default diverges from the binary default (`false`) on the principle that
   production charts ship with the security gate enabled.
 - **Example:** `false`
 - **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HSTS + bind-default + `HORT_REQUIRE_HTTPS`.

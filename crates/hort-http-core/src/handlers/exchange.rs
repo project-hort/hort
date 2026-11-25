@@ -26,9 +26,19 @@
 //! Content-Type: application/json
 //! Cache-Control: no-store
 //!
-//! { "access_token": "hort_cli_…", "issued_token_type": "…access_token",
-//!   "token_type": "Bearer", "expires_in": 2592000 }
+//! { "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.eyJzdWIi…",
+//!   "issued_token_type": "…access_token",
+//!   "token_type": "Bearer", "expires_in": 900 }
 //! ```
+//!
+//! `access_token` is **never** a `hort_cli_…` string: the interactive
+//! `subject_token_type=access_token` branch mints a Hort-signed Ed25519
+//! CliSession **JWT** (`cli_session_signing.rs`; catalog Entry 3), and the
+//! federated `subject_token_type=jwt` branch mints an Argon2id-hashed
+//! `hort_svc_*` ServiceAccount bearer (Entry 4/6). `expires_in` is
+//! computed from the issued token's own `expires_at`, so it reflects the
+//! per-cap clamp — ≤900 s on the CliSession branch, ≤3600 s on the
+//! federated one.
 //!
 //! Response — failure (RFC 8693 §2.4 / RFC 6749 §5.2):
 //!
@@ -43,14 +53,30 @@
 //! # Order of validation
 //!
 //! 1. Form parsing.
-//! 2. `grant_type` URI match.
-//! 3. `subject_token` / `subject_token_type` presence + allowed values.
-//! 4. `requested_token_type` (when present) must be `access_token`.
-//! 5. **PAT-shape gate** — `parse_pat_token_format` on the
+//! 2. **Transport evidence** — [`credential_transport_verdict`] on this
+//!    request's [`RequestTrust`], with the unscoped waiver pinned off
+//!    ([`UNSCOPED_WAIVER_REACHES_THIS_ENDPOINT`]). Fires before every gate
+//!    below, before any IdP or validator call, and before either mint:
+//!    this endpoint both receives a credential and answers with one, so a
+//!    refusal here protects a secret that does not exist yet. The refusal
+//!    is `426` in this endpoint's own envelope
+//!    ([`TRANSPORT_REFUSAL_REASON`]).
+//! 3. `grant_type` URI match.
+//! 4. `subject_token` / `subject_token_type` presence + allowed values.
+//! 5. `requested_token_type` (when present) must be `access_token`.
+//! 6. **PAT-shape gate** — `parse_pat_token_format` on the
 //!    `subject_token`. Fires BEFORE any IdP call,
 //!    so a chained PAT round-trips zero IdP traffic.
-//! 6. IdP validation via `AuthenticateUseCase::authenticate_bearer`.
-//! 7. Token mint via `ApiTokenUseCase::issue_cli_session`.
+//! 7. IdP validation via `AuthenticateUseCase::authenticate_bearer`.
+//! 8. Token mint via `ApiTokenUseCase::issue_cli_session`.
+//!
+//! Step 2 is deliberately *after* form parsing and nothing else: a body
+//! this server cannot parse carries no credential it could have read and
+//! mints nothing, so a `FormRejection` keeps answering `400`/`415` as
+//! before. Every request whose body *did* parse is observed once and
+//! decided once, which is what keeps
+//! `hort_credential_transport_total{entry_point="exchange"}` the
+//! denominator of the other two counters on this surface.
 //!
 //! # Headers
 //!
@@ -58,7 +84,11 @@
 //! plaintext token leaves the server exactly once.
 //!
 //! `WWW-Authenticate` is **NEVER** emitted. `/exchange` is target-of-
-//! exchange, not target-of-protected-resource.
+//! exchange, not target-of-protected-resource. That holds for the
+//! transport `426` too — no credential the client could present would
+//! change the answer, so advertising how to present one would loop a
+//! challenge-following client against an unchanged response. The `426`
+//! carries `Upgrade: TLS/1.2, HTTP/1.1` instead (RFC 9110 §15.6.7).
 //!
 //! # Tracing
 //!
@@ -77,13 +107,26 @@
 //! `result ∈ { success, source_token_invalid, source_token_expired,
 //! source_token_pat_rejected, idp_unavailable, bad_request,
 //! subject_not_authorised, cap_exceeds_authority, validation_error,
-//! infrastructure_error }`. No high-cardinality labels (no username,
-//! user_id, client_id, source_ip, external_id). The catalog row in
-//! `docs/metrics-catalog.md` is authoritative. `bad_request` +
+//! infrastructure_error, transport_refused }`. No high-cardinality labels
+//! (no username, user_id, client_id, source_ip, external_id). The catalog
+//! row in `docs/metrics-catalog.md` is authoritative. `bad_request` +
 //! `subject_not_authorised` are deliberately distinct from
 //! `source_token_invalid` — pre-IdP wire-shape rejects
 //! and post-validation 403s must not share a label with OIDC
-//! credential-abuse rejects.
+//! credential-abuse rejects. `transport_refused` is distinct from
+//! `bad_request` for the same reason one level across: a refused
+//! transport is a deployment condition the operator fixes in their
+//! topology, not a client that built the form wrong, and collapsing it
+//! onto the buggy-client bucket would hide a whole deployment going dark
+//! behind ordinary wire-shape noise.
+//!
+//! Step 2 of the order above also emits the shared credential-transport
+//! counters under `entry_point="exchange"`:
+//! `hort_credential_transport_total{entry_point,evidence}` on every
+//! parsed request, plus `hort_credential_transport_refusals_total` or
+//! `hort_credential_transport_waived_total{scope}` for the policy
+//! outcome. They are the cross-surface view; `hort_token_exchange_total`
+//! stays this endpoint's protocol-outcome taxonomy.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -112,6 +155,10 @@ use crate::context::{AppContext, AuthContext};
 use crate::handlers::token_exchange_common::{
     is_supported_subject_token_type, EXCHANGE_GRANT_TYPE, TOKEN_TYPE_ACCESS_TOKEN, TOKEN_TYPE_JWT,
 };
+use crate::middleware::credential_transport::{
+    credential_transport_verdict, record_credential_transport, record_credential_transport_verdict,
+    CredentialEntryPoint, CredentialTransportVerdict, UPGRADE_OFFER,
+};
 use crate::middleware::trust::RequestTrust;
 
 // ---------------------------------------------------------------------------
@@ -137,6 +184,56 @@ const CLIENT_ID_MAX_LEN: usize = 255;
 /// waits out a TTL-bounded session cap, a fundamentally slower
 /// condition than an event-stream append race.
 const MINT_CONTENDED_RETRY_AFTER_SECS: u64 = 1;
+
+/// The unscoped-waiver argument this endpoint passes to
+/// [`credential_transport_verdict`]: pinned **off**.
+///
+/// `HORT_BEARER_ALLOW_OVER_HTTP` is unscoped — it accepts a credential
+/// from any peer, on any evidence, relayed or not. A transport setting of
+/// that shape must not silently extend to *minting* a credential onto a
+/// wire this server knows nothing about: the other surfaces decide
+/// whether a secret that already crossed the wire may be read, while this
+/// one decides whether to put a new one on it. A deployment that
+/// genuinely wants plaintext token exchange declares the scope it is
+/// talking to with `HORT_TLS_NOT_REQUIRED_FROM`, which names a peer range
+/// and is the operator's own statement about their own topology. No
+/// second development switch exists for this endpoint, and that is the
+/// decision rather than an omission.
+///
+/// This is also the one place the obligation is not the operator's to
+/// trade away. RFC 6749 §3.2 binds the authorization server — *"the
+/// authorization server MUST require the use of TLS … when sending
+/// requests to the token endpoint"* — and an RFC 8693 exchange is a
+/// token-endpoint request, so the rule here is a specification rather
+/// than a judgement about exposure. A declared scope is still honoured;
+/// what conformance is and is not claimed for inside one is recorded in
+/// the ADR, not here.
+///
+/// Named rather than spelled `false` at the call so that the reason lives
+/// where the value does: a bare boolean literal at a security call site is
+/// exactly the argument a later edit flips without reading the comment
+/// above it.
+const UNSCOPED_WAIVER_REACHES_THIS_ENDPOINT: bool = false;
+
+/// The one reason string a transport refusal carries — into the `426`
+/// body's `error_description` and into the refusal `warn!`'s `reason`
+/// field, verbatim in both.
+///
+/// It names the asymmetry explicitly because this surface is the only one
+/// whose answer contradicts an enabled `HORT_BEARER_ALLOW_OVER_HTTP`, and
+/// the two signals an operator would otherwise have are a `426` that
+/// looks like a bug and a boot `warn!` that says bearer-over-HTTP is
+/// allowed. Both remedies are named so the fix does not require reading
+/// this file: terminate TLS, or declare the peer.
+///
+/// Deliberately *not* the shared `REFUSAL_REASON` the predicate returns.
+/// The shared string names a generic refusal; this endpoint needs to name
+/// the narrower waiver that can help here.
+const TRANSPORT_REFUSAL_REASON: &str =
+    "TLS evidence is required for token exchange: RFC 6749 §3.2 binds the authorization \
+     server, so HORT_BEARER_ALLOW_OVER_HTTP does not apply to this endpoint. Terminate TLS \
+     in front of this hop (and have the proxy send X-Forwarded-Proto while listed in \
+     HORT_TRUSTED_PROXY_CIDRS), or declare this peer's range in HORT_TLS_NOT_REQUIRED_FROM.";
 
 // ---------------------------------------------------------------------------
 // Metric labels — closed taxonomy; `docs/metrics-catalog.md` is the
@@ -177,6 +274,19 @@ mod metrics {
     pub(super) const RESULT_CAP_EXCEEDS_AUTHORITY: &str = "cap_exceeds_authority";
     pub(super) const RESULT_VALIDATION_ERROR: &str = "validation_error";
     pub(super) const RESULT_INFRASTRUCTURE_ERROR: &str = "infrastructure_error";
+    /// The request arrived with neither positive evidence of TLS nor an
+    /// applicable operator waiver, so no credential was read and none
+    /// was minted. HTTP 426.
+    ///
+    /// Its own value rather than `bad_request`: that bucket is the
+    /// buggy-client signal (a wrong `grant_type`, a malformed form), and
+    /// a refused transport is a *deployment* condition — one proxy
+    /// stopping to overwrite a forwarded scheme takes every exchange on
+    /// that deployment to 426 at once, which must not arrive on a
+    /// dashboard as a client suddenly building its form wrong. The
+    /// cross-surface view of the same event is
+    /// `hort_credential_transport_refusals_total{entry_point="exchange"}`.
+    pub(super) const RESULT_TRANSPORT_REFUSED: &str = "transport_refused";
 
     pub(super) const COUNTER: &str = "hort_token_exchange_total";
     pub(super) const HISTOGRAM: &str = "hort_token_exchange_duration_seconds";
@@ -402,6 +512,11 @@ async fn run(
     source_ip: &str,
     client_ip: Option<IpAddr>,
 ) -> Outcome {
+    // Cloned out of the extensions before `Form` consumes the request.
+    // `None` — the bare routers several handler tests mount — is the
+    // precedence table's first refusing row, never an allow.
+    let trust = request.extensions().get::<RequestTrust>().cloned();
+
     // 1. Form parsing — RFC 8693 §2.1 wire body. Map axum's typed
     //    rejection into the RFC 8693 error envelope. Most variants
     //    return HTTP 400 `invalid_request`; `InvalidFormContentType`
@@ -416,7 +531,40 @@ async fn run(
         Err(rej) => return form_rejection_outcome(&rej),
     };
 
-    // 2. grant_type — must be the RFC 8693 token-exchange URI.
+    // 2. Transport evidence, before every gate below and before either
+    //    mint.
+    //
+    //    This endpoint is a token endpoint, and the subject of the rule
+    //    here is the *request to it* rather than a field in its body.
+    //    RFC 6749 §3.2 is written that way, and so is this call: a
+    //    payload-keyed condition — "decide only when `subject_token` is
+    //    present" — would make the rule's reach depend on a form field
+    //    name, which is the same mistake as keying it on a token's
+    //    prefix one layer up. `subject_token` is the only credential
+    //    field this endpoint reads today; a future RFC 8693 parameter
+    //    that is not it would silently arrive outside the rule.
+    //
+    //    Refused before `grant_type`, before the token-type checks,
+    //    before the PAT-shape gate, before
+    //    `authenticate_bearer_with_client_ip`, before
+    //    `handle_federated_jwt`, and therefore before both mints: the
+    //    CliSession JWT on the access-token path and the ServiceAccount
+    //    bearer on the federated one are covered by this one call. On
+    //    the consume surfaces a refusal stops the *next* request,
+    //    because the credential is already on the wire; here it
+    //    protects a secret that does not exist yet.
+    let trust = trust.as_ref();
+    record_credential_transport(CredentialEntryPoint::Exchange, trust.map(|t| t.transport));
+    let verdict = credential_transport_verdict(trust, UNSCOPED_WAIVER_REACHES_THIS_ENDPOINT);
+    record_credential_transport_verdict(CredentialEntryPoint::Exchange, verdict);
+    // The verdict's generic reason is discarded on purpose: this endpoint's
+    // reason must explain that the unscoped waiver cannot help here.
+    // `TRANSPORT_REFUSAL_REASON` carries that explanation on the wire.
+    if matches!(verdict, CredentialTransportVerdict::Refused(_)) {
+        return transport_refused_outcome(trust);
+    }
+
+    // 3. grant_type — must be the RFC 8693 token-exchange URI.
     let grant_type = match form.grant_type.as_deref() {
         Some(s) if !s.is_empty() => s,
         _ => return invalid_request_outcome("grant_type is required".to_string()),
@@ -430,13 +578,13 @@ async fn run(
         );
     }
 
-    // 3. subject_token presence.
+    // 4. subject_token presence.
     let subject_token = match form.subject_token.as_deref() {
         Some(s) if !s.is_empty() => s,
         _ => return invalid_request_outcome("subject_token is required".to_string()),
     };
 
-    // 4. subject_token_type — must be access_token or id_token.
+    // 5. subject_token_type — must be access_token or id_token.
     let subject_token_type = match form.subject_token_type.as_deref() {
         Some(s) if !s.is_empty() => s,
         _ => return invalid_request_outcome("subject_token_type is required".to_string()),
@@ -472,7 +620,7 @@ async fn run(
         .await;
     }
 
-    // 5. requested_token_type — if present, must be access_token.
+    // 6. requested_token_type — if present, must be access_token.
     if let Some(req_type) = form.requested_token_type.as_deref() {
         if !req_type.is_empty() && req_type != TOKEN_TYPE_ACCESS_TOKEN {
             return error_outcome(
@@ -484,7 +632,7 @@ async fn run(
         }
     }
 
-    // 5b. Parse `scope` (space-separated permissions)
+    // 6b. Parse `scope` (space-separated permissions)
     //     and `requested_token_lifetime` (seconds). Unknown permission
     //     names or oversize/negative lifetimes are wire-shape errors
     //     (bad_request). The `lifetime` value itself is bounds-checked
@@ -496,7 +644,7 @@ async fn run(
     };
     let requested_lifetime_secs = form.requested_token_lifetime;
 
-    // 6. PAT-shape gate — fires BEFORE any IdP call so chained-PAT
+    // 7. PAT-shape gate — fires BEFORE any IdP call so chained-PAT
     //    attempts cost zero IdP traffic.
     if parse_pat_token_format(subject_token).is_ok() {
         tracing::info!(
@@ -511,7 +659,7 @@ async fn run(
         );
     }
 
-    // 7. IdP validation via the existing AuthenticateUseCase. The
+    // 8. IdP validation via the existing AuthenticateUseCase. The
     //    AuthContext::Enabled branch is the only one that wires
     //    AuthenticateUseCase; under Disabled the route is unreachable
     //    in production (composition fails to wire token_exchange when
@@ -546,7 +694,7 @@ async fn run(
     };
 
     // Threaded for the per-IP PAT lockout the client-IP-aware entry
-    // point arms. On THIS path the PAT branch is unreachable — step 6
+    // point arms. On THIS path the PAT branch is unreachable — step 7
     // above rejects every PAT-shaped `subject_token` before we get
     // here — so the lockout cannot engage from the exchange endpoint
     // today. It is threaded anyway because the alternative is a
@@ -630,7 +778,7 @@ async fn run(
         }
     };
 
-    // 8. Mint via the existing ApiTokenUseCase::issue_cli_session.
+    // 9. Mint via the existing ApiTokenUseCase::issue_cli_session.
     //    Truncate client_id to 255 chars at a char boundary BEFORE handoff.
     let client_name = form.client_id.as_deref().map(|s| {
         if s.len() <= CLIENT_ID_MAX_LEN {
@@ -855,6 +1003,58 @@ fn error_outcome_with_kind(
         label,
         kind,
     }
+}
+
+/// The `426` answer to a token-exchange request on a transport with
+/// neither evidence of TLS nor an applicable operator waiver.
+///
+/// The endpoint's **own** envelope — `{"error","error_description"}`,
+/// OAuth code `invalid_request` per RFC 6749 §5.2 — rather than the
+/// generic `{"error": "<reason>"}` body the non-OCI middlewares emit or
+/// the Distribution-Spec `errors` array the OCI plane emits: an RFC 8693
+/// client parses this shape and nothing else, and a 426 is no reason to
+/// hand it a body it has no parser for. [`with_no_store`] applies through
+/// [`error_outcome_with_kind`], so the refusal carries
+/// `Cache-Control: no-store` like every other response here.
+///
+/// `Upgrade: TLS/1.2, HTTP/1.1` is the shared
+/// [`UPGRADE_OFFER`] rather than a third hand-typed copy of a wire
+/// literal; RFC 9110 §15.6.7 requires a `426` to name the protocol it
+/// wants. No `WWW-Authenticate`, per the module header's rule and
+/// because no credential the client could present would change the
+/// answer.
+///
+/// `kind = "cli_session"` because the refusal fires before the dispatch
+/// branch is known — the same attribution [`invalid_request_outcome`]
+/// already makes for every pre-dispatch wire-shape gate, for catalog
+/// continuity rather than because the request was headed for that
+/// branch.
+///
+/// The `warn!` carries the evidence actually derived and whether the peer
+/// was a trusted proxy: those two facts are what separate "terminate TLS
+/// in front" from "your proxy is not overwriting the forwarded scheme"
+/// from "declare this hop", and the reason field carries the same string
+/// the operator reads on the wire.
+fn transport_refused_outcome(trust: Option<&RequestTrust>) -> Outcome {
+    tracing::warn!(
+        reason = TRANSPORT_REFUSAL_REASON,
+        evidence = ?trust.map(|t| t.transport),
+        peer_trusted = ?trust.map(|t| t.peer_trusted),
+        "/exchange refused: no TLS evidence and no applicable waiver — nothing was \
+         validated and nothing was minted"
+    );
+    let mut outcome = error_outcome_with_kind(
+        StatusCode::UPGRADE_REQUIRED,
+        "invalid_request",
+        TRANSPORT_REFUSAL_REASON.to_string(),
+        metrics::RESULT_TRANSPORT_REFUSED,
+        metrics::KIND_CLI_SESSION,
+    );
+    outcome
+        .response
+        .headers_mut()
+        .insert(header::UPGRADE, HeaderValue::from_static(UPGRADE_OFFER));
+    outcome
 }
 
 /// Build the `503 Service Unavailable` + advisory `Retry-After`
@@ -1845,6 +2045,26 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         (router, idp, mocks)
     }
 
+    /// The `/api/v1/auth/exchange`-only router over a given context —
+    /// the one assembly every builder here ends with.
+    fn exchange_router(ctx: &Arc<AppContext>) -> Router {
+        Router::new()
+            .nest("/api/v1", token_exchange_routes())
+            .with_state(ctx.clone())
+    }
+
+    /// The interactive router with the **unscoped**
+    /// `HORT_BEARER_ALLOW_OVER_HTTP` waiver flipped on — the one
+    /// operator instrument this endpoint deliberately does not consult.
+    fn build_test_router_with_unscoped_waiver() -> (Router, Arc<MockIdentityProvider>, MockPorts) {
+        let metrics_handle = PrometheusBuilder::new().build_recorder().handle();
+        let (base, mocks) = build_mock_ctx(metrics_handle);
+        let idp = Arc::new(MockIdentityProvider::new());
+        let (_, ctx) = build_router_with_idp(&base, &mocks, idp.clone());
+        let ctx = crate::test_support::with_pat_over_http_allowed(&ctx, true);
+        (exchange_router(&ctx), idp, mocks)
+    }
+
     fn form_body(pairs: &[(&str, &str)]) -> String {
         let mut s = String::new();
         for (i, (k, v)) in pairs.iter().enumerate() {
@@ -1871,14 +2091,69 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         out
     }
 
+    /// A `RequestTrust` with positive evidence of TLS, behind a trusted
+    /// proxy that reported `https` — the posture every documented
+    /// production deployment of this endpoint runs.
+    ///
+    /// Carried by [`post_form`] on every request, because the endpoint
+    /// now refuses a token exchange on a transport with no evidence and
+    /// no waiver and a bare `oneshot` carries no trust extension at all,
+    /// which is the precedence table's first refusing row. The tests that
+    /// are *about* the transport decision build their own trust with
+    /// [`post_form_under_trust`] instead.
+    fn trust_over_tls() -> RequestTrust {
+        RequestTrust {
+            client_ip: "198.51.100.7".parse().expect("test peer parses"),
+            public_url: url::Url::parse("https://hort.example.com/").expect("test URL parses"),
+            transport: crate::middleware::trust::TransportSecurity::Tls,
+            peer_trusted: true,
+            tls_requirement_waived: false,
+        }
+    }
+
+    /// A `RequestTrust` with no evidence and no waiver — a direct,
+    /// untrusted peer nobody declared. The shape an in-cluster caller
+    /// over plaintext HTTP arrives with.
+    fn trust_without_evidence() -> RequestTrust {
+        RequestTrust {
+            client_ip: "10.1.2.3".parse().expect("test peer parses"),
+            public_url: url::Url::parse("http://hort.internal/").expect("test URL parses"),
+            transport: crate::middleware::trust::TransportSecurity::Unknown,
+            peer_trusted: false,
+            tls_requirement_waived: false,
+        }
+    }
+
+    /// The same unproven peer, inside an operator-declared
+    /// `HORT_TLS_NOT_REQUIRED_FROM` range. The evidence stays `Unknown`:
+    /// a waiver never asserts that TLS happened.
+    fn trust_waived() -> RequestTrust {
+        RequestTrust {
+            tls_requirement_waived: true,
+            ..trust_without_evidence()
+        }
+    }
+
     fn post_form(router: Router, body: String) -> impl std::future::Future<Output = Response> {
-        let req = Request::post("/api/v1/auth/exchange")
-            .header(
-                http_header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(Body::from(body))
-            .unwrap();
+        post_form_under_trust(router, body, Some(trust_over_tls()))
+    }
+
+    /// `POST /api/v1/auth/exchange` under an explicit trust context, or
+    /// under none at all (`None` — the bare-router shape).
+    fn post_form_under_trust(
+        router: Router,
+        body: String,
+        trust: Option<RequestTrust>,
+    ) -> impl std::future::Future<Output = Response> {
+        let builder = Request::post("/api/v1/auth/exchange").header(
+            http_header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded",
+        );
+        let builder = match trust {
+            Some(trust) => builder.extension(trust),
+            None => builder,
+        };
+        let req = builder.body(Body::from(body)).unwrap();
         async move { router.oneshot(req).await.unwrap() }
     }
 
@@ -1981,6 +2256,514 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
             counter_value(&snap, metrics::COUNTER, metrics::RESULT_BAD_REQUEST),
             1,
             "expected exactly one bad_request increment; saw: {snap:?}"
+        );
+        assert_eq!(transport_observed(&snap, "tls"), 1);
+    }
+
+    /// The evidence this endpoint refuses on is still *observed* as the
+    /// evidence actually derived: `hort_credential_transport_total`
+    /// reports the wire, never the policy outcome, which is what keeps
+    /// "how much of my traffic has no TLS evidence" answerable once
+    /// refusals and waivers are in play.
+    ///
+    /// A trusted peer reporting `proto=http` is positive evidence that
+    /// an external client spoke cleartext, which no declared scope
+    /// waives, and `HORT_BEARER_ALLOW_OVER_HTTP` does not reach this
+    /// endpoint — so the request is refused while the counter keeps
+    /// saying `plaintext` rather than being folded into the refusal.
+    #[test]
+    fn exchange_refuses_a_plaintext_transport_and_still_counts_it_as_plaintext() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, _, _) = build_test_router();
+                let trust = RequestTrust {
+                    transport: crate::middleware::trust::TransportSecurity::Plaintext,
+                    peer_trusted: true,
+                    // Declared *and* refused: a scope waives `Unknown`
+                    // only, so carrying the waiver here proves the row
+                    // rather than passing because the fixture omitted it.
+                    tls_requirement_waived: true,
+                    ..trust_without_evidence()
+                };
+                let resp =
+                    post_form_under_trust(router, happy_form("presented-token"), Some(trust)).await;
+                assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+                assert_eq!(body_json(resp).await["error"], "invalid_request");
+            });
+        });
+        assert_eq!(transport_observed(&snap, "plaintext"), 1);
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_TRANSPORT_REFUSED),
+            1,
+            "expected exactly one transport_refused increment; saw: {snap:?}"
+        );
+    }
+
+    // =======================================================================
+    // The credential-transport boundary (step 2 of the order of validation)
+    // =======================================================================
+    //
+    // This endpoint is the one surface in the credential census whose
+    // answer can contradict an enabled `HORT_BEARER_ALLOW_OVER_HTTP`, so
+    // the tests below pin that asymmetry on both mint branches rather
+    // than pinning the status alone: a `426` proves the response, and
+    // only the validator call counts and the mint-side mocks prove that
+    // nothing ran behind it.
+
+    /// Headers and envelope of the refusal, asserted once so the other
+    /// cases can assert on status alone.
+    ///
+    /// `Upgrade` because RFC 9110 §15.6.7 requires a `426` to name the
+    /// protocol it wants; `no-store` because every response here carries
+    /// it; no `WWW-Authenticate` because no credential the client could
+    /// present would change the answer.
+    fn assert_refusal_wire_shape(resp: &Response) {
+        assert_eq!(resp.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            resp.headers()
+                .get(http_header::UPGRADE)
+                .and_then(|v| v.to_str().ok()),
+            Some(UPGRADE_OFFER),
+            "a 426 must name the protocol it wants (RFC 9110 §15.6.7)"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(http_header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store"),
+        );
+        assert!(
+            resp.headers().get(http_header::WWW_AUTHENTICATE).is_none(),
+            "/exchange never emits WWW-Authenticate — a refused transport \
+             least of all, since presenting a credential cannot change the \
+             answer"
+        );
+    }
+
+    /// The refusal body is the endpoint's own OAuth envelope carrying the
+    /// one reason string, which names all three facts an operator needs:
+    /// that TLS evidence is the requirement, that the unscoped flag does
+    /// not apply here, and both remedies.
+    async fn assert_refusal_envelope(resp: Response) {
+        let v = body_json(resp).await;
+        assert_eq!(v["error"], "invalid_request", "RFC 6749 §5.2 shape");
+        let desc = v["error_description"].as_str().unwrap_or_default();
+        assert_eq!(
+            desc, TRANSPORT_REFUSAL_REASON,
+            "the body carries the one reason string verbatim"
+        );
+        for fact in [
+            "TLS evidence is required for token exchange",
+            "HORT_BEARER_ALLOW_OVER_HTTP does not apply to this endpoint",
+            "HORT_TLS_NOT_REQUIRED_FROM",
+        ] {
+            assert!(
+                desc.contains(fact),
+                "the reason must name {fact:?} so the asymmetry does not \
+                 have to be read out of the source; got {desc:?}"
+            );
+        }
+    }
+
+    /// Interactive branch: refused before the IdP is consulted and before
+    /// anything is minted.
+    ///
+    /// The IdP has a *valid* token registered, so a 426 cannot be
+    /// explained by the credential being bad — and
+    /// `idp.validate_call_count() == 0` is what separates "refused before
+    /// the IdP call" from "refused after one", which the status cannot.
+    #[test]
+    fn an_interactive_exchange_on_an_unproven_transport_is_refused_before_the_idp_and_the_mint() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, idp, mocks) = build_test_router();
+                idp.register_token("good-token", sample_claims("idp:unproven"));
+                let resp = post_form_under_trust(
+                    router,
+                    happy_form("good-token"),
+                    Some(trust_without_evidence()),
+                )
+                .await;
+                assert_refusal_wire_shape(&resp);
+                assert_refusal_envelope(resp).await;
+                assert_eq!(
+                    idp.validate_call_count(),
+                    0,
+                    "the refusal must fire before any IdP call"
+                );
+                assert!(
+                    mocks.events.appended_batches().is_empty(),
+                    "no CliSession was minted, so no ApiTokenIssued was appended"
+                );
+                assert!(
+                    mocks.api_tokens.inserted().is_empty(),
+                    "no token row may be written on a refused transport"
+                );
+            });
+        });
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_TRANSPORT_REFUSED),
+            1,
+            "expected exactly one transport_refused increment; saw: {snap:?}"
+        );
+        assert_eq!(
+            counter_value_kind_result(
+                &snap,
+                metrics::COUNTER,
+                metrics::KIND_CLI_SESSION,
+                metrics::RESULT_TRANSPORT_REFUSED
+            ),
+            1,
+            "the refusal fires before the dispatch branch is known, so it is \
+             attributed to kind=cli_session like every other pre-dispatch gate"
+        );
+        assert!(
+            histogram_sample_count(&snap, metrics::HISTOGRAM, metrics::RESULT_TRANSPORT_REFUSED)
+                >= 1,
+            "the histogram records on every exit path, this one included"
+        );
+        assert_eq!(transport_observed(&snap, "unknown"), 1);
+        assert_eq!(
+            transport_counter(
+                &snap,
+                "hort_credential_transport_refusals_total",
+                &[("entry_point", "exchange")]
+            ),
+            1,
+            "the cross-surface refusal counter carries this entry point too"
+        );
+    }
+
+    /// Federated branch: refused before the validator runs and before the
+    /// ServiceAccount bearer is minted.
+    ///
+    /// The validator has a JWT registered that would validate and an SA
+    /// that would match it, so again a 426 cannot be explained by the
+    /// credential. `validator.validate_call_count() == 0` is the
+    /// absence assertion.
+    #[test]
+    fn a_federated_exchange_on_an_unproven_transport_is_refused_before_validation_and_the_mint() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, validator, sas, mocks) = build_federation_router();
+                let sa = sample_sa();
+                seed_sa_user(&mocks, &sa);
+                sas.insert(sa);
+                validator.register_token("ok-jwt", sample_validated_claims(600));
+                let resp = post_form_under_trust(
+                    router,
+                    federation_form("ok-jwt"),
+                    Some(trust_without_evidence()),
+                )
+                .await;
+                assert_refusal_wire_shape(&resp);
+                assert_refusal_envelope(resp).await;
+                assert_eq!(
+                    validator.validate_call_count(),
+                    0,
+                    "the refusal must fire before `handle_federated_jwt`, so \
+                     no federated validation happens at all"
+                );
+                assert!(
+                    mocks.api_tokens.inserted().is_empty(),
+                    "no ServiceAccount bearer may be minted on a refused transport"
+                );
+                assert!(
+                    mocks.events.appended_batches().is_empty(),
+                    "and no ApiTokenIssued is appended to the SA's stream"
+                );
+            });
+        });
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_TRANSPORT_REFUSED),
+            1,
+            "expected exactly one transport_refused increment; saw: {snap:?}"
+        );
+        assert_eq!(transport_observed(&snap, "unknown"), 1);
+    }
+
+    /// **The behaviour that distinguishes this surface from the other
+    /// five.** `HORT_BEARER_ALLOW_OVER_HTTP=true` accepts a credential
+    /// from any peer on every other credential surface, and here it
+    /// changes nothing: both branches still answer `426`, and neither
+    /// mints.
+    ///
+    /// RFC 6749 §3.2 is the reason — the obligation on the token
+    /// endpoint binds this server rather than the operator, so the
+    /// operator's unscoped instrument does not reach it. A regression
+    /// here is not a cosmetic one: it would let an operator who set the
+    /// flag for a plaintext package-manager client silently re-open
+    /// cleartext *minting*.
+    #[test]
+    fn the_unscoped_waiver_does_not_make_a_plaintext_exchange_succeed_on_either_branch() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                // Interactive branch.
+                let (router, idp, mocks) = build_test_router_with_unscoped_waiver();
+                idp.register_token("good-token", sample_claims("idp:unscoped"));
+                let resp = post_form_under_trust(
+                    router,
+                    happy_form("good-token"),
+                    Some(trust_without_evidence()),
+                )
+                .await;
+                assert_refusal_wire_shape(&resp);
+                assert_refusal_envelope(resp).await;
+                assert_eq!(idp.validate_call_count(), 0);
+                assert!(mocks.events.appended_batches().is_empty());
+
+                // Federated branch, same flag, same answer.
+                let (router, validator, sas, mocks) =
+                    build_federation_router_with_unscoped_waiver();
+                let sa = sample_sa();
+                seed_sa_user(&mocks, &sa);
+                sas.insert(sa);
+                validator.register_token("ok-jwt", sample_validated_claims(600));
+                let resp = post_form_under_trust(
+                    router,
+                    federation_form("ok-jwt"),
+                    Some(trust_without_evidence()),
+                )
+                .await;
+                assert_refusal_wire_shape(&resp);
+                assert_refusal_envelope(resp).await;
+                assert_eq!(validator.validate_call_count(), 0);
+                assert!(mocks.api_tokens.inserted().is_empty());
+            });
+        });
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_TRANSPORT_REFUSED),
+            2,
+            "both branches refuse with the flag set; saw: {snap:?}"
+        );
+        assert_eq!(
+            transport_counter(
+                &snap,
+                "hort_credential_transport_waived_total",
+                &[("entry_point", "exchange"), ("scope", "unscoped")]
+            ),
+            0,
+            "the unscoped waiver is never *applied* here, so it is never \
+             counted as having waived anything on this entry point"
+        );
+    }
+
+    /// A `Plaintext` transport is refused even with the unscoped flag
+    /// set — the same row as above on the other evidence value, which
+    /// matters because `Plaintext` is the one value the unscoped flag
+    /// does still waive on every other surface.
+    #[test]
+    fn the_unscoped_waiver_does_not_rescue_a_trusted_peer_reporting_plaintext() {
+        rt().block_on(async {
+            let (router, idp, mocks) = build_test_router_with_unscoped_waiver();
+            idp.register_token("good-token", sample_claims("idp:plaintext"));
+            let trust = RequestTrust {
+                transport: crate::middleware::trust::TransportSecurity::Plaintext,
+                peer_trusted: true,
+                ..trust_without_evidence()
+            };
+            let resp = post_form_under_trust(router, happy_form("good-token"), Some(trust)).await;
+            assert_refusal_wire_shape(&resp);
+            assert_eq!(idp.validate_call_count(), 0);
+            assert!(mocks.events.appended_batches().is_empty());
+        });
+    }
+
+    /// The precedence table's first row on this surface: no
+    /// `RequestTrust` extension at all is a refusal, and the unscoped
+    /// flag does not change that either.
+    ///
+    /// This is the shape a bare router produces, and it used to be the
+    /// shape every test in this module produced — which is why
+    /// [`post_form`] now carries [`trust_over_tls`].
+    #[test]
+    fn an_absent_trust_extension_is_refused_with_the_evidence_recorded_as_unknown() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, idp, _mocks) = build_test_router_with_unscoped_waiver();
+                idp.register_token("good-token", sample_claims("idp:no-trust"));
+                let resp = post_form_under_trust(router, happy_form("good-token"), None).await;
+                assert_refusal_wire_shape(&resp);
+                assert_eq!(idp.validate_call_count(), 0);
+            });
+        });
+        assert_eq!(
+            transport_observed(&snap, "unknown"),
+            1,
+            "a missing trust extension is recorded as `unknown`, never as `tls`"
+        );
+    }
+
+    /// A peer inside a declared `HORT_TLS_NOT_REQUIRED_FROM` range
+    /// succeeds on **both** mint branches, and the evidence still reads
+    /// `Unknown`: a waiver changes what is accepted, never what the
+    /// server claims to have seen.
+    #[test]
+    fn a_declared_waiver_admits_both_branches_with_the_evidence_still_unknown() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                // Interactive branch mints the signed CliSession JWT.
+                let (router, idp, _mocks) = build_test_router();
+                idp.register_token("good-token", sample_claims("idp:waived"));
+                let resp =
+                    post_form_under_trust(router, happy_form("good-token"), Some(trust_waived()))
+                        .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                let v = body_json(resp).await;
+                let token = v["access_token"].as_str().unwrap_or_default();
+                assert_eq!(
+                    token.split('.').count(),
+                    3,
+                    "the interactive branch mints a signed JWT, not a \
+                     `hort_cli_…` string; got {token:?}"
+                );
+
+                // Federated branch mints the ServiceAccount bearer.
+                let (router, validator, sas, mocks) = build_federation_router();
+                let sa = sample_sa();
+                seed_sa_user(&mocks, &sa);
+                sas.insert(sa);
+                validator.register_token("ok-jwt", sample_validated_claims(600));
+                let resp =
+                    post_form_under_trust(router, federation_form("ok-jwt"), Some(trust_waived()))
+                        .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                let v = body_json(resp).await;
+                assert!(
+                    v["access_token"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with("hort_svc_"),
+                    "the federated branch mints a ServiceAccount bearer"
+                );
+                assert_eq!(validator.validate_call_count(), 1);
+            });
+        });
+        assert_eq!(
+            transport_observed(&snap, "unknown"),
+            2,
+            "both waived requests leave the evidence `unknown` — a waiver \
+             never asserts that TLS happened"
+        );
+        assert_eq!(
+            transport_counter(
+                &snap,
+                "hort_credential_transport_waived_total",
+                &[("entry_point", "exchange"), ("scope", "declared")]
+            ),
+            2,
+            "both waived mints are counted apart from the evidence; saw: {snap:?}"
+        );
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_TRANSPORT_REFUSED),
+            0,
+            "a declared waiver refuses nothing"
+        );
+    }
+
+    /// A declared waiver is **not** rescued by being a trusted proxy's
+    /// peer: an ingress controller shares the pod range with the
+    /// workloads behind it, so a peer-keyed waiver that reached a
+    /// declared proxy would let an external plaintext request mint a
+    /// credential here. The precedence table excludes it; this asserts
+    /// the exclusion reaches this surface.
+    #[test]
+    fn a_declared_peer_that_is_also_a_trusted_proxy_is_refused_here_too() {
+        rt().block_on(async {
+            let (router, idp, mocks) = build_test_router();
+            idp.register_token("good-token", sample_claims("idp:proxy-peer"));
+            let trust = RequestTrust {
+                peer_trusted: true,
+                ..trust_waived()
+            };
+            let resp = post_form_under_trust(router, happy_form("good-token"), Some(trust)).await;
+            assert_refusal_wire_shape(&resp);
+            assert_eq!(idp.validate_call_count(), 0);
+            assert!(mocks.events.appended_batches().is_empty());
+        });
+    }
+
+    /// A request that parsed but carries **no** `subject_token` is
+    /// decided all the same: on this entry point the subject of both the
+    /// observation and the decision is the *request*, not the body.
+    /// Pinned here so it cannot quietly narrow back to a payload field.
+    ///
+    /// Under a payload-keyed condition this request would slip the rule
+    /// and answer `400 subject_token is required` over cleartext. That
+    /// is harmless on its own, and it is not the point: the point is that
+    /// the condition would be a form-field name, and the next credential
+    /// parameter RFC 8693 or a future grant type puts on this endpoint
+    /// would arrive outside the rule with nobody re-checking. The
+    /// endpoint-level rule has no such edge.
+    #[test]
+    fn a_request_with_no_subject_token_is_still_decided_on_its_transport() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, _idp, _mocks) = build_test_router();
+                let body = form_body(&[
+                    ("grant_type", EXCHANGE_GRANT_TYPE),
+                    ("subject_token_type", TOKEN_TYPE_ACCESS_TOKEN),
+                ]);
+                let resp =
+                    post_form_under_trust(router, body, Some(trust_without_evidence())).await;
+                assert_refusal_wire_shape(&resp);
+            });
+        });
+        assert_eq!(transport_observed(&snap, "unknown"), 1);
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_TRANSPORT_REFUSED),
+            1,
+        );
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_BAD_REQUEST),
+            0,
+            "the transport answer precedes the wire-shape one, so this is \
+             not also counted as a buggy client"
+        );
+    }
+
+    /// A body this server cannot parse is answered before the transport
+    /// decision runs — the ordering the module header states, and the
+    /// reason the observation counter stays the denominator of the other
+    /// two on this entry point.
+    ///
+    /// A `FormRejection` carries no credential we could have read and
+    /// mints nothing, so there is nothing for the transport rule to be
+    /// about. Driven with **no** trust extension, which would otherwise
+    /// be the first refusing row.
+    #[test]
+    fn a_form_rejection_answers_before_the_transport_decision() {
+        let snap = capture_full_snapshot(|| {
+            rt().block_on(async {
+                let (router, _idp, _mocks) = build_test_router();
+                let req = Request::post("/api/v1/auth/exchange")
+                    .header(http_header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"grant_type":"x"}"#))
+                    .unwrap();
+                let resp = router.oneshot(req).await.unwrap();
+                assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+            });
+        });
+        for evidence in ["tls", "plaintext", "unknown"] {
+            assert_eq!(
+                transport_observed(&snap, evidence),
+                0,
+                "an unparseable body is not observed at this entry point, so \
+                 `total` stays the denominator of `refusals` + `waived`"
+            );
+        }
+        assert_eq!(
+            transport_counter(
+                &snap,
+                "hort_credential_transport_refusals_total",
+                &[("entry_point", "exchange")]
+            ),
+            0,
+        );
+        assert_eq!(
+            counter_value(&snap, metrics::COUNTER, metrics::RESULT_BAD_REQUEST),
+            1,
+            "it stays the wire-shape answer it was"
         );
     }
 
@@ -2874,6 +3657,45 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         0
     }
 
+    /// How many times `hort_credential_transport_total` was incremented
+    /// for `entry_point="exchange"` with the given `evidence` label.
+    ///
+    /// The observation counter reports the evidence actually derived and
+    /// never the policy outcome, so a refused request still shows up
+    /// here — which is what keeps "how much of my traffic has no TLS
+    /// evidence" answerable after a waiver is in place.
+    fn transport_observed(snap: &FullSnapshot, evidence: &str) -> u64 {
+        transport_counter(
+            snap,
+            "hort_credential_transport_total",
+            &[("entry_point", "exchange"), ("evidence", evidence)],
+        )
+    }
+
+    /// Whether a cross-surface credential-transport counter other than
+    /// the observation one fired for this entry point, with the label set
+    /// spelled out. `labels` is matched as a subset, so the
+    /// `entry_point` the caller passes is checked alongside it.
+    fn transport_counter(snap: &FullSnapshot, name: &str, labels: &[(&str, &str)]) -> u64 {
+        use metrics_util::debugging::DebugValue;
+        for (key, _, _, value) in snap {
+            if key.kind() != metrics_util::MetricKind::Counter || key.key().name() != name {
+                continue;
+            }
+            let matched = labels.iter().all(|(want_key, want_value)| {
+                key.key()
+                    .labels()
+                    .any(|label| label.key() == *want_key && label.value() == *want_value)
+            });
+            if matched {
+                if let DebugValue::Counter(n) = value {
+                    return *n;
+                }
+            }
+        }
+        0
+    }
+
     /// Counter lookup that matches the exact `(kind, result)` label
     /// pair — used for `hort_api_token_issued_total{kind="cli", result=...}`
     /// where both labels are load-bearing.
@@ -3522,7 +4344,20 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         Arc<hort_app::use_cases::test_support::MockServiceAccountRepository>,
         MockPorts,
     ) {
-        build_federation_router_full(guard, true, Vec::new())
+        build_federation_router_full(guard, true, Vec::new(), false)
+    }
+
+    /// The federation router with the **unscoped**
+    /// `HORT_BEARER_ALLOW_OVER_HTTP` waiver flipped on, so the federated
+    /// mint branch can be driven against the knob it does not consult.
+    fn build_federation_router_with_unscoped_waiver() -> (
+        Router,
+        Arc<hort_app::use_cases::test_support::MockFederatedJwtValidator>,
+        Arc<hort_app::use_cases::test_support::MockServiceAccountRepository>,
+        MockPorts,
+    ) {
+        let guard = Arc::new(hort_app::use_cases::test_support::MockReplayGuardPort::first_seen());
+        build_federation_router_full(guard, true, Vec::new(), true)
     }
 
     /// Federation router whose auth-context `RbacEvaluator` holds the
@@ -3538,13 +4373,14 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         MockPorts,
     ) {
         let guard = Arc::new(hort_app::use_cases::test_support::MockReplayGuardPort::first_seen());
-        build_federation_router_full(guard, true, sa_grants)
+        build_federation_router_full(guard, true, sa_grants, false)
     }
 
     fn build_federation_router_full(
         guard: Arc<dyn hort_domain::ports::replay_guard::ReplayGuardPort>,
         require_jti: bool,
         sa_grants: Vec<PermissionGrant>,
+        unscoped_waiver: bool,
     ) -> (
         Router,
         Arc<hort_app::use_cases::test_support::MockFederatedJwtValidator>,
@@ -3623,10 +4459,14 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
         );
         let ctx = with_api_token_use_case(&ctx, api_token_uc);
 
+        // The unscoped waiver, when a test asks for it. It reaches this
+        // handler's `AppContext` exactly as it reaches every other
+        // surface's — the asymmetry is at the call site in `run`, not in
+        // how the flag is wired.
+        let ctx = crate::test_support::with_pat_over_http_allowed(&ctx, unscoped_waiver);
+
         let _ = router; // discard the original; we rebuild below.
-        let router = Router::new()
-            .nest("/api/v1", token_exchange_routes())
-            .with_state(ctx);
+        let router = exchange_router(&ctx);
         (router, validator, service_accounts, mocks)
     }
 
@@ -4322,7 +5162,7 @@ MC4CAQAwBQYDK2VwBCIEIDZ8p91dvQwtVEfepJLRhRzzpZilORVQ8b4YDZcteA1T\n\
                     Arc::new(hort_app::use_cases::test_support::MockReplayGuardPort::replayed());
                 // require_jti = false on the seeded issuer.
                 let (router, validator, sas, mocks) =
-                    build_federation_router_full(guard, false, Vec::new());
+                    build_federation_router_full(guard, false, Vec::new(), false);
                 let sa = sample_sa();
                 seed_sa_user(&mocks, &sa);
                 sas.insert(sa);

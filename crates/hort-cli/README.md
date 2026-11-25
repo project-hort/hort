@@ -34,7 +34,7 @@ to `warn` to avoid leaking bearer tokens via debug logs.
 
 ```bash
 hort-cli auth login --paste
-# Paste a hort_svc_*/hort_cli_* token at the prompt.
+# Paste a CLI-session JWT or an hort_pat_*/hort_svc_* token at the prompt.
 
 hort-cli get pypi-dev/some-package
 ```

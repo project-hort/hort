@@ -522,7 +522,8 @@ async fn run_async() -> anyhow::Result<()> {
         cfg.public_base_url.clone(),
         cfg.trusted_proxy_cidrs.clone(),
         bind_addr_default,
-    );
+    )
+    .with_tls_not_required_from(cfg.tls_not_required_from.clone());
     let trust_mode = match (
         trust_config.public_base_url.is_some(),
         !trust_config.trusted_proxy_cidrs.is_empty(),
@@ -551,6 +552,7 @@ async fn run_async() -> anyhow::Result<()> {
         trust_mode,
         client_ip_source,
         trusted_proxy_cidr_count = trust_config.trusted_proxy_cidrs.len(),
+        tls_not_required_from = ?trust_config.tls_not_required_from,
         "trust configuration loaded"
     );
 

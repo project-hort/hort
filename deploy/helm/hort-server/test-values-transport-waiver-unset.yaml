@@ -1,0 +1,18 @@
+# Admin tasks render while the transport waiver is unset. Their plaintext
+# Service calls are intentionally refused until the operator declares a scope.
+publicBaseUrl: "https://example.com"
+clientIpFromSocketPeer: true
+scheduledTasks:
+  adminTasksEnabled: true
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+  admin:
+    existingSecret: "hort-admin-db-secret"
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+storage:
+  backend: filesystem

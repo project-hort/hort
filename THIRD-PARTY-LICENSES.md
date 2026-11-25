@@ -29,9 +29,9 @@ the result instead.
 | aws-lc-sys | 0.47.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
 | blake3 | 1.8.7 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
 | constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
-| kube-client | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
-| kube-core | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
-| kube | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
+| kube-client | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
+| kube-core | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
+| kube | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
 | metrics-exporter-prometheus | 0.18.3 | Apache-2.0 | https://github.com/metrics-rs/metrics |
 | pep440_rs | 0.7.3 | Apache-2.0 | https://github.com/konstin/pep440-rs |
 | rpassword | 7.5.5 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
@@ -3458,7 +3458,7 @@ limitations under the License.
 
 ```
 
-### kube-client 4.2.0 — Apache-2.0
+### kube-client 4.2.1 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 
@@ -3539,7 +3539,7 @@ limitations under the License.
 
 ```
 
-### kube-core 4.2.0 — Apache-2.0
+### kube-core 4.2.1 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 
@@ -3620,7 +3620,7 @@ limitations under the License.
 
 ```
 
-### kube 4.2.0 — Apache-2.0
+### kube 4.2.1 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 

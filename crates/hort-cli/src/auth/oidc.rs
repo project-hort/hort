@@ -6,7 +6,7 @@
 //!
 //! # Security invariants
 //!
-//! * The IdP JWT and the minted `hort_cli_*` token NEVER appear in tracing
+//! * The IdP JWT and the minted CLI-session JWT NEVER appear in tracing
 //!   output, `Display` of error chains, or any printed string.
 //! * The verification URL scheme is validated before any open attempt or
 //!   URL print. A hostile IdP cannot smuggle `javascript:` or `file://`
@@ -518,7 +518,7 @@ struct ExchangeErrorResponse {
 /// # Security
 ///
 /// The response body is never logged -- it may contain the JWT in some error
-/// shapes. The minted `hort_cli_*` token never appears in tracing output.
+/// shapes. The minted CLI-session JWT never appears in tracing output.
 pub async fn exchange(
     server_endpoint: &Url,
     jwt: &str,
@@ -533,7 +533,7 @@ pub async fn exchange(
     // `subject_token_type` is `access_token` (the device flow's
     // access_token, see `TokenSuccessResponse`); `requested_token_type`
     // is also `access_token` because we want a session access token
-    // (`hort_cli_*`) back from the server. RFC 8693 §2.1 — the two
+    // (a signed CLI-session JWT) back from the server. RFC 8693 §2.1 — the two
     // URIs are independent; the server picks the resulting token shape
     // based on `requested_token_type`. The server side's accepted set
     // is the single-element closed set `[access_token]` (see

@@ -22,6 +22,14 @@
 
 name: hort
 
+# Pinned so there IS a stable CIDR to declare: without an explicit `ipam`
+# subnet Docker picks one out of its address pool per environment. Every
+# client in this stack reaches hort-server directly on this bridge, and a
+# connection from the host through a published port is source-NATed to the
+# bridge gateway, which is inside the same range — so one declaration covers
+# both. The same value is rendered into HORT_TLS_NOT_REQUIRED_FROM below.
+x-hort-network-subnet: &hort-network-subnet "10.247.72.0/24"
+
 services:
   postgres:
     # Alpine (musl), not the Debian (glibc) tag: the glibc images add an
@@ -290,6 +298,15 @@ services:
       # Production behind nginx/Caddy/traefik leaves this UNSET and
       # relies on the proxy's X-Forwarded-Proto header.
       HORT_PUBLIC_BASE_URL: "http://hort-server:8080"
+      # This stack is plaintext by design, so declare that TLS is not
+      # required on the bridge every client arrives over: a credential
+      # presented without evidence of TLS is otherwise refused 426 before
+      # any validator runs. The waiver never asserts that TLS happened —
+      # the evidence stays `unknown` — and it reaches only a direct,
+      # unrelayed peer in the range, so it does not cover an external
+      # request forwarded in by a proxy. Production terminates TLS in
+      # front and leaves this UNSET.
+      HORT_TLS_NOT_REQUIRED_FROM: *hort-network-subnet
       # Clients in this stack reach hort-server directly on the compose
       # network — no proxy, ingress or LB in between — so the TCP peer
       # IS the client and the per-IP controls (PAT lockout,
@@ -514,3 +531,9 @@ volumes:
   # `compose restart` within a single smoke run; `compose down` (with
   # `-v`) clears it.
   cas:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: *hort-network-subnet

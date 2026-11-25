@@ -8,10 +8,9 @@
 //!
 //! # Policy
 //!
-//! The two fields are derived from **different** inputs, so the policy
-//! is two independent tables rather than one.
+//! The address and caller attribution are derived from different inputs.
 //! `HORT_PUBLIC_BASE_URL` governs `public_url` only;
-//! `HORT_TRUSTED_PROXY_CIDRS` governs `client_ip` only. In
+//! `HORT_TRUSTED_PROXY_CIDRS` governs `client_ip` and transport evidence. In
 //! particular a pinned public base URL does **not** switch off
 //! `X-Forwarded-For` attribution: [`evaluate_trust`] never reads
 //! `public_base_url` when computing `client_ip`. (An earlier single
@@ -48,6 +47,26 @@
 //! undeclared case
 //! (`hort_server::config::ConfigError::ClientIpAttributionUnconfigured`),
 //! which is why this middleware can treat the row as deliberate.
+//!
+//! `tls_requirement_waived` — the operator's declaration that TLS is not
+//! required on this request's hop, derived here once and read by
+//! [`crate::middleware::credential_transport::credential_transport_verdict`]:
+//!
+//! | `HORT_TLS_NOT_REQUIRED_FROM` | socket peer | `Forwarded` / `X-Forwarded-*` | `tls_requirement_waived` |
+//! |---|---|---|---|
+//! | set | in range, NOT a trusted proxy | none present | `true` |
+//! | set | in range, NOT a trusted proxy | any present | `false` |
+//! | set | in range, a trusted proxy | (any) | `false` |
+//! | set | not in range | (any) | `false` |
+//! | set | absent (no `ConnectInfo`) | (any) | `false` |
+//! | empty | (any) | (any) | `false` |
+//!
+//! It is matched against the **raw socket peer**, never the derived
+//! `client_ip`, and it never affects `transport`: a waiver changes what a
+//! credential decision accepts, never what this server claims to have
+//! seen. The forwarding-header condition is what makes the waiver a
+//! statement about *this* request rather than about the topology — see
+//! [`request_is_relayed`].
 //!
 //! `HORT_PUBLIC_BASE_URL` unset together with `HORT_TRUSTED_PROXY_CIDRS`
 //! unset never reaches this middleware — see the startup note below.
@@ -117,9 +136,7 @@ const XFF_WARN_THROTTLE_WINDOW: Duration = Duration::from_secs(60);
 /// Per-request trust context, evaluated once by the middleware and
 /// stashed in request extensions for every downstream consumer.
 ///
-/// Only two fields — no `peer_trusted: bool`. Speculative API without a
-/// named consumer is scope creep; if a future change needs the bool,
-/// add it with the consumer in the same PR.
+/// Transport evidence is independent of the address used to emit URLs.
 #[derive(Debug, Clone)]
 pub struct RequestTrust {
     /// The real caller's IP. When the socket peer is listed in
@@ -132,6 +149,36 @@ pub struct RequestTrust {
     /// `UrlResolver::resolve() -> Url` contract holds. See the policy
     /// table above for derivation rules.
     pub public_url: url::Url,
+    /// Evidence about the incoming transport. `Unknown` is never a
+    /// lenient default for a credential decision.
+    pub transport: TransportSecurity,
+    /// Whether the socket peer matched `HORT_TRUSTED_PROXY_CIDRS`.
+    /// This is the peer's trust status, not the derived caller's.
+    pub peer_trusted: bool,
+    /// The operator declared that TLS is not required on this request's
+    /// hop: the raw TCP peer matched `HORT_TLS_NOT_REQUIRED_FROM`, the
+    /// peer is **not** a trusted proxy, and the request carries **no**
+    /// forwarding header (see [`request_is_relayed`]). All three are
+    /// folded in here so a decision site reads one derived fact rather
+    /// than re-deriving a policy from a socket address.
+    ///
+    /// This never changes `transport` evidence: a waiver says the
+    /// requirement does not apply to this peer, never that TLS happened.
+    pub tls_requirement_waived: bool,
+}
+
+/// What this binary knows about the transport on which the request arrived.
+///
+/// Carries evidence only; an address, convenient default, or header from an
+/// untrusted peer cannot establish TLS. `Unknown` must never be treated as TLS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportSecurity {
+    /// A trusted peer reported HTTPS.
+    Tls,
+    /// A trusted peer reported HTTP or supplied ambiguous scheme evidence.
+    Plaintext,
+    /// No trustworthy scheme evidence was supplied.
+    Unknown,
 }
 
 /// Startup-configured policy the layer evaluates on every request.
@@ -147,6 +194,8 @@ pub struct TrustConfig {
     /// Parsed `HORT_TRUSTED_PROXY_CIDRS`. Empty vec means "no proxy trust";
     /// forwarded headers are ignored for every request.
     pub trusted_proxy_cidrs: Vec<IpNet>,
+    /// TCP peer ranges on which the operator waived the TLS requirement.
+    pub tls_not_required_from: Vec<IpNet>,
     /// Derived from the server's bind address. Used only when both the
     /// public base URL is unset AND the request has no `Host` header
     /// (the backstop branch that guarantees `public_url` is always
@@ -179,9 +228,16 @@ impl TrustConfig {
         Self {
             public_base_url,
             trusted_proxy_cidrs,
+            tls_not_required_from: Vec::new(),
             bind_addr_default,
             xff_warn_last: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Attach a parsed peer-scoped TLS waiver to the request trust policy.
+    pub fn with_tls_not_required_from(mut self, cidrs: Vec<IpNet>) -> Self {
+        self.tls_not_required_from = cidrs;
+        self
     }
 
     /// Throttle decision for the trusted-peer + missing-XFF `WARN`.
@@ -282,8 +338,10 @@ fn trust_middleware_fn(
             .map(|ci| ci.0.ip());
         let trust = evaluate_trust(&config, peer, req.headers());
         tracing::debug!(
+            ?peer,
             client_ip = %trust.client_ip,
             public_url = %trust.public_url,
+            transport = ?trust.transport,
             "request trust evaluated"
         );
         req.extensions_mut().insert(trust);
@@ -347,10 +405,185 @@ pub(crate) fn evaluate_trust(
     };
 
     let public_url = resolve_public_url(config, peer_trusted, peer_ip, headers);
+    let transport = resolve_transport_security(peer_trusted, headers);
+    // The scoped waiver is derived once, here, beside `client_ip` — never
+    // re-derived at a decision site from a socket address. A missing
+    // `ConnectInfo` grants nothing: there is no peer to match.
+    let tls_requirement_waived = !peer_trusted
+        && !request_is_relayed(headers)
+        && peer_ip.is_some_and(|ip| cidr_contains(ip, &config.tls_not_required_from));
 
     RequestTrust {
         client_ip,
         public_url,
+        transport,
+        peer_trusted,
+        tls_requirement_waived,
+    }
+}
+
+/// Whether the request carries any `Forwarded` or `X-Forwarded-*` header,
+/// i.e. whether some L7 hop announced itself.
+///
+/// This is the discriminator that keeps a peer-scoped TLS waiver from
+/// reaching a request that is not the declared peer's own. A waived peer
+/// must **be** the client, and a client that arrived through an L7 proxy
+/// carries that proxy's forwarding header — so any such header present
+/// means the peer is relaying for someone else, whether or not the
+/// operator declared that peer a trusted proxy. An attacker cannot forge
+/// the *absence* of a header the proxy in front appends, and an L4
+/// passthrough that adds none preserves the real source address, which is
+/// then not inside an internal range. `hort-cli`, a Prometheus scraper and
+/// the package-manager clients send none of these, so the condition costs
+/// the intended callers nothing.
+///
+/// The residual case it does not reach is an L7 proxy that adds no
+/// forwarding header at all and source-NATs to an address inside the
+/// declared range. Client-IP attribution is already dead in that
+/// deployment — every caller lands in one bucket — which is what the
+/// existing trust boot error describes.
+///
+/// Header names in `http` are lowercase by construction, so the prefix
+/// test needs no case folding.
+fn request_is_relayed(headers: &HeaderMap) -> bool {
+    headers
+        .keys()
+        .any(|name| name == "forwarded" || name.as_str().starts_with("x-forwarded-"))
+}
+
+/// Scheme evidence from every forwarded field supplied by a trusted socket peer.
+/// A comma list represents multiple hops, so it is ambiguous even when the
+/// elements agree. Repeated fields are each inspected; neither header name wins.
+fn resolve_transport_security(peer_trusted: bool, headers: &HeaderMap) -> TransportSecurity {
+    if !peer_trusted {
+        return TransportSecurity::Unknown;
+    }
+
+    let mut observed = None;
+    for (name, forwarded) in [("forwarded", true), ("x-forwarded-proto", false)] {
+        let mut seen_element = false;
+        for value in headers.get_all(name) {
+            if seen_element {
+                return TransportSecurity::Plaintext;
+            }
+            seen_element = true;
+            let Ok(raw) = value.to_str() else {
+                return TransportSecurity::Plaintext;
+            };
+            let Ok(elements) = split_unquoted(raw, ',') else {
+                return TransportSecurity::Plaintext;
+            };
+            if elements.len() != 1 {
+                return TransportSecurity::Plaintext;
+            }
+            let scheme = if forwarded {
+                match forwarded_element_proto(elements[0]) {
+                    Ok(scheme) => scheme,
+                    Err(()) => return TransportSecurity::Plaintext,
+                }
+            } else {
+                match parse_scheme(elements[0]) {
+                    Some(scheme) => Some(scheme),
+                    None => return TransportSecurity::Plaintext,
+                }
+            };
+            if let Some(scheme) = scheme {
+                if observed.is_some_and(|previous| previous != scheme) {
+                    return TransportSecurity::Plaintext;
+                }
+                observed = Some(scheme);
+            }
+        }
+    }
+    observed.unwrap_or(TransportSecurity::Unknown)
+}
+
+/// Split RFC 7239 list and parameter separators outside quoted strings.
+/// Invalid quoting is malformed evidence, so the caller rejects it.
+fn split_unquoted(raw: &str, separator: char) -> Result<Vec<&str>, ()> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in raw.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if quoted && character == '\\' {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == separator && !quoted {
+            parts.push(&raw[start..index]);
+            start = index + character.len_utf8();
+        }
+    }
+    if quoted || escaped {
+        return Err(());
+    }
+    parts.push(&raw[start..]);
+    Ok(parts)
+}
+
+fn forwarded_element_proto(element: &str) -> Result<Option<TransportSecurity>, ()> {
+    let mut scheme = None;
+    let mut names: Vec<&str> = Vec::new();
+    for parameter in split_unquoted(element, ';')? {
+        let parameter = parameter.trim();
+        if parameter.is_empty() {
+            continue;
+        }
+        let (name, value) = parameter.split_once('=').ok_or(())?;
+        let name = name.trim();
+        if !name.bytes().all(is_http_token_byte)
+            || name.is_empty()
+            || names.iter().any(|prior| prior.eq_ignore_ascii_case(name))
+            || !valid_forwarded_value(value.trim())
+        {
+            return Err(());
+        }
+        names.push(name);
+        if name.eq_ignore_ascii_case("proto") {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(value);
+            scheme = Some(parse_scheme(value).ok_or(())?);
+        }
+    }
+    Ok(scheme)
+}
+
+fn is_http_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte)
+}
+
+fn valid_forwarded_value(value: &str) -> bool {
+    if let Some(inner) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+        let mut escaped = false;
+        for byte in inner.bytes() {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' || !(b' '..=b'~').contains(&byte) {
+                return false;
+            }
+        }
+        !escaped
+    } else {
+        !value.is_empty() && value.bytes().all(is_http_token_byte)
+    }
+}
+
+fn parse_scheme(raw: &str) -> Option<TransportSecurity> {
+    let proto = raw.trim();
+    if proto.eq_ignore_ascii_case("https") {
+        Some(TransportSecurity::Tls)
+    } else if proto.eq_ignore_ascii_case("http") {
+        Some(TransportSecurity::Plaintext)
+    } else {
+        None
     }
 }
 
@@ -492,6 +725,10 @@ mod tests {
     use tower::ServiceExt;
     use tracing_test::traced_test;
 
+    use crate::middleware::credential_transport::{
+        credential_transport_verdict, CredentialTransportVerdict, WaiverScope,
+    };
+
     fn url(s: &str) -> url::Url {
         url::Url::parse(s).unwrap()
     }
@@ -521,6 +758,258 @@ mod tests {
             cidrs.iter().copied().map(cidr).collect(),
             url("http://0.0.0.0:8080/"),
         )
+    }
+
+    #[test]
+    fn transport_security_requires_a_trusted_peer_and_explicit_scheme() {
+        let config = default_config(None, &["10.0.0.0/8"]);
+        for h in [
+            headers(&[("host", "hort.example.com")]),
+            headers(&[("host", "hort.example.com"), ("x-forwarded-proto", "https")]),
+        ] {
+            assert_eq!(
+                evaluate_trust(&config, Some(ip("203.0.113.9")), &h).transport,
+                TransportSecurity::Unknown
+            );
+        }
+        assert_eq!(
+            evaluate_trust(&config, Some(ip("10.0.0.5")), &HeaderMap::new()).transport,
+            TransportSecurity::Unknown
+        );
+        for (name, value, expected) in [
+            ("x-forwarded-proto", "https", TransportSecurity::Tls),
+            ("x-forwarded-proto", "HTTPS", TransportSecurity::Tls),
+            ("x-forwarded-proto", "http", TransportSecurity::Plaintext),
+            (
+                "forwarded",
+                "for=203.0.113.9; proto=https",
+                TransportSecurity::Tls,
+            ),
+        ] {
+            assert_eq!(
+                evaluate_trust(&config, Some(ip("10.0.0.5")), &headers(&[(name, value)])).transport,
+                expected
+            );
+        }
+        assert_eq!(
+            evaluate_trust(
+                &config,
+                Some(ip("::ffff:10.0.0.5")),
+                &headers(&[("forwarded", "proto=https")])
+            )
+            .transport,
+            TransportSecurity::Tls
+        );
+    }
+
+    #[test]
+    fn transport_security_downgrades_ambiguous_forwarded_values() {
+        let config = default_config(None, &["10.0.0.0/8"]);
+        let cases = [
+            vec![("forwarded", "proto=http"), ("x-forwarded-proto", "https")],
+            vec![("x-forwarded-proto", "https"), ("forwarded", "proto=http")],
+            vec![("forwarded", "proto=https, for=203.0.113.9;proto=https")],
+            vec![("forwarded", "proto=ftp")],
+            vec![("forwarded", "proto=https;proto=https")],
+            vec![("forwarded", "for=one;For=two;proto=https")],
+            vec![("forwarded", "proto=\"https")],
+            vec![("forwarded", "proto=https;for=")],
+            vec![("forwarded", "proto=https;broken")],
+            vec![("forwarded", "proto=https;for=abc\"def\"")],
+            vec![("forwarded", "proto=https;for=\"a\"b\"c\"")],
+            vec![("forwarded", "proto=https;=value")],
+            vec![("x-forwarded-proto", "https,http")],
+            vec![("x-forwarded-proto", "")],
+        ];
+        for case in cases {
+            assert_eq!(
+                evaluate_trust(&config, Some(ip("10.0.0.5")), &headers(&case)).transport,
+                TransportSecurity::Plaintext,
+                "case: {case:?}"
+            );
+        }
+        assert_eq!(
+            evaluate_trust(
+                &config,
+                Some(ip("10.0.0.5")),
+                &headers(&[("forwarded", "for=203.0.113.9")])
+            )
+            .transport,
+            TransportSecurity::Unknown
+        );
+        assert_eq!(
+            evaluate_trust(
+                &config,
+                Some(ip("10.0.0.5")),
+                &headers(&[
+                    ("forwarded", "for=203.0.113.9"),
+                    ("x-forwarded-proto", "https")
+                ])
+            )
+            .transport,
+            TransportSecurity::Tls
+        );
+        for (name, first, second) in [
+            ("forwarded", "proto=https", "proto=http"),
+            ("x-forwarded-proto", "https", "http"),
+        ] {
+            let mut h = HeaderMap::new();
+            h.append(name, HeaderValue::from_static(first));
+            h.append(name, HeaderValue::from_static(second));
+            assert_eq!(
+                evaluate_trust(&config, Some(ip("10.0.0.5")), &h).transport,
+                TransportSecurity::Plaintext
+            );
+        }
+        for name in ["forwarded", "x-forwarded-proto"] {
+            let mut h = HeaderMap::new();
+            let value = if name == "forwarded" {
+                "proto=https"
+            } else {
+                "https"
+            };
+            h.append(name, HeaderValue::from_static(value));
+            h.append(name, HeaderValue::from_static(value));
+            assert_eq!(
+                evaluate_trust(&config, Some(ip("10.0.0.5")), &h).transport,
+                TransportSecurity::Plaintext
+            );
+        }
+        let h = headers(&[("forwarded", "proto=https"), ("x-forwarded-proto", "https")]);
+        assert_eq!(
+            evaluate_trust(&config, Some(ip("10.0.0.5")), &h).transport,
+            TransportSecurity::Tls
+        );
+        let h = headers(&[("forwarded", "for=\"a,b\";proto=\"https\"")]);
+        assert_eq!(
+            evaluate_trust(&config, Some(ip("10.0.0.5")), &h).transport,
+            TransportSecurity::Tls
+        );
+        let h = headers(&[("forwarded", "for=\"a\\\"b\";proto=https")]);
+        assert_eq!(
+            evaluate_trust(&config, Some(ip("10.0.0.5")), &h).transport,
+            TransportSecurity::Tls
+        );
+        let h = headers(&[("forwarded", ";proto=https; ")]);
+        assert_eq!(
+            evaluate_trust(&config, Some(ip("10.0.0.5")), &h).transport,
+            TransportSecurity::Tls
+        );
+        let mut h = HeaderMap::new();
+        h.append("forwarded", HeaderValue::from_bytes(&[0xff]).unwrap());
+        assert_eq!(
+            evaluate_trust(&config, Some(ip("10.0.0.5")), &h).transport,
+            TransportSecurity::Plaintext
+        );
+    }
+
+    #[test]
+    fn address_emission_stays_independent_while_hsts_requires_transport_evidence() {
+        use crate::middleware::security_headers::security_headers_middleware;
+        use crate::url_resolver::UrlResolver;
+
+        async fn emitted_url(req: Request) -> Response {
+            let trust = req.extensions().get::<RequestTrust>().unwrap();
+            let url = UrlResolver.resolve(trust).join("pkg/file").unwrap();
+            Response::new(Body::from(url.to_string()))
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for (cfg, peer, proto, expected_url, hsts) in [
+                (
+                    default_config(None, &["10.0.0.0/8"]),
+                    "10.0.0.5",
+                    None,
+                    "https://hort.example.com/pkg/file",
+                    false,
+                ),
+                (
+                    default_config(None, &["10.0.0.0/8"]),
+                    "203.0.113.9",
+                    Some("http"),
+                    "https://hort.example.com/pkg/file",
+                    false,
+                ),
+                (
+                    default_config(Some("https://pinned.example.com"), &["10.0.0.0/8"]),
+                    "203.0.113.9",
+                    None,
+                    "https://pinned.example.com/pkg/file",
+                    false,
+                ),
+                (
+                    default_config(None, &["10.0.0.0/8"]),
+                    "10.0.0.5",
+                    Some("http"),
+                    "http://hort.example.com/pkg/file",
+                    false,
+                ),
+                (
+                    default_config(None, &["10.0.0.0/8"]),
+                    "10.0.0.5",
+                    Some("https"),
+                    "https://hort.example.com/pkg/file",
+                    true,
+                ),
+                (
+                    default_config(Some("http://pinned.example.com"), &["10.0.0.0/8"]),
+                    "10.0.0.5",
+                    Some("https"),
+                    "http://pinned.example.com/pkg/file",
+                    false,
+                ),
+            ] {
+                let router = Router::new()
+                    .route("/url", get(emitted_url))
+                    .layer(axum::middleware::from_fn(security_headers_middleware))
+                    .layer(request_trust_layer(cfg));
+                let mut builder = HttpRequest::get("/url").header("host", "hort.example.com");
+                if let Some(proto) = proto {
+                    builder = builder.header("x-forwarded-proto", proto);
+                }
+                let mut request = builder.body(Body::empty()).unwrap();
+                request
+                    .extensions_mut()
+                    .insert(ConnectInfo(SocketAddr::new(ip(peer), 8080)));
+                let response = router.oneshot(request).await.unwrap();
+                assert_eq!(
+                    response.headers().contains_key("strict-transport-security"),
+                    hsts
+                );
+                let body = axum::body::to_bytes(response.into_body(), 1024)
+                    .await
+                    .unwrap();
+                assert_eq!(body.as_ref(), expected_url.as_bytes());
+            }
+        });
+    }
+
+    #[traced_test]
+    #[test]
+    fn trust_debug_log_distinguishes_socket_peer_from_derived_client() {
+        let cfg = default_config(Some("https://hort.example.com"), &["10.0.0.0/8"]);
+        let router = Router::new()
+            .route("/probe", get(probe_handler))
+            .layer(request_trust_layer(cfg));
+        let mut req = HttpRequest::get("/probe")
+            .header("x-forwarded-for", "203.0.113.7")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(ip("10.0.0.5"), 8080)));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                assert_eq!(router.oneshot(req).await.unwrap().status(), StatusCode::OK)
+            });
+        assert!(logs_contain("peer=Some(10.0.0.5)"));
+        assert!(logs_contain("client_ip=203.0.113.7"));
     }
 
     // ---------- policy: HORT_PUBLIC_BASE_URL wins ----------
@@ -745,6 +1234,121 @@ mod tests {
         assert!(cidr_contains(ip("10.1.2.3"), &nets));
         assert!(cidr_contains(ip("192.168.1.1"), &nets));
         assert!(!cidr_contains(ip("172.16.0.1"), &nets));
+    }
+
+    /// A config declaring one range as not requiring TLS, with no
+    /// trusted-proxy range — the shape every waiver row below starts from.
+    fn waiver_config() -> TrustConfig {
+        default_config(Some("https://public.example"), &[])
+            .with_tls_not_required_from(vec![cidr("10.247.72.0/24")])
+    }
+
+    /// The one row a declared scope reaches: an untrusted, unrelayed peer
+    /// inside the range. Evidence stays `Unknown` — the waiver says the
+    /// requirement does not apply, never that TLS happened — and an
+    /// IPv4-mapped IPv6 peer matches an IPv4 range, the same
+    /// canonicalisation `cidr_contains` applies everywhere else.
+    #[test]
+    fn a_direct_unrelayed_peer_in_the_declared_range_is_waived() {
+        let config = waiver_config();
+        for peer in ["10.247.72.8", "::ffff:10.247.72.8"] {
+            let trust = evaluate_trust(&config, Some(ip(peer)), &headers(&[]));
+            assert_eq!(trust.transport, TransportSecurity::Unknown, "{peer}");
+            assert!(!trust.peer_trusted, "{peer}");
+            assert!(trust.tls_requirement_waived, "{peer}");
+            assert_eq!(
+                credential_transport_verdict(Some(&trust), false),
+                CredentialTransportVerdict::Waived(WaiverScope::Declared),
+                "{peer}"
+            );
+        }
+    }
+
+    /// Any forwarding header withdraws the waiver, asserted per header
+    /// name. This is the condition that closes the undeclared-ingress
+    /// hole: an ingress inside the waived range but absent from
+    /// `HORT_TRUSTED_PROXY_CIDRS` is an untrusted peer whose forwarded
+    /// scheme is ignored, so evidence is `Unknown` and every other
+    /// condition holds.
+    #[test]
+    fn any_forwarding_header_withdraws_the_scoped_waiver() {
+        let config = waiver_config();
+        for name in [
+            "x-forwarded-for",
+            "x-forwarded-proto",
+            "forwarded",
+            "x-forwarded-host",
+        ] {
+            let trust = evaluate_trust(
+                &config,
+                Some(ip("10.247.72.8")),
+                &headers(&[(name, "https")]),
+            );
+            assert_eq!(trust.transport, TransportSecurity::Unknown, "{name}");
+            assert!(!trust.tls_requirement_waived, "{name}");
+            assert!(
+                matches!(
+                    credential_transport_verdict(Some(&trust), false),
+                    CredentialTransportVerdict::Refused(_)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    /// The waiver matches the raw TCP peer, so a forwarded address naming
+    /// an inside address from an outside peer buys nothing — and a peer
+    /// simply outside the range is refused with the same declaration in
+    /// place.
+    #[test]
+    fn the_scoped_waiver_matches_the_raw_peer_not_a_forwarded_address() {
+        let config = waiver_config();
+        for request in [headers(&[]), headers(&[("x-forwarded-for", "10.247.72.8")])] {
+            let trust = evaluate_trust(&config, Some(ip("192.0.2.8")), &request);
+            assert!(!trust.tls_requirement_waived);
+            assert!(matches!(
+                credential_transport_verdict(Some(&trust), false),
+                CredentialTransportVerdict::Refused(_)
+            ));
+        }
+    }
+
+    /// A peer with no `ConnectInfo` has no address to match, so it gets no
+    /// waiver — the same posture as `peer_trusted`.
+    #[test]
+    fn a_peer_without_connect_info_is_never_waived() {
+        assert!(!evaluate_trust(&waiver_config(), None, &headers(&[])).tls_requirement_waived);
+    }
+
+    /// A peer listed in BOTH variables gets the trusted-proxy behaviour,
+    /// which is the stricter one: a declared scope means "this peer is the
+    /// client", and a peer the operator already declared to be a proxy is
+    /// outside that meaning. Its honestly-reported `proto=http` is
+    /// `Plaintext`, which no scope waives either.
+    #[test]
+    fn a_trusted_proxy_peer_is_never_waived_by_a_scope() {
+        let config = default_config(Some("https://public.example"), &["10.247.72.0/24"])
+            .with_tls_not_required_from(vec![cidr("10.247.72.0/24")]);
+        let silent = evaluate_trust(&config, Some(ip("10.247.72.8")), &headers(&[]));
+        assert_eq!(silent.transport, TransportSecurity::Unknown);
+        assert!(silent.peer_trusted);
+        assert!(!silent.tls_requirement_waived);
+        assert!(matches!(
+            credential_transport_verdict(Some(&silent), false),
+            CredentialTransportVerdict::Refused(_)
+        ));
+
+        let plaintext = evaluate_trust(
+            &config,
+            Some(ip("10.247.72.8")),
+            &headers(&[("x-forwarded-proto", "http")]),
+        );
+        assert_eq!(plaintext.transport, TransportSecurity::Plaintext);
+        assert!(!plaintext.tls_requirement_waived);
+        assert!(matches!(
+            credential_transport_verdict(Some(&plaintext), false),
+            CredentialTransportVerdict::Refused(_)
+        ));
     }
 
     #[test]

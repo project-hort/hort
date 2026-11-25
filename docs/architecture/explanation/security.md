@@ -217,13 +217,16 @@ enumeration-defence separation keeps brute-force dashboards
 ## Request trust
 
 `crates/hort-http-core/src/middleware/trust.rs` populates
-`RequestTrust { client_ip, public_url }` once per request, before auth
-runs. Every downstream consumer (auth attempt logs, `UrlResolver`, the
-rate-limiter's key extractor) reads from extensions — none
-re-implement peer-IP or proxy-trust logic.
+`RequestTrust { client_ip, public_url, transport, peer_trusted,
+tls_requirement_waived }` once per request, before auth runs. Auth,
+`UrlResolver`, rate limiting and security headers read the derived fields
+from extensions rather than re-implementing peer-IP or proxy-trust logic.
 
-**The two fields read different inputs.** `HORT_PUBLIC_BASE_URL`
-governs `public_url`; `HORT_TRUSTED_PROXY_CIDRS` governs `client_ip`.
+**Address and attribution read different inputs.** `HORT_PUBLIC_BASE_URL`
+governs `public_url`; `HORT_TRUSTED_PROXY_CIDRS` governs whether a peer's
+forwarded attribution and scheme report can be trusted. `transport` reads
+the reported scheme only from a trusted peer, and the scoped waiver reads
+the raw socket peer plus the request's forwarding-header presence.
 A pinned public base URL does **not** switch off `X-Forwarded-For`
 attribution — `evaluate_trust` never reads `public_base_url` when
 computing `client_ip`. (This document and the middleware's own policy
@@ -233,12 +236,18 @@ looked correctly configured.)
 
 `public_url`:
 
+This table describes URL emission only; it does not establish TLS evidence.
+
 | `HORT_PUBLIC_BASE_URL` | `HORT_TRUSTED_PROXY_CIDRS` | Behaviour |
 |---|---|---|
 | set | (not read for this) | Use verbatim; `X-Forwarded-*` and `Host` ignored. |
 | unset | set, peer trusted | `X-Forwarded-Proto`/`-Host`, falling back to `Host`. |
 | unset | peer not trusted | Synthesise from `Host` + `https`; bind-address default when `Host` is absent. |
-| unset | unset | **Unconditional startup failure.** `X-Forwarded-Host` injection poisons PyPI/npm/cargo download URLs regardless of auth state, so the check is not auth-gated. |
+| unset | unset | Startup fails unless `HORT_CLIENT_IP_FROM_SOCKET_PEER=true` declares direct-peer attribution. If declared, derive the URL from `Host` or the bind address; neither is TLS evidence. |
+
+Hort emits HSTS only when `transport` is `Tls` and `public_url` has an
+`https` scheme. The proxy may add its own HSTS policy; the URL alone never
+causes hort to emit the header (ADR 0068).
 
 `client_ip`:
 
@@ -527,8 +536,6 @@ What the server does **not** attempt:
 
 - **TLS termination.** hort speaks plain HTTP. TLS is the
   reverse proxy's job.
-- **HSTS.** Emitted by the reverse proxy — hort does not
-  know its public hostname.
 - **Secrets management.** `DATABASE_URL`, OIDC client secret, S3
   credentials are read from env. Rotation, vault integration, and
   per-environment isolation are the operator's.

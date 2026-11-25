@@ -60,10 +60,9 @@ manifest (annotations, `ingressClassName: nginx`, `tls:` block, and
 
 The chart's pods see plain HTTP. ingress-nginx terminates TLS using
 the certificate cert-manager issued. The chart's `requireHttps: true`
-works because `trustedProxyCidrs` is non-empty AND the ingress
-controller sets `X-Forwarded-Proto: https` — the binary's
-HSTS-emission path checks that combination as
-positive evidence of upstream TLS, and HSTS becomes safe to emit.
+boot check passes because `trustedProxyCidrs` is non-empty. Separately,
+Hort emits HSTS when a trusted ingress reports `https` in an unambiguous
+forwarded scheme and `publicBaseUrl` is `https://...`.
 
 ### Pitfalls
 
@@ -224,47 +223,43 @@ snippet.
 ### TLS termination details
 
 TLS is terminated upstream of the cluster. The chart's pods see
-plain HTTP arriving from the LB. `requireHttps: false` is
-**deliberate**: the chart's listener has no positive TLS evidence,
-and setting `requireHttps: true` here would either (a) reject every
-request because the `X-Forwarded-Proto` check fails, or
-(b) silently produce HSTS without corroboration. False is the safe
-call.
+plain HTTP arriving from the LB. `requireHttps: false` removes only the
+boot-time configuration check; it cannot establish TLS evidence or change
+the per-request credential decision. A trusted LB must overwrite both
+`Forwarded` and `X-Forwarded-Proto` with the client-facing scheme. Without
+that report, credentialed requests answer `426` unless a waiver applies.
 
-### Why HSTS stays off in this configuration
+### When HSTS is emitted in this configuration
 
-The chart's HSTS code path emits
+Hort's HSTS code path emits
 `Strict-Transport-Security` only when there is positive TLS
-evidence: an `X-Forwarded-Proto: https` header from a source inside
-`trustedProxyCidrs` AND a `publicBaseUrl` that begins `https://`.
-External-LB-without-explicit-`X-Forwarded-Proto: https` would create
+evidence: a single, unambiguous `https` scheme report in `Forwarded` or
+`X-Forwarded-Proto` from a source inside `trustedProxyCidrs` AND a
+`publicBaseUrl` that begins `https://`.
+An external LB without an explicit `https` scheme report would create
 a footgun where a misconfigured LB forwarding plain HTTP would
-publish a permanent redirect-to-HTTPS the chart cannot verify is
-honest. The chart errs on the side of not emitting. Operators who
-want HSTS in this setup configure it on the LB itself — every
-enterprise LB supports adding response headers.
+publish a permanent redirect-to-HTTPS that hort cannot verify is
+honest. Hort errs on the side of not emitting. Operators can configure
+HSTS on the LB when its own TLS policy warrants it.
 
 ### Pitfalls
 
-#### LB MUST set `X-Forwarded-Proto: https` (and `X-Forwarded-For`)
+#### LB MUST overwrite `Forwarded` and `X-Forwarded-Proto`
 
-If the LB is misconfigured and forwards traffic without these
-headers (or with wrong values), every request looks to the binary
-like plain HTTP arriving from the LB's IP. The chart will then
-render `http://` URLs back to clients in OCI manifest responses,
-Cargo download links, and similar self-referential surfaces — even
-though clients hit `https://registry.example.com`. The mismatch
-breaks clients that enforce scheme consistency. Verify with
+The LB must overwrite both header names so no caller-supplied scheme
+survives. If neither header provides a usable scheme report, hort has no
+TLS evidence and refuses credentialed calls without a waiver. A pinned
+`publicBaseUrl` still controls emitted links and realms; it never proves TLS. Verify with
 `curl -I https://registry.example.com/healthz` from outside the
 cluster and check pod logs to confirm the binary saw
 `X-Forwarded-Proto: https`.
 
 #### `trustedProxyCidrs` MUST list every LB source IP
 
-The chart trusts `X-Forwarded-*` headers only from the CIDRs listed
+Hort trusts `X-Forwarded-*` headers only from the CIDRs listed
 in `trustedProxyCidrs`. If the LB's egress IPs are missing, the
-chart silently ignores the headers and reverts to seeing plain
-HTTP from the LB's IP — the same symptoms as the previous pitfall.
+binary ignores their scheme claims, leaving transport evidence `Unknown`
+and refusing credentialed calls without an applicable waiver.
 If the LB rotates IPs (cloud NLB scaling, autoscaled VM pool),
 wildcard the LB's subnet (e.g. `10.123.4.0/24`) rather than
 enumerating instances. Every IP not in `trustedProxyCidrs` is
@@ -288,7 +283,7 @@ every client that downloads anything.
 | K8s version floor | 1.27 | 1.30 (1.27–1.29 with `v1beta1`) | 1.27 |
 | Controller required | ingress-nginx | Gateway-API-conformant controller | none in-cluster |
 | Cert lifecycle | cert-manager + ACME / internal CA | external Secret (cert-manager or manual) | LB / network team |
-| HSTS emitted | yes | yes | no (deliberate — see §3) |
+| HSTS emitted | with TLS evidence + https public URL | with TLS evidence + https public URL | conditional on the LB's trusted scheme report + https public URL |
 | `requireHttps` | `true` | `true` | `false` |
 | `BackendTLSPolicy` applicable | n/a | future (v2 = no) | n/a |
 | Chart Service type | ClusterIP | ClusterIP | NodePort or LoadBalancer |

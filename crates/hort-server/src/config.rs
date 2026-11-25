@@ -201,6 +201,8 @@ pub struct Config {
     /// Individual malformed CIDR entries surface as
     /// [`ConfigError::InvalidCidr`] with the offending string.
     pub trusted_proxy_cidrs: Vec<IpNet>,
+    /// TCP peer ranges where the operator has waived the TLS requirement.
+    pub tls_not_required_from: Vec<IpNet>,
     /// Authentication provider configuration.
     ///
     /// `AuthConfig::Disabled` (default) preserves the
@@ -770,13 +772,20 @@ pub struct Config {
     /// with `SubscriptionTarget::NatsJetStream { ... }` will fail
     /// delivery with no notifier supporting that target_kind).
     pub nats_url: Option<String>,
-    /// Operator override allowing bearer
-    /// authentication over plaintext HTTP. Parsed from
-    /// `HORT_BEARER_ALLOW_OVER_HTTP`; defaults to `false`. When `false`,
-    /// the auth middleware emits `426 Upgrade Required` on a
-    /// PAT-shaped token OR a CliSession-family JWT whose
-    /// request lacks TLS evidence
-    /// (`RequestTrust.public_url.scheme() != "https"`).
+    /// The **unscoped** operator waiver of the credential-transport
+    /// requirement. Parsed from `HORT_BEARER_ALLOW_OVER_HTTP`; defaults
+    /// to `false`. When `false`, every credential surface answers
+    /// `426 Upgrade Required` for **any** presented credential — an IdP
+    /// access token as much as a native one — on a request with neither
+    /// positive evidence of TLS nor an applicable waiver. The subject is
+    /// "a credential was presented", not a token shape, and the evidence
+    /// is `RequestTrust::transport`, never the emitted address.
+    ///
+    /// **It does not reach the token endpoint.**
+    /// `POST /api/v1/auth/exchange` passes the unscoped argument pinned
+    /// off, because RFC 6749 §3.2 requires the authorization server to
+    /// require TLS there; the scoped `HORT_TLS_NOT_REQUIRED_FROM` is the
+    /// only waiver that reaches it.
     ///
     /// **Transport flag, not a trust knob.** No `*_INSECURE_TLS`
     /// equivalent is allowed (see anti-pattern in CLAUDE.md). Setting
@@ -932,6 +941,7 @@ impl std::fmt::Debug for Config {
             metadata_blob_max_bytes,
             public_base_url,
             trusted_proxy_cidrs,
+            tls_not_required_from,
             auth,
             claim_mappings,
             config_dir,
@@ -1013,6 +1023,7 @@ impl std::fmt::Debug for Config {
             .field("metadata_blob_max_bytes", metadata_blob_max_bytes)
             .field("public_base_url", public_base_url)
             .field("trusted_proxy_cidrs", trusted_proxy_cidrs)
+            .field("tls_not_required_from", tls_not_required_from)
             .field("auth", auth)
             .field("claim_mappings", claim_mappings)
             .field("config_dir", config_dir)
@@ -1595,6 +1606,22 @@ pub enum ConfigError {
         #[source]
         source: ipnet::AddrParseError,
     },
+    /// Tripwire for a common proxy-trust copy-paste mistake. The operator
+    /// remains the trust authority and can express equivalent wider ranges.
+    #[error(
+        "invalid value for HORT_TRUSTED_PROXY_CIDRS: wildcard range {entry} trusts every peer"
+    )]
+    WildcardTrustedProxyCidr { entry: IpNet },
+    /// A wildcard waiver is indistinguishable from turning the
+    /// credential-transport requirement off, which the unscoped
+    /// `HORT_BEARER_ALLOW_OVER_HTTP` already does — visibly, with a boot
+    /// WARN and an unsafe-config gauge. Refusing it here keeps the scoped
+    /// instrument meaning "this peer range", and an operator who wants
+    /// the blunt behaviour sets the knob that announces it.
+    #[error(
+        "invalid value for HORT_TLS_NOT_REQUIRED_FROM: wildcard range {entry} waives every peer"
+    )]
+    WildcardTlsNotRequiredCidr { entry: IpNet },
     /// Unconditional startup failure when BOTH `HORT_PUBLIC_BASE_URL` AND
     /// `HORT_TRUSTED_PROXY_CIDRS` are unset. NOT auth-gated —
     /// X-Forwarded-Host injection poisoning package download URLs is
@@ -1709,19 +1736,17 @@ pub enum ConfigError {
         port: u16,
     },
     /// `HORT_REQUIRE_HTTPS=true` was set
-    /// but the binary has no positive evidence the public connection
-    /// is TLS: `HORT_PUBLIC_BASE_URL` is `http://...` AND
-    /// `HORT_TRUSTED_PROXY_CIDRS` is empty. The combination silently ships
-    /// a registry over plaintext when the operator believed the
-    /// opposite (the gate's whole reason for existing); refuse to
-    /// start so the misconfiguration is loud, not silent.
+    /// but the configured public URL is HTTP and no trusted proxy is
+    /// declared: `HORT_PUBLIC_BASE_URL` is `http://...` AND
+    /// `HORT_TRUSTED_PROXY_CIDRS` is empty. This combination contradicts
+    /// the operator's requirement; refuse it at startup.
     #[error(
-        "HORT_REQUIRE_HTTPS=true but the binary has no positive evidence the public \
-        connection is TLS: HORT_PUBLIC_BASE_URL is http://... AND HORT_TRUSTED_PROXY_CIDRS \
-        is empty. Either set HORT_PUBLIC_BASE_URL to an https:// URL (e.g. \
-        https://hort.example.com) so the binary emits HSTS and absolute \
-        URLs over TLS, or set HORT_TRUSTED_PROXY_CIDRS to the reverse-proxy ranges \
-        (e.g. 10.0.0.0/8) so the binary trusts X-Forwarded-Proto from the proxy. \
+        "HORT_REQUIRE_HTTPS=true but HORT_PUBLIC_BASE_URL is http://... AND \
+        HORT_TRUSTED_PROXY_CIDRS is empty. Set HORT_PUBLIC_BASE_URL to the public \
+        https:// URL (e.g. https://hort.example.com) for correct links, or set \
+        HORT_TRUSTED_PROXY_CIDRS to the reverse-proxy ranges (e.g. 10.0.0.0/8) \
+        whose forwarded scheme the binary may trust. This is a boot-time \
+        configuration check, not evidence that a request used TLS. \
         Disable the gate via HORT_REQUIRE_HTTPS=false if plaintext is intentional."
     )]
     InsecureHttp,
@@ -2014,6 +2039,7 @@ impl Config {
         let public_base_url = parse_public_base_url()?;
 
         let trusted_proxy_cidrs = parse_trusted_proxy_cidrs()?;
+        let tls_not_required_from = parse_tls_not_required_from()?;
 
         let publish_body_limit_bytes = parse_publish_body_limit_bytes()?;
 
@@ -2333,6 +2359,7 @@ impl Config {
             metadata_blob_max_bytes,
             public_base_url,
             trusted_proxy_cidrs,
+            tls_not_required_from,
             auth,
             claim_mappings,
             config_dir,
@@ -2542,18 +2569,16 @@ fn parse_retention_stream_mode() -> Result<StreamRetentionMode, ConfigError> {
 
 /// Enforce the `HORT_REQUIRE_HTTPS` opt-in gate.
 ///
-/// When the operator has set the gate AND the binary has no positive
-/// evidence the public connection is TLS, refuse to start so the
-/// misconfiguration is loud. Positive evidence is either:
+/// When the operator has set the gate AND the public URL is explicitly
+/// HTTP with no trusted proxy declared, refuse to start so the
+/// misconfiguration is loud. The accepted configurations include:
 ///   1. `HORT_PUBLIC_BASE_URL` is `https://...`, OR
 ///   2. `HORT_TRUSTED_PROXY_CIDRS` is non-empty (operator wired a
 ///      proxy and trusts its `X-Forwarded-Proto`).
 ///
-/// The AND-condition means the gate fires only on the silent
-/// plaintext-deployment case (forgot the proxy, exposed 8080
-/// directly, used HTTP-only ingress) — exactly the trap the
-/// gate exists to close. `require_https = false` keeps existing
-/// local-dev setups booting without changes.
+/// An unset public URL also passes. This gate is a configuration
+/// consistency check, not evidence that any particular request used TLS.
+/// `require_https = false` keeps existing local-dev setups booting.
 fn enforce_require_https(
     require_https: bool,
     public_base_url: Option<&url::Url>,
@@ -3379,7 +3404,19 @@ fn parse_upstream_allowlist() -> hort_app::use_cases::apply_config_use_case::Ups
 }
 
 fn parse_trusted_proxy_cidrs() -> Result<Vec<IpNet>, ConfigError> {
-    parse_cidr_list("HORT_TRUSTED_PROXY_CIDRS")
+    let cidrs = parse_cidr_list("HORT_TRUSTED_PROXY_CIDRS")?;
+    if let Some(entry) = cidrs.iter().find(|net| net.prefix_len() == 0) {
+        return Err(ConfigError::WildcardTrustedProxyCidr { entry: *entry });
+    }
+    Ok(cidrs)
+}
+
+fn parse_tls_not_required_from() -> Result<Vec<IpNet>, ConfigError> {
+    let cidrs = parse_cidr_list("HORT_TLS_NOT_REQUIRED_FROM")?;
+    if let Some(entry) = cidrs.iter().find(|net| net.prefix_len() == 0) {
+        return Err(ConfigError::WildcardTlsNotRequiredCidr { entry: *entry });
+    }
+    Ok(cidrs)
 }
 
 /// Parse `HORT_RATELIMIT_EXEMPT_CIDRS`.
@@ -4169,6 +4206,7 @@ mod tests {
             metadata_blob_max_bytes: 10 * 1024 * 1024,
             public_base_url: None,
             trusted_proxy_cidrs: Vec::new(),
+            tls_not_required_from: Vec::new(),
             auth: AuthConfig::Disabled,
             claim_mappings: Vec::new(),
             publish_body_limit_bytes: None,
@@ -4295,6 +4333,7 @@ mod tests {
             metadata_blob_max_bytes: 10 * 1024 * 1024,
             public_base_url: None,
             trusted_proxy_cidrs: Vec::new(),
+            tls_not_required_from: Vec::new(),
             auth: AuthConfig::Disabled,
             claim_mappings: Vec::new(),
             publish_body_limit_bytes: None,
@@ -4616,6 +4655,7 @@ mod tests {
             // `env.last_mut()` or by constructing a fresh env slice.
             ("HORT_PUBLIC_BASE_URL", Some("http://hort-server:8080")),
             ("HORT_TRUSTED_PROXY_CIDRS", None),
+            ("HORT_TLS_NOT_REQUIRED_FROM", None),
             // Client-IP attribution is required at startup too: an
             // empty `HORT_TRUSTED_PROXY_CIDRS` attributes every request
             // to its socket peer, which is only correct when nothing
@@ -7176,6 +7216,48 @@ mod tests {
                 other => panic!("expected InvalidCidr, got {other:?}"),
             }
         });
+    }
+
+    #[test]
+    fn trusted_proxy_cidrs_rejects_ipv4_and_ipv6_wildcards() {
+        for wildcard in ["0.0.0.0/0", "::/0"] {
+            let mut env = fs_env();
+            set_trusted_proxy_cidrs(&mut env, Some(wildcard));
+            temp_env::with_vars(env, || {
+                let err = Config::from_env().unwrap_err();
+                assert!(matches!(err, ConfigError::WildcardTrustedProxyCidr { .. }));
+                assert!(err.to_string().contains("HORT_TRUSTED_PROXY_CIDRS"));
+                assert!(err.to_string().contains(wildcard));
+            });
+        }
+    }
+
+    #[test]
+    fn tls_not_required_from_parses_ranges_and_rejects_wildcards() {
+        let mut env = fs_env();
+        env.iter_mut()
+            .find(|slot| slot.0 == "HORT_TLS_NOT_REQUIRED_FROM")
+            .unwrap()
+            .1 = Some("10.88.0.0/16, ::1/128");
+        temp_env::with_vars(env, || {
+            let cfg = Config::from_env().unwrap();
+            assert_eq!(cfg.tls_not_required_from.len(), 2);
+        });
+        for wildcard in ["0.0.0.0/0", "::/0"] {
+            let mut env = fs_env();
+            env.iter_mut()
+                .find(|slot| slot.0 == "HORT_TLS_NOT_REQUIRED_FROM")
+                .unwrap()
+                .1 = Some(wildcard);
+            temp_env::with_vars(env, || {
+                let err = Config::from_env().unwrap_err();
+                assert!(matches!(
+                    err,
+                    ConfigError::WildcardTlsNotRequiredCidr { .. }
+                ));
+                assert!(err.to_string().contains("HORT_TLS_NOT_REQUIRED_FROM"));
+            });
+        }
     }
 
     // CIDR parsing: empty env var → empty vec (but the startup guard

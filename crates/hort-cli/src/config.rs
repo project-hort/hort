@@ -84,7 +84,7 @@ pub enum ConfigError {
 ///
 /// ```toml
 /// server = "https://artifacts.example.com"
-/// token  = "hort_cli_z3..."
+/// token  = "hort_pat_example..."
 ///
 /// [output]
 /// default_format = "table"  # or "json"

@@ -6,6 +6,12 @@
 //! suites need before a held row hydrates as an indefinite hold.
 //! Extracted so the mirrored test modules share one implementation
 //! instead of byte-identical copies.
+//!
+//! Also home to [`with_native_oci_tokens`], the native-token wiring both
+//! OCI credential boundaries need on a context: the consume middleware
+//! gates its verify path on `ctx.oci_token_exchange` and the `/v2/auth`
+//! handler `404`s without it, so the two suites would otherwise each
+//! carry a copy of the same forty lines.
 
 use std::sync::Arc;
 
@@ -14,8 +20,14 @@ use axum::response::Response;
 use chrono::Utc;
 use uuid::Uuid;
 
+use hort_app::oci_token_signing::OciTokenSigningKey;
 use hort_app::rbac::RbacEvaluator;
 use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
+use hort_app::use_cases::oci_token_exchange_use_case::{
+    OciTokenExchangeConfig, OciTokenExchangeUseCase,
+};
+use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
+use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
 use hort_app::use_cases::repository_access::{RbacAccess, RepositoryAccessUseCase};
 use hort_app::use_cases::test_support::{
     MockIdentityProvider, MockPolicyProjectionRepository, MockRepositoryRepository,
@@ -29,10 +41,15 @@ use hort_domain::entities::scan_policy::{
     NegligibleAction, ProvenanceMode, ScanEnforcement, ScanPolicyProjection, SeverityThreshold,
 };
 use hort_domain::events::PolicyScope;
+use hort_domain::ports::api_token_repository::ApiTokenRepository;
+use hort_domain::ports::ephemeral_store::EphemeralStore;
 use hort_domain::ports::identity_provider::IdentityProvider;
+use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::user_repository::UserRepository;
 use hort_http_core::context::{AppContext, AuthContext};
-use hort_http_core::test_support::{with_auth, with_repository_access};
+use hort_http_core::test_support::{
+    with_auth, with_oci_signing_key, with_oci_token_exchange, with_repository_access,
+};
 
 /// Build an RBAC-enabled context over an explicit grant set, reusing
 /// the harness's `repositories` mock so seeded repos resolve.
@@ -351,4 +368,55 @@ pub(crate) fn quarantining_policy_with_window(
         created_at: now,
         updated_at: now,
     }
+}
+
+/// Wire BOTH the OCI signing key AND a real `OciTokenExchangeUseCase`
+/// (carrying the same key + a config `jwt_audience`) onto `ctx`.
+///
+/// The consume-side verify path gates on `ctx.oci_token_exchange` — it
+/// holds the key and the single authoritative `aud` — and `/v2/auth`
+/// answers `404` when the slot is empty, so a test that exercises either
+/// boundary past those gates needs this. The verify path never touches
+/// PAT/RBAC, but the constructor needs collaborators; the mock handles
+/// from `build_mock_ctx` suffice.
+pub(crate) fn with_native_oci_tokens(
+    ctx: &Arc<AppContext>,
+    mocks: &hort_http_core::test_support::MockPorts,
+    signing_key: Arc<OciTokenSigningKey>,
+    jwt_audience: &str,
+) -> Arc<AppContext> {
+    let users: Arc<dyn UserRepository> = mocks.users.clone();
+    let tokens: Arc<dyn ApiTokenRepository> = mocks.api_tokens.clone();
+    let ephemeral: Arc<dyn EphemeralStore> = mocks.ephemeral_durable.clone();
+    let pat_cache = Arc::new(PatCache::new(8, std::time::Duration::from_secs(60)));
+    let pat_validation = Arc::new(PatValidationUseCase::new(
+        tokens,
+        users.clone(),
+        ephemeral,
+        pat_cache,
+        Arc::new(SystemClock),
+        PatLockoutConfig::DEFAULT,
+    ));
+    let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
+        Vec::new(),
+    )));
+    let repo_access = Arc::new(RepositoryAccessUseCase::new(
+        mocks.repositories.clone() as Arc<dyn RepositoryRepository>,
+        RbacAccess::Enabled(rbac.clone()),
+        true,
+    ));
+    let cfg = OciTokenExchangeConfig::new(
+        "https://hort.example.com/v2/auth".to_string(),
+        jwt_audience.to_string(),
+    );
+    let exchange = Arc::new(OciTokenExchangeUseCase::new(
+        pat_validation,
+        users,
+        rbac,
+        repo_access,
+        signing_key.clone(),
+        cfg,
+    ));
+    let ctx = with_oci_signing_key(ctx, Some(signing_key));
+    with_oci_token_exchange(&ctx, Some(exchange))
 }
