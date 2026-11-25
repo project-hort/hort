@@ -98,6 +98,18 @@ test-values-cronjobs.yaml|value: "10.244.0.0/16,127.0.0.1/32"$|1|the server rece
 test-values-cronjobs.yaml|HORT_BEARER_ALLOW_OVER_HTTP|0|the scoped chart path does not use the unscoped bearer flag
 test-values-transport-waiver-unset.yaml|name: hort-server-replay-seen-prune$|1|admin-task CronJobs still render when no transport waiver is declared
 test-values-transport-waiver-unset.yaml|name: HORT_TLS_NOT_REQUIRED_FROM$|0|an empty transport waiver produces no server env variable
+test-values-tls-sidecar.yaml|name: tls-sidecar$|3|TLS sidecar appears as a container, a config mount and a ConfigMap volume
+test-values-tls-sidecar.yaml|value: "127.0.0.1:8080"$|1|the server API binds loopback when TLS terminates in the pod
+test-values-tls-sidecar.yaml|value: "10.244.3.0/24,127.0.0.1/32"$|1|loopback is appended to the edge range
+test-values-tls-sidecar.yaml|targetPort: https$|1|the Service routes API traffic to the TLS container
+test-values-tls-sidecar.yaml|proxy_set_header X-Forwarded-Proto https;|1|the sidecar overwrites the forwarded scheme
+test-values-tls-sidecar.yaml|proxy_set_header Forwarded "";|1|the sidecar discards caller-supplied RFC Forwarded scheme claims
+test-values-tls-sidecar.yaml|proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;|1|the sidecar appends to the client chain
+test-values-tls-sidecar.yaml|url="https://hort-server:8080/healthz"|1|the Helm test hook uses verified HTTPS when the sidecar is enabled
+test-values-transport-waiver-unset.yaml|name: tls-sidecar$|0|disabled TLS sidecar adds no container, mount or volume
+test-values-transport-waiver-unset.yaml|targetPort: https$|0|disabled TLS sidecar leaves the Service plaintext
+test-values-transport-waiver-unset.yaml|proxy_set_header X-Forwarded-Proto https;|0|disabled TLS sidecar creates no nginx config
+test-values-transport-waiver-unset.yaml|url="http://hort-server:8080/healthz"|1|the Helm test hook keeps its plaintext URL with the sidecar disabled
 test-values-cronjobs.yaml|name: hort-server-advisory-watch-tick$|1|advisory-watch-tick CronJob renders with conventional release-name suffix
 test-values-cronjobs.yaml|name: hort-server-staging-sweep$|1|staging-sweep CronJob renders with conventional release-name suffix
 test-values-cronjobs.yaml|name: hort-server-noop$|1|noop CronJob renders with conventional release-name suffix
@@ -231,6 +243,14 @@ scoped_expectations() {
     cat <<'EOF'
 test-values.yaml|templates/deployment.yaml|HORT_CLIENT_IP_FROM_SOCKET_PEER|1|with trustedProxyCidrs empty the server Deployment renders the attribution declaration (default false ⇒ the binary refuses to start, which is the point: an empty allowlist attributes every caller to the TCP peer)
 test-values.yaml|templates/deployment.yaml|HORT_TRUSTED_PROXY_CIDRS|0|the allowlist env is NOT rendered on the server Deployment when trustedProxyCidrs is empty
+test-values-tls-sidecar.yaml|templates/deployment.yaml|name: HORT_API_BIND$|1|enabled TLS sidecar leaves one server API bind variable
+test-values-tls-sidecar.yaml|templates/deployment.yaml|name: HORT_TRUSTED_PROXY_CIDRS$|1|enabled TLS sidecar trusts its loopback peer for scheme evidence
+test-values-transport-waiver-unset.yaml|templates/deployment.yaml|value: "0.0.0.0:8080"$|1|disabled TLS sidecar preserves the public API bind
+test-values-transport-waiver-unset.yaml|templates/service.yaml|targetPort: http$|1|disabled TLS sidecar preserves the plaintext Service target
+test-values-transport-waiver-unset.yaml|templates/deployment.yaml|scheme: HTTPS$|0|disabled TLS sidecar leaves the HTTP probes unchanged
+test-values-tls-sidecar.yaml|templates/deployment.yaml|scheme: HTTPS$|3|all three API probes use the TLS sidecar
+test-values-tls-sidecar.yaml|templates/service.yaml|targetPort: http$|0|enabled TLS sidecar never sends Service traffic to hort directly
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|proxy_pass http://127.0.0.1:8080;|1|the TLS sidecar sends traffic only to hort on loopback
 test-values-ha.yaml|templates/deployment.yaml|HORT_TRUSTED_PROXY_CIDRS|1|trustedProxyCidrs set ⇒ the allowlist env renders on the server Deployment. Scoped, because `hort-server.runtimeEnv` renders the same variable into every CronJob and the worker, so a full-render count tracks how many scheduled tasks the fixture enables rather than anything about the server
 test-values-ha.yaml|templates/deployment.yaml|HORT_CLIENT_IP_FROM_SOCKET_PEER|0|the declaration is NOT rendered when trustedProxyCidrs is set — the allowlist already says where the edge is, so the two are mutually exclusive by construction and an operator cannot set both
 test-values-cronjobs.yaml|templates/worker-deployment.yaml|readOnly: true|0|worker's CAS data mount renders WITHOUT readOnly (the worker writes scan-finding + prefetch-ingest blobs)
@@ -272,6 +292,28 @@ test-values.yaml|templates/worker-deployment.yaml|^ *value: "30"$|1|DEFAULT REND
 EOF
 }
 
+# Each credentialed admin-task CronJob must use the same Service transport
+# and trust source. Keep this list explicit so a missing template is visible
+# beside the chart's execution-path inventory.
+admin_task_transport_expectations() {
+    local task
+    for task in noop staging-sweep cron-rescan-tick advisory-watch-tick \
+        eventstore-checkpoint replay-seen-prune scanner-registry-prune \
+        retention-evaluate retention-purge eventstore-archive \
+        service-account-rotation; do
+        cat <<EOF
+test-values-admin-task-tls.yaml|templates/cronjob-${task}.yaml|value: "https://hort-server:8080"$|1|${task} calls the TLS Service URL
+test-values-admin-task-tls.yaml|templates/cronjob-${task}.yaml|name: HORT_EXTRA_CA_BUNDLE$|1|${task} sets the CLI trust path
+test-values-admin-task-tls.yaml|templates/cronjob-${task}.yaml|value: "/etc/hort-server/ca/ca.crt"$|1|${task} points the CLI at the mounted CA file
+test-values-admin-task-tls.yaml|templates/cronjob-${task}.yaml|name: extra-ca-bundle$|2|${task} mounts the CA volume
+test-values-admin-task-tls.yaml|templates/cronjob-${task}.yaml|name: "hort-server-service-ca"$|1|${task} uses the configured CA ConfigMap
+test-values-admin-task-plaintext.yaml|templates/cronjob-${task}.yaml|value: "http://hort-server:8080"$|1|${task} keeps the plaintext Service URL when TLS is disabled
+test-values-admin-task-plaintext.yaml|templates/cronjob-${task}.yaml|name: HORT_EXTRA_CA_BUNDLE$|0|${task} has no chart-set CA path when TLS is disabled
+test-values-admin-task-plaintext.yaml|templates/cronjob-${task}.yaml|name: extra-ca-bundle$|0|${task} has no CA mount when TLS is disabled
+EOF
+    done
+}
+
 # Byte-equivalence pin: rendering `scheduledTasks.svcTokens` at its
 # DEFAULT (the single pre-list `cronjob-tasks` identity) must be
 # byte-for-byte identical to the golden fixtures captured from the
@@ -297,6 +339,7 @@ test-values-ephemeral-broken.yaml|ephemeralStore.redis|per-class override set bu
 test-values-token-exchange-broken.yaml|nativeTokens|tokenExchange.enabled=true with nativeTokens.enabled=false must fail schema validation (chart-level mirror of ConfigError::TokenExchangeRequiresNativeTokens)
 test-values-rotation-half-on.yaml|scheduledTasks.adminTasksEnabled|the single rotation toggle scheduledTasks.serviceAccountRotation.enabled=true WITHOUT the scheduledTasks.adminTasksEnabled umbrella is a silent half-on — schema rule 9a must reject it at helm template
 test-values-extra-ca-both-sources.yaml|extraCaBundle|configMapName AND secretName both set is mutually exclusive — schema oneOf + validateSources must fail the render
+test-values-admin-task-tls-missing-ca.yaml|extraCaBundle.configMapName or extraCaBundle.secretName|credentialed HTTPS CronJobs require a chart-mounted Service CA source
 test-values-strict-schema-typo.yaml|[Aa]dditional propert|the strict schema (additionalProperties:false on the top-level + every nested block) must REJECT mistyped / retired keys (replicaCountt, apiBindAddr, http.ociUploadTimeoutSeconds, worker.scanner.osvScanner, worker.scanner.osvv, networkPolicy.jobEgres) at helm template instead of silently ignoring them. The last is the fail-OPEN member of the set: an ignored networkPolicy.jobEgress typo leaves the Job pods on the unrestricted default while the operator believes they narrowed it
 test-values-worker-metrics-no-scrapers.yaml|scrapeFrom|worker.metrics.enabled=true with an empty scrapeFrom must be rejected — an empty NetworkPolicy `from: []` means ALL sources (fail-OPEN) per the k8s spec, so the schema's `if enabled then scrapeFrom minItems 1` rule must fail the render rather than open the metrics port cluster-wide
 test-values-worker-metrics-no-networkpolicy.yaml|worker.metrics.enabled=true with networkPolicy.enabled=false|worker.metrics.enabled=true with networkPolicy.enabled=false is the one combination nothing else rejects — the listener turns on with no NetworkPolicy protecting it at all — so worker-networkpolicy.yaml's unconditional `fail` guard must reject it at helm template, naming both values
@@ -415,6 +458,7 @@ done < <(expectations; derived_expectations)
 # Process scoped expectations (see scoped_expectations() above) — each
 # row renders only the named template via `--show-only` and asserts a
 # pattern's match count within that template alone.
+declare -A scoped_render_cache=()
 while IFS='|' read -r fixture tmpl pattern expected_count label; do
     [[ -z "${fixture}" ]] && continue
     fixture_path="${chart_dir}/${fixture}"
@@ -425,16 +469,20 @@ while IFS='|' read -r fixture tmpl pattern expected_count label; do
         continue
     fi
 
-    if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
-        echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
-        echo "${rendered}" | sed 's/^/    /' >&2
-        failed=$((failed + 1))
+    render_key="${fixture}|${tmpl}"
+    if [[ ! -v scoped_render_cache["${render_key}"] ]]; then
+        if ! rendered=$(helm template hort-server "${chart_dir}" --namespace default -f "${fixture_path}" --show-only "${tmpl}" 2>&1); then
+            echo "FAIL: helm template --show-only ${tmpl} failed for ${fixture}:" >&2
+            echo "${rendered}" | sed 's/^/    /' >&2
+            failed=$((failed + 1))
+            checked_fixtures+=("${fixture}")
+            continue
+        fi
+        scoped_render_cache["${render_key}"]="${rendered}"
         checked_fixtures+=("${fixture}")
-        continue
     fi
-    checked_fixtures+=("${fixture}")
 
-    actual_count=$(printf '%s\n' "${rendered}" | grep -cE "${pattern}" || true)
+    actual_count=$(printf '%s\n' "${scoped_render_cache["${render_key}"]}" | grep -cE "${pattern}" || true)
 
     if [[ "${actual_count}" -ne "${expected_count}" ]]; then
         echo "FAIL: ${fixture} (${tmpl}) → ${label}" >&2
@@ -445,7 +493,7 @@ while IFS='|' read -r fixture tmpl pattern expected_count label; do
     else
         echo "PASS: ${fixture} (${tmpl}) → ${label} (${actual_count} match(es))"
     fi
-done < <(scoped_expectations)
+done < <(scoped_expectations; admin_task_transport_expectations)
 
 # Process render-failure expectations — fixtures that MUST fail to
 # render (typically because they exercise an install-block schema

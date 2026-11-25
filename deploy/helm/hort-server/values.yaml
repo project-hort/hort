@@ -17,13 +17,14 @@ global:
   # Empty (default) ⇒ every image reference below renders exactly as it
   # does today: `image.repository`/`worker.image.repository`/
   # `auth.dex.image`, each with its own tag. Set to a registry host (e.g.
-  # "registry.hort.rs") to rewrite ALL THREE image references onto that
-  # registry in one step — the chart's `hort-server.image` /
+  # "registry.hort.rs") to rewrite the server, worker and Dex image
+  # references onto that registry in one step — the chart's `hort-server.image` /
   # `hort-server.worker.image` / `hort-server.dex.image` helpers
   # (templates/_helpers.tpl) own the registry+path-prefix split
   # (`<imageRegistry>/hort-oci/hort-{server,worker}:<tag>`,
   # `<imageRegistry>/hort-base/dex:<pin>`) so operators set ONE value
-  # instead of three per-component repository overrides. See issue #60.
+  # instead of three per-component repository overrides. The optional nginx
+  # TLS sidecar uses its explicit `tlsSidecar.image` reference.
   imageRegistry: ""
 
 # -------------------- Image --------------------
@@ -73,8 +74,39 @@ api:
   #   "127.0.0.1:8080"                — loopback only; useful when an
   #                                     in-pod sidecar proxies the binary
   # A non-default port (e.g. "0.0.0.0:9080") also works; remember to
-  # raise `service.httpPort` to match.
+  # raise `service.httpPort` to match. With tlsSidecar.enabled, the chart
+  # forces loopback at service.httpPort regardless of this bind value.
   bindAddr: "0.0.0.0:8080"
+
+# Terminate inbound TLS in the server pod. Disabled on upgrade so existing
+# installations keep their plaintext Service until the operator provides a
+# Secret with tls.crt and tls.key and explicitly enables this block. The
+# Service keeps service.httpPort as its externally visible port but sends it
+# to the sidecar's HTTPS listener. The certificate must cover the Service DNS
+# name used by in-cluster clients and be trusted by those clients. If
+# networkPolicy.ingress restricts ports, permit the httpsPort there.
+# The edge MUST redirect or refuse plaintext client requests and verify the
+# Service certificate: the sidecar can attest only its own TLS hop. The edge must
+# also append or overwrite X-Forwarded-For with the real client address.
+# The sidecar overwrites X-Forwarded-Proto, discards Forwarded, and appends
+# X-Forwarded-For. The chart trusts 127.0.0.1/32 automatically; also declare
+# the edge's source range in trustedProxyCidrs so the rightmost-untrusted
+# address remains the client. An overly broad range degrades attribution.
+# With this block off, an ingress-to-pod plaintext hop still relies on the
+# edge's scheme assertion; credentialed direct in-cluster calls require TLS
+# evidence or a scoped transport waiver. See ADR 0068.
+tlsSidecar:
+  enabled: false
+  image: "nginx:1.30.8"
+  httpsPort: 8443
+  secretName: ""
+  resources:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 250m
+      memory: 128Mi
 
 # HORT_REQUIRE_HTTPS — when `true`, the binary refuses to start unless
 # `publicBaseUrl` is `https://...` OR `trustedProxyCidrs` is non-empty
@@ -84,9 +116,11 @@ requireHttps: true
 
 # HORT_TRUSTED_PROXY_CIDRS — list of CIDRs the binary trusts
 # X-Forwarded-* headers from (gates the requireHttps + HSTS path).
-# Set to your edge's pod / service / LB CIDRs. Empty = no trust,
-# X-Forwarded-* ignored, and every request is attributed to its TCP
-# peer. Example: ["10.244.0.0/16", "::1/128"]
+# Set to your edge's pod / service / LB CIDRs. With tlsSidecar.enabled,
+# the chart also adds 127.0.0.1/32 for the sidecar's scheme assertion;
+# include the edge range for rightmost-untrusted client-IP attribution.
+# With the sidecar disabled, empty = no trust, X-Forwarded-* ignored,
+# and every request is attributed to its TCP peer.
 # SECURITY: in a Kubernetes install there is essentially always an
 # ingress or LB in front, so leaving this empty makes the per-IP
 # controls (PAT brute-force lockout, auth-failure rate limit, per-IP
@@ -99,7 +133,8 @@ trustedProxyCidrs: []
 
 # HORT_TLS_NOT_REQUIRED_FROM — CIDRs of raw TCP peers for which hort waives
 # the credential TLS requirement. Empty by default; no pod CIDR is portable.
-# To use the plaintext Service URL of the admin-task CronJobs, measure the
+# With tlsSidecar disabled, to use the plaintext Service URL of the admin-task
+# CronJobs, measure the
 # `peer` hort sees from those pods before setting this to their pod range.
 # Set `RUST_LOG=info,hort_http_core::middleware::trust=debug` and read the trust
 # layer's `request trust evaluated` line: `peer` is the socket peer IP;
@@ -1031,14 +1066,15 @@ extraCaBundle:
   # Auto-mount source A (Recipe A): name of an existing ConfigMap
   # holding the PEM bundle under key `ca.crt`. When set, the chart
   # mounts it read-only at `path` AND sets HORT_EXTRA_CA_BUNDLE on the
-  # server Deployment, the worker Deployment, and the server-runtime
-  # CronJobs — symmetrically. Mutually exclusive with `secretName`.
+  # server Deployment, the worker Deployment, server-runtime CronJobs,
+  # and credentialed admin-task CronJobs when tlsSidecar.enabled.
+  # Mutually exclusive with `secretName`.
   configMapName: ""
   # Auto-mount source B (Recipe B, auto): name of an existing Secret
   # holding the PEM bundle under key `ca.crt` (e.g. a cert-manager
   # output or an operator-managed Secret). Behaves IDENTICALLY to
   # `configMapName` — same mount path, same read-only 0444 projection,
-  # same auto-mount on server + worker + CronJobs, same
+  # same auto-mount targets as `configMapName`, same
   # HORT_EXTRA_CA_BUNDLE wiring. Mutually exclusive with
   # `configMapName` (a pod can mount only one `ca.crt` at `path`); the
   # chart fails the render at `helm install` if both are set.
@@ -1502,12 +1538,14 @@ scheduledTasks:
   #   - postgres.admin.existingSecret — the bootstrap Job uses the admin DSN
   #     to write the service-account user and token rows.
   #   - A working in-cluster network path from the CronJob pods to the
-  #     hort-server Service (HORT_SERVER = http://<fullname>:<httpPort>).
-  #   - Set tlsNotRequiredFrom to the measured TCP peer range of those
-  #     pods. Without it, the CronJobs still render but their credentials
-  #     are refused (426). An HTTPS endpoint is the alternative; use
-  #     HORT_EXTRA_CA_BUNDLE when it needs an internal CA. A trusted proxy
-  #     reporting proto=http cannot be waived by the scoped setting.
+  #     hort-server Service. With tlsSidecar.enabled, the admin-task CLI
+  #     uses HTTPS and extraCaBundle must name the ConfigMap or Secret
+  #     containing the Service certificate's CA. The chart mounts it in
+  #     each credentialed CronJob and sets HORT_EXTRA_CA_BUNDLE.
+  #   - With the sidecar disabled, the CLI keeps the plaintext Service
+  #     URL. Set tlsNotRequiredFrom to the CronJob pods' measured TCP peer
+  #     range or credentialed calls are refused (426). A trusted proxy
+  #     reporting proto=http cannot use the scoped waiver.
   #   - A gitops-declared `cronjob-tasks` ServiceAccount PLUS a global
   #     `admin_task_invoke` PermissionGrant targeting it (subject
   #     `kind: serviceAccount, name: cronjob-tasks`) — this chart never

@@ -64,7 +64,7 @@ for the full rationale behind each control.
 | Two-role Postgres | `HORT_DATABASE_URL` (split by role; chart injects this canonical name, binary falls back to bare `DATABASE_URL`) | `postgres.app.existingSecret` + `postgres.admin.existingSecret` | (required) | (no default) |
 | Concurrency cap | `HORT_MAX_INFLIGHT` | `http.maxInflight` | `0` (binary default) | `512` |
 | Per-IP concurrency cap | `HORT_MAX_INFLIGHT_PER_IP` | `http.maxInflightPerIp` | `0` (binary default) | `32` |
-| API bind | `HORT_API_BIND` | `api.bindAddr` | `0.0.0.0:8080` | `127.0.0.1:8080` |
+| API bind | `HORT_API_BIND` | `api.bindAddr` (overridden by `tlsSidecar.enabled`) | `0.0.0.0:8080` | `127.0.0.1:8080` |
 | Require HTTPS | `HORT_REQUIRE_HTTPS` | `requireHttps` | `true` | `false` |
 | Public base URL | `HORT_PUBLIC_BASE_URL` | `publicBaseUrl` | (required) | (no default) |
 | Secret file root | `HORT_SECRETS_FILE_ROOT` | `secrets.fileRoot` | `/etc/hort-server/secrets` | (none) |
@@ -286,6 +286,23 @@ image:
   > after any custom `proxy_set_header` / header-rewrite config) and
   > watch for the `trusted peer with missing X-Forwarded-For` WARN.
 - **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HSTS, rightmost-untrusted `X-Forwarded-For`.
+
+### `tlsSidecar`
+
+- **Default:** `enabled: false`; existing plaintext Service behavior is preserved.
+- **When enabled:** supply `secretName` for a TLS Secret with `tls.crt` and
+  `tls.key`. nginx listens at `httpsPort` (default `8443`) and the Service
+  still exposes `service.httpPort` (default `8080`) but targets nginx. The
+  chart forces `HORT_API_BIND=127.0.0.1:<service.httpPort>` and adds
+  `127.0.0.1/32` to the trusted proxy list. `api.bindAddr` is ignored in
+  this mode. The edge's source range still belongs in `trustedProxyCidrs`
+  so the client IP can be resolved from the appended `X-Forwarded-For` chain.
+  An operator-managed `networkPolicy.ingress` must allow `httpsPort`.
+- **Operator obligations:** provide and rotate a certificate valid for the
+  Service DNS name used by in-cluster clients, restart the Deployment after
+  replacing the Secret, configure the edge to redirect or refuse plaintext
+  clients, and make its `X-Forwarded-For` identify the real client. See
+  [`inbound-credential-transport.md`](./inbound-credential-transport.md).
 
 ### `auth`
 
