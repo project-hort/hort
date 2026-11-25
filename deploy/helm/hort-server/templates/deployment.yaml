@@ -2,6 +2,19 @@
        (mutually-exclusive configMapName/secretName, or an auto-mount
        source with no path). */}}
 {{- include "hort-server.extraCaBundle.validateSources" . }}
+{{- if and .Values.tlsSidecar.enabled .Values.scheduledTasks.adminTasksEnabled (not (include "hort-server.extraCaBundle.autoMounted" .)) }}
+{{- fail "tlsSidecar.enabled with scheduledTasks.adminTasksEnabled requires extraCaBundle.configMapName or extraCaBundle.secretName and extraCaBundle.path so credentialed CronJobs can verify the Service certificate" }}
+{{- end }}
+{{- if and .Values.tlsSidecar.enabled (eq (int .Values.tlsSidecar.httpsPort) (int .Values.service.httpPort)) }}
+{{- fail "tlsSidecar.httpsPort must differ from service.httpPort because both listeners share the pod network namespace" }}
+{{- end }}
+{{- if .Values.tlsSidecar.enabled }}
+{{- range .Values.extraEnv }}
+{{- if eq .name "HORT_API_BIND" }}
+{{- fail "extraEnv must not override HORT_API_BIND when tlsSidecar.enabled: the API must bind loopback" }}
+{{- end }}
+{{- end }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -29,6 +42,9 @@ spec:
       annotations:
         # Roll pods when the gitops ConfigMap changes.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- if .Values.tlsSidecar.enabled }}
+        checksum/tls-sidecar-config: {{ include (print $.Template.BasePath "/tls-sidecar-configmap.yaml") . | sha256sum }}
+        {{- end }}
         {{- if .Values.extraCaBundle.configMapName }}
         # Roll pods when the operator-supplied extra-CA-bundle ConfigMap
         # changes (or when the values switch which ConfigMap is referenced).
@@ -104,10 +120,17 @@ spec:
             - name: HORT_PUBLIC_BASE_URL
               value: {{ .Values.publicBaseUrl | quote }}
             - name: HORT_API_BIND
+              {{- if .Values.tlsSidecar.enabled }}
+              value: {{ printf "127.0.0.1:%v" .Values.service.httpPort | quote }}
+              {{- else }}
               value: {{ .Values.api.bindAddr | quote }}
+              {{- end }}
             - name: HORT_REQUIRE_HTTPS
               value: {{ .Values.requireHttps | quote }}
-            {{- if .Values.trustedProxyCidrs }}
+            {{- if .Values.tlsSidecar.enabled }}
+            - name: HORT_TRUSTED_PROXY_CIDRS
+              value: {{ join "," (uniq (append .Values.trustedProxyCidrs "127.0.0.1/32")) | quote }}
+            {{- else if .Values.trustedProxyCidrs }}
             - name: HORT_TRUSTED_PROXY_CIDRS
               value: {{ join "," .Values.trustedProxyCidrs | quote }}
             {{- else }}
@@ -417,11 +440,23 @@ spec:
             {{- toYaml .Values.containerSecurityContext | nindent 12 }}
           # Probes wired to the /healthz + /readyz endpoints.
           livenessProbe:
+            {{- if and .Values.tlsSidecar.enabled .Values.probes.liveness.httpGet }}
+            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.liveness) (dict "httpGet" (dict "port" "https" "scheme" "HTTPS"))) | nindent 12 }}
+            {{- else }}
             {{- toYaml .Values.probes.liveness | nindent 12 }}
+            {{- end }}
           readinessProbe:
+            {{- if and .Values.tlsSidecar.enabled .Values.probes.readiness.httpGet }}
+            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.readiness) (dict "httpGet" (dict "port" "https" "scheme" "HTTPS"))) | nindent 12 }}
+            {{- else }}
             {{- toYaml .Values.probes.readiness | nindent 12 }}
+            {{- end }}
           startupProbe:
+            {{- if and .Values.tlsSidecar.enabled .Values.probes.startup.httpGet }}
+            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.startup) (dict "httpGet" (dict "port" "https" "scheme" "HTTPS"))) | nindent 12 }}
+            {{- else }}
             {{- toYaml .Values.probes.startup | nindent 12 }}
+            {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
@@ -450,11 +485,55 @@ spec:
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+        {{- if .Values.tlsSidecar.enabled }}
+        - name: tls-sidecar
+          image: {{ .Values.tlsSidecar.image | quote }}
+          imagePullPolicy: IfNotPresent
+          command: ["nginx"]
+          args: ["-g", "daemon off;", "-c", "/etc/nginx/nginx.conf"]
+          ports:
+            - name: https
+              containerPort: {{ .Values.tlsSidecar.httpsPort }}
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            {{- toYaml .Values.tlsSidecar.resources | nindent 12 }}
+          volumeMounts:
+            - name: tls-sidecar
+              mountPath: /etc/nginx/nginx.conf
+              subPath: nginx.conf
+              readOnly: true
+            - name: tls-sidecar-cert
+              mountPath: /etc/nginx/tls
+              readOnly: true
+            - name: tls-sidecar-tmp
+              mountPath: /tmp
+        {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
         - name: staging
           emptyDir: {}
+        {{- if .Values.tlsSidecar.enabled }}
+        - name: tls-sidecar
+          configMap:
+            name: {{ include "hort-server.fullname" . }}-tls-sidecar
+        - name: tls-sidecar-cert
+          secret:
+            secretName: {{ .Values.tlsSidecar.secretName | quote }}
+            defaultMode: 0440
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+        - name: tls-sidecar-tmp
+          emptyDir: {}
+        {{- end }}
         {{- if eq .Values.storage.backend "filesystem" }}
         - name: data
           {{- if .Values.storage.filesystem.pvc.enabled }}

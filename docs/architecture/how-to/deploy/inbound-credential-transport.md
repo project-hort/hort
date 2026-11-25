@@ -24,6 +24,43 @@ another boot gate may still fail. It is **never**
 evidence about a request. Set an `https://` public base URL for correct
 links, and verify the proxy's actual header behavior independently.
 
+## TLS inside the server pod
+
+Set `tlsSidecar.enabled: true` and `tlsSidecar.secretName` to an existing
+Kubernetes Secret with `tls.crt` and `tls.key`. The certificate must cover the
+Service DNS name used by in-cluster clients; those clients must trust its CA.
+The chart does not issue or rotate the certificate. Restart the server
+Deployment after replacing the Secret so nginx reloads the certificate.
+The Service keeps `service.httpPort` but targets nginx's TLS listener at
+`tlsSidecar.httpsPort`. Hort binds `127.0.0.1:<service.httpPort>` so other
+pods cannot reach its plaintext listener directly. The chart adds
+`127.0.0.1/32` to `HORT_TRUSTED_PROXY_CIDRS` for nginx's scheme assertion.
+If `networkPolicy.ingress` restricts ports, permit the TLS listener port
+instead of hort's loopback port.
+
+The edge must redirect or refuse plaintext client requests before it forwards
+to the Service, and verify the Service certificate on its TLS connection.
+nginx overwrites `X-Forwarded-Proto` with `https` to report
+the ingress-to-pod TLS hop; it cannot prove how the client reached the edge.
+nginx discards a caller's `Forwarded` header and appends to
+`X-Forwarded-For`. Configure the edge to append or overwrite
+`X-Forwarded-For` with the real client address, and list the edge's source
+range in `trustedProxyCidrs` as well as the chart-added loopback address.
+Hort's rightmost-untrusted address is then the client. A range that also
+trusts unrelated pods can damage attribution, even though they cannot reach
+hort's loopback listener to forge TLS evidence. Keep the edge range narrow.
+
+The sidecar is off by default. With it off, the Service still carries HTTP
+between ingress and pod. The operator must keep the edge's scheme headers
+trustworthy for credentialed external calls and provide TLS or an applicable
+scope for credentialed in-cluster calls. With the sidecar enabled, the
+credentialed admin-task CronJobs use the HTTPS Service URL and the chart
+mounts the CA named by `extraCaBundle.configMapName` or
+`extraCaBundle.secretName` at `extraCaBundle.path`. Set the source and path
+before enabling `scheduledTasks.adminTasksEnabled`; the chart rejects that
+combination without an auto-mounted CA. The certificate must cover the
+Service DNS name the CronJobs use.
+
 ## Deliberate plaintext hops
 
 Set `HORT_TLS_NOT_REQUIRED_FROM` to a CSV of raw TCP peer CIDRs only for a
@@ -39,7 +76,8 @@ range, sends no forwarding header, and is absent from the trust list remains
 indistinguishable from a direct client. Do not put external ingress traffic
 in a waived scope.
 
-The chart's eleven admin-task CronJobs use the plain HTTP Service URL. Measure
+With the TLS sidecar disabled, the chart's eleven admin-task CronJobs use the
+plain HTTP Service URL. Measure
 their observed peer before setting `tlsNotRequiredFrom`; an ordinary
 source-preserving ClusterIP path shows the CronJob pod IP, while meshes and
 NAT can change it. The default metrics listener binds `127.0.0.1:9090` for

@@ -1,0 +1,20 @@
+# A credentialed HTTPS CronJob cannot render without its Service CA source.
+publicBaseUrl: "https://example.com"
+trustedProxyCidrs: ["10.244.3.0/24"]
+tlsSidecar:
+  enabled: true
+  secretName: "hort-server-tls"
+scheduledTasks:
+  adminTasksEnabled: true
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+  admin:
+    existingSecret: "hort-admin-db-secret"
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+storage:
+  backend: filesystem

@@ -1,7 +1,7 @@
 {{/*
 `helm test` Job. Polls /healthz over the cluster Service until it
-returns 200, exits 0. busybox carries `wget`; the hort-server image is
-distroless and has no shell, so we run the test from a separate image.
+returns 200, exits 0. In TLS mode curl verifies the Service certificate
+with the system roots or the chart's auto-mounted extra CA bundle.
 
 Helm v3 best practice: `helm test` Jobs are stable across cleanup
 (unlike Pods, which the test runner sometimes leaves behind on failure).
@@ -31,6 +31,45 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
+        {{- if .Values.tlsSidecar.enabled }}
+        - name: curl
+          image: curlimages/curl:8.12.1
+          imagePullPolicy: IfNotPresent
+          {{- if include "hort-server.extraCaBundle.autoMounted" . }}
+          env:
+            - name: HORT_TEST_CA_BUNDLE
+              value: {{ .Values.extraCaBundle.path | quote }}
+          volumeMounts:
+            {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 12 }}
+          {{- end }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              url="https://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort }}/healthz"
+              for i in $(seq 1 30); do
+                if [ -n "${HORT_TEST_CA_BUNDLE:-}" ]; then
+                  if curl -fsS --cacert "$HORT_TEST_CA_BUNDLE" "$url" >/dev/null 2>&1; then
+                    echo "OK: /healthz reachable on attempt $i"
+                    exit 0
+                  fi
+                elif curl -fsS "$url" >/dev/null 2>&1; then
+                  echo "OK: /healthz reachable on attempt $i"
+                  exit 0
+                fi
+                echo "attempt $i: $url not yet reachable"
+                sleep 2
+              done
+              echo "FAIL: /healthz unreachable after 30 attempts"
+              exit 1
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+        {{- else }}
         - name: wget
           image: busybox:1.36
           imagePullPolicy: IfNotPresent
@@ -56,3 +95,8 @@ spec:
             capabilities:
               drop:
                 - ALL
+        {{- end }}
+      {{- if and .Values.tlsSidecar.enabled (include "hort-server.extraCaBundle.autoMounted" .) }}
+      volumes:
+        {{- include "hort-server.extraCaBundle.volume" . | nindent 8 }}
+      {{- end }}

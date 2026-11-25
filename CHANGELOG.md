@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The Helm chart can serve HTTPS from the server pod, including admin-task CronJobs. Provide a Service-name TLS certificate and its CA bundle, enable `tlsSidecar`, and require HTTPS at the edge (#457).
+
 ### Fixed
 
 - The upload-payload metadata cap now applies to verified ingest (hosted PyPI

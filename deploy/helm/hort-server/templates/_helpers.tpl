@@ -319,7 +319,8 @@ the same path):
     the chart mounts it read-only at `extraCaBundle.path`.
 
 Both auto-mount the SAME targets symmetrically: the server Deployment,
-the worker Deployment, and the server-runtime CronJobs. The manual
+the worker Deployment, and the server-runtime CronJobs. Credentialed
+admin-task CronJobs use the same helpers when tlsSidecar.enabled. The manual
 Recipe-B path (`extraCaBundle.path` set, but NEITHER source) is for
 operators wiring `extraVolumes`/`extraVolumeMounts` (and the
 `worker.*` equivalents) themselves — e.g. a CSI-projected
@@ -327,8 +328,9 @@ ClusterTrustBundle.
 
 `hort-server.extraCaBundle.autoMounted` returns a non-empty string when
 the chart owns the mount (configMapName OR secretName set) and empty
-otherwise. This is the single gate that BOTH the volume/volumeMount
-blocks AND the `HORT_EXTRA_CA_BUNDLE` env var key off, so the chart can
+otherwise. The volume/volumeMount blocks AND `HORT_EXTRA_CA_BUNDLE` env var
+share this source gate; credentialed admin-task CronJobs also require
+`tlsSidecar.enabled`. The chart can
 NEVER set the env on a pod it did not also mount the bundle onto
 (convention 9). For the manual path the chart leaves the env unset and
 the operator sets `HORT_EXTRA_CA_BUNDLE` themselves via `extraEnv` /
@@ -355,8 +357,8 @@ true
 
 {{/*
 The auto-mount `volumeMount` for the CA bundle. Emitted by the server
-Deployment, worker Deployment, and the server-runtime CronJobs whenever
-`hort-server.extraCaBundle.autoMounted` is true. Mounting at
+Deployment, worker Deployment, server-runtime CronJobs, and TLS-enabled
+credentialed admin-task CronJobs when they use the auto-mount source. Mounting at
 `extraCaBundle.path` with `subPath: ca.crt` matches the shape used by
 both ConfigMap- and Secret-backed volumes (the volume itself projects
 `ca.crt`). Callers nest the output at the right indent.
