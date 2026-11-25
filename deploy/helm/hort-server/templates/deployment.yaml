@@ -441,19 +441,19 @@ spec:
           # Probes wired to the /healthz + /readyz endpoints.
           livenessProbe:
             {{- if and .Values.tlsSidecar.enabled .Values.probes.liveness.httpGet }}
-            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.liveness) (dict "httpGet" (dict "port" "https" "scheme" "HTTPS"))) | nindent 12 }}
+            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.liveness) (dict "httpGet" (dict "port" .Values.tlsSidecar.httpsPort "scheme" "HTTPS"))) | nindent 12 }}
             {{- else }}
             {{- toYaml .Values.probes.liveness | nindent 12 }}
             {{- end }}
           readinessProbe:
             {{- if and .Values.tlsSidecar.enabled .Values.probes.readiness.httpGet }}
-            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.readiness) (dict "httpGet" (dict "port" "https" "scheme" "HTTPS"))) | nindent 12 }}
+            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.readiness) (dict "httpGet" (dict "port" .Values.tlsSidecar.httpsPort "scheme" "HTTPS"))) | nindent 12 }}
             {{- else }}
             {{- toYaml .Values.probes.readiness | nindent 12 }}
             {{- end }}
           startupProbe:
             {{- if and .Values.tlsSidecar.enabled .Values.probes.startup.httpGet }}
-            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.startup) (dict "httpGet" (dict "port" "https" "scheme" "HTTPS"))) | nindent 12 }}
+            {{- toYaml (mergeOverwrite (deepCopy .Values.probes.startup) (dict "httpGet" (dict "port" .Values.tlsSidecar.httpsPort "scheme" "HTTPS"))) | nindent 12 }}
             {{- else }}
             {{- toYaml .Values.probes.startup | nindent 12 }}
             {{- end }}

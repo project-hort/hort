@@ -97,7 +97,7 @@ api:
 # evidence or a scoped transport waiver. See ADR 0068.
 tlsSidecar:
   enabled: false
-  image: "nginx:1.30.8"
+  image: "docker.io/library/nginx:1.30.8"
   httpsPort: 8443
   secretName: ""
   resources:

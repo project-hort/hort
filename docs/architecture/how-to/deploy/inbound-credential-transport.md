@@ -28,7 +28,9 @@ links, and verify the proxy's actual header behavior independently.
 
 Set `tlsSidecar.enabled: true` and `tlsSidecar.secretName` to an existing
 Kubernetes Secret with `tls.crt` and `tls.key`. The certificate must cover the
-Service DNS name used by in-cluster clients; those clients must trust its CA.
+Service DNS name used by in-cluster clients, including the bare Service name
+`<fullname>` in the CronJobs' `https://<fullname>:<port>` URL; those clients
+must trust its CA.
 The chart does not issue or rotate the certificate. Restart the server
 Deployment after replacing the Secret so nginx reloads the certificate.
 The Service keeps `service.httpPort` but targets nginx's TLS listener at
@@ -58,8 +60,9 @@ credentialed admin-task CronJobs use the HTTPS Service URL and the chart
 mounts the CA named by `extraCaBundle.configMapName` or
 `extraCaBundle.secretName` at `extraCaBundle.path`. Set the source and path
 before enabling `scheduledTasks.adminTasksEnabled`; the chart rejects that
-combination without an auto-mounted CA. The certificate must cover the
-Service DNS name the CronJobs use.
+combination without an auto-mounted CA. The certificate must cover the bare
+Service name `<fullname>` that the CronJobs use, even if it also covers `.svc`
+forms.
 
 ## Deliberate plaintext hops
 
