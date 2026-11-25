@@ -95,6 +95,7 @@ accepted?*
 | ADR | Decision |
 |---|---|
 | [0010](0010-tls-builder-no-insecure-knobs.md) | Centralised TLS construction; no insecure-TLS knobs |
+| [0068](0068-inbound-credential-transport-evidence.md) | Inbound credentials require trusted transport evidence or a scoped operator waiver; an address is never TLS evidence |
 
 ### Operations and configuration
 

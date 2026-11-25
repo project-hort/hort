@@ -54,6 +54,7 @@ Start here if you want to know **why** the system looks the way it does.
 - [Install `hort-server` + `hort-worker` on a single Linux host](how-to/deploy/local-bringup.md)
 - [Helm chart — values reference](how-to/deploy/values-reference.md)
 - [Helm chart — edge overlays](how-to/deploy/examples-overlays.md)
+- [Configure inbound credential transport](how-to/deploy/inbound-credential-transport.md)
 - [Install fully sovereign against `registry.hort.rs`](how-to/deploy/self-contained-registry-install.md)
 - [Upgrade a running deployment (and `### Migration notice` releases)](how-to/deploy/upgrade.md)
 - [Provision the two Postgres roles](how-to/deploy/postgres-roles.md)

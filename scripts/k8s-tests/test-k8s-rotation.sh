@@ -215,6 +215,13 @@ if [ "${CURRENT_CONTEXT}" != "kind-${CLUSTER_NAME}" ]; then
 fi
 
 kubectl cluster-info >/dev/null
+# kind creates one node here. Read its assigned pod CIDR so the smoke uses
+# the range of its actual direct Service callers, not a fixed cluster guess.
+KIND_POD_CIDR="$(kubectl get nodes -o jsonpath='{.items[0].spec.podCIDR}')"
+if [ -z "${KIND_POD_CIDR}" ]; then
+    echo "MISSING: kind node has no assigned pod CIDR for the scoped transport waiver." >&2
+    exit 2
+fi
 
 # -- Image build + load ------------------------------------------------
 #
@@ -546,15 +553,12 @@ auth:
       existingSecret: hort-oci-signing-key
       secretKey: hort-oci-token-signing-key.pem
 
-# The smoke runs hort-server with plaintext HTTP inside the kind
-# cluster. The PAT-over-HTTP gate refuses native tokens on unencrypted
-# connections; an in-cluster smoke is the canonical case where the
-# operator (here, the smoke script) deliberately accepts plaintext
-# between sibling pods. \`HORT_BEARER_ALLOW_OVER_HTTP=true\` is the
-# documented override.
-extraEnv:
-  - name: HORT_BEARER_ALLOW_OVER_HTTP
-    value: "true"
+# The direct CronJob-to-Service hop uses the kind node's assigned pod
+# CIDR. The loopback range covers a sidecar metrics scrape if enabled.
+# No unscoped plaintext-token flag is needed for this test posture.
+tlsNotRequiredFrom:
+  - "${KIND_POD_CIDR}"
+  - "127.0.0.1/32"
 
 storage:
   backend: filesystem

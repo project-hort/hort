@@ -58,6 +58,9 @@ mod tests {
         RequestTrust {
             client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             public_url: url(public_url),
+            transport: crate::middleware::trust::TransportSecurity::Unknown,
+            peer_trusted: false,
+            tls_requirement_waived: false,
         }
     }
 

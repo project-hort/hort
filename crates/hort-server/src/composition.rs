@@ -283,8 +283,10 @@ pub struct NotifyConfig {
     pub nats_url: Option<String>,
 }
 
-/// Boot-time signal for the
-/// `HORT_BEARER_ALLOW_OVER_HTTP` operator opt-in.
+/// Boot-time signal for the `HORT_BEARER_ALLOW_OVER_HTTP` operator
+/// opt-in — the **unscoped** waiver of the credential-transport
+/// requirement, which accepts a presented credential regardless of
+/// evidence, peer or relay.
 ///
 /// On the safe (`allowed = false`) path: gauge is set to `0.0` so a
 /// scrape on a fresh recorder sees the metric anyway — absence vs
@@ -300,8 +302,13 @@ pub struct NotifyConfig {
 pub(crate) fn emit_pat_over_http_signal(allowed: bool) {
     if allowed {
         tracing::warn!(
-            "HORT_BEARER_ALLOW_OVER_HTTP active — bearer auth (PAT + CliSession JWT) \
-             without TLS is allowed; use only on a trusted internal network or for development"
+            "HORT_BEARER_ALLOW_OVER_HTTP active — any presented credential is accepted \
+             without evidence of TLS, from any peer, EXCEPT on the token endpoint \
+             (POST /api/v1/auth/exchange), which this flag does not reach and which \
+             answers 426 until TLS is in front or the peer's range is declared in \
+             HORT_TLS_NOT_REQUIRED_FROM; prefer declaring the plaintext hop with \
+             HORT_TLS_NOT_REQUIRED_FROM, which reaches every surface including that \
+             one, and use this only for development"
         );
         metrics::gauge!("hort_unsafe_config_active", "kind" => "pat_over_http").set(1.0);
     } else {

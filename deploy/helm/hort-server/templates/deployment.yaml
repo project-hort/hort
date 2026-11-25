@@ -121,6 +121,10 @@ spec:
             - name: HORT_CLIENT_IP_FROM_SOCKET_PEER
               value: {{ .Values.clientIpFromSocketPeer | quote }}
             {{- end }}
+            {{- if .Values.tlsNotRequiredFrom }}
+            - name: HORT_TLS_NOT_REQUIRED_FROM
+              value: {{ join "," .Values.tlsNotRequiredFrom | quote }}
+            {{- end }}
             {{- if .Values.rateLimitExemptCidrs }}
             - name: HORT_RATELIMIT_EXEMPT_CIDRS
               value: {{ join "," .Values.rateLimitExemptCidrs | quote }}

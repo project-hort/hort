@@ -317,6 +317,32 @@ pub enum OciError {
     /// `Retry-After`. Code is `UNAVAILABLE`, the same spec-extension
     /// the other two holds use; no new OCI error code.
     PublishingDisabled,
+    /// 426 — a credential was presented on, or would be issued onto, a
+    /// transport this server has no positive evidence of TLS for, and no
+    /// operator waiver covers this request's peer. Emitted by the two OCI
+    /// credential boundaries — the `/v2/*` consume middleware and the
+    /// `/v2/auth` mint — through
+    /// [`crate::middleware::oci_auth::refuse_credential_transport`],
+    /// before any validator runs and before any token is minted.
+    ///
+    /// `message` carries the refusal reason the shared predicate
+    /// returned, verbatim, so one alert expression matches this plane and
+    /// the hosted-format plane.
+    ///
+    /// Code is `DENIED`: the request was refused on policy grounds, which
+    /// is what that code says, and the Distribution Spec defines no code
+    /// for a transport requirement. The `426` status is what separates it
+    /// from the `403` an RBAC denial returns — the same
+    /// status-carries-the-distinction shape
+    /// [`Self::RangeNotSatisfiable`] and [`Self::BadGateway`] use. A new
+    /// hort spec-extension code was rejected: a client parser that does
+    /// not know it learns nothing from it, and `DENIED` is honest.
+    ///
+    /// Carries `Upgrade: TLS/1.2, HTTP/1.1` (RFC 9110 §15.6.7 requires a
+    /// `426` to name the protocol it wants), emitted from
+    /// [`IntoResponse::into_response`] rather than at the call site so no
+    /// emitter can omit the half of the response that says what to do.
+    TransportUnproven { reason: String },
 }
 
 impl OciError {
@@ -352,6 +378,10 @@ impl OciError {
             Self::TooManyRequests { .. } => "TOOMANYREQUESTS",
             Self::NameInvalid { .. } => "NAME_INVALID",
             Self::PublishingDisabled => "UNAVAILABLE",
+            // Policy refusal, which is what `DENIED` says; the 426
+            // status is what separates it from an RBAC 403 (see the
+            // variant doc).
+            Self::TransportUnproven { .. } => "DENIED",
         }
     }
 
@@ -381,6 +411,7 @@ impl OciError {
             Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::NameInvalid { .. } => StatusCode::BAD_REQUEST,
             Self::PublishingDisabled => StatusCode::SERVICE_UNAVAILABLE,
+            Self::TransportUnproven { .. } => StatusCode::UPGRADE_REQUIRED,
         }
     }
 
@@ -424,6 +455,10 @@ impl OciError {
             // operator reading two client logs side by side sees one
             // answer, not two.
             Self::PublishingDisabled => "publishing is disabled on this server".to_string(),
+            // The shared predicate's own reason, verbatim: operators
+            // alert on that keyword and the OCI plane must not give them
+            // a second one to match.
+            Self::TransportUnproven { reason } => reason.clone(),
         }
     }
 
@@ -508,6 +543,10 @@ impl OciError {
             // deadline (see the variant doc). `null` on the wire, same
             // shape as `ScanIndeterminate`.
             Self::PublishingDisabled => None,
+            // Nothing about the request belongs here: the remedy is a
+            // deployment change, which the `Upgrade` header names and
+            // the server's own `warn!` spells out for the operator.
+            Self::TransportUnproven { .. } => None,
         }
     }
 }
@@ -581,6 +620,18 @@ impl IntoResponse for OciError {
             // variant doc).
             _ => None,
         };
+        // `Upgrade` is mandatory on a 426: RFC 9110 §15.6.7 requires
+        // the response to name the protocol the server wants. Decided
+        // here rather than at the emitter so the half of the response
+        // that says what to do cannot be left off, and the value is the
+        // one `hort-http-core` sends on the non-OCI surfaces rather than
+        // a second hand-typed copy.
+        let upgrade_offer: Option<&'static str> = match &self {
+            Self::TransportUnproven { .. } => {
+                Some(hort_http_core::middleware::credential_transport::UPGRADE_OFFER)
+            }
+            _ => None,
+        };
         // `Range` header is set on 416 responses — the client uses it
         // to resume from the session's real `bytes_received`.
         // Computed before `code()`/`message()`/`detail()` for the same
@@ -629,6 +680,15 @@ impl IntoResponse for OciError {
                 "Range",
                 axum::http::HeaderValue::from_str(&value)
                     .expect("Range header is ASCII by construction"),
+            );
+        }
+        if let Some(offer) = upgrade_offer {
+            // Pure-ASCII compile-time constant, so the parse cannot
+            // fail; `from_static` panics on a non-visible byte, which
+            // this value cannot contain.
+            response.headers_mut().insert(
+                axum::http::header::UPGRADE,
+                axum::http::HeaderValue::from_static(offer),
             );
         }
         response
@@ -1012,6 +1072,64 @@ mod tests {
         assert_eq!(parsed["errors"][0]["code"], "INTERNAL");
         assert_eq!(parsed["errors"][0]["message"], "internal error");
         assert!(parsed["errors"][0]["detail"].is_null());
+    }
+
+    /// The transport refusal is a `426` in this envelope, carrying the
+    /// `Upgrade` RFC 9110 §15.6.7 requires — and the reason verbatim, so
+    /// one alert expression matches this plane and the hosted-format one.
+    #[tokio::test]
+    async fn transport_unproven_is_426_denied_with_the_upgrade_offer() {
+        let response = OciError::TransportUnproven {
+            reason: "credential transport refused".into(),
+        }
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::UPGRADE)
+                .map(|v| v.to_str().unwrap()),
+            Some("TLS/1.2, HTTP/1.1"),
+            "a 426 that does not name the protocol it wants is not a 426"
+        );
+        let bytes = to_bytes(response.into_body(), 4 * 1024).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let errors = parsed["errors"].as_array().expect("errors array");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["code"], "DENIED");
+        assert_eq!(errors[0]["message"], "credential transport refused");
+        assert!(errors[0]["detail"].is_null());
+    }
+
+    /// `Upgrade` belongs to the one variant that is a `426`: a sibling
+    /// that started emitting it would be telling a client to switch
+    /// protocols over an answer that has nothing to do with the wire.
+    #[tokio::test]
+    async fn only_the_transport_refusal_offers_an_upgrade() {
+        for err in [
+            OciError::NameUnknown {
+                repository: "x".into(),
+            },
+            OciError::Denied {
+                repository: "x".into(),
+                actions: vec!["push".into()],
+            },
+            OciError::Unauthorized {
+                message: "nope".into(),
+                detail: None,
+            },
+            OciError::PublishingDisabled,
+        ] {
+            let label = format!("{err:?}");
+            let response = err.into_response();
+            assert!(
+                response
+                    .headers()
+                    .get(axum::http::header::UPGRADE)
+                    .is_none(),
+                "{label} must not offer an Upgrade"
+            );
+        }
     }
 
     #[tokio::test]

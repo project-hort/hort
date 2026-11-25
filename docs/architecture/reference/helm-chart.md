@@ -268,7 +268,7 @@ server boot-crash loop.
 | `replicaCount >= 2` | `storage.backend == s3` | multiple pods racing one RWO PVC that cannot multi-attach. |
 | `auth.provider == oidc` | `auth.oidc.issuerUrl` + `auth.oidc.audience` (non-empty) | booting with an unusable JWT validator. |
 | `auth.tokenExchange.enabled` | `auth.provider == oidc` + `auth.tokenExchange.cliClientId` | enabling the exchange endpoint with no upstream OIDC / CLI client. |
-| `auth.tokenExchange.enabled` | `auth.nativeTokens.enabled == true` + `signingKey.existingSecret` + `signingKey.secretKey` | exchange minting `hort_cli_*` tokens whose validator only wires when native tokens are on (binary `ConfigError::TokenExchangeRequiresNativeTokens`). |
+| `auth.tokenExchange.enabled` | `auth.nativeTokens.enabled == true` + `signingKey.existingSecret` + `signingKey.secretKey` | exchange minting signed CliSession JWTs whose validator only wires when native tokens are on (binary `ConfigError::TokenExchangeRequiresNativeTokens`). |
 | `storage.backend == s3` | `storage.s3.endpoint` + `storage.s3.bucket` + `storage.s3.existingSecret` (non-empty) | an S3 client that cannot be constructed. |
 | `storage.s3.sseMode == sse-kms` | `storage.s3.sseKmsKeyArn` (non-empty) | SSE-KMS writes failing at runtime with no key ARN. |
 | `ephemeralStore.backend == redis` | exactly one of `redis.url` / `redis.existingSecret` (`oneOf`) | redis with no connection string, or an ambiguous double source. |

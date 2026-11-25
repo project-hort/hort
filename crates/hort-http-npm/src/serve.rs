@@ -560,6 +560,9 @@ mod tests {
         RequestTrust {
             client_ip: "127.0.0.1".parse().unwrap(),
             public_url: url::Url::parse("http://0.0.0.0:8080/").unwrap(),
+            transport: hort_http_core::middleware::trust::TransportSecurity::Unknown,
+            peer_trusted: false,
+            tls_requirement_waived: false,
         }
     }
 

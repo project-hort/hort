@@ -1,19 +1,28 @@
 //! `/metrics` endpoint authentication and listener placement.
 //!
-//! Regression coverage for the lockdown (#113):
+//! Coverage for the metrics lockdown:
 //!
 //! 1. Anonymous `GET /metrics` on the admin listener returns 401 (no
 //!    bearer at all — `require_principal` denies before the handler is
-//!    ever reached).
+//!    ever reached). An anonymous request presents no credential, so the
+//!    transport decision never reaches it: the status is about authority,
+//!    not about the wire.
 //! 2. An authenticated principal WITHOUT the `read_metrics` grant gets 403
 //!    on the admin listener (`require_principal` passes; the handler's
 //!    `MetricsReaderPrincipal` extractor denies).
-//! 3. `GET /metrics` on the main/public listener returns 404 — item 3
-//!    removed the `metrics_require_auth && path=="/metrics"` carve-out, so
+//! 3. `GET /metrics` on the main/public listener returns 404 — the
+//!    `metrics_require_auth && path=="/metrics"` carve-out is gone, so
 //!    the main router never mounts `/metrics` at all, regardless of any
 //!    config. There is no flag left that puts it back.
 //! 4. `HORT_METRICS_PUBLIC_BIND` gates the `0.0.0.0` bind refusal at
 //!    config-parse time (covered in `config.rs`'s own tests, not here).
+//!
+//! A scrape that presents a credential crosses the credential-transport
+//! boundary first, so (2) declares its loopback hop with
+//! `HORT_TLS_NOT_REQUIRED_FROM` — otherwise the authority answer it is
+//! about is masked by a `426`, which
+//! `authenticated_scrape_without_a_declared_hop_is_refused` pins on its
+//! own.
 //!
 //! These tests intentionally drive the real router via
 //! `tower::util::ServiceExt::oneshot` — including the real
@@ -24,6 +33,7 @@
 //! already refuses `AUTH=disabled`, so the auth-required path is the only
 //! relevant production posture.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -42,7 +52,10 @@ use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims};
 use hort_domain::ports::user_repository::UserRepository;
 
 use hort_http_core::context::{AppContext, AuthContext};
-use hort_http_core::test_support::{build_mock_ctx as build_base_ctx, with_auth};
+use hort_http_core::middleware::trust::TrustConfig;
+use hort_http_core::test_support::{
+    build_mock_ctx as build_base_ctx, with_auth, with_trust_config,
+};
 
 use hort_server::http::{build_admin_router, build_router};
 
@@ -145,7 +158,44 @@ fn anonymous_get_metrics_on_admin_listener_returns_401() {
     );
 }
 
-/// **#113 item 3 acceptance: authenticated-but-ungranted → 403.**
+/// A loopback scrape carrying `valid-token`, with the loopback hop
+/// optionally declared as not requiring TLS — the sidecar-scrape posture.
+///
+/// The context is built inside the runtime because the mock ephemeral
+/// store registers a timer on construction.
+fn scrape_status(
+    handle: metrics_exporter_prometheus::PrometheusHandle,
+    declare_loopback_hop: bool,
+) -> StatusCode {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let ctx = build_enabled_auth_ctx(handle, "valid-token", vec![read_metrics_grant()]);
+            let ctx = if declare_loopback_hop {
+                with_trust_config(
+                    &ctx,
+                    TrustConfig::default().with_tls_not_required_from(vec!["127.0.0.1/32"
+                        .parse()
+                        .expect("loopback CIDR parses")]),
+                )
+            } else {
+                ctx
+            };
+            let req = Request::get("/metrics")
+                .header("authorization", "Bearer valid-token")
+                .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                    [127, 0, 0, 1],
+                    40000,
+                ))))
+                .body(Body::empty())
+                .unwrap();
+            build_admin_router(ctx).oneshot(req).await.unwrap().status()
+        })
+}
+
+/// **Authenticated-but-ungranted → 403.**
 ///
 /// A caller with a VALID bearer (passes `require_principal`) but no
 /// `read_metrics` grant reaches `MetricsReaderPrincipal` and is denied —
@@ -155,31 +205,33 @@ fn authenticated_without_grant_on_admin_listener_returns_403() {
     let recorder = PrometheusBuilder::new().build_recorder();
     let handle = recorder.handle();
 
-    let status = metrics::with_local_recorder(&recorder, || {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let ctx = build_enabled_auth_ctx(
-                    handle.clone(),
-                    "valid-token",
-                    vec![read_metrics_grant()],
-                );
-                let router = build_admin_router(ctx);
-
-                let req = Request::get("/metrics")
-                    .header("authorization", "Bearer valid-token")
-                    .body(Body::empty())
-                    .unwrap();
-                router.oneshot(req).await.unwrap().status()
-            })
-    });
+    let status = metrics::with_local_recorder(&recorder, || scrape_status(handle.clone(), true));
 
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
         "authenticated caller without read_metrics must 403 on the admin listener"
+    );
+}
+
+/// The same scrape on a plaintext listener with no declared hop is
+/// refused `426` before any authority is evaluated: a credential is on
+/// the wire, and the refusal is what tells the scraper to stop sending it.
+/// A deployment that cannot terminate TLS in front of the metrics
+/// listener declares that hop instead — which admits every process
+/// sharing the listener's network namespace, so it is a deliberate
+/// operator statement rather than a default.
+#[test]
+fn authenticated_scrape_without_a_declared_hop_is_refused() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+
+    let status = metrics::with_local_recorder(&recorder, || scrape_status(handle.clone(), false));
+
+    assert_eq!(
+        status,
+        StatusCode::UPGRADE_REQUIRED,
+        "a credential presented on an unproven transport must be refused"
     );
 }
 

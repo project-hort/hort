@@ -4,10 +4,12 @@
 //! (`require_principal`, `extract_optional_principal` — see
 //! `docs/auth-catalog.md` and ADR 0021), the [`trust`] layer that
 //! establishes per-request [`trust::RequestTrust`] before any downstream
-//! consumer (`docs/architecture/explanation/security.md`), and the
-//! [`rate_limit`] layers built on top of it.
+//! consumer (`docs/architecture/explanation/security.md`), the
+//! [`credential_transport`] predicate both auth layers consult before
+//! any validator runs, and the [`rate_limit`] layers built on top of it.
 
 pub mod auth;
+pub mod credential_transport;
 pub mod load_shed;
 pub mod metrics;
 pub mod rate_limit;

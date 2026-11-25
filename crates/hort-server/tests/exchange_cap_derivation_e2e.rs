@@ -500,6 +500,7 @@ mod federation_sa {
     use hort_domain::ports::service_account_repository::ServiceAccountRepository;
     use hort_http_core::context::AuthContext;
     use hort_http_core::handlers::exchange::token_exchange_routes;
+    use hort_http_core::middleware::trust::{RequestTrust, TransportSecurity};
     use hort_http_core::test_support::{
         build_mock_ctx, with_api_token_use_case, with_auth, with_federation_ports,
         with_oidc_issuer_repo,
@@ -799,6 +800,19 @@ mod federation_sa {
             .register_token(jwt_alias, validated_claims(&format!("jti-{jwt_alias}")));
         let req = Request::post("/api/v1/auth/exchange")
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            // The token endpoint refuses a request with no evidence of TLS
+            // and no operator waiver, and a bare `oneshot` carries no
+            // `RequestTrust` at all — the precedence table's first
+            // refusing row. This chain is about the cap derivation, so it
+            // runs under the posture a documented deployment has: a
+            // trusted TLS-terminating proxy in front.
+            .extension(RequestTrust {
+                client_ip: "198.51.100.7".parse().expect("test peer parses"),
+                public_url: url::Url::parse("https://hort.test/").expect("test URL parses"),
+                transport: TransportSecurity::Tls,
+                peer_trusted: true,
+                tls_requirement_waived: false,
+            })
             .body(Body::from(exchange_form(jwt_alias, scope)))
             .unwrap();
         let resp = harness.router.clone().oneshot(req).await.unwrap();

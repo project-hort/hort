@@ -35,10 +35,5 @@ services:
       # derive from the base file's HORT_PUBLIC_BASE_URL
       # (http://hort-server:8080 → service/aud "hort-server:8080").
       HORT_OCI_TOKEN_SIGNING_KEY_FILE: "/etc/hort/sign/oci-signing-key.pem"
-      # The stack is plaintext HTTP (dev/CI only); native tokens are refused
-      # over unencrypted connections without this documented override — the
-      # loopback/in-network smoke is the intended case (same rationale as the
-      # federation overlay).
-      HORT_BEARER_ALLOW_OVER_HTTP: "true"
     volumes:
       - ./native-tokens/oci-signing-key.pem:/etc/hort/sign/oci-signing-key.pem:ro

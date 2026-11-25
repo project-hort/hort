@@ -683,13 +683,13 @@ async fn run_paste_flow<R: BufRead>(
                     Some("svc_account") => {
                         eprintln!(
                             "hort-cli: warning: token kind is svc_account — \
-                             you probably want an hort_cli_* or hort_pat_* token"
+                             use a CLI-session JWT or hort_pat_* token for a human login"
                         );
                     }
                     Some("pat") => {
                         eprintln!(
                             "hort-cli: warning: token kind is pat — \
-                             consider using an hort_cli_* CLI-session token instead"
+                             consider using a CLI-session JWT instead"
                         );
                     }
                     _ => {}
@@ -793,7 +793,7 @@ pub(crate) fn headless_signals_in(env: &dyn EnvAccess, stderr_is_tty: bool) -> b
 /// Uses `rpassword::prompt_password` which handles both Unix (`termios`)
 /// and Windows (`ReadConsole`) APIs for disabling echo.
 pub(crate) fn read_token_masked() -> Result<String> {
-    rpassword::prompt_password("Paste your hort_cli_* or hort_pat_* token: ")
+    rpassword::prompt_password("Paste a CLI-session JWT or hort_pat_*/hort_svc_* token: ")
         .context("reading token from terminal")
 }
 

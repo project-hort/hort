@@ -97,6 +97,32 @@ requireHttps: true
 # which lets any caller choose its own attribution.
 trustedProxyCidrs: []
 
+# HORT_TLS_NOT_REQUIRED_FROM — CIDRs of raw TCP peers for which hort waives
+# the credential TLS requirement. Empty by default; no pod CIDR is portable.
+# To use the plaintext Service URL of the admin-task CronJobs, measure the
+# `peer` hort sees from those pods before setting this to their pod range.
+# Set `RUST_LOG=info,hort_http_core::middleware::trust=debug` and read the trust
+# layer's `request trust evaluated` line: `peer` is the socket peer IP;
+# `client_ip` is derived and may differ. The credential transport metric
+# has no address label and cannot identify the range. On an ordinary
+# source-preserving ClusterIP path, the peer is the CronJob pod's ephemeral
+# IP. kube-proxy `masqueradeAll`, a mesh sidecar that re-dials, or a
+# `hostNetwork` client can change that peer; verify the actual path.
+# A declared range admits every unrelayed caller that can reach the socket
+# from it, so use NetworkPolicy to restrict access to the Service. Any
+# Forwarded or X-Forwarded-* header makes a request relayed and ineligible.
+# An ingress or proxy inside this range should also be in
+# HORT_TRUSTED_PROXY_CIDRS for correct client-IP attribution; trusted proxy
+# peers are never waived. The residual risk is an L7 ingress that adds no
+# forwarding header, source-NATs into this range, and is absent from the
+# trusted-proxy list; client-IP attribution is already broken there.
+# A trusted internal proxy reporting proto=http has plaintext evidence,
+# which this scope cannot waive: use a direct unrelayed path or TLS.
+# For the default loopback sidecar metrics scrape, also declare
+# `127.0.0.1/32` or put TLS in front of the listener. A loopback waiver
+# admits any process sharing the pod's network namespace.
+tlsNotRequiredFrom: []
+
 # HORT_CLIENT_IP_FROM_SOCKET_PEER — declares that clients connect to
 # this server DIRECTLY, with no proxy, ingress or load balancer in
 # between, so the TCP peer address IS the client. Required (true) only
@@ -429,6 +455,10 @@ metrics:
   #   "127.0.0.1:9090" (default) — loopback only; sidecar-scrape pattern
   #   "0.0.0.0:9090"             — all interfaces; needs allowUnspecifiedBind: true
   #   ""                         — /metrics not exposed on any listener
+  # A token-bearing sidecar scrape on loopback needs a declared
+  # tlsNotRequiredFrom entry of 127.0.0.1/32 or TLS on this hop;
+  # otherwise the credential check returns 426. That range admits
+  # any process sharing the pod's network namespace.
   bindAddr: "127.0.0.1:9090"
   # HORT_METRICS_PUBLIC_BIND — required when `bindAddr` binds to
   # `0.0.0.0` or `::`. The binary refuses to start with an unspecified
@@ -1473,6 +1503,11 @@ scheduledTasks:
   #     to write the service-account user and token rows.
   #   - A working in-cluster network path from the CronJob pods to the
   #     hort-server Service (HORT_SERVER = http://<fullname>:<httpPort>).
+  #   - Set tlsNotRequiredFrom to the measured TCP peer range of those
+  #     pods. Without it, the CronJobs still render but their credentials
+  #     are refused (426). An HTTPS endpoint is the alternative; use
+  #     HORT_EXTRA_CA_BUNDLE when it needs an internal CA. A trusted proxy
+  #     reporting proto=http cannot be waived by the scoped setting.
   #   - A gitops-declared `cronjob-tasks` ServiceAccount PLUS a global
   #     `admin_task_invoke` PermissionGrant targeting it (subject
   #     `kind: serviceAccount, name: cronjob-tasks`) — this chart never

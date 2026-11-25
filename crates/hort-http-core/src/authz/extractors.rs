@@ -1660,13 +1660,26 @@ mod tests {
     /// `extract_optional_principal` middleware — same shape as
     /// `method_based_auth_dispatch` produces in production for
     /// GET / HEAD / OPTIONS.
+    ///
+    /// The trust extension carries TLS evidence because this harness is
+    /// about the extractor, not about the transport decision the auth
+    /// layer makes before it: without evidence the layer answers `426`
+    /// and the extractor is never reached.
     fn admin_router_behind_optional(ctx: Arc<AppContext>) -> Router {
+        let trust = crate::middleware::trust::RequestTrust {
+            client_ip: "192.0.2.1".parse().expect("test client IP parses"),
+            public_url: url::Url::parse("https://example.invalid").expect("test URL parses"),
+            transport: crate::middleware::trust::TransportSecurity::Tls,
+            peer_trusted: false,
+            tls_requirement_waived: false,
+        };
         Router::new()
             .route("/admin/thing", get(admin_handler))
             .layer(axum::middleware::from_fn_with_state(
                 ctx.clone(),
                 crate::middleware::auth::extract_optional_principal,
             ))
+            .layer(Extension(trust))
             .with_state(ctx)
     }
 

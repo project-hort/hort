@@ -220,7 +220,7 @@ impl StateValue {
 /// access_token.
 ///
 /// The returned token is then exchanged via
-/// [`crate::auth::oidc::exchange`] for an `hort_cli_*` session token (same
+/// [`crate::auth::oidc::exchange`] for a signed CLI-session JWT (same
 /// downstream step as the device flow).
 ///
 /// # Errors

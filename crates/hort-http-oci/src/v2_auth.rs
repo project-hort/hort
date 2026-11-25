@@ -37,6 +37,13 @@
 //! - **Malformed scope**: 400 with `{"errors":[{"code":"UNSUPPORTED",
 //!   "message":"invalid scope: <raw>"}]}`.
 //! - **Mint / infrastructure failure**: 500 with `INTERNAL`.
+//! - **No evidence of TLS on the transport, and no operator waiver for
+//!   this peer**: 426 with the `DENIED` envelope and
+//!   `Upgrade: TLS/1.2, HTTP/1.1`, before the credential is parsed and
+//!   before anything is minted — on the anonymous path too, because the
+//!   response is a credential either way (see the position stated in
+//!   [`handle_v2_auth`]). No `WWW-Authenticate`: nothing the client could
+//!   present would change the answer.
 
 use std::sync::Arc;
 
@@ -60,10 +67,14 @@ use hort_app::use_cases::oci_token_exchange_use_case::{
 };
 use hort_http_core::auth_scheme::{strip_auth_scheme, AuthScheme};
 use hort_http_core::context::AppContext;
+use hort_http_core::middleware::credential_transport::{
+    credential_transport_verdict, record_credential_transport, record_credential_transport_verdict,
+    CredentialEntryPoint, CredentialTransportVerdict,
+};
 use hort_http_core::middleware::trust::RequestTrust;
 
 use crate::error::OciError;
-use crate::middleware::oci_auth::v2_auth_challenge_value;
+use crate::middleware::oci_auth::{refuse_credential_transport, v2_auth_challenge_value};
 
 /// The canonical Distribution-Spec token-mint path. **Single source of truth
 /// for the literal:** the route registration ([`crate::oci_routes_with_config`])
@@ -133,6 +144,11 @@ struct V2AuthResponseBody {
 ///   `<anything>`, or empty); only the password (PAT) matters.
 /// - The PAT is validated AS a PAT (via `OciTokenExchangeUseCase`), not as an
 ///   IdP JWT — the middleware's bearer flow would mis-handle it.
+///
+/// Owning its own credential validation means owning its own transport
+/// decision as well: the consume middleware's path-skip takes this route
+/// out of that boundary, so the refusal below is this surface's, and it
+/// applies to the anonymous mint too. The reason is stated at the call.
 pub async fn handle_v2_auth(
     State(ctx): State<Arc<AppContext>>,
     Query(query): Query<V2AuthQuery>,
@@ -164,6 +180,45 @@ pub async fn handle_v2_auth(
             .into_response();
         }
     };
+    let trust_ref = trust.as_ref().map(|Extension(t)| t);
+    record_credential_transport(
+        CredentialEntryPoint::OciMint,
+        trust_ref.map(|t| t.transport),
+    );
+
+    // A mint requires evidence of TLS, or an operator waiver, whether or
+    // not the caller presented a credential — and that is the whole
+    // position, stated here rather than left to be inferred from the
+    // branch below.
+    //
+    // This endpoint's response IS a credential: it puts a freshly signed
+    // bearer on the wire on both paths, so "a credential is in play" is
+    // true of the anonymous path by construction. Keying the rule on what
+    // the request carried instead would leave the one surface in the
+    // system that creates a secret out of nothing as the one surface with
+    // no transport rule — the same mistake as keying it on a token's
+    // prefix, one level up.
+    //
+    // The price, named so nobody has to rediscover it: a
+    // challenge-following anonymous `docker pull` of a PUBLIC repository
+    // cannot complete its token handshake on a hop with neither TLS
+    // evidence nor a declared waiver. The direct anonymous read of that
+    // same repository is untouched (ADR 0021) — it presents nothing and
+    // receives nothing — so the remedy is the deployment's, and the
+    // narrower alternative (mint anonymously over cleartext because that
+    // token's authority is only public-repo `pull`) was rejected: it
+    // makes the rule depend on an authority bound held in another layer,
+    // and a bearer this server signed is one it should not hand to a wire
+    // it cannot vouch for.
+    //
+    // Refused before `extract_basic_password`, so a presented PAT reaches
+    // no validator, and before either `exchange` call, so no token is
+    // minted.
+    let verdict = credential_transport_verdict(trust_ref, ctx.pat_over_http_allowed);
+    record_credential_transport_verdict(CredentialEntryPoint::OciMint, verdict);
+    if let CredentialTransportVerdict::Refused(reason) = verdict {
+        return refuse_credential_transport(reason, trust_ref);
+    }
 
     // The `service=`-vs-configured-`aud` 400-on-mismatch gate is
     // enforced INSIDE `OciTokenExchangeUseCase::exchange` as an
@@ -634,5 +689,96 @@ mod tests {
     #[test]
     fn challenge_response_carries_distribution_api_version_header() {
         let _name: HeaderName = "Docker-Distribution-API-Version".parse().unwrap();
+    }
+
+    // -- the mint's credential-transport boundary ----------------------
+    //
+    // Driven at the handler, with the mint machinery wired so the
+    // decision is actually reached (an empty `ctx.oci_token_exchange`
+    // answers 404 before it). The end-to-end flows — a refusal landing
+    // before the PAT is looked up and before anything is minted, each
+    // waiver instrument, the envelope — are in `tests/v2_auth_e2e.rs`
+    // against the real router; these pin the handler's own branch so the
+    // refusal does not depend on that harness to be exercised at all.
+
+    /// The `/v2/auth` handler on a bare router, with native tokens wired
+    /// and an optional [`RequestTrust`].
+    fn mint_router(trust: Option<RequestTrust>) -> axum::Router {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let handle = PrometheusBuilder::new().build_recorder().handle();
+        let (ctx, mocks) = hort_http_core::test_support::build_mock_ctx(handle);
+        let signing_key = Arc::new(hort_app::oci_token_signing::OciTokenSigningKey::new(
+            ed25519_dalek::SigningKey::generate(&mut rand::rand_core::UnwrapErr(
+                rand::rngs::SysRng,
+            )),
+            None,
+        ));
+        let ctx = crate::test_authz::with_native_oci_tokens(
+            &ctx,
+            &mocks,
+            signing_key,
+            "hort.example.com",
+        );
+        let router = axum::Router::new()
+            .route(V2_AUTH_PATH, axum::routing::get(handle_v2_auth))
+            .with_state(ctx);
+        match trust {
+            Some(trust) => router.layer(Extension(trust)),
+            None => router,
+        }
+    }
+
+    /// One `GET /v2/auth` through [`mint_router`], returning the status
+    /// and the `Upgrade` header.
+    fn mint_status(trust: Option<RequestTrust>) -> (StatusCode, Option<String>) {
+        use tower::ServiceExt as _;
+
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime builds")
+            .block_on(async {
+                let resp = mint_router(trust)
+                    .oneshot(
+                        axum::http::Request::get("/v2/auth?service=hort.example.com")
+                            .body(axum::body::Body::empty())
+                            .expect("request builds"),
+                    )
+                    .await
+                    .expect("router answers");
+                let upgrade = resp
+                    .headers()
+                    .get(header::UPGRADE)
+                    .map(|v| v.to_str().expect("ASCII").to_string());
+                (resp.status(), upgrade)
+            })
+    }
+
+    /// A mint with no transport evidence and no waiver is refused —
+    /// including this one, which presents no credential at all.
+    #[test]
+    fn an_anonymous_mint_without_evidence_is_refused_with_an_upgrade_offer() {
+        let trust = RequestTrust {
+            client_ip: "203.0.113.7".parse().expect("test address parses"),
+            public_url: "https://hort.example.com/"
+                .parse()
+                .expect("test URL parses"),
+            transport: hort_http_core::middleware::trust::TransportSecurity::Unknown,
+            peer_trusted: false,
+            tls_requirement_waived: false,
+        };
+        let (status, upgrade) = mint_status(Some(trust));
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(upgrade.as_deref(), Some("TLS/1.2, HTTP/1.1"));
+    }
+
+    /// No trust extension is the refusing row too: a handler mountable
+    /// on a bare router must not read that as permission.
+    #[test]
+    fn a_mint_with_no_trust_extension_is_refused() {
+        let (status, upgrade) = mint_status(None);
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(upgrade.as_deref(), Some("TLS/1.2, HTTP/1.1"));
     }
 }

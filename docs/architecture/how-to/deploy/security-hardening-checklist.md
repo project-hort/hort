@@ -359,7 +359,8 @@ distinct mechanism) is unchanged.
 ### HSTS + bind-default + `HORT_REQUIRE_HTTPS`
 
 - **Control:** `Strict-Transport-Security: max-age=15552000; includeSubDomains`
-  emitted only when `RequestTrust::public_url.scheme() == "https"`.
+  emitted only when `RequestTrust::transport` is `Tls` **and** the public URL
+  has an `https` scheme.
   Binary refuses to start if `HORT_REQUIRE_HTTPS=true` AND
   `HORT_PUBLIC_BASE_URL` is `http://` AND `HORT_TRUSTED_PROXY_CIDRS` is empty.
   Default API bind is `127.0.0.1:8080` in the binary; the chart flips
@@ -374,12 +375,12 @@ distinct mechanism) is unchanged.
   curl -sI -H 'X-Forwarded-Proto: https' http://<svc-or-ingress>/healthz \
     | grep -i strict-transport-security
   # Expect: Strict-Transport-Security: max-age=15552000; includeSubDomains
-  # If absent: the trust middleware does NOT see the request as https
-  # — re-check trustedProxyCidrs covers the edge's pod IP range.
+  # If absent: check the proxy's observed peer, both overwritten scheme
+  # headers, trustedProxyCidrs, and the public URL's https scheme.
   ```
-- **Relaxation:** `requireHttps: false` re-permits plaintext startup;
-  this is intended only for in-cluster eval where the operator owns
-  the entire path between client and Service.
+- **Relaxation:** `requireHttps: false` removes this boot configuration
+  check. It never changes the per-request credential transport decision;
+  use a narrow `tlsNotRequiredFrom` for a deliberately plaintext hop.
 
 ### Mounted-file secret containment + mode
 

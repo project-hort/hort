@@ -5955,6 +5955,16 @@ impl VersionDiscovery for StubFormatHandler {
 pub struct MockIdentityProvider {
     claims_by_token: Mutex<HashMap<String, IdpClaims>>,
     errors_by_token: Mutex<HashMap<String, OidcValidationError>>,
+    /// How many times [`IdentityProvider::validate_token`] was invoked.
+    ///
+    /// A **count**, not a log of the tokens: a caller that needs to know
+    /// *which* token reached the IdP registers an outcome for it and
+    /// asserts on that, and a mock is not a place to accumulate
+    /// credential-shaped strings. What this answers is the absence
+    /// question — a gate that claims to fire "before any IdP call" is
+    /// only proved by a zero here, because the status code alone cannot
+    /// tell a refusal before the call apart from one after it.
+    validate_calls: AtomicUsize,
 }
 
 impl MockIdentityProvider {
@@ -5962,7 +5972,14 @@ impl MockIdentityProvider {
         Self {
             claims_by_token: Mutex::new(HashMap::new()),
             errors_by_token: Mutex::new(HashMap::new()),
+            validate_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times `validate_token` has been called. See
+    /// [`Self::validate_calls`].
+    pub fn validate_call_count(&self) -> usize {
+        self.validate_calls.load(Ordering::SeqCst)
     }
 
     /// Register `claims` as the result of validating `token`. The mock stores
@@ -5988,6 +6005,7 @@ impl MockIdentityProvider {
 
 impl IdentityProvider for MockIdentityProvider {
     fn validate_token(&self, token: &str) -> BoxFuture<'_, Result<IdpClaims, OidcValidationError>> {
+        self.validate_calls.fetch_add(1, Ordering::SeqCst);
         // Registered error takes precedence over claims — lets a test
         // "poison" a token that was previously registered with claims.
         if let Some(err) = self.errors_by_token.lock().unwrap().get(token).cloned() {
@@ -10207,6 +10225,15 @@ pub struct MockFederatedJwtValidator {
     /// tests assert that the warm-up was invoked with the expected
     /// issuer name regardless of outcome.
     refresh_calls: Mutex<Vec<String>>,
+    /// How many times [`FederatedJwtValidator::validate`] was invoked.
+    ///
+    /// A count rather than a log of the JWTs, for the same reason
+    /// [`MockIdentityProvider::validate_calls`] is one. It answers the
+    /// absence question a status code cannot: a gate that claims to fire
+    /// before any federated validation is only proved by a zero here.
+    ///
+    /// [`FederatedJwtValidator::validate`]: hort_domain::ports::federated_jwt_validator::FederatedJwtValidator::validate
+    validate_calls: AtomicUsize,
 }
 
 impl Default for MockFederatedJwtValidator {
@@ -10221,7 +10248,14 @@ impl MockFederatedJwtValidator {
             outcomes: Mutex::new(HashMap::new()),
             refresh_outcomes: Mutex::new(HashMap::new()),
             refresh_calls: Mutex::new(Vec::new()),
+            validate_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times `validate` has been called. See
+    /// [`Self::validate_calls`].
+    pub fn validate_call_count(&self) -> usize {
+        self.validate_calls.load(Ordering::SeqCst)
     }
 
     /// Pin the validator to return [`Ok(claims)`] for the given raw
@@ -10286,6 +10320,7 @@ impl hort_domain::ports::federated_jwt_validator::FederatedJwtValidator
             hort_domain::ports::federated_jwt_validator::FederationDenyReason,
         >,
     > {
+        self.validate_calls.fetch_add(1, Ordering::SeqCst);
         let key = jwt.to_string();
         let outcome = self
             .outcomes

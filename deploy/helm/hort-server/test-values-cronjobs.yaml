@@ -63,6 +63,11 @@ scheduledTasks:
 
 # Minimal required values to pass helm lint (schema validation).
 publicBaseUrl: "https://example.com"
+clientIpFromSocketPeer: true
+# Render-only sample ranges; an operator must measure the observed peer.
+tlsNotRequiredFrom:
+  - "10.244.0.0/16"
+  - "127.0.0.1/32"
 postgres:
   app:
     existingSecret: "hort-app-db-secret"
