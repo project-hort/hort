@@ -249,8 +249,18 @@ test-values-transport-waiver-unset.yaml|templates/deployment.yaml|value: "0.0.0.
 test-values-transport-waiver-unset.yaml|templates/service.yaml|targetPort: http$|1|disabled TLS sidecar preserves the plaintext Service target
 test-values-transport-waiver-unset.yaml|templates/deployment.yaml|scheme: HTTPS$|0|disabled TLS sidecar leaves the HTTP probes unchanged
 test-values-tls-sidecar.yaml|templates/deployment.yaml|scheme: HTTPS$|3|all three API probes use the TLS sidecar
+test-values-tls-sidecar.yaml|templates/deployment.yaml|^ +port: 8443$|3|all three API probes use the numeric TLS listener port
+test-values-tls-sidecar.yaml|templates/deployment.yaml|^ +port: [A-Za-z][A-Za-z0-9-]*$|0|no enabled API probe uses a named port resolved in the server container
+test-values-transport-waiver-unset.yaml|templates/deployment.yaml|^ +port: http$|3|disabled TLS sidecar preserves all three named HTTP probes
+test-values-transport-waiver-unset.yaml|templates/deployment.yaml|^ +port: 8443$|0|disabled TLS sidecar does not change the probe port
 test-values-tls-sidecar.yaml|templates/service.yaml|targetPort: http$|0|enabled TLS sidecar never sends Service traffic to hort directly
 test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|proxy_pass http://127.0.0.1:8080;|1|the TLS sidecar sends traffic only to hort on loopback
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|^      client_body_temp_path /tmp/client_body;$|1|nginx writes request bodies to the writable tmp volume
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|^      proxy_temp_path /tmp/proxy;$|1|nginx writes proxy temp files to the writable tmp volume
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|^      fastcgi_temp_path /tmp/fastcgi;$|1|nginx creates the FastCGI temp directory on the writable tmp volume
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|^      uwsgi_temp_path /tmp/uwsgi;$|1|nginx creates the uWSGI temp directory on the writable tmp volume
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|^      scgi_temp_path /tmp/scgi;$|1|nginx creates the SCGI temp directory on the writable tmp volume
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|^      [[:alnum:]_]+_temp_path |5|the five explicit nginx temp paths are the complete set in the rendered config
 test-values-ha.yaml|templates/deployment.yaml|HORT_TRUSTED_PROXY_CIDRS|1|trustedProxyCidrs set ⇒ the allowlist env renders on the server Deployment. Scoped, because `hort-server.runtimeEnv` renders the same variable into every CronJob and the worker, so a full-render count tracks how many scheduled tasks the fixture enables rather than anything about the server
 test-values-ha.yaml|templates/deployment.yaml|HORT_CLIENT_IP_FROM_SOCKET_PEER|0|the declaration is NOT rendered when trustedProxyCidrs is set — the allowlist already says where the edge is, so the two are mutually exclusive by construction and an operator cannot set both
 test-values-cronjobs.yaml|templates/worker-deployment.yaml|readOnly: true|0|worker's CAS data mount renders WITHOUT readOnly (the worker writes scan-finding + prefetch-ingest blobs)
