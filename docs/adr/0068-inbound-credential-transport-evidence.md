@@ -60,9 +60,15 @@ token endpoint admits only `Tls` evidence and the §3.2 requirement is
 enforced; hort does not measure the session, so that conformance claim rests
 on the edge preconditions stated above.
 
-The eleven chart admin-task CronJobs call the plain HTTP Service URL and are
-the worked example of a declared in-cluster hop. The chart exposes the
-waiver range; it does not infer a portable pod CIDR. A loopback metrics
+The chart's admin-task CronJobs call the plain HTTP Service URL. **On
+Kubernetes the declared in-cluster waiver is not the recommended shape, and
+on a common topology it cannot be configured at all** — see the 2026-11-25
+amendment. The recommended deployment terminates TLS in a proxy inside the
+server's own pod and trusts only `127.0.0.1/32`, which is the shape the
+Ansible flavour already has; `HORT_TLS_NOT_REQUIRED_FROM` is then a narrow
+escape hatch for a measured, deliberately plaintext peer range rather than
+the answer. The chart exposes the waiver range; it does not infer a portable
+pod CIDR. A loopback metrics
 sidecar needs its own scope or TLS, and a loopback scope admits every process
 sharing that network namespace. Network policy remains the control over who
 can reach the socket from a waived range.
@@ -98,8 +104,49 @@ separates declared and unscoped waivers. The generic auth middleware also
 emits `hort_auth_attempts_total` and attempts a best-effort auth audit event
 on its refusals. The
 OCI subtree has never emitted those auth streams, so its transport counter
-and warning are the complete refusal signal there. The trust-layer `debug!`
-line includes the raw socket `peer`; metric labels contain no address.
+and warning are the complete refusal signal there. The trust layer logs the raw socket
+address in two places: the `debug!` line's `peer`, and — at `warn!`, so
+without any log-level change — the `peer_addr` of a trusted peer that sent no
+`X-Forwarded-For`. Metric labels contain no address. An operator can
+therefore measure a peer without enabling debug, which is how the range in
+the amendment below was established.
+
+## Amendment 2026-11-25 — the declared in-cluster waiver is not the Kubernetes shape
+
+Measured on the first real deployment of this decision. The admin-task
+CronJobs were refused `426`, and the refusal could **not** be lifted by
+declaring their peer range: the installation trusted the pod network as a
+proxy range for client-IP attribution, so `peer_trusted` was true on every
+refusal, and the declared scope waives only an *untrusted* peer.
+
+That is not an operator error. hort refuses to boot without a trusted-proxy
+range, offers CIDRs as the only vocabulary for it, and its own boot message
+suggests a range as wide as `10.0.0.0/8`; on Kubernetes the expressible
+approximation of "trust my ingress" is therefore "trust the pod network".
+Where the ingress and the admin-task pods draw from one range — unavoidable
+on a single-node cluster — **no CIDR separates them and no waiver
+configuration exists.** The worked example this ADR previously named was
+unachievable on that topology.
+
+**Decided:** the Kubernetes shape is a TLS-terminating proxy in the server's
+own pod, with `HORT_TRUSTED_PROXY_CIDRS=127.0.0.1/32`. It makes both
+deployment flavours structurally identical, narrows forwarded-header trust
+from every pod in the cluster to the server pod's own network namespace, and
+removes the need for any waiver on the in-cluster hop.
+
+**Rejected:** giving the ingress controller `hostNetwork` to move it out of
+the pod network. It would trade pod-network isolation, NetworkPolicy
+applicability and `baseline`/`restricted` Pod Security compliance for the
+ability to configure a security control, and would widen forwarded-header
+trust to anything able to source from a node IP. Also rejected: pinning the
+admin-task pods to a node outside the trusted range, which would make a
+security property depend on scheduling — a reschedule would flip
+`peer_trusted` and refuse the task with no configuration change.
+
+**Not resolved here:** a proxy in the pod is still an assertion rather than a
+measurement, and anything sharing that pod's network namespace can make it.
+In-process TLS termination remains the only source that would let hort know
+rather than believe, and remains unimplemented.
 
 ## Alternatives considered
 

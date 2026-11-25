@@ -62,8 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Credentialed API, OCI and metrics requests, and token issuance, now return `426` without TLS evidence or an applicable waiver; anonymous reads are unaffected.
-  Configure the edge to overwrite forwarded scheme headers, or declare a deliberately plaintext direct hop with `HORT_TLS_NOT_REQUIRED_FROM`; `HORT_BEARER_ALLOW_OVER_HTTP` does not waive token exchange (#457).
+- Credentialed API, OCI and metrics requests, and token issuance, now return `426` without TLS evidence or an applicable waiver; anonymous reads are unaffected. `HORT_BEARER_ALLOW_OVER_HTTP` does not waive token exchange.
+  The edge must overwrite the forwarded scheme header, and `HORT_TLS_NOT_REQUIRED_FROM` cannot waive a peer that is inside `HORT_TRUSTED_PROXY_CIDRS` — on Kubernetes that means the in-cluster hop needs TLS rather than a waiver (#457).
 - Updated `kube` to 4.2.1, resolving RUSTSEC-2026-0600.
 - Discovery now answers 404 instead of 403 for repositories the caller cannot
   read, matching the response for a missing repository (#458).
