@@ -6,7 +6,7 @@
 {{- fail "metrics.serviceMonitor.enabled=true requires tlsSidecar.enabled for a verified HTTPS scrape" -}}
 {{- end -}}
 {{- if not (and .Values.metrics.serviceMonitor.caSecretName .Values.metrics.serviceMonitor.caSecretKey .Values.metrics.serviceMonitor.serverName .Values.metrics.serviceMonitor.bearerSecretName .Values.metrics.serviceMonitor.bearerSecretKey) -}}
-{{- fail "metrics.serviceMonitor.enabled=true requires caSecretName, caSecretKey, serverName, bearerSecretName and bearerSecretKey" -}}
+{{- fail "metrics.serviceMonitor.enabled=true requires caSecretName, caSecretKey, serverName, bearerSecretName and bearerSecretKey: with the sidecar enabled the Service's metrics port serves TLS, so these supply the scrape's CA, verified serverName and read_metrics bearer" -}}
 {{- end -}}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor

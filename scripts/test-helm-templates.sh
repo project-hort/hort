@@ -584,6 +584,7 @@ tlsSidecar.metricsHttpsPort=9090|tlsSidecar.metricsHttpsPort must differ from se
 tlsSidecar.metricsHttpsPort=9443,control.bindAddr=127.0.0.1:9443,scheduledTasks.adminTasksEnabled=false|tlsSidecar.metricsHttpsPort must differ from service.controlPort|metrics TLS and control bind collision
 metrics.bindAddr=0.0.0.0:9090|metrics.bindAddr must equal 127.0.0.1|network-reachable plaintext admin bind
 metrics.bindAddr=127.0.0.1:9191|metrics.bindAddr must equal 127.0.0.1|admin bind and proxy port mismatch
+metrics.bindAddr=0.0.0.0:9090|Service's metrics port now serves TLS, so point the scraper at https with a CA and a bearer carrying read_metrics|bindAddr refusal names the scrape consequence
 extraEnv[0].name=HORT_METRICS_BIND|extraEnv must not override HORT_METRICS_BIND|environment override of metrics bind
 extraEnv[0].name=HORT_API_BIND|extraEnv must not override HORT_API_BIND|environment override of API bind
 control.bindAddr=127.0.0.1:9443|control listener has no Service route|split control listener with admin tasks
@@ -592,6 +593,7 @@ tlsSidecar.enabled=false|requires tlsSidecar.enabled|ServiceMonitor without TLS 
 metrics.bindAddr=|requires metrics.bindAddr|ServiceMonitor without admin bind
 metrics.serviceMonitor.caSecretName=,scheduledTasks.adminTasksEnabled=false|requires caSecretName|ServiceMonitor without CA Secret
 metrics.serviceMonitor.bearerSecretName=,scheduledTasks.adminTasksEnabled=false|requires caSecretName|ServiceMonitor without bearer Secret
+metrics.serviceMonitor.caSecretName=,scheduledTasks.adminTasksEnabled=false|Service's metrics port serves TLS, so these supply the scrape's CA, verified serverName and read_metrics bearer|ServiceMonitor field refusal names the scrape consequence
 EOF
 
 # Every version-bearing byte in these manifests derives from Chart.yaml's

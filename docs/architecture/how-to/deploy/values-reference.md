@@ -510,6 +510,17 @@ is the recipe. `bindAddr` controls whether that listener binds at all:
 metrics Service port). The chart fails `helm template` / `helm
 install` with an explicit message if these conditions are not met.
 
+> **Migration note: enabling `tlsSidecar` on an install with a
+> non-loopback `metrics.bindAddr` is a two-part change — make both parts
+> in one edit.** Part one is required by the chart itself: `bindAddr`
+> must move to `127.0.0.1:<metricsPort>` (the render-time refusal in
+> `templates/deployment.yaml` enforces this). Part two is not enforced
+> by the chart and is easy to miss: once the sidecar is enabled, the
+> Service's `metrics` port serves TLS instead of plaintext, so whatever
+> scrapes it needs reconfiguring for `https`, a trusted CA, and a bearer
+> carrying `read_metrics`. Fixing only part one renders successfully and
+> silently drops the scrape.
+
 The rendered ServiceMonitor carries **no** authentication — the chart
 cannot guess your token-issuance mechanism, so it does not invent one.
 Extend it with `bearerTokenSecret` (or `authorization.credentials`)
