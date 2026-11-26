@@ -363,15 +363,21 @@ log "  manifest: ${MANIFEST_DIGEST}"
 log "  config  : ${CONFIG_DIGEST}"
 log "  layers  : ${LAYER_DIGESTS[*]}"
 
-MANIFEST_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'manifests/${MANIFEST_DIGEST}';")"
+# Manifest and blob rows carry the OCI image name they were pushed under
+# (`manifests/<name>/sha256:<hex>`, `blobs/<name>/sha256:<hex>`): identity is
+# scoped to the name, so the same bytes can be held under two names in one
+# repository. The fallback below stays scoped to the same name for that
+# reason — the repository's newest manifest under ANOTHER name is not this
+# fixture's manifest.
+MANIFEST_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'manifests/${TEST_IMAGE_NAME}/${MANIFEST_DIGEST}';")"
 if [ -z "$MANIFEST_ID" ]; then
-    # Fall back to the repository's only manifest row: the digest is over
+    # Fall back to this name's newest manifest row: the digest is over
     # the exact served bytes, and a re-encode should not turn into an
     # unexplained miss.
-    log "  (no row at manifests/${MANIFEST_DIGEST} — falling back to the repository's newest manifest row)"
-    MANIFEST_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path LIKE 'manifests/%' ORDER BY created_at DESC LIMIT 1;")"
+    log "  (no row at manifests/${TEST_IMAGE_NAME}/${MANIFEST_DIGEST} — falling back to this name's newest manifest row)"
+    MANIFEST_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path LIKE 'manifests/${TEST_IMAGE_NAME}/%' ORDER BY created_at DESC LIMIT 1;")"
 fi
-CONFIG_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/${CONFIG_DIGEST}';")"
+CONFIG_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/${TEST_IMAGE_NAME}/${CONFIG_DIGEST}';")"
 if [ -z "$MANIFEST_ID" ] || [ -z "$CONFIG_ID" ]; then
     fail "(5) manifest and config rows must be locatable" \
         "manifest id='${MANIFEST_ID:-<none>}' config id='${CONFIG_ID:-<none>}' for repository_id='${REPO_ID}'"
@@ -418,10 +424,10 @@ if [ "${#LAYER_DIGESTS[@]}" -ne 2 ]; then
         "found ${#LAYER_DIGESTS[@]}: ${LAYER_DIGESTS[*]:-<none>}"
 fi
 for d in "${LAYER_DIGESTS[@]}"; do
-    lid="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/${d}';")"
+    lid="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/${TEST_IMAGE_NAME}/${d}';")"
     if [ -z "$lid" ]; then
         fail "(5) layer row must be locatable" \
-            "no artifacts row for repository_id='${REPO_ID}' path='blobs/${d}'"
+            "no artifacts row for repository_id='${REPO_ID}' path='blobs/${TEST_IMAGE_NAME}/${d}'"
         continue
     fi
     if [ "$d" = "$BASE_LAYER_DIGEST" ]; then
@@ -641,8 +647,10 @@ else
         "found ${ROW_COUNT_6:-0} artifacts rows for repository_id='${REPO_ID}', expected ${ATT_EXPECTED_ROWS} -- an unexpected fixture shape changes what the assertions below test."
 fi
 
-ATT_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'manifests/sha256:${ATT_MANIFEST_HEX}';")"
-IDX_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'manifests/sha256:${ATT_INDEX_HEX}';")"
+# Pushed through /v2/${REPO_KEY}/${TEST_IMAGE_NAME}/manifests/… above, so both
+# rows carry that name in their path.
+ATT_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'manifests/${TEST_IMAGE_NAME}/sha256:${ATT_MANIFEST_HEX}';")"
+IDX_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'manifests/${TEST_IMAGE_NAME}/sha256:${ATT_INDEX_HEX}';")"
 if [ -z "$ATT_ID" ] || [ -z "$IDX_ID" ]; then
     fail "(6) the attestation manifest and index rows must be locatable" \
         "attestation id='${ATT_ID:-<none>}' index id='${IDX_ID:-<none>}' for repository_id='${REPO_ID}'"

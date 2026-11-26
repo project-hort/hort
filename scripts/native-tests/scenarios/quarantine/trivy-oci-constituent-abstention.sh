@@ -287,11 +287,16 @@ if [ "${ROW_COUNT:-0}" -ne "$EXPECTED_ROWS" ]; then
 fi
 pass "(2) ${EXPECTED_ROWS} rows ingested"
 
-LINK_LAYER_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/sha256:${NEW_LAYER_HEX}';")"
-BASE_LAYER_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/${BASE_LAYER_DIGEST}';")"
+# A blob row's `path` carries the OCI image name it was pushed under
+# (`blobs/<name>/sha256:<hex>`): identity is scoped to the name, so the same
+# bytes can be held under two names in one repository. Asserting the name
+# rather than wildcarding it is deliberate — a row that turns up under a
+# different name is exactly the cross-name resolution that must not happen.
+LINK_LAYER_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/${TEST_IMAGE_NAME}/sha256:${NEW_LAYER_HEX}';")"
+BASE_LAYER_ID="$(psql_one "SELECT id FROM artifacts WHERE repository_id = '${REPO_ID}' AND path = 'blobs/${TEST_IMAGE_NAME}/${BASE_LAYER_DIGEST}';")"
 if [ -z "$LINK_LAYER_ID" ] || [ -z "$BASE_LAYER_ID" ]; then
-    fail "(2) both layer rows must be locatable by the digest the fixture pushed" \
-        "link-carrying layer id='${LINK_LAYER_ID:-<none>}' (blobs/sha256:${NEW_LAYER_HEX}), base layer id='${BASE_LAYER_ID:-<none>}' (blobs/${BASE_LAYER_DIGEST})"
+    fail "(2) both layer rows must be locatable by the digest the fixture pushed, under the name it pushed them under" \
+        "link-carrying layer id='${LINK_LAYER_ID:-<none>}' (blobs/${TEST_IMAGE_NAME}/sha256:${NEW_LAYER_HEX}), base layer id='${BASE_LAYER_ID:-<none>}' (blobs/${TEST_IMAGE_NAME}/${BASE_LAYER_DIGEST}). If both are <none> while the row census above passed, the rows are present under a different path shape than this query names."
     summary
 fi
 log "  link-carrying layer row : ${LINK_LAYER_ID}"
