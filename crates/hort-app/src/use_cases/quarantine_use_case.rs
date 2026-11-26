@@ -10925,7 +10925,7 @@ spec:
             DomainEvent::ScanIndeterminate(hort_domain::events::ScanIndeterminate {
                 artifact_id,
                 scanner: "trivy".into(),
-                reason: "trivy=no_analyzer_matched".into(),
+                reason: "trivy=no_analyzer_matched_fs_empty_report".into(),
                 attempts: 5,
             });
         events.set_stream(&stream_id, vec![quarantined, indeterminate]);

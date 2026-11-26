@@ -244,7 +244,7 @@ impl TaskHandler for ScanTaskHandler {
                     serde_json::json!({ "skipped": "no_backends" })
                 }
                 ScanRunOutcome::NothingAnalysable { scanner, reason } => {
-                    // Not an `error`: every backend ran. This arm
+                    // Not an `error`: the absence is deterministic. This arm
                     // reaches a `Completed` disposition, so the summary
                     // is the row's only record of what abstained — the
                     // reason does not go on `last_error`, which is
@@ -353,7 +353,7 @@ mod tests {
         let summary = serde_json::json!({
             "scanner": "trivy",
             "nothing_analysable": "no scan backend could analyse artifact \
-                                   (kind npm_tarball): trivy=no_analyzer_matched",
+                                   (kind npm_tarball): trivy=no_analyzer_matched_fs_empty_report",
         });
         let outcome = outcome_for(ScanRowDisposition::Completed, summary.clone());
         assert_eq!(
@@ -372,13 +372,13 @@ mod tests {
     #[test]
     fn failed_disposition_is_a_terminal_row_failure_with_the_reason_verbatim() {
         let outcome = outcome_for(
-            ScanRowDisposition::Failed("trivy=no_analyzer_matched".into()),
+            ScanRowDisposition::Failed("trivy=no_analyzer_matched_fs_empty_report".into()),
             serde_json::json!({ "ignored": true }),
         );
         assert_eq!(
             outcome,
             TaskOutcome::Failed {
-                reason: "trivy=no_analyzer_matched".into(),
+                reason: "trivy=no_analyzer_matched_fs_empty_report".into(),
                 retry: false,
             },
             "a scan with no verdict to record must not ask to be re-driven"

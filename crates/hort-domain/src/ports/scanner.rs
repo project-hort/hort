@@ -325,10 +325,26 @@ impl ScanTarget<'_> {
 // ScanAnalysis
 // ---------------------------------------------------------------------------
 
+/// Origin of a missing analyzer verdict.
+///
+/// The cause is part of the existing abstention reason, so event trails and
+/// job summaries retain it without a second field to reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoAnalyzerCause {
+    /// The effective backend and format pairing cannot produce an analysis.
+    InertPairing,
+    /// A root filesystem archive contained links that were skipped for containment.
+    RootfsLinksSkipped,
+    /// A filesystem scan returned no analysed targets.
+    FsEmptyReport,
+    /// No backend abstention was available after a composition was assembled.
+    EmptyCompositionAbstentions,
+}
+
 /// Why a backend produced no verdict.
 ///
-/// Each arm is a *different* operational story and they are kept apart
-/// deliberately. Every one of them is the absence of a verdict — but
+/// Each value tells an operational story, with unmatched analyzer causes
+/// kept apart. Every one of them is the absence of a verdict — but
 /// they do **not** all gate the artifact, and they are not all
 /// statements about the same thing, which is the whole reason the enum
 /// exists:
@@ -342,14 +358,14 @@ impl ScanTarget<'_> {
 ///   — scan authority exists, the release gate opens, and the trail says
 ///   "not applicable" rather than "analysed, clean". Holding here would
 ///   be a category error, not caution.
-/// - [`Self::UnusableArchive`], [`Self::NoAnalyzerMatched`] and
-///   [`Self::IncompleteComposition`] — **gate.** A surface was expected
-///   and could not be assessed, which is the same situation an absent
-///   verdict puts the scan axis in, so they fail closed to
+/// - [`Self::UnusableArchive`] and [`Self::IncompleteComposition`]
+///   — **gate.** A surface was expected and could not be assessed, so
+///   they fail closed to
 ///   [`QuarantineStatus::ScanIndeterminate`](crate::entities::artifact::QuarantineStatus::ScanIndeterminate)
 ///   (ADR 0007). One of these among the abstentions is enough to hold
 ///   the artifact even when the rest are `NotApplicable`.
-/// - [`Self::UnsupportedContainer`] — **gates, except for the one row
+/// - [`Self::UnsupportedContainer`] and [`Self::NoAnalyzerMatched`]
+///   — **gate, except for the one row
 ///   whose filesystem is not its own to assess.** See below.
 ///
 /// # Two kinds of refusal, and only one of them is about the artifact
@@ -377,7 +393,7 @@ impl ScanTarget<'_> {
 /// in this tree" is an absence of analysis of the filesystem, while "I
 /// could not build the image" is the composition's own absent
 /// assessment and has nothing above it to hand the obligation to. Four
-/// values and two answers, every one of them stated at its own arm.
+/// abstention families and two gate answers, each stated at its own arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotAnalysable {
     /// The artifact carries no package surface for this backend to look
@@ -462,25 +478,19 @@ pub enum NotAnalysable {
     /// with the composition: it is not a statement that the layer's
     /// bytes are dangerous, so it must not gate the constituent once
     /// something above it is assessing the filesystem. The obligation
-    /// **moves**, it is never dropped, which is why it moves only where
-    /// an operator has promoted the composite verdict — before that, a
-    /// constituent that stopped gating here would be a constituent
-    /// nothing gates, trading a precise-but-wrong hold for no hold at
-    /// all.
+    /// **moves**, it is never dropped: the composition carries the
+    /// filesystem verdict for every constituent.
     UnsupportedContainer,
-    /// The backend ran against a materialised target and reported no
-    /// analysable target at all — not "analysed and clean", but "found
-    /// nothing to analyse". For Trivy this is a report with no `Results`
-    /// section: no analyzer claimed anything in the workspace.
+    /// An expected surface went unassessed. The cause distinguishes an
+    /// inert effective backend/format pairing, an incomplete root
+    /// filesystem walk, an empty filesystem report, and an assembled
+    /// composition with no backend abstention to explain its absence.
+    /// None is an analysed and clean verdict.
     ///
-    /// It is an expected surface left unassessed: the pairing of this
-    /// artifact with this backend is a policy mismatch, or the tree the
-    /// analyzers walked was not the whole artifact (a layer whose link
-    /// entries were skipped on the way in).
-    ///
-    /// A **composed image** ([`ScanUnit::Image`]) does not reach it. An
-    /// empty report over an assembled composition is the analyzers
-    /// agreeing the composed filesystem carries no package surface, and
+    /// The scanner adapter's **composed image** mode
+    /// ([`ScanUnit::Image`]) does not produce it. An empty report over an
+    /// assembled composition is the analyzers agreeing the composed
+    /// filesystem carries no package surface, and
     /// that is a completed fact about the image — [`Self::NotApplicable`]
     /// — because a composition is returned whole or not at all, so there
     /// is no unread constituent the empty report could be about. An
@@ -495,16 +505,15 @@ pub enum NotAnalysable {
     /// analysis rather than a claim that the layer's bytes are
     /// dangerous. On a layer whose composition is the unit of filesystem
     /// assessment, that absence belongs to the composition; the
-    /// obligation moves rather than being dropped, which is why it moves
-    /// only where an operator has promoted the composite verdict.
+    /// obligation moves rather than being dropped.
     ///
     /// On every other row it gates as before: a manifest is not a
     /// constituent ([`ArtifactKind::is_composition_constituent`]), so
-    /// where a manifest row does reach this value — the orchestrator's
-    /// own inert-pairing record, since the adapter's `image` mode no
-    /// longer produces it — there is nothing above it for the obligation
-    /// to move to and it fails closed.
-    NoAnalyzerMatched,
+    /// where a manifest row does reach this value — including the
+    /// orchestrator's inert-pairing record and the composite empty-set
+    /// fallback — there is nothing above it for the obligation to move
+    /// to and it fails closed.
+    NoAnalyzerMatched(NoAnalyzerCause),
     /// No report about a composed image exists. In every case this value
     /// reaches today, that is because the composition itself was not
     /// produced: a constituent was missing from storage, unreadable, the
@@ -596,7 +605,7 @@ impl NotAnalysable {
     pub fn gates_release(&self, kind: ArtifactKind) -> bool {
         match self {
             Self::NotApplicable => false,
-            Self::UnsupportedContainer | Self::NoAnalyzerMatched => {
+            Self::UnsupportedContainer | Self::NoAnalyzerMatched(_) => {
                 !kind.is_composition_constituent()
             }
             Self::UnusableArchive | Self::IncompleteComposition => true,
@@ -612,7 +621,18 @@ impl NotAnalysable {
             Self::NotApplicable => "not_applicable",
             Self::UnusableArchive => "unusable_archive",
             Self::UnsupportedContainer => "unsupported_container",
-            Self::NoAnalyzerMatched => "no_analyzer_matched",
+            Self::NoAnalyzerMatched(NoAnalyzerCause::InertPairing) => {
+                "no_analyzer_matched_inert_pairing"
+            }
+            Self::NoAnalyzerMatched(NoAnalyzerCause::RootfsLinksSkipped) => {
+                "no_analyzer_matched_rootfs_links_skipped"
+            }
+            Self::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport) => {
+                "no_analyzer_matched_fs_empty_report"
+            }
+            Self::NoAnalyzerMatched(NoAnalyzerCause::EmptyCompositionAbstentions) => {
+                "no_analyzer_matched_empty_composition_abstentions"
+            }
             Self::IncompleteComposition => "incomplete_composition",
         }
     }
@@ -953,11 +973,58 @@ mod tests {
 
     /// Every arm, so a new one has to be added here before the
     /// assertions below can be read as covering the enum.
-    const EVERY_ABSTENTION: [NotAnalysable; 5] = [
+    const EVERY_CAUSE: [NoAnalyzerCause; 4] = [
+        NoAnalyzerCause::InertPairing,
+        NoAnalyzerCause::RootfsLinksSkipped,
+        NoAnalyzerCause::FsEmptyReport,
+        NoAnalyzerCause::EmptyCompositionAbstentions,
+    ];
+
+    #[test]
+    fn no_analyzer_cause_identifiers_are_stable() {
+        assert_eq!(
+            EVERY_CAUSE.map(|cause| NotAnalysable::NoAnalyzerMatched(cause).as_str()),
+            [
+                "no_analyzer_matched_inert_pairing",
+                "no_analyzer_matched_rootfs_links_skipped",
+                "no_analyzer_matched_fs_empty_report",
+                "no_analyzer_matched_empty_composition_abstentions",
+            ]
+        );
+    }
+
+    #[test]
+    fn abstention_gate_table_is_independent_of_no_analyzer_cause() {
+        for (kind, constituent) in [
+            (ArtifactKind::OciBlob, true),
+            (ArtifactKind::OciManifest, false),
+            (ArtifactKind::NpmTarball, false),
+        ] {
+            assert!(!NotAnalysable::NotApplicable.gates_release(kind));
+            assert_eq!(
+                NotAnalysable::UnsupportedContainer.gates_release(kind),
+                !constituent
+            );
+            for cause in EVERY_CAUSE {
+                assert_eq!(
+                    NotAnalysable::NoAnalyzerMatched(cause).gates_release(kind),
+                    !constituent,
+                    "{kind} {cause:?}"
+                );
+            }
+            assert!(NotAnalysable::UnusableArchive.gates_release(kind));
+            assert!(NotAnalysable::IncompleteComposition.gates_release(kind));
+        }
+    }
+
+    const EVERY_ABSTENTION: [NotAnalysable; 8] = [
         NotAnalysable::NotApplicable,
         NotAnalysable::UnusableArchive,
         NotAnalysable::UnsupportedContainer,
-        NotAnalysable::NoAnalyzerMatched,
+        NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::InertPairing),
+        NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::RootfsLinksSkipped),
+        NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
+        NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::EmptyCompositionAbstentions),
         NotAnalysable::IncompleteComposition,
     ];
 
@@ -1000,7 +1067,10 @@ mod tests {
         for kind in UNMOVED {
             assert!(!NotAnalysable::NotApplicable.gates_release(kind));
             assert!(NotAnalysable::UnusableArchive.gates_release(kind));
-            assert!(NotAnalysable::NoAnalyzerMatched.gates_release(kind));
+            assert!(
+                NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport)
+                    .gates_release(kind)
+            );
             // An image that was never assembled is an image whose
             // filesystem went unassessed — the one answer that must not
             // be the non-gating one.
@@ -1060,7 +1130,7 @@ mod tests {
     fn a_constituent_does_not_gate_on_an_unmatched_analyzer_but_does_on_the_composition() {
         let kind = ArtifactKind::OciBlob;
         assert!(
-            !NotAnalysable::NoAnalyzerMatched.gates_release(kind),
+            !NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport).gates_release(kind),
             "no analyzer claiming this layer is an absence of analysis, not a claim \
              about the bytes; the composition that is assessed carries it"
         );
@@ -1078,9 +1148,10 @@ mod tests {
     /// And the cells that moved are the only ones: every variant over
     /// every kind.
     ///
-    /// Two cells, one per abstention that states an absence of analysis
-    /// rather than a fact about the bytes — a container with no decoder
-    /// and a tree no analyzer claimed — and both only on an OCI blob.
+    /// Two refusal families state an absence of analysis rather than a
+    /// fact about the bytes — a container with no decoder and a tree no
+    /// analyzer claimed — and both only stop gating an OCI blob. Every
+    /// cause of the second family has the same answer.
     ///
     /// The exhaustive form is what scopes the loosening. ADR 0064 decides
     /// the OCI image and says of every other format "not decided here";
@@ -1090,7 +1161,7 @@ mod tests {
     /// abstention joining `MOVED_REFUSALS` would release a layer on a
     /// statement that is about its bytes.
     #[test]
-    fn exactly_two_cells_of_the_refusal_kind_matrix_moved() {
+    fn only_absent_analysis_refusals_stop_gating_a_constituent() {
         const EVERY_KIND: [ArtifactKind; 9] = [
             ArtifactKind::MavenJar,
             ArtifactKind::MavenPom,
@@ -1105,9 +1176,12 @@ mod tests {
         /// The abstentions ADR 0064 D2 places with the composition: each
         /// says an assessment is *absent*, neither says anything about the
         /// layer's bytes.
-        const MOVED_REFUSALS: [NotAnalysable; 2] = [
+        const MOVED_REFUSALS: [NotAnalysable; 5] = [
             NotAnalysable::UnsupportedContainer,
-            NotAnalysable::NoAnalyzerMatched,
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::InertPairing),
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::RootfsLinksSkipped),
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::EmptyCompositionAbstentions),
         ];
         let mut moved = 0usize;
         for refusal in EVERY_ABSTENTION {
@@ -1270,7 +1344,7 @@ mod tests {
     fn an_unassembled_composition_is_not_the_same_value_as_an_empty_one() {
         assert_ne!(
             NotAnalysable::IncompleteComposition,
-            NotAnalysable::NoAnalyzerMatched
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport)
         );
         assert_ne!(
             NotAnalysable::IncompleteComposition,
@@ -1281,8 +1355,8 @@ mod tests {
     #[test]
     fn not_analysable_display_matches_as_str() {
         assert_eq!(
-            NotAnalysable::NoAnalyzerMatched.to_string(),
-            "no_analyzer_matched"
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport).to_string(),
+            "no_analyzer_matched_fs_empty_report"
         );
         assert_eq!(NotAnalysable::NotApplicable.to_string(), "not_applicable");
         assert_eq!(
@@ -1303,7 +1377,9 @@ mod tests {
         assert_eq!(clean, ScanAnalysis::Analysed(Vec::new()));
         assert_ne!(
             clean,
-            ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched)
+            ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched(
+                NoAnalyzerCause::FsEmptyReport
+            ))
         );
         // And there is no finding list to read off the absent verdict.
         match ScanAnalysis::NothingAnalysable(NotAnalysable::UnusableArchive) {

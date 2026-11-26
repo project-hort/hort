@@ -129,8 +129,8 @@ use hort_domain::ports::composite_scan_observation::{
     CompositeScanObservation, CompositeScanObservationRepository, GateDecision,
 };
 use hort_domain::ports::scanner::{
-    ComposedImage, EvidenceBasis, LayerRole, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit,
-    ScannerPort,
+    ComposedImage, EvidenceBasis, LayerRole, NoAnalyzerCause, NotAnalysable, ScanAnalysis,
+    ScanTarget, ScanUnit, ScannerPort,
 };
 use hort_domain::ports::storage::StoragePort;
 use hort_domain::ports::upstream_proxy::UpstreamProxy;
@@ -557,7 +557,8 @@ fn classify_config_refusal(refusal: &ConfigRefusal) -> CompositeResolution {
 /// An **empty** abstention set is the other thing entirely: the
 /// composition exists and nothing looked at it, which is an expected
 /// surface left unassessed, so it keeps
-/// [`NotAnalysable::NoAnalyzerMatched`] and keeps gating.
+/// [`NotAnalysable::NoAnalyzerMatched`] with the empty-abstention cause
+/// and keeps gating.
 fn assembled_composition_absence(
     abstentions: &[(String, NotAnalysable)],
     kind: ArtifactKind,
@@ -567,7 +568,9 @@ fn assembled_composition_absence(
         .map(|(_, why)| *why)
         .find(|why| why.gates_release(kind))
         .or_else(|| abstentions.first().map(|(_, why)| *why))
-        .unwrap_or(NotAnalysable::NoAnalyzerMatched)
+        .unwrap_or(NotAnalysable::NoAnalyzerMatched(
+            NoAnalyzerCause::EmptyCompositionAbstentions,
+        ))
 }
 
 /// `backend=reason` per abstention, comma-joined — the spelling the
@@ -2929,7 +2932,7 @@ mod tests {
             ),
             (
                 Ok(ScanAnalysis::NothingAnalysable(
-                    NotAnalysable::NoAnalyzerMatched,
+                    NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
                 )),
                 CompositeDisposition::Settled,
             ),
@@ -3983,7 +3986,7 @@ mod tests {
         let scanner = RecordingScanner::new(
             "trivy",
             Ok(ScanAnalysis::NothingAnalysable(
-                NotAnalysable::NoAnalyzerMatched,
+                NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
             )),
         );
         let fixture = Fixture::new();
@@ -4318,7 +4321,7 @@ mod tests {
         let abstaining = RecordingScanner::new(
             "trivy",
             Ok(ScanAnalysis::NothingAnalysable(
-                NotAnalysable::NoAnalyzerMatched,
+                NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
             )),
         );
         let fixture = Fixture::new().with_policy(policy_blocking_at(SeverityThreshold::Critical));
@@ -4336,7 +4339,9 @@ mod tests {
         .await;
         assert_eq!(
             assembled.verdict,
-            CompositeVerdict::Absent(NotAnalysable::NoAnalyzerMatched),
+            CompositeVerdict::Absent(NotAnalysable::NoAnalyzerMatched(
+                NoAnalyzerCause::FsEmptyReport,
+            )),
             "the composition was complete and the scanners claimed nothing in it; \
              `incomplete_composition` would say a constituent was missing, \
              unreadable or over budget, and all three are false"
@@ -4354,7 +4359,7 @@ mod tests {
             rows[0]
                 .reason
                 .as_deref()
-                .is_some_and(|r| r.contains("trivy=no_analyzer_matched")),
+                .is_some_and(|r| r.contains("trivy=no_analyzer_matched_fs_empty_report")),
             "{:?}",
             rows[0].reason
         );
@@ -4526,7 +4531,9 @@ mod tests {
         .await;
         assert_eq!(
             outcome.verdict,
-            CompositeVerdict::Absent(NotAnalysable::NoAnalyzerMatched),
+            CompositeVerdict::Absent(NotAnalysable::NoAnalyzerMatched(
+                NoAnalyzerCause::EmptyCompositionAbstentions,
+            )),
         );
         assert!(
             sbom_only.seen().is_empty(),

@@ -50,7 +50,7 @@ use hort_domain::ports::jobs_repository::{JobsRepository, ScanJob};
 use hort_domain::ports::policy_projection_repository::PolicyProjectionRepository;
 use hort_domain::ports::repository_repository::RepositoryRepository;
 use hort_domain::ports::scanner::{
-    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort,
+    EvidenceBasis, NoAnalyzerCause, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort,
     SCAN_REPORT_TOO_LARGE_MARKER,
 };
 use hort_domain::ports::storage::StoragePort;
@@ -279,14 +279,15 @@ pub enum ScanRunOutcome {
     /// And it is the one arm where the artifact and the job end in
     /// opposite states: the artifact is terminal
     /// (`ScanIndeterminate`), because nothing examined it; the job
-    /// reports [`ScanRowDisposition::Completed`], because every backend
-    /// ran and reported. `record_outcome` is where that is spelled out.
+    /// reports [`ScanRowDisposition::Completed`], because the absence is
+    /// deterministic and another attempt would not change it.
+    /// `record_outcome` is where that is spelled out.
     NothingAnalysable {
-        /// Comma-joined backend names that were asked, for the
+        /// Comma-joined backend names selected for the scan, for the
         /// `ScanIndeterminate` event's audit label.
         scanner: String,
         /// Human-readable `backend=reason` breakdown, e.g.
-        /// `"trivy=no_analyzer_matched"`. Lands on the event's reason.
+        /// `"trivy=no_analyzer_matched_fs_empty_report"`. Lands on the event's reason.
         reason: String,
     },
     /// Every configured backend errored. `record_outcome` asks for a
@@ -846,12 +847,14 @@ impl ScanOrchestrationUseCase {
                         scanner = backend,
                         format = %job.format,
                         kind = kind.as_str(),
-                        "capability map: this backend does not analyse this format; the policy \
-                         (or the built-in default `[trivy]`) is inert for this repository — \
-                         configure a covering backend or waive scanning explicitly",
+                        "capability map: effective backend/format pairing is inert despite \
+                         apply-time validation; the surface remains unassessed",
                     );
                     emit_scan_failure(ScanFailureResult::InertPairing, backend);
-                    abstentions.push((backend.clone(), NotAnalysable::NoAnalyzerMatched));
+                    abstentions.push((
+                        backend.clone(),
+                        NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::InertPairing),
+                    ));
                 } else {
                     tracing::debug!(
                         artifact_id = %artifact.id,
@@ -1563,8 +1566,8 @@ impl ScanOrchestrationUseCase {
                     reason = %reason,
                     "no scan backend produced a verdict: this run mints no release authority \
                      and overwrites no verdict the artifact already carries — an artifact \
-                     that carries none is held scan_indeterminate (fail-closed). A backend \
-                     that cannot analyse this format is a policy mismatch, not a clean scan",
+                     that carries none is held scan_indeterminate (fail-closed). The reason \
+                     names the origin of each missing analysis",
                 );
                 self.quarantine
                     .record_scan_indeterminate(job.artifact_id, scanner, reason, job.attempts)

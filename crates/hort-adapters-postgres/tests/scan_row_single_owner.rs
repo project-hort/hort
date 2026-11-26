@@ -522,7 +522,7 @@ async fn a_scan_with_nothing_to_analyse_completes_the_row_and_leaves_the_sweep()
     let artifact = seed_artifact(&pool, repo, Some("scan_indeterminate")).await;
     let job_id = seed_pending_scan(&pool, artifact, repo, 0).await;
     let reason = "no scan backend could analyse artifact (kind npm_tarball): \
-                  trivy=no_analyzer_matched";
+                  trivy=no_analyzer_matched_fs_empty_report";
     let summary = serde_json::json!({
         "scanner": "trivy",
         "nothing_analysable": reason,
