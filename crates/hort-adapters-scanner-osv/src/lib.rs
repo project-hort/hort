@@ -263,7 +263,7 @@ impl OsvScannerAdapter {
     /// Build the argv vector for
     /// `osv-scanner scan source --format json --sbom <path>`.
     ///
-    /// osv-scanner ≥ 2.0 (the worker image pins 2.3.8) requires a
+    /// osv-scanner ≥ 2.0 (the worker image pins 2.7.1) requires a
     /// subcommand — `scan source` for SBOM/lockfile inputs. The v1
     /// flat `osv-scanner --format json --sbom <path>` syntax no
     /// longer reaches the SBOM scanner; instead the v2 binary falls

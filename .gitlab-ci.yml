@@ -137,15 +137,24 @@ workflow:
   #   - deploy/ansible/files/**   -> the gitops tree, walked by the Rust
   #                                  public_deploy_gitops_tree guard test
   #   - deploy/ansible/roles/fail2ban/** -> quality:fail2ban-regex-test
+  #   - deploy/ansible/roles/hort_systemd/defaults/main.yml
+  #                              -> scripts/check-osv-scanner-version.sh, which
+  #                                 holds that file's osv-scanner pin equal to
+  #                                 the worker image's
   # Everything else under deploy/ansible/ (roles, playbooks, inventory,
   # group_vars, README) has no CI coverage and rides the docs-only fast
   # path. RULE: if a future CI job starts exercising another deploy
   # subtree, add that subtree HERE in the same MR — a test-covered path
-  # missing from this list silently skips its gate on targeted MRs.
+  # missing from this list silently skips its gate on targeted MRs. The same
+  # rule reaches outside deploy/: docs/attribution/image-notice.md is prose,
+  # but both scanner pin-sync gates read a version out of it, so an edit to
+  # it alone must still run them.
   - "deploy/helm/**/*"
   - "deploy/compose/**/*"
   - "deploy/ansible/files/**/*"
   - "deploy/ansible/roles/fail2ban/**/*"
+  - "deploy/ansible/roles/hort_systemd/defaults/main.yml"
+  - "docs/attribution/image-notice.md"
   - "docker/**/*"
   - ".dockerignore"
   - "scripts/**/*"
@@ -1851,11 +1860,13 @@ quality:sonar-findings:
 
 # Lint pin-sync between Cargo.toml MSRV / the hort-server Dockerfile rust
 # toolchain; between the Helm chart values.yaml top-level keys / their
-# per-section comment blocks; and between the worker container's
-# OSV_SCANNER_VERSION / the native hort_systemd osv-scanner pin. The scripts are
-# pure bash and finish in well under a second; they run on every pipeline (no
-# rules / no needs:). Alpine has bash, grep, and yq is not required — the
-# scripts use only POSIX awk/sed.
+# per-section comment blocks; between the worker container's
+# OSV_SCANNER_VERSION / the native hort_systemd osv-scanner pin; and between
+# the worker container's TRIVY_VERSION / the two GitHub workflows that install
+# their own Trivy for CI-side scanning. The scripts are pure bash and finish in
+# well under a second; they run on every pipeline (no rules / no needs:).
+# Alpine has bash, grep, and yq is not required — the scripts use only POSIX
+# awk/sed.
 quality:chart-and-rust-pin-sync:
   stage: quality
   image: alpine:3.24
@@ -1867,6 +1878,7 @@ quality:chart-and-rust-pin-sync:
     - bash scripts/run-shell-guards.sh scripts/check-rust-version.sh
     - bash scripts/run-shell-guards.sh scripts/check-values-comments.sh
     - bash scripts/run-shell-guards.sh scripts/check-osv-scanner-version.sh
+    - bash scripts/run-shell-guards.sh scripts/check-trivy-version.sh
 
 # Machine-readable G1 release-predicate gate. Fails unless the
 # event-chain-verify and advisory-ingest telemetry rows are catalogued in

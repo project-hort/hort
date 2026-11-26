@@ -715,12 +715,12 @@ const ROOTFS_TYPE_LAYERS: &str = "layers";
 /// So hort's own decoder inventory does not constrain this set; what governs is
 /// what the scanner opens once handed the layout.
 ///
-/// That makes the set **measured rather than reasoned**. Against Trivy 0.70.0 —
+/// That makes the set **measured rather than reasoned**. Against Trivy 0.76.2 —
 /// the version `docker/Dockerfile.worker` pins — on hand-built two-layer
 /// layouts whose lower layer carried `/etc/os-release` and a dpkg database and
 /// whose upper layer carried a larger one and no OS marker of its own, an upper
 /// layer declaring `tar`, `tar+gzip` or `tar+zstd` composed identically: same
-/// detected OS, same package inventory (measured 2026-10-19). So the upper
+/// detected OS, same package inventory (measured 2026-11-26). So the upper
 /// layer's container did not change what the scanner read out of either layer.
 ///
 /// Measured the same way, the scanner decides by **content** rather than by

@@ -171,7 +171,7 @@ fn malformed_json_propagates_validation_error() {
 
 #[test]
 fn informational_unmaintained_advisory_rides_the_negligible_lane() {
-    // Real osv-scanner 2.3.8 capture for proc-macro-error2 (RUSTSEC-2026-0173,
+    // Real osv-scanner 2.7.1 capture for proc-macro-error2 (RUSTSEC-2026-0173,
     // `affected[].database_specific.informational == "unmaintained"`). The
     // advisory has no CVSS score; without the informational carve-out it would
     // hit the SUP-4 Critical fail-closed fallback and over-block. Routed onto
@@ -182,14 +182,17 @@ fn informational_unmaintained_advisory_rides_the_negligible_lane() {
 
     assert_eq!(f.vulnerability_id, "RUSTSEC-2026-0173");
     assert_eq!(f.purl, "pkg:cargo/proc-macro-error2@2.0.1");
-    // The raw OSV informational class is stored verbatim (the fact); the
-    // boolean derives from it via the domain recognizer.
+    assert!(f.is_informational(), "must be marked informational: {f:?}");
+    // `is_informational()` only proves the class is one of the recognised
+    // three, so it would still hold if upstream reclassified this advisory.
+    // The raw class is the *fact* the column exists to persist — a future
+    // per-class policy re-derives the routing from it — so pin the value the
+    // capture actually carries, and keep it agreeing with the comment above.
     assert_eq!(
         f.informational_class.as_deref(),
         Some("unmaintained"),
-        "raw informational class must be stored: {f:?}"
+        "the raw informational class must be stored verbatim: {f:?}"
     );
-    assert!(f.is_informational(), "must be marked informational: {f:?}");
     // Severity is cosmetic for informational findings — it must NOT be the
     // Critical fail-closed fallback (that is the over-block this fix removes).
     assert_ne!(f.severity, SeverityThreshold::Critical);

@@ -7,10 +7,69 @@
   "labels": ["dependencies"],
   "commitMessagePrefix": "chore:",
   "description": [
-    "github-actions manager disabled: GitHub Dependabot manages hort's .github/workflows; Renovate handles the cargo / docker / gitlab-ci deps and targets develop. NOTE: Renovate reads this from the default branch (main), so it takes effect once this reaches main via a develop->main promotion."
+    "github-actions manager disabled: GitHub Dependabot manages hort's .github/workflows; Renovate handles the cargo / docker / gitlab-ci deps and targets develop. NOTE: Renovate reads this from the default branch (main), so it takes effect once this reaches main via a develop->main promotion.",
+    "The regex managers also track scanner binary version literals in workflow shell commands and in the bundled-tool NOTICE; Dependabot's github-actions ecosystem in .github/dependabot.yml continues to own action references. A manager pattern that stops matching after one of those files is reformatted fails scripts/check-trivy-version.sh or scripts/check-osv-scanner-version.sh, which compare every site and refuse a file they cannot read a version from — so a silently-missed site surfaces as a red gate rather than as a pin left behind."
   ],
   "github-actions": { "enabled": false },
+  "dependencyDashboard": {
+    "header": "Scanner version proposals are version-only: approving one creates an MR that bumps every Trivy or osv-scanner version statement but not the SHA-256 checksums beside them. Copy that scanner's new amd64 and arm64 checksums from the upstream release into docker/Dockerfile.worker before merging — no merge-request pipeline builds the worker image, so an incomplete bump merges green and the pinned-checksum verification refuses it in the next release tag's image build."
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^docker\\/Dockerfile\\.worker$/",
+        "/^\\.github\\/workflows\\/(docker-publish|scheduled-container-scan)\\.yml$/",
+        "/^docs\\/attribution\\/image-notice\\.md$/"
+      ],
+      "matchStrings": [
+        "ARG TRIVY_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "ghcr\\.io/aquasecurity/trivy:(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "\\| Trivy \\| (?<currentValue>\\d+\\.\\d+\\.\\d+) \\|"
+      ],
+      "depNameTemplate": "aquasecurity/trivy",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$",
+      "versioningTemplate": "semver"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^docker\\/Dockerfile\\.worker$/",
+        "/^deploy\\/ansible\\/roles\\/hort_systemd\\/defaults\\/main\\.yml$/",
+        "/^docs\\/attribution\\/image-notice\\.md$/"
+      ],
+      "matchStrings": [
+        "ARG OSV_SCANNER_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)",
+        "hort_systemd_osv_version: \"(?<currentValue>\\d+\\.\\d+\\.\\d+)\"",
+        "\\| osv-scanner \\| (?<currentValue>\\d+\\.\\d+\\.\\d+) \\|"
+      ],
+      "depNameTemplate": "google/osv-scanner",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>\\d+\\.\\d+\\.\\d+)$",
+      "versioningTemplate": "semver"
+    }
+  ],
   "packageRules": [
+    {
+      "description": "Scanner releases need human-reviewed checksums before the verified binaries can build. Approval holds version proposals in the dashboard until a maintainer is ready to finish them.",
+      "matchDatasources": ["github-releases"],
+      "matchPackageNames": ["aquasecurity/trivy", "google/osv-scanner"],
+      "dependencyDashboardApproval": true,
+      "prBodyNotes": [
+        "This changes scanner version statements only. Update the matching amd64 and arm64 SHA-256 ARGs in docker/Dockerfile.worker from the upstream release checksum file before merging. Nothing in this pipeline will say you forgot: the worker image builds on tags, main and release branches only, so a version-only bump is green here and the pinned-checksum verification refuses it in the next release tag's image build."
+      ]
+    },
+    {
+      "matchDatasources": ["github-releases"],
+      "matchPackageNames": ["aquasecurity/trivy"],
+      "groupName": "Trivy scanner version"
+    },
+    {
+      "matchDatasources": ["github-releases"],
+      "matchPackageNames": ["google/osv-scanner"],
+      "groupName": "osv-scanner version"
+    },
     {
       "description": "Hold quay.io/buildah/stable at v1.43: v1.45 ships no /etc/containers/registries.conf, an empty registries.conf.d/ and no policy.json, where v1.43 ships all three. Measured with podman against both tags, not assumed: v1.43 carries registries.conf.d/000-shortnames.conf with \"rust\" = \"docker.io/library/rust\" (line 146) and \"debian\" = \"docker.io/library/debian\" (line 126), a 3935-byte registries.conf, storage.conf and policy.json; v1.45's registries.conf.d/ is empty and registries.conf does not exist. scripts/ci/base-image-preflight.sh reads exactly those files to predict the runner's pull target for the short-name base-image pins, so under v1.45 it reports 'no short-name alias for rust; runner pull target is unresolved' and exits 1. It ran green on v1.43 at v0.17.3, v0.17.4-beta.5 and v0.17.4-beta.6 and red on v0.17.4-beta.7, the first tag cut after the bump - and the job runs only on tags, main and release/*, so no MR pipeline shows it. Two further consequences of the same missing file: the docker.io prefix rewrite that routes CI's base-image pulls through the project's own pull-through proxy is gone with it, and the image-build jobs (.docker) were never exercised on v1.45 at all because the failing preflight gates their stage. Unpark by making the preflight's resolution inputs the project's own rather than the job image's - the script already honours BASE_IMAGE_REGISTRIES_CONF - and by deciding where the prefix rewrite lives, since it names the instance registry and must not be committed. Patch and digest updates inside v1.43 keep flowing; only minor and major are held.",
       "matchPackageNames": ["quay.io/buildah/stable"],
