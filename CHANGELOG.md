@@ -11,7 +11,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - The Helm chart can serve HTTPS from the server pod, including health probes and admin-task CronJobs. Provide a certificate covering the bare Service name and its CA bundle, enable `tlsSidecar`, and require HTTPS at the edge (#457).
 
+- A credentialed Prometheus scrape of `/metrics` now has a TLS path: the chart's
+  TLS sidecar serves it on its own `tlsSidecar.metricsHttpsPort`. With the
+  sidecar enabled, `metrics.bindAddr` must be `127.0.0.1:<service.metricsPort>`
+  and an enabled `metrics.serviceMonitor` now requires the CA and bearer Secret
+  references it previously told operators to add by hand (#462).
+
 ### Fixed
+
+- The TLS sidecar now serves a rotated certificate without a Deployment
+  rollout; it previously kept presenting the replaced one until the pod was
+  restarted, while reporting ready (#462).
 
 - The upload-payload metadata cap now applies to verified ingest (hosted PyPI
   publication, OCI manifest and blob writes, every pull-through) and to pushed

@@ -2,6 +2,12 @@
 {{- if not .Values.metrics.bindAddr -}}
 {{- fail "metrics.serviceMonitor.enabled=true requires metrics.bindAddr to be set (the ServiceMonitor scrapes the dedicated metrics Service port; with bindAddr empty, no admin listener binds and /metrics is not exposed anywhere)." -}}
 {{- end -}}
+{{- if not .Values.tlsSidecar.enabled -}}
+{{- fail "metrics.serviceMonitor.enabled=true requires tlsSidecar.enabled for a verified HTTPS scrape" -}}
+{{- end -}}
+{{- if not (and .Values.metrics.serviceMonitor.caSecretName .Values.metrics.serviceMonitor.caSecretKey .Values.metrics.serviceMonitor.serverName .Values.metrics.serviceMonitor.bearerSecretName .Values.metrics.serviceMonitor.bearerSecretKey) -}}
+{{- fail "metrics.serviceMonitor.enabled=true requires caSecretName, caSecretKey, serverName, bearerSecretName and bearerSecretKey" -}}
+{{- end -}}
 apiVersion: monitoring.coreos.com/v1
 kind: ServiceMonitor
 metadata:
@@ -22,14 +28,17 @@ spec:
   {{- end }}
   endpoints:
     - port: metrics
+      scheme: https
       interval: {{ .Values.metrics.serviceMonitor.interval }}
       scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
       path: /metrics
-      # `/metrics` always requires a bearer carrying the `read_metrics`
-      # grant (#113 item 3 — no opt-out). The operator must supply a
-      # Secret carrying that bearer token. Wire it via `secrets.mounts`
-      # AND extend this ServiceMonitor with `bearerTokenSecret`. The
-      # chart cannot guess the operator's token-issuance mechanism
-      # (static, OIDC service-account, K8s SA tokens, …); see
-      # `docs/architecture/how-to/deploy/install.md` § Metrics auth.
+      tlsConfig:
+        ca:
+          secret:
+            name: {{ .Values.metrics.serviceMonitor.caSecretName | quote }}
+            key: {{ .Values.metrics.serviceMonitor.caSecretKey | quote }}
+        serverName: {{ .Values.metrics.serviceMonitor.serverName | quote }}
+      bearerTokenSecret:
+        name: {{ .Values.metrics.serviceMonitor.bearerSecretName | quote }}
+        key: {{ .Values.metrics.serviceMonitor.bearerSecretKey | quote }}
 {{- end -}}

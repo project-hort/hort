@@ -99,6 +99,9 @@ tlsSidecar:
   enabled: false
   image: "docker.io/library/nginx:1.30.8"
   httpsPort: 8443
+  # Dedicated TLS port for /metrics. Keep it distinct from the API port so
+  # NetworkPolicy can admit scrapers without admitting API traffic.
+  metricsHttpsPort: 9444
   secretName: ""
   resources:
     requests:
@@ -153,9 +156,6 @@ trustedProxyCidrs: []
 # trusted-proxy list; client-IP attribution is already broken there.
 # A trusted internal proxy reporting proto=http has plaintext evidence,
 # which this scope cannot waive: use a direct unrelayed path or TLS.
-# For the default loopback sidecar metrics scrape, also declare
-# `127.0.0.1/32` or put TLS in front of the listener. A loopback waiver
-# admits any process sharing the pod's network namespace.
 tlsNotRequiredFrom: []
 
 # HORT_CLIENT_IP_FROM_SOCKET_PEER — declares that clients connect to
@@ -490,10 +490,8 @@ metrics:
   #   "127.0.0.1:9090" (default) — loopback only; sidecar-scrape pattern
   #   "0.0.0.0:9090"             — all interfaces; needs allowUnspecifiedBind: true
   #   ""                         — /metrics not exposed on any listener
-  # A token-bearing sidecar scrape on loopback needs a declared
-  # tlsNotRequiredFrom entry of 127.0.0.1/32 or TLS on this hop;
-  # otherwise the credential check returns 426. That range admits
-  # any process sharing the pod's network namespace.
+  # With tlsSidecar.enabled, this must be 127.0.0.1:<service.metricsPort>.
+  # The sidecar supplies the credentialed TLS hop and proxies this bind.
   bindAddr: "127.0.0.1:9090"
   # HORT_METRICS_PUBLIC_BIND — required when `bindAddr` binds to
   # `0.0.0.0` or `::`. The binary refuses to start with an unspecified
@@ -504,15 +502,20 @@ metrics:
   # optional.
   allowUnspecifiedBind: false
   serviceMonitor:
-    # When true, renders `templates/servicemonitor.yaml`. Requires the
-    # Prometheus Operator CRDs to be installed in the cluster, AND
-    # `bindAddr` to be non-empty (the ServiceMonitor scrapes the
-    # dedicated metrics Service port).
+    # Requires the Prometheus Operator CRDs, tlsSidecar.enabled, a metrics
+    # bind, a CA Secret and a bearer Secret in the ServiceMonitor namespace.
+    # The bearer must carry the global read_metrics grant.
     enabled: false
     interval: 30s
     scrapeTimeout: 10s
     # "" ⇒ same namespace as the chart release.
     namespace: ""
+    caSecretName: ""
+    caSecretKey: ca.crt
+    # DNS name on the sidecar certificate, e.g. hort-server.default.svc.
+    serverName: ""
+    bearerSecretName: ""
+    bearerSecretKey: token
 
 # -------------------- Control plane --------------------
 # The internal-only control-plane tier: the /admin API,
@@ -533,6 +536,8 @@ metrics:
 #   or subscription management. Container + Service ports for
 #   `controlPort` are exposed and the NetworkPolicy gains a control-port
 #   ingress rule (see `networkPolicy` below).
+#   With tlsSidecar.enabled and scheduledTasks.adminTasksEnabled, this split
+#   is refused: the admin-task Service URL has no route to the control bind.
 #
 # This is DEFENSE-IN-DEPTH on top of — never instead of — the
 # admin authz gate and the webhook allowlist. Network position
