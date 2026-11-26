@@ -1105,8 +1105,9 @@ impl ArtifactRejected {
 // ScanIndeterminate (fail-closed scanner, ADR 0007)
 // ---------------------------------------------------------------------------
 
-/// Terminal scan failure: every configured backend errored and the
-/// job exhausted its retry budget. Recorded on `StreamCategory::Artifact`
+/// Terminal absence of a scan verdict: every configured backend either
+/// abstained or errored through the job's retry budget. Recorded on
+/// `StreamCategory::Artifact`
 /// alongside the `QuarantineStatus -> ScanIndeterminate` transition via
 /// `ArtifactLifecyclePort::commit_transition_with_score`. Fail-closed
 /// (ADR 0007).
@@ -1121,15 +1122,16 @@ impl ArtifactRejected {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanIndeterminate {
     pub artifact_id: Uuid,
-    /// Comma-joined backend names that were attempted (e.g.
+    /// Comma-joined backend names selected for this scan (e.g.
     /// `"trivy,osv"`). Mirrors [`ScanCompleted::scanner`] for audit
     /// symmetry; may be `"(none)"` if backend resolution itself failed.
     pub scanner: String,
-    /// Operator-readable last error from the exhausted job, length-capped
-    /// at `MAX_REASON_LEN` (same cap as [`ArtifactRejected::reason`]).
+    /// Operator-readable reason for the missing verdict, including stable
+    /// per-backend cause identifiers where analysis was not possible.
+    /// Length-capped at `MAX_REASON_LEN` (same cap as [`ArtifactRejected::reason`]).
     pub reason: String,
-    /// Attempts the job made before exhaustion (`job.attempts` at the
-    /// moment of `mark_failed`). Audit-only; no invariant.
+    /// Job attempt count when this verdictless result was recorded.
+    /// Audit-only; no invariant.
     pub attempts: u32,
 }
 

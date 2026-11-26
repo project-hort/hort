@@ -39,6 +39,7 @@ use hort_domain::events::{
 };
 use hort_domain::ports::advisory::AdvisoryPort;
 use hort_domain::ports::composite_scan_observation::{CompositeAssessment, GateDecision};
+use hort_domain::ports::event_store::EventStore;
 use hort_domain::ports::format_handler::{
     FormatHandler, PayloadSbom, PayloadSbomExtraction, SbomResolution,
 };
@@ -49,7 +50,8 @@ use hort_domain::ports::repository_upstream_mapping_repository::{
     RepositoryUpstreamMapping, UpstreamAuth,
 };
 use hort_domain::ports::scanner::{
-    EvidenceBasis, LayerRole, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit, ScannerPort,
+    EvidenceBasis, LayerRole, NoAnalyzerCause, NotAnalysable, ScanAnalysis, ScanTarget, ScanUnit,
+    ScannerPort,
 };
 use hort_domain::ports::BoxFuture;
 use hort_domain::types::{
@@ -2246,7 +2248,7 @@ async fn no_record_outcome_arm_writes_the_jobs_row() {
             1,
             ScanRunOutcome::NothingAnalysable {
                 scanner: "trivy".into(),
-                reason: "trivy=no_analyzer_matched".into(),
+                reason: "trivy=no_analyzer_matched_fs_empty_report".into(),
             },
             ScanRowDisposition::Completed,
         ),
@@ -4548,7 +4550,7 @@ mod metrics_emission_tests {
                     &job,
                     ScanRunOutcome::NothingAnalysable {
                         scanner: "trivy".into(),
-                        reason: "trivy=no_analyzer_matched".into(),
+                        reason: "trivy=no_analyzer_matched_fs_empty_report".into(),
                     },
                 )
                 .await
@@ -6089,7 +6091,7 @@ async fn run_scan_returns_nothing_analysable_not_a_clean_completion() {
     for reason in [
         NotAnalysable::UnusableArchive,
         NotAnalysable::UnsupportedContainer,
-        NotAnalysable::NoAnalyzerMatched,
+        NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
     ] {
         let scanner = Arc::new(MockScanner::with_analysis(
             "trivy",
@@ -6131,7 +6133,7 @@ async fn run_scan_keeps_a_verdict_when_only_one_of_two_backends_abstains() {
     let abstaining = Arc::new(MockScanner::with_analysis(
         "trivy",
         Ok(ScanAnalysis::NothingAnalysable(
-            NotAnalysable::NoAnalyzerMatched,
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
         )),
     ));
     let verdict = Arc::new(MockScanner::new(
@@ -6226,7 +6228,7 @@ async fn record_outcome_nothing_analysable_holds_the_artifact_and_completes_the_
     let scanner = Arc::new(MockScanner::with_analysis(
         "trivy",
         Ok(ScanAnalysis::NothingAnalysable(
-            NotAnalysable::NoAnalyzerMatched,
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
         )),
     ));
     let (uc, jobs, _events, artifacts, repositories) = make_uc_with_handler(
@@ -6243,7 +6245,7 @@ async fn record_outcome_nothing_analysable_holds_the_artifact_and_completes_the_
             ScanRunOutcome::NothingAnalysable {
                 scanner: "trivy".into(),
                 reason: "no scan backend could analyse artifact (kind npm_tarball): \
-                         trivy=no_analyzer_matched"
+                         trivy=no_analyzer_matched_fs_empty_report"
                     .into(),
             },
         )
@@ -6277,6 +6279,69 @@ async fn record_outcome_nothing_analysable_holds_the_artifact_and_completes_the_
             .is_downloadable(),
         "an unexamined artifact must not be downloadable"
     );
+}
+
+#[tokio::test]
+async fn every_no_analyzer_origin_survives_in_the_event_trail() {
+    for cause in [
+        NoAnalyzerCause::InertPairing,
+        NoAnalyzerCause::RootfsLinksSkipped,
+        NoAnalyzerCause::FsEmptyReport,
+        NoAnalyzerCause::EmptyCompositionAbstentions,
+    ] {
+        let scanner = Arc::new(MockScanner::with_analysis(
+            "trivy",
+            Ok(ScanAnalysis::NothingAnalysable(
+                NotAnalysable::NoAnalyzerMatched(cause),
+            )),
+        ));
+        let (uc, _jobs, events, artifacts, repositories) = make_uc_with_handler(
+            vec!["trivy".into()],
+            one_scanner(scanner),
+            handler_map("npm", ArtifactKind::NpmTarball),
+        );
+        let artifact_id = seed_quarantined_artifact(&artifacts, &repositories);
+        let job = sample_scan_job(artifact_id, 1);
+        let outcome = uc.run_scan(&job).await.expect("scan outcome");
+        let ScanRunOutcome::NothingAnalysable { ref reason, .. } = outcome else {
+            panic!("expected an abstention for {cause:?}, got {outcome:?}");
+        };
+        assert!(reason.contains(&format!(
+            "trivy={}",
+            NotAnalysable::NoAnalyzerMatched(cause).as_str()
+        )));
+        let reason = reason.clone();
+
+        let disposition = uc
+            .record_outcome(&job, outcome)
+            .await
+            .expect("record outcome");
+        assert_eq!(disposition, ScanRowDisposition::Completed);
+        assert_eq!(
+            artifacts
+                .get(artifact_id)
+                .expect("artifact")
+                .quarantine_status,
+            QuarantineStatus::ScanIndeterminate
+        );
+
+        let trail = events
+            .read_stream(
+                &StreamId::artifact(artifact_id),
+                hort_domain::ports::event_store::ReadFrom::Start,
+                u64::MAX,
+            )
+            .await
+            .expect("committed event trail");
+        let recorded = trail
+            .iter()
+            .find_map(|entry| match &entry.event {
+                DomainEvent::ScanIndeterminate(event) => Some(event),
+                _ => None,
+            })
+            .expect("scan indeterminate event");
+        assert_eq!(recorded.reason, reason, "{cause:?}");
+    }
 }
 
 /// The abstention path is idempotent on an already-terminal artifact —
@@ -6589,7 +6654,7 @@ async fn run_scan_holds_when_a_gating_abstention_joins_a_not_applicable_one() {
     for gating in [
         NotAnalysable::UnusableArchive,
         NotAnalysable::UnsupportedContainer,
-        NotAnalysable::NoAnalyzerMatched,
+        NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
     ] {
         let not_applicable = Arc::new(MockScanner::with_analysis(
             "trivy",
@@ -6846,7 +6911,7 @@ async fn run_scan_does_not_invoke_a_backend_that_cannot_analyse_the_format() {
     let mut scanners: HashMap<String, Arc<dyn ScannerPort>> = HashMap::new();
     scanners.insert("trivy".into(), trivy.clone());
 
-    let (uc, _jobs, _events, artifacts, repositories) = make_uc_with_handler(
+    let (uc, _jobs, events, artifacts, repositories) = make_uc_with_handler(
         vec!["trivy".into()],
         scanners,
         handler_map("npm", ArtifactKind::NpmTarball),
@@ -6857,15 +6922,34 @@ async fn run_scan_does_not_invoke_a_backend_that_cannot_analyse_the_format() {
     let job = scan_job_for_format(artifact_id, "npm");
 
     let outcome = uc.run_scan(&job).await.expect("run_scan");
-    assert!(
-        matches!(outcome, ScanRunOutcome::NothingAnalysable { .. }),
-        "an inert pairing leaves the surface unassessed and must hold, got {outcome:?}"
-    );
+    let ScanRunOutcome::NothingAnalysable { ref reason, .. } = outcome else {
+        panic!("an inert pairing leaves the surface unassessed and must hold, got {outcome:?}");
+    };
+    assert!(reason.contains("trivy=no_analyzer_matched_inert_pairing"));
     assert_eq!(
         trivy.calls(),
         0,
         "the orchestrator must consult the capability map BEFORE spending an invocation"
     );
+    assert_eq!(
+        uc.record_outcome(&job, outcome)
+            .await
+            .expect("record outcome"),
+        ScanRowDisposition::Completed
+    );
+    let trail = events
+        .read_stream(
+            &StreamId::artifact(artifact_id),
+            hort_domain::ports::event_store::ReadFrom::Start,
+            u64::MAX,
+        )
+        .await
+        .expect("committed event trail");
+    assert!(trail.iter().any(|entry| matches!(
+        &entry.event,
+        DomainEvent::ScanIndeterminate(event)
+            if event.reason.contains("trivy=no_analyzer_matched_inert_pairing")
+    )));
 }
 
 /// A covering backend's verdict stands while the inert one beside it is
@@ -9551,7 +9635,7 @@ async fn a_deterministic_refusal_holds_the_manifest_indeterminate() {
 #[tokio::test]
 async fn a_composition_with_no_analyzer_match_holds_the_manifest() {
     let scanner = manifest_scanner(Ok(ScanAnalysis::NothingAnalysable(
-        NotAnalysable::NoAnalyzerMatched,
+        NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
     )));
     let (uc, _events, storage, artifacts, repositories) = make_uc_under_policy(
         seed_global_policy(vec!["trivy".into()]),
@@ -9568,7 +9652,7 @@ async fn a_composition_with_no_analyzer_match_holds_the_manifest() {
         panic!("an abstention over an assembled composition has no verdict, got {outcome:?}");
     };
     assert!(
-        reason.contains("composite=no_analyzer_matched"),
+        reason.contains("composite=no_analyzer_matched_fs_empty_report"),
         "the composition was complete and the scanners claimed nothing in it: {reason}"
     );
     assert!(
@@ -9912,7 +9996,7 @@ async fn a_constituent_does_not_hold_when_no_analyzer_matched_its_tree() {
     let (outcome, _events, artifacts, artifact_id, uc, job) = constituent_scan(
         seed_global_policy(vec!["trivy".into()]),
         Ok(ScanAnalysis::NothingAnalysable(
-            NotAnalysable::NoAnalyzerMatched,
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
         )),
     )
     .await;
@@ -10772,7 +10856,7 @@ async fn the_cutover_makes_a_permanently_held_layer_deliverable_through_its_mani
     let scanner = Arc::new(MockScanner::with_analysis(
         "trivy",
         Ok(ScanAnalysis::NothingAnalysable(
-            NotAnalysable::NoAnalyzerMatched,
+            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
         )),
     ));
     let (uc, _events, storage, artifacts, repositories) = make_uc_with_handler_and_storage(

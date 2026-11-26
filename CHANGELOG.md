@@ -17,6 +17,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and an enabled `metrics.serviceMonitor` now requires the CA and bearer Secret
   references it previously told operators to add by hand (#462).
 
+### Changed
+
+- A withheld artifact whose scan reached no verdict now records **which** of
+  four origins caused it — an inert backend/format pairing, skipped archive
+  link entries, an empty filesystem report, or an assembled image no backend
+  assessed — on the event trail and the job summary rather than only in the
+  worker log. The stable identifier therefore changes from
+  `no_analyzer_matched` to a per-origin form, so a dashboard or alert matching
+  the old string needs updating (#461).
+
 ### Fixed
 
 - The TLS sidecar now serves a rotated certificate without a Deployment
