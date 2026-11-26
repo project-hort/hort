@@ -4,6 +4,12 @@ trustedProxyCidrs: ["10.244.3.0/24"]
 tlsSidecar:
   enabled: true
   secretName: "hort-server-tls"
+metrics:
+  serviceMonitor:
+    enabled: true
+    caSecretName: "hort-server-service-ca"
+    serverName: "hort-server.default.svc"
+    bearerSecretName: "hort-metrics-token"
 extraCaBundle:
   path: "/etc/hort-server/ca/ca.crt"
   configMapName: "hort-server-service-ca"

@@ -32,6 +32,10 @@ spec:
     {{- if .Values.metrics.bindAddr }}
     - name: metrics
       port: {{ .Values.service.metricsPort }}
+      {{- if .Values.tlsSidecar.enabled }}
+      targetPort: metrics-https
+      {{- else }}
       targetPort: metrics
+      {{- end }}
       protocol: TCP
     {{- end }}

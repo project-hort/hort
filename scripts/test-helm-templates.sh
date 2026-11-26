@@ -102,9 +102,9 @@ test-values-tls-sidecar.yaml|name: tls-sidecar$|3|TLS sidecar appears as a conta
 test-values-tls-sidecar.yaml|value: "127.0.0.1:8080"$|1|the server API binds loopback when TLS terminates in the pod
 test-values-tls-sidecar.yaml|value: "10.244.3.0/24,127.0.0.1/32"$|1|loopback is appended to the edge range
 test-values-tls-sidecar.yaml|targetPort: https$|1|the Service routes API traffic to the TLS container
-test-values-tls-sidecar.yaml|proxy_set_header X-Forwarded-Proto https;|1|the sidecar overwrites the forwarded scheme
-test-values-tls-sidecar.yaml|proxy_set_header Forwarded "";|1|the sidecar discards caller-supplied RFC Forwarded scheme claims
-test-values-tls-sidecar.yaml|proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;|1|the sidecar appends to the client chain
+test-values-tls-sidecar.yaml|proxy_set_header X-Forwarded-Proto https;|2|both sidecar listeners overwrite the forwarded scheme
+test-values-tls-sidecar.yaml|proxy_set_header Forwarded "";|2|both sidecar listeners discard caller-supplied RFC Forwarded scheme claims
+test-values-tls-sidecar.yaml|proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;|2|both sidecar listeners append to the client chain
 test-values-tls-sidecar.yaml|url="https://hort-server:8080/healthz"|1|the Helm test hook uses verified HTTPS when the sidecar is enabled
 test-values-transport-waiver-unset.yaml|name: tls-sidecar$|0|disabled TLS sidecar adds no container, mount or volume
 test-values-transport-waiver-unset.yaml|targetPort: https$|0|disabled TLS sidecar leaves the Service plaintext
@@ -254,6 +254,21 @@ test-values-tls-sidecar.yaml|templates/deployment.yaml|^ +port: [A-Za-z][A-Za-z0
 test-values-transport-waiver-unset.yaml|templates/deployment.yaml|^ +port: http$|3|disabled TLS sidecar preserves all three named HTTP probes
 test-values-transport-waiver-unset.yaml|templates/deployment.yaml|^ +port: 8443$|0|disabled TLS sidecar does not change the probe port
 test-values-tls-sidecar.yaml|templates/service.yaml|targetPort: http$|0|enabled TLS sidecar never sends Service traffic to hort directly
+test-values-tls-sidecar.yaml|templates/service.yaml|targetPort: metrics-https$|1|the metrics Service port targets its own TLS listener
+test-values-transport-waiver-unset.yaml|templates/service.yaml|targetPort: metrics$|1|disabled sidecar keeps the original metrics Service target
+test-values-tls-sidecar.yaml|templates/deployment.yaml|name: metrics-https$|1|the sidecar exposes a separate named metrics port
+test-values-tls-sidecar.yaml|templates/deployment.yaml|containerPort: 9444$|1|the sidecar metrics listener uses its configured unprivileged port
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|listen 8443 ssl;|1|the API listener remains distinct
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|listen 9444 ssl;|1|the metrics listener is TLS
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|ssl_certificate_cache off;|2|both TLS listeners use current projected certificates
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|proxy_pass http://127.0.0.1:9090;|1|metrics proxy targets only the admin loopback bind
+test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|location = /metrics|1|the metrics listener exposes only the metrics path
+test-values-tls-sidecar.yaml|templates/servicemonitor.yaml|scheme: https$|1|the scrape uses TLS
+test-values-tls-sidecar.yaml|templates/servicemonitor.yaml|serverName: "hort-server.default.svc"$|1|the scrape verifies the Service certificate name
+test-values-tls-sidecar.yaml|templates/servicemonitor.yaml|name: "hort-server-service-ca"$|1|the scrape uses a CA Secret
+test-values-tls-sidecar.yaml|templates/servicemonitor.yaml|name: "hort-metrics-token"$|1|the scrape uses a bearer Secret
+test-values-tls-sidecar.yaml|templates/servicemonitor.yaml|key: "ca.crt"$|1|the CA key reaches the scrape
+test-values-tls-sidecar.yaml|templates/servicemonitor.yaml|key: "token"$|1|the bearer key reaches the scrape
 test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|proxy_pass http://127.0.0.1:8080;|1|the TLS sidecar sends traffic only to hort on loopback
 test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|^      client_body_temp_path /tmp/client_body;$|1|nginx writes request bodies to the writable tmp volume
 test-values-tls-sidecar.yaml|templates/tls-sidecar-configmap.yaml|^      proxy_temp_path /tmp/proxy;$|1|nginx writes proxy temp files to the writable tmp volume
@@ -542,6 +557,42 @@ while IFS='|' read -r fixture pattern label; do
         checked_fixtures+=("${fixture}")
     fi
 done < <(expect_render_failure)
+
+# Exercise listener and scrape refusals against one known-good TLS render.
+# Each override changes only the condition under test.
+while IFS='|' read -r overrides pattern label; do
+    [[ -z "$overrides" ]] && continue
+    if rendered_bad=$(helm template hort-server "$chart_dir" --namespace default \
+            -f "$chart_dir/test-values-tls-sidecar.yaml" --set "$overrides" 2>&1); then
+        echo "FAIL: $label: render unexpectedly succeeded" >&2
+        failed=$((failed + 1))
+    elif ! grep -qF "$pattern" <<<"$rendered_bad"; then
+        echo "FAIL: $label: expected '$pattern', got: $rendered_bad" >&2
+        failed=$((failed + 1))
+    else
+        echo "PASS: $label"
+    fi
+done <<'EOF'
+service.metricsPort=8080|service.httpPort must differ from service.metricsPort|API and admin bind collision
+control.bindAddr=127.0.0.1:9443,service.controlPort=8080,scheduledTasks.adminTasksEnabled=false|service.httpPort must differ from service.controlPort|API and control bind collision
+control.bindAddr=127.0.0.1:9443,service.controlPort=9090,scheduledTasks.adminTasksEnabled=false|service.metricsPort must differ from service.controlPort|admin and control bind collision
+tlsSidecar.httpsPort=9090|tlsSidecar.httpsPort must differ from service.metricsPort|API TLS and admin bind collision
+tlsSidecar.httpsPort=9443,control.bindAddr=127.0.0.1:9443,scheduledTasks.adminTasksEnabled=false|tlsSidecar.httpsPort must differ from service.controlPort|API TLS and control bind collision
+tlsSidecar.metricsHttpsPort=8443|tlsSidecar.metricsHttpsPort must differ from tlsSidecar.httpsPort|API TLS and metrics TLS collision
+tlsSidecar.metricsHttpsPort=8080|tlsSidecar.metricsHttpsPort must differ from service.httpPort|metrics TLS and API bind collision
+tlsSidecar.metricsHttpsPort=9090|tlsSidecar.metricsHttpsPort must differ from service.metricsPort|metrics TLS and admin bind collision
+tlsSidecar.metricsHttpsPort=9443,control.bindAddr=127.0.0.1:9443,scheduledTasks.adminTasksEnabled=false|tlsSidecar.metricsHttpsPort must differ from service.controlPort|metrics TLS and control bind collision
+metrics.bindAddr=0.0.0.0:9090|metrics.bindAddr must equal 127.0.0.1|network-reachable plaintext admin bind
+metrics.bindAddr=127.0.0.1:9191|metrics.bindAddr must equal 127.0.0.1|admin bind and proxy port mismatch
+extraEnv[0].name=HORT_METRICS_BIND|extraEnv must not override HORT_METRICS_BIND|environment override of metrics bind
+extraEnv[0].name=HORT_API_BIND|extraEnv must not override HORT_API_BIND|environment override of API bind
+control.bindAddr=127.0.0.1:9443|control listener has no Service route|split control listener with admin tasks
+extraCaBundle.configMapName=,extraCaBundle.secretName=|requires extraCaBundle.configMapName or extraCaBundle.secretName|admin tasks without a CA source
+tlsSidecar.enabled=false|requires tlsSidecar.enabled|ServiceMonitor without TLS listener
+metrics.bindAddr=|requires metrics.bindAddr|ServiceMonitor without admin bind
+metrics.serviceMonitor.caSecretName=,scheduledTasks.adminTasksEnabled=false|requires caSecretName|ServiceMonitor without CA Secret
+metrics.serviceMonitor.bearerSecretName=,scheduledTasks.adminTasksEnabled=false|requires caSecretName|ServiceMonitor without bearer Secret
+EOF
 
 # Every version-bearing byte in these manifests derives from Chart.yaml's
 # `version`/`appVersion` (chart label, app-version label, and the default

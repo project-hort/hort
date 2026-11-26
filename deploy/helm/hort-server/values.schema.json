@@ -651,12 +651,13 @@
         "enabled": {"type": "boolean"},
         "image": {"type": "string", "minLength": 1},
         "httpsPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "metricsHttpsPort": {"type": "integer", "minimum": 1, "maximum": 65535},
         "secretName": {"type": "string"},
         "resources": {"type": "object"}
       },
       "allOf": [{
         "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
-        "then": {"required": ["image", "httpsPort", "secretName"], "properties": {"secretName": {"minLength": 1}}}
+        "then": {"required": ["image", "httpsPort", "metricsHttpsPort", "secretName"], "properties": {"secretName": {"minLength": 1}}}
       }]
     },
     "requireHttps": {"type": "boolean"},
@@ -704,7 +705,12 @@
             "enabled": {"type": "boolean"},
             "interval": {"type": "string"},
             "scrapeTimeout": {"type": "string"},
-            "namespace": {"type": "string"}
+            "namespace": {"type": "string"},
+            "caSecretName": {"type": "string"},
+            "caSecretKey": {"type": "string"},
+            "serverName": {"type": "string"},
+            "bearerSecretName": {"type": "string"},
+            "bearerSecretKey": {"type": "string"}
           }
         }
       }
@@ -875,9 +881,9 @@
       "additionalProperties": false,
       "properties": {
         "type": {"type": "string"},
-        "httpPort": {"type": "integer", "minimum": 1},
-        "metricsPort": {"type": "integer", "minimum": 1},
-        "controlPort": {"type": "integer", "minimum": 1},
+        "httpPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "metricsPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "controlPort": {"type": "integer", "minimum": 1, "maximum": 65535},
         "annotations": {"type": "object"}
       }
     },
