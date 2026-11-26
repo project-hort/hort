@@ -13,7 +13,7 @@
 # final stage — the same builder image the server/worker images pin. cargo needs
 # every member's Cargo.toml for workspace resolution, hence `COPY crates`, but
 # only hort-cli's subgraph is compiled.
-FROM rust:1.100-slim-trixie@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS cli-builder
+FROM rust:1.100-slim-trixie@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS cli-builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 # `.cargo/config.toml` declares the `hort-crates` registry that every

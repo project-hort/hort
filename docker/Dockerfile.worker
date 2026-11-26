@@ -75,7 +75,7 @@ ARG OSV_SCANNER_SHA256_ARM64=8158b18edd2d03b1a30d905ca91b032bc62262167be8f206c27
 
 # ---------- Stage 1: builder ----------
 # Digest-pinned (B10/INFRA-7); Dependabot (docker ecosystem) bumps tag+digest.
-FROM rust:${RUST_VERSION}-slim@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS builder
+FROM rust:${RUST_VERSION}-slim@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS builder
 
 WORKDIR /src
 
