@@ -45,8 +45,8 @@
 # shape here.
 
 ARG RUST_VERSION=1.100.0
-ARG TRIVY_VERSION=0.70.0
-ARG OSV_SCANNER_VERSION=2.3.8
+ARG TRIVY_VERSION=0.76.2
+ARG OSV_SCANNER_VERSION=2.7.1
 
 # SHA256 hashes of the upstream binaries we install, per target architecture.
 # Mandatory upstream verification requires every external download to be
@@ -54,8 +54,8 @@ ARG OSV_SCANNER_VERSION=2.3.8
 # osv-scanner are no exception. The trivy / osv stages pick the matching pair
 # at build time from buildx's `TARGETARCH` (amd64 or arm64), so BOTH arch
 # checksums must be present for a multi-arch (`linux/amd64,linux/arm64`) build.
-# When a `*_VERSION` ARG above is bumped, ALL four `*_SHA256_*` ARGs MUST be
-# bumped to the new release's published checksums. Find them at:
+# When a `*_VERSION` ARG above is bumped, BOTH architecture checksums for
+# that scanner MUST be bumped to the new release's published values. Find them at:
 #   Trivy:       https://github.com/aquasecurity/trivy/releases — file
 #                trivy_${VERSION}_checksums.txt, lines
 #                "trivy_${VERSION}_Linux-64bit.tar.gz" (amd64) and
@@ -68,10 +68,10 @@ ARG OSV_SCANNER_VERSION=2.3.8
 # exit non-zero, which aborts the build. That is the desired behaviour — a
 # silently-substituted scanner binary changes scan output, which the
 # operator depends on as part of the rejection contract.
-ARG TRIVY_SHA256_AMD64=8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
-ARG TRIVY_SHA256_ARM64=2f6bb988b553a1bbac6bdd1ce890f5e412439564e17522b88a4541b4f364fc8d
-ARG OSV_SCANNER_SHA256_AMD64=bc98e15319ed0d515e3f9235287ba53cdc5535d576d24fd573978ecfe9ab92dc
-ARG OSV_SCANNER_SHA256_ARM64=8158b18edd2d03b1a30d905ca91b032bc62262167be8f206c27114f08823e27c
+ARG TRIVY_SHA256_AMD64=bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+ARG TRIVY_SHA256_ARM64=ab9d51f86e6a5fb936f605faff6b593ac51bc378fff4d3e8b9d58358b9c367c3
+ARG OSV_SCANNER_SHA256_AMD64=fb7dab19a8bd9bbe5c3189f09d4b7ee1820c9553a23bac202648a56efd2f6ee8
+ARG OSV_SCANNER_SHA256_ARM64=983d22fbad9724514e3fcc6acc83b5fa64c5ffa6b0d9f510028f22c1b223ff81
 
 # ---------- Stage 1: builder ----------
 # Digest-pinned (B10/INFRA-7); Dependabot (docker ecosystem) bumps tag+digest.

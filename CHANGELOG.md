@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- The worker image now carries Trivy 0.76.2 and osv-scanner 2.7.1, up from
+  0.70.0 and 2.3.8; the native (non-Kubernetes) install and the bundled-tool
+  NOTICE move with it. Both scanners' rulesets advanced over those releases, so
+  an artifact rescanned after the upgrade can earn findings it did not have
+  before (#463).
+
 - A withheld artifact whose scan reached no verdict now records **which** of
   four origins caused it — an inert backend/format pairing, skipped archive
   link entries, an empty filesystem report, or an assembled image no backend

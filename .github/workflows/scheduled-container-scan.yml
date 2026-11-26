@@ -31,11 +31,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # NOTE: trivy binary extracted from official GHCR image because the
-      # aquasecurity/trivy GitHub repo was wiped (no releases/tags).
+      # The Trivy binary comes from the published GHCR image rather than from
+      # a release tarball: the tag resolves to one multi-arch image, so this
+      # step needs no per-architecture asset name. The version is pinned here
+      # and held in lockstep with the Trivy the worker image ships by
+      # scripts/check-trivy-version.sh.
       - name: Install Trivy
         run: |
-          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.69.3)
+          CONTAINER_ID=$(docker create ghcr.io/aquasecurity/trivy:0.76.2)
           docker cp "$CONTAINER_ID:/usr/local/bin/trivy" /usr/local/bin/trivy
           docker rm "$CONTAINER_ID"
           trivy --version
