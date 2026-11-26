@@ -499,7 +499,11 @@ metrics:
   # level bind ALSO take responsibility for restricting reachability via
   # NetworkPolicy / ingress rules — network position is defense-in-depth
   # ONLY; the `read_metrics` grant is the sole authz gate and is never
-  # optional.
+  # optional. This does NOT exempt `bindAddr` from the loopback
+  # requirement above when `tlsSidecar.enabled`: the chart refuses a
+  # non-loopback `bindAddr` under the sidecar regardless of this flag,
+  # because the sidecar's plaintext hop would otherwise be a reachable
+  # bypass of the TLS listener.
   allowUnspecifiedBind: false
   serviceMonitor:
     # Requires the Prometheus Operator CRDs, tlsSidecar.enabled, a metrics

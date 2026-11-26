@@ -22,7 +22,7 @@
 {{- fail "tlsSidecar.enabled with control.bindAddr and scheduledTasks.adminTasksEnabled is unsupported: the control listener has no Service route for credentialed admin tasks" }}
 {{- end }}
 {{- if and .Values.metrics.bindAddr (ne .Values.metrics.bindAddr (printf "127.0.0.1:%v" .Values.service.metricsPort)) }}
-{{- fail "metrics.bindAddr must equal 127.0.0.1:<service.metricsPort> when tlsSidecar.enabled so the admin listener has no reachable plaintext bypass" }}
+{{- fail "metrics.bindAddr must equal 127.0.0.1:<service.metricsPort> when tlsSidecar.enabled so the admin listener has no reachable plaintext bypass; the Service's metrics port now serves TLS, so point the scraper at https with a CA and a bearer carrying read_metrics" }}
 {{- end }}
 {{- if and .Values.metrics.bindAddr (eq (int .Values.tlsSidecar.metricsHttpsPort) (int .Values.tlsSidecar.httpsPort)) }}
 {{- fail "tlsSidecar.metricsHttpsPort must differ from tlsSidecar.httpsPort" }}
