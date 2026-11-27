@@ -260,7 +260,7 @@ for the timeout knobs in depth.
 | `HORT_PUBLIC_BASE_URL` | URL | _unset → none_ | Cond. | Public-facing base URL (scheme+authority only; must be `http`/`https` with a host). |
 | `HORT_TRUSTED_PROXY_CIDRS` | CSV of CIDRs | _empty_ | Cond. | Reverse-proxy allowlist for trusting `X-Forwarded-*`, **and the sole input to client-IP attribution** — with it empty every request is attributed to its TCP peer. Never `0.0.0.0/0`: that trusts `X-Forwarded-For` from everyone, letting any caller pick its own attribution. |
 | `HORT_CLIENT_IP_FROM_SOCKET_PEER` | bool | `false` | Cond. | Declares that clients reach this server **directly** (no proxy, ingress or LB), so the TCP peer *is* the client. Required `true` when `HORT_TRUSTED_PROXY_CIDRS` is empty; not read when it is set. |
-| `HORT_REQUIRE_HTTPS` | bool | `false` | No | Refuse to boot without positive TLS evidence (see interlocks). |
+| `HORT_REQUIRE_HTTPS` | bool | `false` | No | Boot-time configuration check: rejects an explicit `http://` public base URL with an empty trusted-proxy list; an unset base URL passes this check, though another boot gate may fail. Never request TLS evidence (see interlocks). |
 | `HORT_EXTRA_CA_BUNDLE` | path | _unset → system trust only_ | No | Extra CA PEM bundle, layered onto the system store for **all four** outbound TLS surfaces (upstream proxy, S3/MinIO, OIDC discovery+JWKS, outbound webhook delivery). **Fail-closed**: set-but-unreadable / bad PEM / zero certs aborts boot. See [extra-ca-bundle.md](../how-to/deploy/extra-ca-bundle.md). |
 
 > One of `HORT_PUBLIC_BASE_URL` or a non-empty `HORT_TRUSTED_PROXY_CIDRS`
@@ -301,7 +301,8 @@ for the timeout knobs in depth.
 | `HORT_OCI_TOKEN_SIGNING_KEY_PREV_FILE` | path | _unset → none_ | No | Previous signing key from a file (mutually exclusive with the inline `_PREV`). |
 | `HORT_TOKEN_ALLOW_ADMIN` | bool | `false` | No | Permit `Permission::Admin` in token issuance / exchange. |
 | `HORT_TOKEN_ALLOW_UNBOUNDED_SVC` | bool | `false` | No | Permit null-expiry service-account tokens via admin-mint. |
-| `HORT_BEARER_ALLOW_OVER_HTTP` | bool | `false` | No | Allow bearer auth (every bearer kind: PAT + CliSession JWT) over plaintext HTTP (transport-unsafe; logs one boot WARN + sets the unsafe-config gauge). **Boot-fails** when combined with an `https://` `HORT_PUBLIC_BASE_URL` — a TLS-terminated deploy that also relaxes the bearer transport guard is self-contradictory (INFRA-13). Only WARNs when `HORT_PUBLIC_BASE_URL` is `http://...` or unset. |
+| `HORT_BEARER_ALLOW_OVER_HTTP` | bool | `false` | No | The **unscoped** waiver of the credential-transport requirement: accept **any** presented credential — IdP access token, PAT, service-account token, CliSession JWT, or one carried in a Basic password — with no evidence of TLS, from any peer, relayed or not (transport-unsafe; logs one boot WARN + sets the unsafe-config gauge). **It does not reach the token endpoint** (`POST /api/v1/auth/exchange`): RFC 6749 §3.2 requires the authorization server to require TLS there, so an exchange over an unproven transport is refused `426` whatever this flag says, and the only waiver that reaches it is `HORT_TLS_NOT_REQUIRED_FROM`. Prefer `HORT_TLS_NOT_REQUIRED_FROM` generally, which is scoped to a peer range and reaches every surface. **Boot-fails** when combined with an `https://` `HORT_PUBLIC_BASE_URL` — a TLS-terminated deploy that also relaxes the transport guard is self-contradictory (INFRA-13). Only WARNs when `HORT_PUBLIC_BASE_URL` is `http://...` or unset. |
+| `HORT_TLS_NOT_REQUIRED_FROM` | CSV of CIDRs | _unset → empty_ | No | The **scoped** waiver: TCP peer ranges on which TLS is not required for a presented credential. Matched against the raw socket peer (never a forwarded address), with the same IPv4-mapped canonicalisation as `HORT_TRUSTED_PROXY_CIDRS`. It waives the requirement and **never** asserts that TLS happened: such a request still reports `evidence="unknown"`. It applies only when there is no evidence either way **and** the peer is not a trusted proxy **and** the request carries no `Forwarded` / `X-Forwarded-*` header — so it covers a direct client on a plaintext hop and not an external request forwarded in by an undeclared ingress. Every caller that can open a socket from inside a declared range inherits it, so declare the narrowest range the topology allows. `0.0.0.0/0` and `::/0` are refused at boot. The declared ranges are named in the `trust configuration loaded` boot log. |
 
 ### Rate limiting, lockout & load shedding
 
@@ -592,10 +593,10 @@ rather than run misconfigured.
    set. If anything at all sits in front of hort, set the allowlist —
    that is also the fix for the attribution bug the rule exists to
    surface.
-2. **`HORT_REQUIRE_HTTPS=true`.** Fails if `HORT_PUBLIC_BASE_URL` is `http`
-   **and** `HORT_TRUSTED_PROXY_CIDRS` is empty (no positive TLS
-   evidence). An `https://` base URL **or** a non-empty CIDR list
-   satisfies it.
+2. **`HORT_REQUIRE_HTTPS=true`.** Fails if `HORT_PUBLIC_BASE_URL` is explicitly
+   `http://` **and** `HORT_TRUSTED_PROXY_CIDRS` is empty. An `https://` base URL,
+   a non-empty CIDR list, **or an unset base URL** passes. This is a boot-time
+   configuration check, never evidence about any request.
 3. **Metrics public-bind guard.** `HORT_METRICS_BIND` on an unspecified
    IP while `HORT_METRICS_PUBLIC_BIND=false` → boot fails
    (`MetricsPublicBindRefused`).

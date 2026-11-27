@@ -129,9 +129,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.104"
+version = "1.0.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+checksum = "2cb931c189b85683d69a5cfad41d4d418671e1ac413dd209f3f2fc31e3cfd902"
 
 [[package]]
 name = "arc-swap"
@@ -523,7 +523,7 @@ dependencies = [
  "regex",
  "rustc-hash",
  "shlex 2.0.1",
- "syn 2.0.117",
+ "syn 3.0.10",
 ]
 
 [[package]]
@@ -574,9 +574,9 @@ dependencies = [
 
 [[package]]
 name = "blake3"
-version = "1.8.7"
+version = "1.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6d9e454fc11f76977dc803893aff6304ed33d6a26efae8696573bea74baa27ae"
+checksum = "64c0e36294adc8db531500e3f2b8ec75c4af9177271e9c6d33f93609d56e57cd"
 dependencies = [
  "arrayvec",
  "cc",
@@ -913,7 +913,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -978,9 +978,12 @@ dependencies = [
 
 [[package]]
 name = "constant_time_eq"
-version = "0.4.2"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
+checksum = "144e7f1de087984240b7816d47f698b414979faa6f40839c5b86d6bd47db57b7"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "cookie-factory"
@@ -1492,7 +1495,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1713,7 +1716,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2341,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-advisory-osv"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -2369,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-checkpoint-anchor"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2388,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-ephemeral-memory"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2402,7 +2405,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-ephemeral-redis"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2418,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-kubernetes"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -2437,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-oidc"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -2465,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-postgres"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "chrono",
  "hort-adapters-storage",
@@ -2489,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-provenance-cosign-key"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "hort-domain",
  "p256 0.14.0",
@@ -2501,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-provenance-sigstore"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -2525,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-scanner-osv"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "bytes",
  "cvss",
@@ -2541,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-scanner-trivy"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "bytes",
  "flate2",
@@ -2559,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-secrets"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "hort-domain",
  "metrics",
@@ -2574,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-storage"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "bytes",
  "futures",
@@ -2597,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-upstream-http"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2606,6 +2609,7 @@ dependencies = [
  "bytes",
  "chrono",
  "futures",
+ "hex",
  "hort-app",
  "hort-config",
  "hort-domain",
@@ -2634,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "hort-app"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -2674,11 +2678,11 @@ dependencies = [
 
 [[package]]
 name = "hort-attribution"
-version = "0.18.0"
+version = "0.18.1"
 
 [[package]]
 name = "hort-cli"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2711,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "hort-config"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "chrono",
  "hort-domain",
@@ -2727,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "hort-domain"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -2749,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2773,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats-upstream"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "bytes",
  "chrono",
@@ -2792,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-admin-security"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2814,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-admin-tasks"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2836,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-cargo"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2869,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-core"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2904,7 +2908,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-discovery"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2925,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-events"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2947,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-maven"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2978,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-npm"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3014,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-oci"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3053,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-pypi"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3088,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-subscriptions"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3109,11 +3113,11 @@ dependencies = [
 
 [[package]]
 name = "hort-net-egress"
-version = "0.18.0"
+version = "0.18.1"
 
 [[package]]
 name = "hort-notifier-nats"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "async-nats",
  "bytes",
@@ -3132,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "hort-notifier-webhook"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "chrono",
  "hex",
@@ -3156,14 +3160,14 @@ dependencies = [
 
 [[package]]
 name = "hort-secret-file"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "hort-server"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3231,7 +3235,7 @@ dependencies = [
 
 [[package]]
 name = "hort-worker"
-version = "0.18.0"
+version = "0.18.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3415,7 +3419,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3616,7 +3620,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3670,7 +3674,7 @@ dependencies = [
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3846,9 +3850,9 @@ checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
 name = "kube"
-version = "4.2.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "208d7fe1380066abb194812a8a8e303cb896a33bb3d7b3177b71bd03ff39bf18"
+checksum = "e0a034a7cb6141527e9225e660e48565305b8557f9fb71946d5436aee929d82f"
 dependencies = [
  "k8s-openapi",
  "kube-client",
@@ -3857,9 +3861,9 @@ dependencies = [
 
 [[package]]
 name = "kube-client"
-version = "4.2.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31e940a73033a7c5c7918b5ece7851d84571b58be25e937198da37fa13f116d3"
+checksum = "0dd59e09518478bda46674fb056103318e443a000089b342d32e440a52afe552"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -3893,9 +3897,9 @@ dependencies = [
 
 [[package]]
 name = "kube-core"
-version = "4.2.0"
+version = "4.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9d2353c118cf3462c352ee0b5bd5b0cf17990af456dfd8662d136ff9812eeb4"
+checksum = "10b14df286fa701cd30920fa5251f26d8fcbd0fc54b50e02281cafe0a4505743"
 dependencies = [
  "derive_more",
  "form_urlencoded",
@@ -4017,9 +4021,9 @@ dependencies = [
 
 [[package]]
 name = "lru"
-version = "0.19.0"
+version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a9f71e3591c7ec44d3e563e87bf14ddc2bada8519dca046e5b0e560cd004e2d"
+checksum = "d4e2a1b977b42ee8b53a2a4adbd1183431c493f1d1960b7ccd893e2f0b9407ba"
 dependencies = [
  "hashbrown 0.17.1",
 ]
@@ -4261,7 +4265,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4342,7 +4346,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http",
@@ -5192,7 +5196,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -5231,9 +5235,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5640,7 +5644,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5699,7 +5703,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5935,7 +5939,7 @@ checksum = "7bd22781911de0ca6debda95f073c8f18bec65d1a94f1fa9573f3102e514cea4"
 dependencies = [
  "ahash",
  "annotate-snippets",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser 0.0.7",
@@ -6808,7 +6812,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7015,9 +7019,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.2.1+spec-1.1.0"
+version = "1.2.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5755c51863cdac711f1956baf8eb9588e060755f7d3c4c979e70ea1e1f32cd7"
+checksum = "5426cb1b964690d913f6c5c1a1ae0b42f428ec506bb4d452876d7a209c9bca3b"
 dependencies = [
  "indexmap 2.14.0",
  "serde_core",
@@ -7051,9 +7055,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.5+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c"
+checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
 dependencies = [
  "winnow",
 ]
@@ -7420,9 +7424,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.29.2"
+version = "1.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bed99139f7dac9b5cfe5f17be4d66dc7079a34dee1d74bcc77217119240e267c"
+checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -7700,7 +7704,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8132,9 +8136,9 @@ dependencies = [
 
 [[package]]
 name = "zeroize"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 dependencies = [
  "zeroize_derive",
 ]

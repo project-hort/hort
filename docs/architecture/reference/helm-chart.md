@@ -188,12 +188,12 @@ hook it precedes the SA template.
 | Job — migrate | `hort-server migrate` (`args: ["migrate"]`) under the **admin** DSN |
 | Job — svc-token bootstrap | init: `hort-server admin issue-svc-token --name=cronjob-tasks --permission=admin_task_invoke --output=file:/run/bootstrap/token`; main: `kubectl apply` of the Secret (image `scheduledTasks.svcTokenKubectlImage`, default `bitnamilegacy/kubectl:1.30`) |
 | CronJob — scrub | `hort-server scrub [--sample-fraction <scheduledTasks.scrub.samplingRate>] [--concurrency <scheduledTasks.scrub.concurrency>]` |
-| CronJobs — staging-sweep / cron-rescan-tick / advisory-watch-tick / service-account-rotation / noop | `hort-cli admin task invoke <kind> --idempotency-key-window minute`; env `HORT_SERVER=http://<fullname>:<service.httpPort>`, `HORT_TOKEN` from the `<fullname>-svc-token` Secret |
+| CronJobs — credentialed admin tasks | `hort-cli admin task invoke <kind>` with the per-task idempotency window; `HORT_SERVER=https://<fullname>:<service.httpPort>` when `tlsSidecar.enabled` (otherwise `http://`), `HORT_TOKEN` from the `<fullname>-svc-token` Secret, and `HORT_EXTRA_CA_BUNDLE` from the chart-managed CA mount for HTTPS |
 
-All five `hort-cli` CronJobs use `concurrencyPolicy: Forbid`. The
-Idempotency-Key window is minute-granular, which makes a **5-minute
-period the practical floor** for any `schedule:` you set on the
-admin-task CronJobs.
+All `hort-cli` admin-task CronJobs use `concurrencyPolicy: Forbid`.
+Frequently scheduled kinds use a minute-granular Idempotency-Key window,
+which makes a **5-minute period the practical floor** for their `schedule:`.
+The retention and archive kinds use a day-granular window.
 
 ---
 
@@ -268,7 +268,7 @@ server boot-crash loop.
 | `replicaCount >= 2` | `storage.backend == s3` | multiple pods racing one RWO PVC that cannot multi-attach. |
 | `auth.provider == oidc` | `auth.oidc.issuerUrl` + `auth.oidc.audience` (non-empty) | booting with an unusable JWT validator. |
 | `auth.tokenExchange.enabled` | `auth.provider == oidc` + `auth.tokenExchange.cliClientId` | enabling the exchange endpoint with no upstream OIDC / CLI client. |
-| `auth.tokenExchange.enabled` | `auth.nativeTokens.enabled == true` + `signingKey.existingSecret` + `signingKey.secretKey` | exchange minting `hort_cli_*` tokens whose validator only wires when native tokens are on (binary `ConfigError::TokenExchangeRequiresNativeTokens`). |
+| `auth.tokenExchange.enabled` | `auth.nativeTokens.enabled == true` + `signingKey.existingSecret` + `signingKey.secretKey` | exchange minting signed CliSession JWTs whose validator only wires when native tokens are on (binary `ConfigError::TokenExchangeRequiresNativeTokens`). |
 | `storage.backend == s3` | `storage.s3.endpoint` + `storage.s3.bucket` + `storage.s3.existingSecret` (non-empty) | an S3 client that cannot be constructed. |
 | `storage.s3.sseMode == sse-kms` | `storage.s3.sseKmsKeyArn` (non-empty) | SSE-KMS writes failing at runtime with no key ARN. |
 | `ephemeralStore.backend == redis` | exactly one of `redis.url` / `redis.existingSecret` (`oneOf`) | redis with no connection string, or an ambiguous double source. |

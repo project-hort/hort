@@ -643,8 +643,26 @@
         }
       }
     },
+    "tlsSidecar": {
+      "description": "Optional nginx TLS terminator in the server pod. Requires an operator-supplied Kubernetes Secret containing tls.crt and tls.key when enabled.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "image": {"type": "string", "minLength": 1},
+        "httpsPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "metricsHttpsPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "secretName": {"type": "string"},
+        "resources": {"type": "object"}
+      },
+      "allOf": [{
+        "if": {"properties": {"enabled": {"const": true}}, "required": ["enabled"]},
+        "then": {"required": ["image", "httpsPort", "metricsHttpsPort", "secretName"], "properties": {"secretName": {"minLength": 1}}}
+      }]
+    },
     "requireHttps": {"type": "boolean"},
     "trustedProxyCidrs": {"type": "array", "items": {"type": "string"}},
+    "tlsNotRequiredFrom": {"type": "array", "items": {"type": "string"}},
     "clientIpFromSocketPeer": {"type": "boolean"},
     "rateLimitExemptCidrs": {"type": "array", "items": {"type": "string"}},
     "http": {
@@ -687,7 +705,12 @@
             "enabled": {"type": "boolean"},
             "interval": {"type": "string"},
             "scrapeTimeout": {"type": "string"},
-            "namespace": {"type": "string"}
+            "namespace": {"type": "string"},
+            "caSecretName": {"type": "string"},
+            "caSecretKey": {"type": "string"},
+            "serverName": {"type": "string"},
+            "bearerSecretName": {"type": "string"},
+            "bearerSecretKey": {"type": "string"}
           }
         }
       }
@@ -744,7 +767,7 @@
       }
     },
     "extraCaBundle": {
-      "description": "Additive HORT_EXTRA_CA_BUNDLE trust anchors. `path` is the in-container mount path. `configMapName` (Recipe A) and `secretName` (Recipe B) are mutually-exclusive auto-mount sources holding the PEM under key `ca.crt`; either one auto-mounts the bundle symmetrically on the server + worker + CronJobs and wires the env. Neither set = fully-manual extraVolumes recipe (chart mounts nothing and sets no env).",
+      "description": "Additive HORT_EXTRA_CA_BUNDLE trust anchors. `path` is the in-container mount path. `configMapName` (Recipe A) and `secretName` (Recipe B) are mutually-exclusive auto-mount sources holding the PEM under key `ca.crt`; either one auto-mounts the bundle symmetrically on the server, worker, DSN-direct CronJobs, and TLS-enabled credentialed admin-task CronJobs. Neither set = fully-manual extraVolumes recipe (chart mounts nothing and sets no env), except that tlsSidecar.enabled with scheduledTasks.adminTasksEnabled requires an auto-mount source for the credentialed CronJobs.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -858,9 +881,9 @@
       "additionalProperties": false,
       "properties": {
         "type": {"type": "string"},
-        "httpPort": {"type": "integer", "minimum": 1},
-        "metricsPort": {"type": "integer", "minimum": 1},
-        "controlPort": {"type": "integer", "minimum": 1},
+        "httpPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "metricsPort": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "controlPort": {"type": "integer", "minimum": 1, "maximum": 65535},
         "annotations": {"type": "object"}
       }
     },

@@ -511,7 +511,9 @@ cat > "${scope_root}/bin/trivy" <<'STUB_TRIVY'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == "--version" ]]; then
-    echo 'Version: 0.70.0'
+    version="$(sed -n 's/^ARG TRIVY_VERSION=\([^[:space:]]*\)[[:space:]]*$/\1/p' "$(dirname "$0")/../docker/Dockerfile.worker")"
+    [[ -n "${version}" ]]
+    printf 'Version: %s\n' "${version}"
     exit 0
 fi
 if [[ "${1:-}" == image && "${2:-}" == --download-db-only ]]; then exit 0; fi

@@ -16,6 +16,9 @@
 /// `ScanIndeterminate`) shared by the non-OCI content routes. See the
 /// module docs.
 pub mod artifact_gate;
+/// **The** RFC 7235 §2.1 `Authorization` auth-scheme rule — the single
+/// definition every inbound surface consults. See the module docs.
+pub mod auth_scheme;
 pub mod authz;
 pub mod body;
 /// Generic pull-through projection-cache envelope shared by the

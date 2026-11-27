@@ -66,6 +66,36 @@ pub(crate) const OCI_NAME_MAX_BYTES: usize = 256;
 /// that pass per-component grammar — see module head).
 pub(crate) const OCI_NAME_MAX_COMPONENTS: usize = 8;
 
+/// Split an OCI namespace into the hort repository key (first segment)
+/// and its image name (all remaining segments). The image-name grammar
+/// is checked separately by [`validate_oci_name`] after source-repo
+/// authorization.
+pub(crate) fn split_oci_namespace(namespace: &str) -> Option<(&str, &str)> {
+    let (repo_key, name) = namespace.split_once('/')?;
+    (!repo_key.is_empty() && !name.is_empty()).then_some((repo_key, name))
+}
+
+#[cfg(test)]
+mod namespace_tests {
+    use super::split_oci_namespace;
+
+    #[test]
+    fn splits_first_segment_and_preserves_nested_name() {
+        assert_eq!(
+            split_oci_namespace("private-repo/library/nginx"),
+            Some(("private-repo", "library/nginx"))
+        );
+        assert_eq!(split_oci_namespace("repo/nginx"), Some(("repo", "nginx")));
+    }
+
+    #[test]
+    fn rejects_missing_repository_or_name() {
+        for namespace in ["", "repo", "/nginx", "repo/"] {
+            assert_eq!(split_oci_namespace(namespace), None, "{namespace:?}");
+        }
+    }
+}
+
 /// Validate `name` against the OCI Distribution Spec name grammar +
 /// the hort byte and component-count caps.
 ///
@@ -213,6 +243,54 @@ pub(crate) fn validate_oci_name(name: &str) -> DomainResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hort_domain::oci::{oci_artifact_path, parse_oci_artifact_path, OciArtifactRole};
+    use hort_domain::types::ContentHash;
+
+    #[test]
+    fn name_grammar_matches_artifact_identity_parser() {
+        let hash: ContentHash = "a".repeat(64).parse().expect("SHA-256 digest");
+        let over_byte_cap = "a".repeat(257);
+        let cases = [
+            ("library/nginx", true),         // A canonical two-component name.
+            ("nginx", true),                 // A single component is valid.
+            ("a_b", true),                   // One underscore separates two runs.
+            ("a__b", false),                 // Consecutive underscores are rejected by hort.
+            ("a--b", false),                 // Consecutive hyphens are rejected by hort.
+            ("a..b", false),                 // Consecutive dots are rejected by hort.
+            (".lead", false),                // A component cannot start with a separator.
+            ("trail.", false),               // A component cannot end with a separator.
+            ("UPPER", false),                // Image names use lowercase ASCII.
+            ("a//b", false),                 // An empty component is invalid.
+            ("a/b/c/d/e/f/g/h/i", false),    // Nine components exceed the cap.
+            (over_byte_cap.as_str(), false), // 257 bytes exceed the cap.
+            ("a:b", false),                  // A colon is not a name character.
+        ];
+        let mut accepted = 0;
+        let mut rejected = 0;
+        for (name, expected) in cases {
+            let wire_accepts = validate_oci_name(name).is_ok();
+            assert_eq!(wire_accepts, expected, "wire grammar changed for {name:?}");
+            for role in [OciArtifactRole::Blob, OciArtifactRole::Manifest] {
+                let path = oci_artifact_path(role, name, &hash);
+                let stored_accepts = matches!(
+                    parse_oci_artifact_path(&path),
+                    Some(parsed) if parsed.role == role && parsed.name == Some(name)
+                );
+                assert_eq!(
+                    stored_accepts, wire_accepts,
+                    "path grammar differs for {name:?}"
+                );
+            }
+            if wire_accepts {
+                accepted += 1;
+            } else {
+                rejected += 1;
+            }
+        }
+        // Both verdicts are required: a constant verdict on either side
+        // must disagree with at least one case.
+        assert_eq!((accepted, rejected), (3, 10));
+    }
 
     // ---------------- Acceptance criteria coverage ------------------------
     //

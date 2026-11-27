@@ -70,8 +70,18 @@ spec:
                 - --idempotency-key-window
                 - minute
               env:
+                {{- if .Values.tlsSidecar.enabled }}
+                # The mounted CA verifies the TLS Service hop; no waiver applies.
+                {{- else }}
+                # The direct plaintext Service hop needs a server-side
+                # tlsNotRequiredFrom scope covering the observed pod peer.
+                {{- end }}
                 - name: HORT_SERVER
-                  value: "http://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                  value: "{{ if .Values.tlsSidecar.enabled }}https{{ else }}http{{ end }}://{{ include "hort-server.fullname" . }}:{{ .Values.service.httpPort | default 8080 }}"
+                {{- if .Values.tlsSidecar.enabled }}
+                - name: HORT_EXTRA_CA_BUNDLE
+                  value: {{ .Values.extraCaBundle.path | quote }}
+                {{- end }}
                 - name: HORT_TOKEN
                   valueFrom:
                     secretKeyRef:
@@ -81,4 +91,12 @@ spec:
                 {{- toYaml .Values.containerSecurityContext | nindent 16 }}
               resources:
                 {{- toYaml .Values.resources | nindent 16 }}
+              {{- if .Values.tlsSidecar.enabled }}
+              volumeMounts:
+                {{- include "hort-server.extraCaBundle.volumeMount" . | nindent 16 }}
+              {{- end }}
+          {{- if .Values.tlsSidecar.enabled }}
+          volumes:
+            {{- include "hort-server.extraCaBundle.volume" . | nindent 12 }}
+          {{- end }}
 {{- end }}

@@ -4,13 +4,13 @@ Public URL:
   {{ .Values.publicBaseUrl }}
 
 Service inside the cluster:
-  http://{{ include "hort-server.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
+  {{ if .Values.tlsSidecar.enabled }}https{{ else }}http{{ end }}://{{ include "hort-server.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}
 
 Verify:
   kubectl --namespace {{ .Release.Namespace }} rollout status deploy/{{ include "hort-server.fullname" . }} --timeout=120s
   kubectl --namespace {{ .Release.Namespace }} get jobs -l app.kubernetes.io/instance={{ .Release.Name }}
-  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "hort-server.fullname" . }} 8080:{{ .Values.service.httpPort }}
-  curl -fsS http://localhost:8080/healthz
+  {{ if .Values.tlsSidecar.enabled }}curl -fsS https://{{ include "hort-server.fullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.service.httpPort }}/healthz{{ else }}kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "hort-server.fullname" . }} 8080:{{ .Values.service.httpPort }}
+  curl -fsS http://localhost:8080/healthz{{ end }}
 
 {{- if .Values.metrics.bindAddr }}
 

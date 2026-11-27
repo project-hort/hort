@@ -1,0 +1,29 @@
+# TLS terminates at the server pod; the edge range remains trusted for client attribution.
+publicBaseUrl: "https://example.com"
+trustedProxyCidrs: ["10.244.3.0/24"]
+tlsSidecar:
+  enabled: true
+  secretName: "hort-server-tls"
+metrics:
+  serviceMonitor:
+    enabled: true
+    caSecretName: "hort-server-service-ca"
+    serverName: "hort-server.default.svc"
+    bearerSecretName: "hort-metrics-token"
+extraCaBundle:
+  path: "/etc/hort-server/ca/ca.crt"
+  configMapName: "hort-server-service-ca"
+scheduledTasks:
+  adminTasksEnabled: true
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+  admin:
+    existingSecret: "hort-admin-db-secret"
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+storage:
+  backend: filesystem

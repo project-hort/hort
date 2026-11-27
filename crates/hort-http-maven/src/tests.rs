@@ -2125,6 +2125,309 @@ async fn snapshot_deploy_put_then_v_level_and_unresolved_get() {
 }
 
 // ---------------------------------------------------------------------------
+// sidecar × unresolved SNAPSHOT — both branches inherit ONE resolution
+// ---------------------------------------------------------------------------
+//
+// `serve_file` resolves the mutable version ONCE, on the path that names the
+// content file, and hands the result to whichever branch runs. These tests
+// hold the invariant `non_servable_response`'s doc states: the file GET and
+// the checksum-sidecar GET resolve the same target artifact and reach the
+// same answer (design §11). The agreement is asserted BETWEEN the two
+// responses — a sidecar that resolved a different build (or none) fails here.
+
+/// A `foo-1.0-SNAPSHOT.jar.{algo}` GET against a repo holding only
+/// TIMESTAMPED builds serves the digest of exactly the build the
+/// `foo-1.0-SNAPSHOT.jar` GET serves — for all four algorithms.
+///
+/// Two builds with different bytes are stored, so "the sidecar resolved the
+/// other build" is a divergence this test sees. Before the single-resolution
+/// dispatch the sidecar branch returned ahead of the resolver and this GET
+/// 404'd: the jar served and its checksum did not.
+#[tokio::test]
+async fn unresolved_snapshot_sidecar_agrees_with_the_file_get_for_every_algorithm() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    let repo = insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    insert_snapshot_build(
+        &mocks,
+        repo.id,
+        "com.example:foo",
+        "1.0-SNAPSHOT",
+        "foo-1.0-20231201.120000-1.jar",
+        b"main-old",
+        QuarantineStatus::Released,
+    );
+    insert_snapshot_build(
+        &mocks,
+        repo.id,
+        "com.example:foo",
+        "1.0-SNAPSHOT",
+        "foo-1.0-20231205.080000-3.jar",
+        b"main-latest",
+        QuarantineStatus::Released,
+    );
+    let router = router(ctx);
+    let unresolved = "/maven/mvn/com/example/foo/1.0-SNAPSHOT/foo-1.0-SNAPSHOT.jar";
+
+    // The file GET is the oracle's input: whatever build it resolved, the
+    // sidecar must digest THOSE bytes.
+    let (st, served) = get(&router, unresolved).await;
+    assert_eq!(st, StatusCode::OK, "the unresolved file GET resolves");
+    assert_eq!(
+        served, b"main-latest",
+        "the file GET resolves the highest (timestamp, buildNumber) build"
+    );
+
+    // Every algorithm, paired with the digest of the bytes the FILE GET
+    // served — so the expectation is "the digest of what the file GET
+    // answered", never a literal.
+    for (algo, expected) in [
+        ("sha1", expected_sha1(&served)),
+        ("sha256", expected_sha256(&served)),
+        ("sha512", expected_sha512(&served)),
+        ("md5", expected_md5(&served)),
+    ] {
+        let res = router
+            .clone()
+            .oneshot(
+                Request::get(format!("{unresolved}.{algo}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::OK,
+            "{algo} sidecar of an unresolved SNAPSHOT must resolve like the file GET"
+        );
+        assert_eq!(
+            res.headers().get(CONTENT_TYPE).unwrap(),
+            "text/plain",
+            "{algo} sidecar is text/plain"
+        );
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            expected,
+            "{algo} sidecar must be the digest of the bytes the file GET served"
+        );
+    }
+}
+
+/// A held resolved build: the sidecar answers exactly what the file GET
+/// answers — same status, same `Retry-After` — and the digest is never
+/// computed (no `mavensum:` entry).
+///
+/// The window anchor is backdated past the default observation window so the
+/// advertised `Retry-After` is the configured floor, a fixed number both
+/// responses must carry identically (an in-window hold would derive its
+/// seconds from `Utc::now()` at each call).
+#[tokio::test]
+async fn unresolved_snapshot_sidecar_inherits_the_file_gets_answer_for_a_held_build() {
+    for status in [QuarantineStatus::Quarantined, QuarantineStatus::Rejected] {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+        let content = b"held-build-bytes";
+        let mut build = insert_snapshot_build(
+            &mocks,
+            repo.id,
+            "com.example:foo",
+            "1.0-SNAPSHOT",
+            "foo-1.0-20231205.080000-3.jar",
+            content,
+            status,
+        );
+        // Anchor the observation window in the past so the hold's remaining
+        // seconds are below the floor and the floor is what is advertised.
+        build.quarantine_window_start = Some(chrono::Utc::now() - chrono::Duration::days(2));
+        mocks.artifacts.insert(build.clone());
+        let floor = ctx.quarantine_retry_after_floor_secs.get();
+        let router = router(ctx);
+        let unresolved = "/maven/mvn/com/example/foo/1.0-SNAPSHOT/foo-1.0-SNAPSHOT.jar";
+
+        let file_res = router
+            .clone()
+            .oneshot(Request::get(unresolved).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let file_status = file_res.status();
+        let file_retry_after = file_res
+            .headers()
+            .get("Retry-After")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_ne!(
+            file_status,
+            StatusCode::OK,
+            "{status:?}: the resolved build is not servable"
+        );
+
+        let side_res = router
+            .clone()
+            .oneshot(
+                Request::get(format!("{unresolved}.sha1"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let side_retry_after = side_res
+            .headers()
+            .get("Retry-After")
+            .map(|v| v.to_str().unwrap().to_string());
+        assert_eq!(
+            side_res.status(),
+            file_status,
+            "{status:?}: the sidecar must answer the file GET's status, not a 404 \
+             from an unresolved path"
+        );
+        assert_eq!(
+            side_retry_after, file_retry_after,
+            "{status:?}: the sidecar must carry the file GET's Retry-After"
+        );
+        if status == QuarantineStatus::Quarantined {
+            assert_eq!(
+                file_retry_after.as_deref(),
+                Some(floor.to_string().as_str()),
+                "an elapsed-window hold advertises the configured floor"
+            );
+        }
+
+        // The digest of a held build is never computed, so nothing is
+        // memoised and nothing leaks into the refusal body.
+        let body = to_bytes(side_res.into_body(), 4096).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&body).contains(&expected_sha1(content)),
+            "{status:?}: the held build's digest must not appear in the refusal"
+        );
+        let key = format!("mavensum:{}:sha1", build.sha256_checksum.as_ref());
+        assert!(
+            mocks.ephemeral_evictable.get(&key).await.unwrap().is_none(),
+            "{status:?}: a held sidecar GET must not compute or memoise the digest"
+        );
+    }
+}
+
+/// No stored build matches the requested `(classifier, extension)` → the
+/// sidecar 404s exactly as the file GET falls through. Covered twice: a base
+/// with builds of a DIFFERENT extension (the resolver runs and matches
+/// nothing) and a base with no builds at all.
+#[tokio::test]
+async fn unresolved_snapshot_sidecar_with_no_matching_build_is_404_like_the_file_get() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    let repo = insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    // Only `.jar` builds are stored.
+    insert_snapshot_build(
+        &mocks,
+        repo.id,
+        "com.example:foo",
+        "1.0-SNAPSHOT",
+        "foo-1.0-20231205.080000-3.jar",
+        b"jar-only",
+        QuarantineStatus::Released,
+    );
+    let router = router(ctx);
+
+    for unresolved in [
+        // A build exists for this base — but for another extension.
+        "/maven/mvn/com/example/foo/1.0-SNAPSHOT/foo-1.0-SNAPSHOT.pom",
+        // A classifier nothing was deployed under.
+        "/maven/mvn/com/example/foo/1.0-SNAPSHOT/foo-1.0-SNAPSHOT-sources.jar",
+        // No builds at all under this base.
+        "/maven/mvn/com/example/bar/2.0-SNAPSHOT/bar-2.0-SNAPSHOT.jar",
+    ] {
+        let (file_st, _) = get(&router, unresolved).await;
+        let (side_st, _) = get(&router, &format!("{unresolved}.sha1")).await;
+        assert_eq!(
+            file_st,
+            StatusCode::NOT_FOUND,
+            "{unresolved}: no matching build → the file GET 404s"
+        );
+        assert_eq!(
+            side_st, file_st,
+            "{unresolved}: the sidecar must answer the file GET's status"
+        );
+    }
+}
+
+/// The resolver's pre-filters cost a release / already-timestamped sidecar
+/// NOTHING: neither takes the extra `find_by_name_in_repo` group read.
+///
+/// The probe is an armed one-shot failure on that read. A release sidecar and
+/// a timestamped sidecar must both serve while it is armed (the read never
+/// happened); the unresolved sidecar afterwards consumes it, which is what
+/// proves the probe was live rather than mis-wired.
+#[tokio::test]
+async fn release_and_timestamped_sidecars_take_no_group_read() {
+    let (ctx, mocks) = build_mock_ctx(handle());
+    let repo = insert_repo(&mocks, "mvn", RepositoryFormat::Maven);
+    let release = b"release-bytes";
+    insert_file(
+        &mocks,
+        repo.id,
+        "com.example:foo",
+        "1.0",
+        "com/example/foo/1.0/foo-1.0.jar",
+        release,
+        QuarantineStatus::Released,
+    );
+    let timestamped = b"timestamped-bytes";
+    insert_snapshot_build(
+        &mocks,
+        repo.id,
+        "com.example:foo",
+        "2.0-SNAPSHOT",
+        "foo-2.0-20231205.080000-3.jar",
+        timestamped,
+        QuarantineStatus::Released,
+    );
+    // One armed failure on the group read, consumed by the FIRST caller that
+    // reaches it.
+    mocks
+        .artifacts
+        .fail_next_find_by_name_in_repo(hort_domain::error::DomainError::Conflict(
+            "group read must not happen for a concrete path".into(),
+        ));
+    let router = router(ctx);
+
+    let (st, body) = get(&router, "/maven/mvn/com/example/foo/1.0/foo-1.0.jar.sha1").await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "a release sidecar must not reach the group read"
+    );
+    assert_eq!(std::str::from_utf8(&body).unwrap(), expected_sha1(release));
+
+    let (st, body) = get(
+        &router,
+        "/maven/mvn/com/example/foo/2.0-SNAPSHOT/foo-2.0-20231205.080000-3.jar.sha1",
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::OK,
+        "an already-timestamped sidecar must not reach the group read"
+    );
+    assert_eq!(
+        std::str::from_utf8(&body).unwrap(),
+        expected_sha1(timestamped)
+    );
+
+    // The armed failure is still queued — the unresolved sidecar is the one
+    // request that does take the group read, and it consumes it.
+    let (st, _) = get(
+        &router,
+        "/maven/mvn/com/example/foo/2.0-SNAPSHOT/foo-2.0-SNAPSHOT.jar.sha1",
+    )
+    .await;
+    assert_eq!(
+        st,
+        StatusCode::CONFLICT,
+        "the armed group-read failure was still waiting: the two sidecars above \
+         took zero group reads"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Proxy-repo pull-through wiring (Item 9, design §8, ADR 0033)
 // ---------------------------------------------------------------------------
 //
@@ -2194,6 +2497,57 @@ mod proxy_pull_through {
     }
 
     const REL: &str = "com/example/foo/1.0/foo-1.0.jar";
+
+    /// A Proxy repo's unresolved-SNAPSHOT **sidecar** is answered from the
+    /// locally-cached timestamped builds exactly as a hosted repo's is — the
+    /// single resolution runs for every non-virtual repo type. A local miss
+    /// stays a 404 and makes NO upstream request: the sidecar branch returns
+    /// ahead of the pull-through dispatch, which applies to artifact FILES
+    /// only (design §8).
+    #[tokio::test]
+    async fn proxy_unresolved_snapshot_sidecar_serves_the_cached_build_and_never_pulls() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let repo = proxy_repo(&mocks, "mvn-proxy");
+        seed_mapping(&mocks, repo.id);
+        insert_snapshot_build(
+            &mocks,
+            repo.id,
+            "com.example:foo",
+            "1.0-SNAPSHOT",
+            "foo-1.0-20231205.080000-3.jar",
+            b"cached-timestamped-build",
+            QuarantineStatus::Released,
+        );
+        let router = router(ctx);
+        let unresolved = "/maven/mvn-proxy/com/example/foo/1.0-SNAPSHOT/foo-1.0-SNAPSHOT.jar";
+
+        let (st, served) = get(&router, unresolved).await;
+        assert_eq!(st, StatusCode::OK, "the cached build serves on a proxy");
+        let (st, body) = get(&router, &format!("{unresolved}.sha1")).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "a cached build's sidecar resolves on a proxy too"
+        );
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            expected_sha1(&served),
+            "the proxy sidecar is the digest of the bytes the file GET served"
+        );
+
+        // A base with nothing cached locally: 404, and no upstream leg.
+        let (st, _) = get(
+            &router,
+            "/maven/mvn-proxy/com/example/bar/2.0-SNAPSHOT/bar-2.0-SNAPSHOT.jar.sha1",
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "nothing cached → 404");
+        assert_eq!(
+            mocks.upstream_proxy.metadata_calls(),
+            0,
+            "a sidecar GET must never enter the pull-through path"
+        );
+    }
 
     /// Proxy cache miss + happy upstream → 200 with the verified bytes.
     #[tokio::test]
@@ -2680,6 +3034,45 @@ mod virtual_repo {
             "virtual file download must route to the member"
         );
         assert_eq!(body, b"JARBYTES");
+    }
+
+    /// An unresolved-SNAPSHOT **sidecar** through a virtual resolves inside the
+    /// member hop: the virtual recursion hands the per-member `serve_file` the
+    /// whole request tail, so the member's own single resolution serves both
+    /// branches (ADR 0031 — the virtual hop adds nothing and takes nothing
+    /// away). Asserted as the agreement between the two virtual responses.
+    #[tokio::test]
+    async fn virtual_unresolved_snapshot_sidecar_agrees_with_the_virtual_file_get() {
+        let (ctx, mocks) = build_mock_ctx(handle());
+        let a = insert_repo(&mocks, "mvn-a", RepositoryFormat::Maven);
+        insert_snapshot_build(
+            &mocks,
+            a.id,
+            "com.example:foo",
+            "1.0-SNAPSHOT",
+            "foo-1.0-20231205.080000-3.jar",
+            b"member-build-bytes",
+            QuarantineStatus::Released,
+        );
+        let _virt = insert_virtual_repo(&mocks, "mvn-virt", &[&a]);
+        let router = router(ctx);
+        let unresolved = "/maven/mvn-virt/com/example/foo/1.0-SNAPSHOT/foo-1.0-SNAPSHOT.jar";
+
+        let (st, served) = get(&router, unresolved).await;
+        assert_eq!(st, StatusCode::OK, "the virtual file GET resolves");
+        assert_eq!(served, b"member-build-bytes");
+
+        let (st, body) = get(&router, &format!("{unresolved}.sha1")).await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "the virtual sidecar must resolve through the member like the file GET"
+        );
+        assert_eq!(
+            std::str::from_utf8(&body).unwrap(),
+            expected_sha1(&served),
+            "the virtual sidecar is the digest of the bytes the virtual file GET served"
+        );
     }
 
     /// A virtual file download for a coordinate no member has → 404 (the owner

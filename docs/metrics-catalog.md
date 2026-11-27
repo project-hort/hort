@@ -35,6 +35,9 @@ its labels and units.
 | `source` | Per-metric origin classification. `hort_service_account_authenticated_total`: `federated`, `pat`. `hort_dispatcher_principal_resolved_total`: `snapshot_present`, `snapshot_empty_admin`, `snapshot_empty_no_admin`. Each metric's catalog entry is authoritative for its value set; the sets are disjoint and closed. | ≤3 per metric |
 | `mode` | `off`, `verify_if_present`, `required` (resolved `provenance_mode` on `hort_provenance_verify_total`; lowercase wire-form of `ProvenanceMode`) | 3 |
 | `method`, `path`, `status` | HTTP — `path` MUST be the matched route template | ~50 routes |
+| `entry_point` | `require`, `optional`, `metrics`, `oci_consume`, `oci_mint`, `exchange` (`hort_credential_transport_total`) | 6 |
+| `evidence` | `tls`, `plaintext`, `unknown` (`hort_credential_transport_total`) | 3 |
+| `scope` | `declared`, `unscoped` (`hort_credential_transport_waived_total`) | 2 |
 
 **Cardinality ceiling note:** with `repository` (~10k) × `format` (~40) ×
 `result` (~6), the theoretical ceiling per metric is ~2.4M series. In
@@ -177,9 +180,55 @@ fail2ban / SIEM consumers.
 
 ### Auth middleware
 
+| Metric | Type | Labels | Unit | Label values |
+|--------|------|--------|------|--------------|
+| `hort_credential_transport_total` | counter | `entry_point`, `evidence` | — | `entry_point` ∈ `require`, `optional`, `metrics`, `oci_consume`, `oci_mint`, `exchange`; `evidence` ∈ `tls`, `plaintext`, `unknown` |
+| `hort_credential_transport_refusals_total` | counter | `entry_point` | — | `entry_point` ∈ `require`, `optional`, `metrics`, `oci_consume`, `oci_mint`, `exchange` |
+| `hort_credential_transport_waived_total` | counter | `entry_point`, `scope` | — | `entry_point` ∈ `require`, `optional`, `metrics`, `oci_consume`, `oci_mint`, `exchange`; `scope` ∈ `declared`, `unscoped` |
+
+The first counter **observes** every request that presents a token (or
+`subject_token`) or would mint one, by the evidence actually derived; it never
+decides anything. The other two count the policy outcome: a refusal, and a
+waiver by the instrument that granted it. An allowed request is counted by
+neither — it is the difference — and a waived request keeps the evidence it
+had, so "how much of my traffic has no TLS evidence" stays answerable after a
+waiver is in place.
+
+`metrics` is the separate admin listener's `GET /metrics` route; `oci_mint`
+includes anonymous `/v2/auth` mint requests, which are refused on the same
+terms as credentialed ones because the response is a bearer either way. Absent
+trust context is recorded as `unknown` and refused. Neither client IP nor raw
+socket peer is a label; the trust layer logs those at debug level.
+
+**`exchange` counts by the request rather than by the body.** On the token
+endpoint the subject of the rule is the request to it — RFC 6749 §3.2 is
+written that way — so every request whose form body parsed is observed here,
+whether or not it carried a `subject_token`. A body the server could not parse
+is counted by none of the three: it carries no credential that could have been
+read and mints nothing. That keeps `hort_credential_transport_total` the
+denominator of the other two on this entry point, which a condition keyed on a
+form-field name would not.
+
+The refusal and waiver counters carry the same closed `entry_point` set as the
+observation counter, and every value emits them: `require`, `optional` and
+`metrics` refuse in the generic `{"error":…}` body, `oci_consume` and
+`oci_mint` refuse in the OCI Distribution-Spec `errors` envelope, and
+`exchange` refuses in its own OAuth `{"error","error_description"}` envelope. A
+refusal is `426 Upgrade Required` with `Upgrade: TLS/1.2, HTTP/1.1` on every
+surface.
+
+One asymmetry is visible in these counters and nowhere else: `exchange` never
+emits `hort_credential_transport_waived_total{scope="unscoped"}`, because the
+unscoped `HORT_BEARER_ALLOW_OVER_HTTP` does not reach the token endpoint (see
+the `pat_over_http` entry under *Unsafe config opt-ins*). A climb in
+`hort_credential_transport_refusals_total{entry_point="exchange"}` on a
+deployment that has that flag set is therefore the expected reading, not a
+contradiction — the remedy is TLS or `HORT_TLS_NOT_REQUIRED_FROM`, and the
+`426` body says so.
+
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_auth_attempts_total` | counter | `result` | — | `success`, `missing_header`, `invalid_token`, `expired`, `unknown_issuer`, `idp_unavailable` |
+| `hort_auth_attempts_total` | counter | `result` | — | `success`, `missing_header`, `invalid_token`, `expired`, `unknown_issuer`, `idp_unavailable`, `transport_refused` |
 
 Emitted by both `hort-http-core::middleware::auth::require_principal` (write
 paths) and `hort-http-core::middleware::auth::extract_optional_principal` (read
@@ -188,8 +237,8 @@ request that hits the auth layer regardless of side. Emission covers the
 read path so SIEM / fail2ban consumers can detect read-side
 credential-stuffing (the read layer otherwise swallows every IdP failure
 with `.ok()` and the metric would be silent for those calls). The
-read path still surfaces `Option<CallerPrincipal> = None` on any failure
-(no `401`); the wire-level contract is unchanged.
+read path still surfaces `Option<CallerPrincipal> = None` on token-validation
+failure (no `401`); a transport refusal answers `426` before validation.
 
 **`result` semantics:**
 
@@ -854,7 +903,7 @@ labels — same anti-pattern discipline as the counter.
 
 | Metric | Type | Labels | Unit | `result` values |
 |--------|------|--------|------|-----------------|
-| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, replayed_jti, replayed_composite, replay_guard_unavailable, jti_required, mint_failed, mint_contended, internal_error, bad_request, cap_exceeds_authority}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success`, `bad_request` (shared wire-shape errors), and `cap_exceeds_authority` (a requested scope the caller's authority does not cover, on either branch). |
+| `hort_token_exchange_total` | counter | `kind`, `result` | — | `kind ∈ {cli_session, federated_jwt}` (`refresh` reserved for a future refresh-token phase). `result ∈ {success, source_token_invalid, source_token_expired, source_token_pat_rejected, idp_unavailable, bad_request, subject_not_authorised, cap_exceeds_authority, validation_error, infrastructure_error, transport_refused}` for `kind = cli_session`; `result ∈ {success, invalid_format, unknown_issuer, algorithm_not_allowed, unknown_kid, signature_invalid, aud_mismatch, expired, not_yet_valid, no_sa_match, multiple_sa_match, replayed_jti, replayed_composite, replay_guard_unavailable, jti_required, mint_failed, mint_contended, internal_error, bad_request, cap_exceeds_authority}` for `kind = federated_jwt`. The per-kind sets are disjoint except for `success`, `bad_request` (shared wire-shape errors), and `cap_exceeds_authority` (a requested scope the caller's authority does not cover, on either branch). `transport_refused` is the credential-transport refusal (HTTP 426), and it appears under `kind = cli_session` only — it fires before the `subject_token_type` dispatch, so it is attributed like every other pre-dispatch gate even though it covers **both** mint branches. |
 | `hort_token_exchange_duration_seconds` | histogram | `kind`, `result` | seconds | same set as the counter |
 | `hort_session_admin_issuance_total` | counter | `result` | — | `granted`, `denied_flag`, `denied_authority`, `denied_lifetime` |
 | `hort_fed_sa_match_total` | counter | `result` | — | `matched`, `denied_audience`, `denied_empty_claims` |
@@ -1107,15 +1156,18 @@ unsafe as a label — clients can set it arbitrarily.
 **Relationship to `hort_api_token_issued_total{kind="cli"}`:** the
 two metrics count different stages of the same flow.
 `hort_token_exchange_total` covers the exchange-path-specific
-gates (form parsing, grant_type, PAT-shape, IdP validation) AND
+gates (form parsing, the credential-transport decision, grant_type,
+PAT-shape, IdP validation) AND
 the success pairing; `hort_api_token_issued_total{kind="cli"}` is
 the per-issuance-pipeline metric and fires inside
 `issue_cli_session` for every Ok and Err arm. On a 200 response,
 BOTH increment exactly once: `hort_token_exchange_total{result="success"}`
 AND `hort_api_token_issued_total{kind="cli", result="success"}`.
-On a PAT-shape rejection or IdP failure, only
+On a PAT-shape rejection, a transport refusal, or an IdP failure, only
 `hort_token_exchange_total` increments — `issue_cli_session` is
-never called. On a cap-vs-grants issuance reject (rare —
+never called. (On a transport refusal the federated branch's
+`issue_for_service_account_system` is not called either: the decision
+fires before the `subject_token_type` dispatch, so neither mint runs.) On a cap-vs-grants issuance reject (rare —
 typically a misconfigured group_mapping leaving the JIT user
 without Read/Write/Delete), BOTH increment with the same label:
 `hort_token_exchange_total{result="cap_exceeds_authority"}` AND
@@ -5562,7 +5614,7 @@ them).
 
 | Metric | Type | Labels | Unit | Notes |
 |--------|------|--------|------|-------|
-| `hort_event_chain_checkpoint_total` | counter | `result` | cycles | One increment per checkpoint-emission cycle. `result ∈ {emitted, sign_failed, anchor_write_failed}` — exactly these three, a per-metric closed enum. `emitted` = the signed checkpoint was durably WORM-anchored; `anchor_write_failed` = the cycle could not anchor (anchor-store read/write or live-chain DB read failed — retryable, the CronJob retries next tick); `sign_failed` = a signing fault. **Distinct** from `hort_event_chain_verify_total` (a different metric at a different layer — the verifier; never conflated, architect one-metric-one-layer + reserved-name discipline). |
+| `hort_event_chain_checkpoint_total` | counter | `result` | cycles | One increment per checkpoint-emission cycle. `result ∈ {emitted, sign_failed, anchor_write_failed}` — exactly these three, a per-metric closed enum. `emitted` = the signed checkpoint was durably WORM-anchored; `anchor_write_failed` = the cycle could not anchor (anchor-store read/write failed, the live-chain DB read failed, or the stored chain evidence could not be read back) — the first two retryable, the third terminal; `sign_failed` = a signing fault. **Distinct** from `hort_event_chain_verify_total` (a different metric at a different layer — the verifier; never conflated, architect one-metric-one-layer + reserved-name discipline). |
 
 **`result` label semantics** (closed taxonomy of exactly 3):
 
@@ -5571,6 +5623,7 @@ them).
 | `emitted` | signed checkpoint durably WORM-anchored | `TaskOutcome::Completed` |
 | `sign_failed` | a signing fault (**reserved**: no v1 runtime path — the signing key is validated at adapter construction and ed25519 signing of an in-memory `Vec` is infallible, so a cycle cannot reach a sign fault at run time; the label is in the closed taxonomy and exercised by the `DebuggingRecorder` catalog test so the schema is complete and a future signing-fault surface has a pre-reserved label — documented, not faked) | `TaskOutcome::Failed { retry: true }` |
 | `anchor_write_failed` | could not anchor this cycle (anchor-store read/write failure, or the live-chain DB snapshot failed — the taxonomy has no separate `db_read_failed`; "could not anchor this cycle" is `anchor_write_failed`) | `TaskOutcome::Failed { retry: true }` |
+| `anchor_write_failed` | the **stored chain evidence could not be read back** (a chain-hash column that is not 32 bytes, a `StreamSealed` payload that does not decode). Same label — the enum stays closed at three values, and this is still "could not anchor this cycle" — but **not** the same condition: reading the same bytes again reaches the same verdict | `TaskOutcome::Failed { retry: false }`, so `hort_admin_tasks_completed_total{kind="eventstore-checkpoint",result="failed_terminal"}` rather than `failed_retry`, plus a distinct `error!` carrying `chain_evidence_locus` |
 
 **Single emitter (architect "one metric, one layer, no double-count"):**
 emitted **only** at the `hort-app` emission-task layer
@@ -5583,23 +5636,30 @@ adapter emit nothing. `result` is a per-metric schema label holding
 exactly the three values above; adding any other label/value is
 FORBIDDEN (per-metric closed-enum rule). Cardinality ≤ 3 series.
 
-**S3 Object-Lock WORM nuance (precise, not fudged):** `object_store`
-0.13 exposes no API to set per-object Object-Lock retention on `put`
-(`PutOptions` carries only `mode`/`TagSet`/a fixed `Attributes`
-enum/opaque ignored `extensions`). The emitter does a plain `put`; the
-WORM guarantee is the **operator-provisioned bucket default retention**
-— the anchor bucket MUST be created with **S3 Object Lock enabled + a
-COMPLIANCE-mode default retention** (S3 then stamps every new object
-automatically). The residual: the application cannot enforce/verify the
-bucket provisioning through `object_store`; the deployment hardening
-guide states the requirement (see the `ObjectStoreCheckpointEmitter`
-type doc). Tracing: `info!` on a successful emission (seq,
+**S3 Object-Lock WORM nuance, as it bears on these metrics:**
+`object_store` 0.14 exposes no API to set per-object Object-Lock
+retention on `put`, so the emitter does a plain `put` and the WORM
+guarantee is the operator-provisioned bucket default retention. **No
+metric here can observe whether that provisioning is correct** — a
+`put` to a bucket with no default retention succeeds and reports
+`result="ok"` exactly like a protected one, so a `success` series is
+not evidence of WORM. The requirement, both failure modes and the
+out-of-band verification command are in the deployment hardening guide,
+section *Provision the anchor bucket for WORM*; the
+`ObjectStoreCheckpointEmitter` type doc carries the library-level
+reasoning. Tracing: `info!` on a successful emission (seq,
 max_global_position, stream count, backfill flag — NO key material);
 `error!` on sign / anchor-write failure (unrecoverable for that cycle).
 No `#[instrument(err)]` (a failed cycle is a `TaskOutcome::Failed`, not
 a `Result::Err`).
 
-**Alert spec:** alert on
+**Alert spec:** unreadable stored chain evidence is the most urgent
+condition this emitter can report and it does **not** have its own
+`result` value, so alert on it where it is distinguishable:
+`increase(hort_admin_tasks_completed_total{kind="eventstore-checkpoint",result="failed_terminal"}[period]) > 0`,
+and on the `chain_evidence_locus` field of the emitter's `error!` event
+(a field match, never a substring match on the message). Separately,
+alert on
 `increase(hort_event_chain_checkpoint_total{result="anchor_write_failed"}[period]) > 0`
 (a sustained inability to anchor — the chain is no longer externally
 attested; this is the condition `hort_event_chain_verify_total{result="missing_checkpoint"}`
@@ -6103,13 +6163,21 @@ dashboards alarm on any non-zero value.
 matching env-var parser in `hort-server::config` and a paired catalog
 edit):
 
-- `pat_over_http` — `HORT_BEARER_ALLOW_OVER_HTTP=true` lets bearer auth
-  (PAT-shaped tokens AND CliSession-family JWTs — the transport gate
-  covers all bearers, not just PATs) proceed over plaintext HTTP. The
-  default-OFF posture refuses with `426 Upgrade Required`. Enabling this
+- `pat_over_http` — `HORT_BEARER_ALLOW_OVER_HTTP=true` is the **unscoped**
+  waiver of the credential-transport requirement: any presented
+  credential proceeds with no evidence of TLS, from any peer, on every
+  credential surface **except the token endpoint**
+  (`POST /api/v1/auth/exchange`), which it does not reach — RFC 6749 §3.2
+  binds the authorization server there, so that one refusal is not the
+  operator's to waive without naming a scope. The default-OFF posture
+  refuses with `426 Upgrade Required`. Enabling this
   on a public-facing deployment is a credential-leak vector; the gauge is
-  the boot-time audit trail. (The metric `kind` label stays `pat_over_http`
-  for continuity even though the knob now covers all bearers.)
+  the boot-time audit trail. The scoped alternative,
+  `HORT_TLS_NOT_REQUIRED_FROM`, sets no gauge — it is per-request and
+  therefore counted, as `hort_credential_transport_waived_total{scope="declared"}`
+  — and it is the only waiver that reaches the token endpoint.
+  (The `kind` label stays `pat_over_http` for continuity even though the
+  knob's subject is no longer a token shape.)
 - `plaintext_webhooks` — `HORT_WEBHOOK_ALLOW_PLAINTEXT=true` lets
   subscription webhook URLs use the `http://` scheme. The default-
   OFF posture rejects non-https URLs at subscription-create with

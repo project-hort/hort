@@ -17,6 +17,18 @@ Repositories have a stable `metadata.name` and an artifact format. A `proxy` rep
 
 hort supports OCI/Docker, npm, PyPI, Cargo, and Maven/Gradle. Virtual repositories are supported for npm, PyPI, Cargo and Maven/Gradle, **not OCI**. Do not combine different formats or nest virtual repositories.
 
+## OCI referrers metadata compatibility
+
+OCI subject-reference records written before the descriptor metadata projection
+do not contain the referring name, config media type, or annotations. They are
+not backfilled. A missing key on such a record means **unknown**, not that the
+referring manifest declared the field absent. A same-digest re-push preserves
+the existing record's metadata; it does not fill these keys. If the same
+manifest bytes are published under multiple names in one repository, those
+names still share one artifact and subject-reference record, so the record
+cannot retain every name.
+The referrers response remains unchanged by this storage update.
+
 ## Set up a repository
 
 1. Decide whether clients will publish (`hosted`) or consume from an upstream (proxy or a hosted repository with explicit upstream mappings, depending on the format and supported configuration).

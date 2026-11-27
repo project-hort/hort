@@ -297,8 +297,35 @@ mod scan_kind_classification_tests {
                 "simple/legacy/legacy-1.0-py3.7.egg",
                 ArtifactKind::Other,
             ),
-            // OCI: a tag-addressed manifest is still a manifest.
-            ("oci", "manifests/v1.2.3", ArtifactKind::OciManifest),
+            // OCI identities are digest-addressed; an unproducible path stays
+            // unclassified so it cannot clear a gate.
+            ("oci", "manifests/v1.2.3", ArtifactKind::Other),
+            (
+                "oci",
+                concat!(
+                    "manifests/library/nginx/sha256:",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                ArtifactKind::OciManifest,
+            ),
+            (
+                "oci",
+                concat!(
+                    "blobs/library/nginx/sha256:",
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                ArtifactKind::OciBlob,
+            ),
+            (
+                "oci",
+                "manifests/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ArtifactKind::OciManifest,
+            ),
+            (
+                "oci",
+                "blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                ArtifactKind::OciBlob,
+            ),
         ];
         for (key, path, expected) in cases {
             let got = handler(key).scan_kind(&artifact_row_at(path));

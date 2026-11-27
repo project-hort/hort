@@ -199,6 +199,7 @@ pub struct MockArtifactRepository {
     /// must not read a failed lookup as "not present" and re-fetch content the
     /// repository may already hold.
     find_by_path_errors: Mutex<std::collections::VecDeque<DomainError>>,
+    find_by_path_error_at: Mutex<Option<(String, DomainError)>>,
     /// FIFO of injected errors for
     /// [`find_by_name_in_repo`](ArtifactRepository::find_by_name_in_repo).
     /// Each call pops the front and returns it verbatim. Lets a test
@@ -289,6 +290,7 @@ impl MockArtifactRepository {
             oci_calls: Mutex::new(Vec::new()),
             package_version_status_errors: Mutex::new(std::collections::VecDeque::new()),
             find_by_path_errors: Mutex::new(std::collections::VecDeque::new()),
+            find_by_path_error_at: Mutex::new(None),
             find_by_name_in_repo_errors: Mutex::new(std::collections::VecDeque::new()),
             row_after_next_find_by_id: Mutex::new(HashMap::new()),
             status_after_next_find_by_path: Mutex::new(HashMap::new()),
@@ -416,6 +418,10 @@ impl MockArtifactRepository {
     /// failures.
     pub fn fail_next_find_by_path(&self, err: DomainError) {
         self.find_by_path_errors.lock().unwrap().push_back(err);
+    }
+
+    pub fn fail_find_by_path_at(&self, path: String, err: DomainError) {
+        *self.find_by_path_error_at.lock().unwrap() = Some((path, err));
     }
 
     /// Pin the allowlist that
@@ -902,6 +908,12 @@ impl ArtifactRepository for MockArtifactRepository {
         repository_id: Uuid,
         path: &str,
     ) -> BoxFut<'_, DomainResult<Option<Artifact>>> {
+        let mut targeted = self.find_by_path_error_at.lock().unwrap();
+        if targeted.as_ref().is_some_and(|(target, _)| target == path) {
+            let (_, err) = targeted.take().unwrap();
+            return Box::pin(async move { Err(err) });
+        }
+        drop(targeted);
         if let Some(err) = self.find_by_path_errors.lock().unwrap().pop_front() {
             return Box::pin(async move { Err(err) });
         }
@@ -1335,7 +1347,7 @@ impl ArtifactRepository for MockArtifactRepository {
 
     /// Mock for the OCI membership-edge-backfill candidacy query. Mirrors
     /// [`Self::find_pypi_wheels_without_kind`]'s shape: the SQL adapter's
-    /// `path LIKE '%.whl'` becomes `path LIKE 'manifests/sha256:%'`, and
+    /// `path LIKE '%.whl'` becomes a match on the domain manifest role prefix, and
     /// the media-type / index-exclusion join has no mock-side equivalent
     /// (this mock has no `artifact_metadata` table) — tests that need to
     /// model an index-shaped row simply do not insert it as a candidate
@@ -1364,7 +1376,7 @@ impl ArtifactRepository for MockArtifactRepository {
             .unwrap()
             .values()
             .filter(|a| {
-                a.path.starts_with("manifests/sha256:")
+                a.path.starts_with(hort_domain::oci::OCI_MANIFEST_PATH_PREFIX)
                     && match &filter {
                         None => true,
                         Some(allowed) => allowed.contains(&a.id),
@@ -5943,6 +5955,16 @@ impl VersionDiscovery for StubFormatHandler {
 pub struct MockIdentityProvider {
     claims_by_token: Mutex<HashMap<String, IdpClaims>>,
     errors_by_token: Mutex<HashMap<String, OidcValidationError>>,
+    /// How many times [`IdentityProvider::validate_token`] was invoked.
+    ///
+    /// A **count**, not a log of the tokens: a caller that needs to know
+    /// *which* token reached the IdP registers an outcome for it and
+    /// asserts on that, and a mock is not a place to accumulate
+    /// credential-shaped strings. What this answers is the absence
+    /// question — a gate that claims to fire "before any IdP call" is
+    /// only proved by a zero here, because the status code alone cannot
+    /// tell a refusal before the call apart from one after it.
+    validate_calls: AtomicUsize,
 }
 
 impl MockIdentityProvider {
@@ -5950,7 +5972,14 @@ impl MockIdentityProvider {
         Self {
             claims_by_token: Mutex::new(HashMap::new()),
             errors_by_token: Mutex::new(HashMap::new()),
+            validate_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times `validate_token` has been called. See
+    /// [`Self::validate_calls`].
+    pub fn validate_call_count(&self) -> usize {
+        self.validate_calls.load(Ordering::SeqCst)
     }
 
     /// Register `claims` as the result of validating `token`. The mock stores
@@ -5976,6 +6005,7 @@ impl MockIdentityProvider {
 
 impl IdentityProvider for MockIdentityProvider {
     fn validate_token(&self, token: &str) -> BoxFuture<'_, Result<IdpClaims, OidcValidationError>> {
+        self.validate_calls.fetch_add(1, Ordering::SeqCst);
         // Registered error takes precedence over claims — lets a test
         // "poison" a token that was previously registered with claims.
         if let Some(err) = self.errors_by_token.lock().unwrap().get(token).cloned() {
@@ -7764,6 +7794,9 @@ pub struct MockUpstreamProxy {
     /// from "they all were".
     blob_fetch_log: Mutex<Vec<String>>,
     manifests: Mutex<HashMap<(String, String, String), ManifestFetch>>,
+    /// Every `fetch_manifest` reference, in call order. Lets a test
+    /// distinguish a manifest served from its row from one fetched again.
+    manifest_fetch_log: Mutex<Vec<String>>,
     /// One-shot failure for the next `fetch_manifest` call. Drained on
     /// consumption. Used to drive the `UpstreamUnavailable` path
     /// without bringing up an actual upstream — the helper classifies
@@ -7850,6 +7883,7 @@ impl MockUpstreamProxy {
             blob_errors: Mutex::new(HashMap::new()),
             blob_fetch_log: Mutex::new(Vec::new()),
             manifests: Mutex::new(HashMap::new()),
+            manifest_fetch_log: Mutex::new(Vec::new()),
             next_manifest_error: Mutex::new(None),
             metadata: Mutex::new(HashMap::new()),
             next_metadata_error: Mutex::new(None),
@@ -8068,6 +8102,10 @@ impl MockUpstreamProxy {
         self.blob_fetch_log.lock().unwrap().clone()
     }
 
+    pub fn manifest_fetches(&self) -> Vec<String> {
+        self.manifest_fetch_log.lock().unwrap().clone()
+    }
+
     /// Seed a one-shot failure on the next
     /// `fetch_referrers` call. Cleared on consumption. Mirrors
     /// [`Self::fail_next_manifest_with`] / [`Self::fail_next_metadata_with`].
@@ -8162,6 +8200,10 @@ impl UpstreamProxy for MockUpstreamProxy {
         reference: String,
         _accept: Vec<String>,
     ) -> BoxFuture<'_, DomainResult<ManifestFetchOutcome>> {
+        self.manifest_fetch_log
+            .lock()
+            .unwrap()
+            .push(reference.clone());
         // The mock keys on (path_prefix, upstream_name, reference)
         // and ignores Accept — production tests don't currently
         // assert on Accept negotiation. Mocks accept the parameter
@@ -10183,6 +10225,15 @@ pub struct MockFederatedJwtValidator {
     /// tests assert that the warm-up was invoked with the expected
     /// issuer name regardless of outcome.
     refresh_calls: Mutex<Vec<String>>,
+    /// How many times [`FederatedJwtValidator::validate`] was invoked.
+    ///
+    /// A count rather than a log of the JWTs, for the same reason
+    /// [`MockIdentityProvider::validate_calls`] is one. It answers the
+    /// absence question a status code cannot: a gate that claims to fire
+    /// before any federated validation is only proved by a zero here.
+    ///
+    /// [`FederatedJwtValidator::validate`]: hort_domain::ports::federated_jwt_validator::FederatedJwtValidator::validate
+    validate_calls: AtomicUsize,
 }
 
 impl Default for MockFederatedJwtValidator {
@@ -10197,7 +10248,14 @@ impl MockFederatedJwtValidator {
             outcomes: Mutex::new(HashMap::new()),
             refresh_outcomes: Mutex::new(HashMap::new()),
             refresh_calls: Mutex::new(Vec::new()),
+            validate_calls: AtomicUsize::new(0),
         }
+    }
+
+    /// How many times `validate` has been called. See
+    /// [`Self::validate_calls`].
+    pub fn validate_call_count(&self) -> usize {
+        self.validate_calls.load(Ordering::SeqCst)
     }
 
     /// Pin the validator to return [`Ok(claims)`] for the given raw
@@ -10262,6 +10320,7 @@ impl hort_domain::ports::federated_jwt_validator::FederatedJwtValidator
             hort_domain::ports::federated_jwt_validator::FederationDenyReason,
         >,
     > {
+        self.validate_calls.fetch_add(1, Ordering::SeqCst);
         let key = jwt.to_string();
         let outcome = self
             .outcomes

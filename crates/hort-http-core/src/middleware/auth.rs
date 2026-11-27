@@ -43,12 +43,19 @@ use base64::Engine as _;
 
 use hort_app::error::AppError;
 use hort_app::metrics::labels::RESULT;
+use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::error::DomainError;
 use hort_domain::ports::identity_provider::OidcValidationError;
 
+use crate::auth_scheme::{strip_auth_scheme, AuthScheme};
 use crate::context::{AppContext, AuthContext};
 use crate::error::ApiError;
+use crate::middleware::credential_transport::{
+    credential_transport_verdict, record_credential_transport, record_credential_transport_verdict,
+    CredentialEntryPoint, CredentialTransportVerdict, UPGRADE_OFFER,
+};
+use crate::middleware::trust::RequestTrust;
 
 // ---------------------------------------------------------------------------
 // AuthenticatedPrincipal — the only typed slot a downstream extractor
@@ -208,6 +215,13 @@ const RESULT_UNKNOWN_ISSUER: &str = "unknown_issuer";
 /// distinguish an IdP outage from a credential-stuffing campaign — both
 /// land at 401 on the wire, but only the latter is a security signal.
 const RESULT_IDP_UNAVAILABLE: &str = "idp_unavailable";
+/// `result=transport_refused` — a credential was presented on a request
+/// with no evidence of TLS and no operator waiver, so it was refused
+/// before any validator saw it. Distinct from `invalid_token`: nothing is
+/// known about whether the credential is valid, and the signal an operator
+/// wants from it is a deployment that needs TLS or a declared hop, not a
+/// credential-stuffing campaign.
+const RESULT_TRANSPORT_REFUSED: &str = "transport_refused";
 
 // ---------------------------------------------------------------------------
 // require_principal
@@ -269,10 +283,8 @@ pub async fn require_principal(
     // (which include it). The request trust layer populates this;
     // absence is a composition bug. Fall back to an explicit sentinel
     // so the structured field always exists.
-    let client_ip_raw: Option<std::net::IpAddr> = req
-        .extensions()
-        .get::<crate::middleware::trust::RequestTrust>()
-        .map(|t| t.client_ip);
+    let client_ip_raw: Option<std::net::IpAddr> =
+        req.extensions().get::<RequestTrust>().map(|t| t.client_ip);
     let client_ip = client_ip_raw
         .as_ref()
         .map(std::net::IpAddr::to_string)
@@ -299,16 +311,36 @@ pub async fn require_principal(
             return unauthorized_missing_header(&ctx.auth, path_is_oci);
         }
     };
+    let entry_point = if req.uri().path() == "/metrics" {
+        CredentialEntryPoint::Metrics
+    } else {
+        CredentialEntryPoint::Require
+    };
+    record_credential_transport(
+        entry_point,
+        req.extensions()
+            .get::<RequestTrust>()
+            .map(|trust| trust.transport),
+    );
 
-    // Plaintext-bearer-refusal gate.
-    // When the token shape is a native API token (or a
-    // CliSession-family JWT) AND the request is NOT
-    // proven-TLS AND the operator has not flipped
-    // `HORT_BEARER_ALLOW_OVER_HTTP=true`, refuse with 426 Upgrade Required.
-    // The check runs BEFORE `authenticate_bearer` so we never feed a
-    // PAT plaintext through the validator on an unprotected wire.
-    if let Some(reason) = pat_over_http_decision(&req, &token, &ctx) {
-        return upgrade_required_response(reason);
+    // Decide before validation: the presented credential must not reach a
+    // validator when this request has neither TLS evidence nor a waiver.
+    // The subject is "a credential was presented", not a token shape — a
+    // control whose reach depends on a prefix exempts every credential
+    // kind nobody re-checked, which is how an IdP access token came to be
+    // unrefused here.
+    let trust = req.extensions().get::<RequestTrust>();
+    let verdict = credential_transport_verdict(trust, ctx.pat_over_http_allowed);
+    record_credential_transport_verdict(entry_point, verdict);
+    if let CredentialTransportVerdict::Refused(reason) = verdict {
+        return refuse_credential_transport(
+            reason,
+            trust,
+            &authenticate,
+            client_ip_raw,
+            &client_ip,
+        )
+        .await;
     }
 
     // HTTP Basic is a token *carrier* only, never
@@ -473,10 +505,8 @@ pub async fn extract_optional_principal(
     // SIEM consumers expect a `client_ip` field on every auth-attempt
     // info log so they can correlate read-side credential-stuffing with
     // rate-limit rejections from the same source.
-    let client_ip_raw: Option<std::net::IpAddr> = req
-        .extensions()
-        .get::<crate::middleware::trust::RequestTrust>()
-        .map(|t| t.client_ip);
+    let client_ip_raw: Option<std::net::IpAddr> =
+        req.extensions().get::<RequestTrust>().map(|t| t.client_ip);
     let client_ip = client_ip_raw
         .as_ref()
         .map(std::net::IpAddr::to_string)
@@ -506,6 +536,36 @@ pub async fn extract_optional_principal(
             None
         }
         TokenSource::Bearer(tok) | TokenSource::Basic { password: tok, .. } => {
+            record_credential_transport(
+                CredentialEntryPoint::Optional,
+                req.extensions()
+                    .get::<RequestTrust>()
+                    .map(|trust| trust.transport),
+            );
+            // Same decision, same outcome as the write path: the
+            // credential is already on the wire, so serving the read
+            // anonymously instead would tell the client nothing about
+            // stopping. `TokenSource::Absent` never reaches here, so an
+            // anonymous read over plaintext is unaffected (ADR 0021).
+            //
+            // The refusal returns before `ReadAuthFailed` can be stamped,
+            // and that is correct rather than an oversight: that marker
+            // charges the auth-scope rate-limit bucket for the Argon2id
+            // verify a bad credential costs, and a refusal here runs no
+            // validator at all. There is no amplification to meter.
+            let trust = req.extensions().get::<RequestTrust>();
+            let verdict = credential_transport_verdict(trust, ctx.pat_over_http_allowed);
+            record_credential_transport_verdict(CredentialEntryPoint::Optional, verdict);
+            if let CredentialTransportVerdict::Refused(reason) = verdict {
+                return refuse_credential_transport(
+                    reason,
+                    trust,
+                    &authenticate,
+                    client_ip_raw,
+                    &client_ip,
+                )
+                .await;
+            }
             // The read path deliberately does NOT thread `client_ip_raw`
             // into the validator: see the entry point's own doc for why a
             // per-IP lockout here trades one amplification for another.
@@ -776,6 +836,9 @@ fn basic_creds_reason(result: &BasicCredentialsResult) -> &'static str {
 /// Empty-password is still folded into `MissingColon` (same as the
 /// legacy helper): it's indistinguishable from "no credential" and
 /// gives a single, operator-readable bucket for probe traffic.
+///
+/// The scheme token is matched by [`strip_auth_scheme`], which folds
+/// ASCII case and the `1*SP` separator per RFC 7235 §2.1.
 fn extract_basic_credentials(req: &Request) -> BasicCredentialsResult {
     let Some(value) = req.headers().get(header::AUTHORIZATION) else {
         return BasicCredentialsResult::Absent;
@@ -783,7 +846,7 @@ fn extract_basic_credentials(req: &Request) -> BasicCredentialsResult {
     let Ok(raw) = value.to_str() else {
         return BasicCredentialsResult::MalformedBase64;
     };
-    let Some(encoded) = raw.strip_prefix("Basic ") else {
+    let Some(encoded) = strip_auth_scheme(raw, AuthScheme::Basic) else {
         return BasicCredentialsResult::Absent;
     };
     let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded.trim()) else {
@@ -827,10 +890,12 @@ fn is_token_carrier_username(username: &str) -> bool {
 /// Extract `Authorization: Bearer <token>` into an owned `String`.
 /// Returns `None` for missing, non-UTF-8, non-`Bearer`, or empty-token
 /// variants — the caller treats all absence modes as "no token".
+/// The scheme token is matched by [`strip_auth_scheme`], which folds
+/// ASCII case and the `1*SP` separator per RFC 7235 §2.1.
 fn extract_bearer(req: &Request) -> Option<String> {
     let value = req.headers().get(header::AUTHORIZATION)?;
     let s = value.to_str().ok()?;
-    let token = s.strip_prefix("Bearer ")?;
+    let token = strip_auth_scheme(s, AuthScheme::Bearer)?;
     if token.is_empty() {
         None
     } else {
@@ -854,6 +919,9 @@ fn extract_bearer(req: &Request) -> Option<String> {
 ///
 /// Returns a structured [`BasicAuthResult`] so callers can log
 /// header-format failures distinctly from a legitimately-absent header.
+///
+/// The scheme token is matched by [`strip_auth_scheme`], which folds
+/// ASCII case and the `1*SP` separator per RFC 7235 §2.1.
 #[allow(dead_code)]
 fn extract_basic_password_as_token(req: &Request) -> BasicAuthResult {
     let Some(value) = req.headers().get(header::AUTHORIZATION) else {
@@ -864,7 +932,7 @@ fn extract_basic_password_as_token(req: &Request) -> BasicAuthResult {
         // callers will classify as malformed.
         return BasicAuthResult::MalformedBase64;
     };
-    let Some(encoded) = raw.strip_prefix("Basic ") else {
+    let Some(encoded) = strip_auth_scheme(raw, AuthScheme::Basic) else {
         // Authorization present but not Basic (e.g. Bearer handled
         // separately, or Digest). Not our problem.
         return BasicAuthResult::Absent;
@@ -1080,129 +1148,58 @@ fn emit_attempt_metric(result: &'static str) {
 }
 
 // ---------------------------------------------------------------------------
-// Plaintext-PAT-refusal gate
+// Credential transport refusal
 // ---------------------------------------------------------------------------
 
-/// `true` when the supplied bearer-token plaintext is shaped like an
-/// opaque native API token (`hort_(pat|svc)_…`). Cheap byte-level check
-/// — no body validation; the validator owns full parsing per
-/// `hort_app::use_cases::pat_validation_use_case::parse_pat_token_format`.
+/// Audit a refused credential and answer `426`.
 ///
-/// We only need shape-level discrimination here so the gate refuses
-/// the right traffic; rejecting a malformed `hort_*_*` shape over HTTP
-/// is just as correct as rejecting a well-formed one (the malformed
-/// case would otherwise fall through to the OIDC port and 401).
+/// Both entry points land here so the read path's refusal is observable
+/// exactly as the write path's: the same `hort_auth_attempts_total`
+/// label, the same `client_ip`-carrying `info!` that fail2ban and SIEM
+/// consumers parse, and the same tamper-resistant audit event. A read
+/// refusal that only changed the status code would be invisible to every
+/// consumer that watches the auth stream rather than the access log.
 ///
-/// There is deliberately no `hort_cli_` arm — the
-/// CliSession access token is an Ed25519 JWT
-/// (`aud=urn:hort:cli-session`, `token_kind=cli_session`), so NO token
-/// carries a `hort_cli_` prefix (`issue_cli_session` mints a
-/// JWT via the signer; the only `generate_token_plaintext` callers are
-/// the `Pat`/`ServiceAccount` opaque paths). The CliSession family is
-/// refused over plaintext HTTP by [`looks_like_cli_session_jwt`].
-fn looks_like_pat_token(token: &str) -> bool {
-    let bytes = token.as_bytes();
-    bytes.len() >= 9
-        && &bytes[..5] == b"hort_"
-        && bytes[8] == b'_'
-        && matches!(&bytes[5..8], b"pat" | b"svc")
-}
-
-/// `true` when the supplied bearer-token plaintext is shaped like a
-/// CliSession access-token JWT: a 3-segment JWT whose
-/// **unverified** payload carries `aud == CLI_SESSION_AUDIENCE` AND
-/// `token_kind == CLI_SESSION_TOKEN_KIND`.
+/// The decision itself deliberately stays at each entry point rather than
+/// moving in here: `credential_transport_verdict` is read where the
+/// boundary is, so the structural guard can see it at the function that
+/// owns the surface.
 ///
-/// This is a deliberately **pre-signature**
-/// payload peek — the same posture as [`looks_like_pat_token`]'s
-/// shape-only check. The 426 gate's job is to refuse the *credential*
-/// before it crosses an unprotected wire to the validator; decoding the
-/// (unverified) payload to recognise the CliSession discriminators is
-/// fail-closed by design: a token *shaped* like a CliSession bearer is
-/// refused over cleartext regardless of whether its signature is valid,
-/// so we never leak — nor process — the credential over HTTP. An OIDC
-/// bearer (different `aud`, no `token_kind=cli_session`) and an opaque
-/// token (not a JWT) both fail this check and are unaffected.
-///
-/// The `aud`/`token_kind` literals are sourced from
-/// [`hort_app::cli_session_signing`] so the two discriminators stay in
-/// lock-step with the signer.
-fn looks_like_cli_session_jwt(token: &str) -> bool {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-
-    // A JWT is `header.payload.signature`. We only need the payload.
-    let mut segments = token.split('.');
-    let (Some(_header), Some(payload), Some(_sig), None) = (
-        segments.next(),
-        segments.next(),
-        segments.next(),
-        segments.next(),
-    ) else {
-        return false;
-    };
-    let Ok(payload_bytes) = URL_SAFE_NO_PAD.decode(payload) else {
-        return false;
-    };
-    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&payload_bytes) else {
-        return false;
-    };
-    claims.get("aud").and_then(|v| v.as_str())
-        == Some(hort_app::cli_session_signing::CLI_SESSION_AUDIENCE)
-        && claims.get("token_kind").and_then(|v| v.as_str())
-            == Some(hort_app::cli_session_signing::CLI_SESSION_TOKEN_KIND)
-}
-
-/// Reason string for the 426 response body — also passed verbatim to
-/// the `tracing::warn!` so operators can grep one keyword to see how
-/// many requests landed on this gate.
-const PAT_OVER_HTTP_REFUSAL_REASON: &str = "pat over http refused";
-
-/// Decide whether to refuse this request with 426 Upgrade Required.
-///
-/// Returns `Some(reason)` when ALL of:
-/// - the token plaintext shapes as an opaque PAT prefix
-///   ([`looks_like_pat_token`]) OR as a CliSession-family JWT
-///   ([`looks_like_cli_session_jwt`])
-/// - `pat_over_http_allowed = false` on the AppContext
-/// - the request has no positive evidence of TLS — i.e.
-///   `RequestTrust.public_url.scheme() != "https"` (the trust layer
-///   already folds `X-Forwarded-Proto: https` from a trusted peer
-///   into `public_url`; we deliberately do NOT introduce a new trust
-///   path here).
-///
-/// Returns `None` when ANY of the above is false — the auth pipeline
-/// proceeds normally.
-fn pat_over_http_decision(req: &Request, token: &str, ctx: &AppContext) -> Option<&'static str> {
-    if !looks_like_pat_token(token) && !looks_like_cli_session_jwt(token) {
-        return None;
-    }
-    if ctx.pat_over_http_allowed {
-        return None;
-    }
-    let proven_https = req
-        .extensions()
-        .get::<crate::middleware::trust::RequestTrust>()
-        .map(|t| t.public_url.scheme() == "https")
-        .unwrap_or(false);
-    if proven_https {
-        return None;
-    }
-    Some(PAT_OVER_HTTP_REFUSAL_REASON)
-}
-
-/// Build the 426 response advertised by the gate above. Body carries
-/// the reason; headers include the spec-conformant
-/// `Upgrade: TLS/1.2, HTTP/1.1` per RFC 9110 §15.6.7. Operators
-/// alerting on `426` see one signal per refusal in their access log.
-fn upgrade_required_response(reason: &'static str) -> Response {
-    tracing::warn!(
-        reason = reason,
-        "bearer-over-HTTP refused — set HORT_BEARER_ALLOW_OVER_HTTP=true to override (TLS strongly recommended)"
+/// The response is the one the write path already returned: the reason in
+/// the body, plus the spec-conformant `Upgrade: TLS/1.2, HTTP/1.1` of
+/// RFC 9110 §15.6.7, so operators alerting on `426` see one signal per
+/// refusal in their access log. The `warn!` carries the evidence that was
+/// actually derived and whether the peer was a trusted proxy — the two
+/// facts that distinguish "put TLS in front" from "your proxy is not
+/// overwriting the forwarded scheme" from "declare this hop".
+async fn refuse_credential_transport(
+    reason: &'static str,
+    trust: Option<&RequestTrust>,
+    authenticate: &Arc<AuthenticateUseCase>,
+    client_ip_raw: Option<std::net::IpAddr>,
+    client_ip: &str,
+) -> Response {
+    emit_attempt_metric(RESULT_TRANSPORT_REFUSED);
+    tracing::info!(
+        result = RESULT_TRANSPORT_REFUSED,
+        client_ip = %client_ip,
+        "auth attempt"
     );
+    tracing::warn!(
+        reason,
+        evidence = ?trust.map(|t| t.transport),
+        peer_trusted = ?trust.map(|t| t.peer_trusted),
+        "credential transport refused — terminate TLS in front, have the proxy send \
+         X-Forwarded-Proto and list it in HORT_TRUSTED_PROXY_CIDRS, or declare the plaintext \
+         hop with HORT_TLS_NOT_REQUIRED_FROM"
+    );
+    authenticate
+        .record_auth_failure(client_ip_raw, RESULT_TRANSPORT_REFUSED, None)
+        .await;
     let body = format!(r#"{{"error":"{reason}"}}"#);
     Response::builder()
         .status(StatusCode::UPGRADE_REQUIRED)
-        .header("Upgrade", "TLS/1.2, HTTP/1.1")
+        .header(header::UPGRADE, UPGRADE_OFFER)
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .expect("static response")
@@ -1452,10 +1449,13 @@ mod tests {
     /// middleware sees a deterministic `client_ip`. Mirrors the
     /// `request_trust_layer`'s output without standing up the full
     /// layer for tests that only care about auth-event recording.
-    fn make_request_trust(client_ip: std::net::IpAddr) -> crate::middleware::trust::RequestTrust {
-        crate::middleware::trust::RequestTrust {
+    fn make_request_trust(client_ip: std::net::IpAddr) -> RequestTrust {
+        RequestTrust {
             client_ip,
             public_url: url::Url::parse("http://localhost:8080").unwrap(),
+            transport: crate::middleware::trust::TransportSecurity::Tls,
+            peer_trusted: false,
+            tls_requirement_waived: false,
         }
     }
 
@@ -1489,6 +1489,9 @@ mod tests {
                 ctx.clone(),
                 require_principal,
             ))
+            .layer(axum::Extension(trust_for_transport(
+                crate::middleware::trust::TransportSecurity::Tls,
+            )))
             .with_state(ctx)
     }
 
@@ -1513,6 +1516,9 @@ mod tests {
                 ctx.clone(),
                 extract_optional_principal,
             ))
+            .layer(axum::Extension(trust_for_transport(
+                crate::middleware::trust::TransportSecurity::Tls,
+            )))
             .with_state(ctx)
     }
 
@@ -1683,6 +1689,75 @@ mod tests {
         assert!(matches!(v, DebugValue::Counter(n) if *n == 1));
     }
 
+    /// All three non-OCI entry points observe the evidence AND enforce
+    /// the decision, `metrics` included: `GET /metrics` is served through
+    /// `require_principal` on the admin listener, so the only thing that
+    /// distinguishes it is its label. A loopback scrape with no TLS in
+    /// front therefore needs the declared waiver, which is the deployment
+    /// consequence this test makes visible rather than hides.
+    #[test]
+    fn credential_transport_counts_require_optional_and_metrics_with_refusal() {
+        use crate::middleware::trust::TransportSecurity;
+
+        let (snapshot, statuses) = capture(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime builds")
+                .block_on(async {
+                    let (ctx, idp) = enabled_ctx(prom_handle());
+                    idp.register_token("good", sample_claims("kc:transport"));
+                    let trust = trust_for_transport(TransportSecurity::Plaintext);
+                    let require = transport_router(ctx.clone(), Some(trust.clone()), false);
+                    let optional = transport_router(ctx.clone(), Some(trust.clone()), true);
+                    let metrics = router_with_require_at_path_and_trust(ctx, "/metrics", trust);
+                    let request = |path| {
+                        HttpRequest::get(path)
+                            .header(header::AUTHORIZATION, "Bearer good")
+                            .body(Body::empty())
+                            .expect("test request builds")
+                    };
+                    vec![
+                        require
+                            .oneshot(request("/protected"))
+                            .await
+                            .expect("router answers")
+                            .status(),
+                        optional
+                            .oneshot(request("/read"))
+                            .await
+                            .expect("router answers")
+                            .status(),
+                        metrics
+                            .oneshot(request("/metrics"))
+                            .await
+                            .expect("router answers")
+                            .status(),
+                    ]
+                })
+        });
+        assert_eq!(statuses, vec![StatusCode::UPGRADE_REQUIRED; 3]);
+        let entries = snapshot.into_vec();
+        for entry in ["require", "optional", "metrics"] {
+            let evidence = find(
+                &entries,
+                MetricKind::Counter,
+                "hort_credential_transport_total",
+                &[("entry_point", entry), ("evidence", "plaintext")],
+            )
+            .unwrap_or_else(|| panic!("missing {entry} evidence metric"));
+            assert!(matches!(evidence, DebugValue::Counter(1)));
+            let refusal = find(
+                &entries,
+                MetricKind::Counter,
+                "hort_credential_transport_refusals_total",
+                &[("entry_point", entry)],
+            )
+            .unwrap_or_else(|| panic!("missing {entry} refusal metric"));
+            assert!(matches!(refusal, DebugValue::Counter(1)));
+        }
+    }
+
     // -- /v2/ Basic challenge ------------------------------------------
     //
     // OCI Distribution clients (skopeo, containers/image) parse the 401's
@@ -1693,13 +1768,28 @@ mod tests {
     // resolve_token routes the credential through the same JWT validator
     // as a Bearer token.
 
+    /// Write-path router at an arbitrary path, with TLS evidence so the
+    /// transport decision is satisfied and the test under it is about
+    /// something else.
     fn router_with_require_at_path(ctx: Arc<AppContext>, path: &'static str) -> Router {
+        router_with_require_at_path_and_trust(
+            ctx,
+            path,
+            trust_for_transport(crate::middleware::trust::TransportSecurity::Tls),
+        )
+    }
+
+    fn router_with_require_at_path_and_trust(
+        ctx: Arc<AppContext>,
+        path: &'static str,
+        trust: RequestTrust,
+    ) -> Router {
         async fn handler(req: Request) -> Response {
             match req_principal(&req) {
                 Ok(p) => Response::builder()
                     .status(StatusCode::OK)
                     .body(Body::from(p.user_id.to_string()))
-                    .unwrap(),
+                    .expect("static response"),
                 Err(err) => err.into_response(),
             }
         }
@@ -1709,6 +1799,7 @@ mod tests {
                 ctx.clone(),
                 require_principal,
             ))
+            .layer(axum::Extension(trust))
             .with_state(ctx)
     }
 
@@ -1977,7 +2068,7 @@ mod tests {
                 to_bytes(resp.into_body(), 1024).await.unwrap().to_vec()
             });
         let body = String::from_utf8(body).unwrap();
-        assert!(body.starts_with("some:"), "got: {body}");
+        assert!(body.starts_with("some"), "got: {body}");
     }
 
     #[test]
@@ -2442,6 +2533,9 @@ mod tests {
                         ctx.clone(),
                         require_principal,
                     ))
+                    .layer(axum::Extension(trust_for_transport(
+                        crate::middleware::trust::TransportSecurity::Tls,
+                    )))
                     .with_state(ctx);
                 let resp = router
                     .oneshot(
@@ -3416,7 +3510,7 @@ mod tests {
                 to_bytes(resp.into_body(), 1024).await.unwrap().to_vec()
             });
         let body = String::from_utf8(body).unwrap();
-        assert!(body.starts_with("some:"), "got: {body}");
+        assert!(body.starts_with("some"), "got: {body}");
     }
 
     // -----------------------------------------------------------------
@@ -3520,388 +3614,742 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Plaintext-PAT-refusal middleware tests
+    // Credential transport
     //
-    // Pins the contract: a `Bearer hort_<kind>_<body>`
-    // token over plaintext HTTP, with `pat_over_http_allowed = false`,
-    // returns 426 Upgrade Required without invoking the PAT validator.
-    // The four branches enumerated below cover every leaf of the
-    // decision tree from `pat_over_http_decision`.
+    // The decision runs before either validator, on both entry points,
+    // and its subject is "a credential was presented" rather than a token
+    // shape. The tests below come in two layers:
+    //
+    //   * with an injected `RequestTrust`, pinning what each entry point
+    //     does with a given verdict input;
+    //   * through the real trust layer with a socket peer and headers
+    //     (`drive_full_stack`), pinning the rows of the precedence table
+    //     whose inputs are properties of the request rather than fields
+    //     of the extension — the relay condition and the raw-peer match.
     // -------------------------------------------------------------------
 
-    /// Constant-shape PAT used in every refusal-path test. Body byte
-    /// values are irrelevant to this layer (the validator is the next
-    /// stop, not us); the prefix is what `looks_like_pat_token` keys
-    /// on.
-    const PAT_TOKEN: &str = "hort_pat_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-
-    /// Build a `RequestTrust` with the given scheme on `public_url`,
-    /// pinned to a localhost peer. Mirrors the trust layer's output
-    /// without standing it up; lets the test pin the gate's input.
-    fn trust_with_scheme(scheme: &str) -> crate::middleware::trust::RequestTrust {
-        let url = format!("{scheme}://test.example.invalid:8080");
-        crate::middleware::trust::RequestTrust {
-            client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
-            public_url: url::Url::parse(&url).expect("test scheme parses"),
+    /// Injected trust with no waiver and an untrusted peer: the verdict is
+    /// then a pure function of `transport`.
+    fn trust_for_transport(transport: crate::middleware::trust::TransportSecurity) -> RequestTrust {
+        RequestTrust {
+            client_ip: "192.0.2.4".parse().expect("test client IP parses"),
+            public_url: url::Url::parse("https://public.example").expect("test URL parses"),
+            transport,
+            peer_trusted: false,
+            tls_requirement_waived: false,
         }
     }
 
-    /// Build a router that injects the supplied `RequestTrust` BEFORE
-    /// the auth layer so the gate's `req.extensions().get::<RequestTrust>`
-    /// finds it.
-    fn router_with_trust(
+    /// Router with one entry point and an optionally-absent
+    /// `RequestTrust`. The handler reports whether a principal arrived, so
+    /// a `200` can be told apart from a `200` that silently dropped the
+    /// credential.
+    fn transport_router(
         ctx: Arc<AppContext>,
-        trust: crate::middleware::trust::RequestTrust,
+        trust: Option<RequestTrust>,
+        optional: bool,
     ) -> Router {
-        async fn handler(_req: Request) -> Response {
-            Response::builder()
-                .status(StatusCode::OK)
-                .body(Body::from("ok"))
-                .unwrap()
-        }
-        Router::new()
-            .route("/protected", get(handler))
-            .layer(axum::middleware::from_fn_with_state(
-                ctx.clone(),
-                require_principal,
-            ))
-            .layer(axum::Extension(trust))
-            .with_state(ctx)
+        let router = if optional {
+            Router::new().route("/read", get(report_observed)).layer(
+                axum::middleware::from_fn_with_state(ctx.clone(), extract_optional_principal),
+            )
+        } else {
+            Router::new()
+                .route("/protected", get(report_observed))
+                .layer(axum::middleware::from_fn_with_state(
+                    ctx.clone(),
+                    require_principal,
+                ))
+        };
+        let router = match trust {
+            Some(trust) => router.layer(axum::Extension(trust)),
+            None => router,
+        };
+        router.with_state(ctx)
     }
 
-    /// `pat_over_http_allowed = false` (default) AND the wire is HTTP →
-    /// 426 Upgrade Required, validator NEVER invoked. The body carries
-    /// the reason string and the response includes the spec-mandated
-    /// `Upgrade: TLS/1.2, HTTP/1.1` header.
-    #[test]
-    fn pat_token_over_http_returns_426_when_flag_unset() {
-        let (status, headers, body) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (ctx, _idp) = enabled_ctx(prom_handle());
-                // Default: `pat_over_http_allowed = false`.
-                let router = router_with_trust(ctx, trust_with_scheme("http"));
-                let resp = router
-                    .oneshot(
-                        HttpRequest::get("/protected")
-                            .header(header::AUTHORIZATION, format!("Bearer {PAT_TOKEN}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let status = resp.status();
-                let upgrade = resp.headers().get("Upgrade").cloned();
-                let body = to_bytes(resp.into_body(), 1024).await.unwrap().to_vec();
-                (status, upgrade, body)
-            });
-        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
-        let upgrade_value = headers
-            .expect("Upgrade header missing")
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert!(
-            upgrade_value.contains("TLS"),
-            "Upgrade must advertise TLS, got {upgrade_value:?}"
-        );
-        let body = String::from_utf8(body).unwrap();
-        assert!(body.contains(PAT_OVER_HTTP_REFUSAL_REASON), "got: {body}");
+    /// `<transport>/<some|none>` — the evidence the handler observed and
+    /// whether it got a principal. Both entry points are covered: the
+    /// write path inserts `AuthenticatedPrincipal`, the read path an
+    /// `Option` of it.
+    async fn report_observed(req: Request) -> Response {
+        let transport = req
+            .extensions()
+            .get::<RequestTrust>()
+            .map_or_else(|| "no-trust".to_string(), |t| format!("{:?}", t.transport));
+        let authenticated = req.extensions().get::<AuthenticatedPrincipal>().is_some()
+            || req
+                .extensions()
+                .get::<Option<AuthenticatedPrincipal>>()
+                .is_some_and(Option::is_some);
+        let who = if authenticated { "some" } else { "none" };
+        Response::new(Body::from(format!("{transport}/{who}")))
     }
 
-    /// `pat_over_http_allowed = true` (operator opt-in) → the gate
-    /// short-circuits and the request flows through to the OIDC port
-    /// (which rejects with 401 because no PAT validator is wired in
-    /// the mock). The 401 — NOT 426 — is the assertion: the gate is
-    /// off; downstream auth runs as if the gate didn't exist.
-    #[test]
-    fn pat_token_over_http_returns_normal_response_when_flag_set() {
-        let status = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (ctx, _idp) = enabled_ctx(prom_handle());
-                let ctx = crate::test_support::with_pat_over_http_allowed(&ctx, true);
-                let router = router_with_trust(ctx, trust_with_scheme("http"));
-                let resp = router
-                    .oneshot(
-                        HttpRequest::get("/protected")
-                            .header(header::AUTHORIZATION, format!("Bearer {PAT_TOKEN}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                resp.status()
-            });
-        // The PAT validator is not wired on the mock, so the OIDC port
-        // sees the PAT plaintext and rejects with `SignatureInvalid`
-        // → 401. Either way: NOT 426.
-        assert_ne!(status, StatusCode::UPGRADE_REQUIRED);
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    const IDP_TOKEN: &str = "idp-access-token";
+    /// The operator-declared range, and a peer inside it.
+    const WAIVED_RANGE: &str = "10.247.72.0/24";
+    const WAIVED_PEER: &str = "10.247.72.8";
+    /// A peer outside the declared range.
+    const OUTSIDE_PEER: &str = "192.0.2.8";
+
+    /// Compose the production trust layer underneath the auth layer, with
+    /// `WAIVED_RANGE` declared as not requiring TLS and — when
+    /// `range_is_trusted` — also declared as a trusted proxy range, which
+    /// is the "listed in both variables" shape.
+    fn full_stack_router(ctx: Arc<AppContext>, range_is_trusted: bool, optional: bool) -> Router {
+        use crate::middleware::trust::{request_trust_layer, TrustConfig};
+        let range = vec![WAIVED_RANGE.parse().expect("test CIDR parses")];
+        let trust_config = TrustConfig::new(
+            Some(url::Url::parse("http://hort-server:8080").expect("test base URL parses")),
+            if range_is_trusted {
+                range.clone()
+            } else {
+                Vec::new()
+            },
+            url::Url::parse("http://0.0.0.0:8080/").expect("test bind URL parses"),
+        )
+        .with_tls_not_required_from(range);
+        transport_router(ctx, None, optional).layer(request_trust_layer(trust_config))
     }
 
-    /// An OIDC-shaped token (no `hort_<kind>_` prefix) flows through the
-    /// gate untouched even on plain HTTP — the gate only refuses PAT
-    /// shapes. This is the regression guard against accidentally
-    /// breaking the OIDC over-HTTP dev workflow when the operator
-    /// enables auth on a localhost setup.
-    #[test]
-    fn oidc_token_over_http_unaffected_by_pat_refusal() {
-        let status = tokio::runtime::Builder::new_current_thread()
+    /// Drive one request through the real trust + auth stack and report
+    /// `(status, body)`. `peer` becomes the `ConnectInfo` socket peer, as
+    /// `into_make_service_with_connect_info` supplies in production.
+    fn drive_full_stack(
+        optional: bool,
+        range_is_trusted: bool,
+        peer: &str,
+        request_headers: &[(&str, &str)],
+        authorization: Option<&str>,
+    ) -> (StatusCode, String) {
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap()
+            .expect("test runtime builds")
             .block_on(async {
                 let (ctx, idp) = enabled_ctx(prom_handle());
-                idp.register_token("oidc-tok", sample_claims("kc:over-http"));
-                let router = router_with_trust(ctx, trust_with_scheme("http"));
-                let resp = router
-                    .oneshot(
-                        HttpRequest::get("/protected")
-                            .header(header::AUTHORIZATION, "Bearer oidc-tok")
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
+                idp.register_token(IDP_TOKEN, sample_claims("kc:boundary"));
+                let router = full_stack_router(ctx, range_is_trusted, optional);
+                let mut builder = HttpRequest::get(if optional { "/read" } else { "/protected" });
+                for (name, value) in request_headers {
+                    builder = builder.header(*name, *value);
+                }
+                if let Some(credential) = authorization {
+                    builder = builder.header(header::AUTHORIZATION, credential);
+                }
+                let request = builder
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(
+                        peer.parse().expect("test peer parses"),
+                        40000,
+                    )))
+                    .body(Body::empty())
+                    .expect("test request builds");
+                let response = router.oneshot(request).await.expect("router answers");
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1024)
                     .await
-                    .unwrap();
-                resp.status()
-            });
-        // 200 OK — OIDC token validates and the request proceeds.
+                    .expect("body is readable");
+                (
+                    status,
+                    String::from_utf8(body.to_vec()).expect("body is UTF-8"),
+                )
+            })
+    }
+
+    /// `Bearer <IdP access token>` — the credential kind the shape-keyed
+    /// predicate never covered.
+    fn bearer() -> Option<&'static str> {
+        Some("Bearer idp-access-token")
+    }
+
+    /// An IdP access token is refused on BOTH entry points with no
+    /// evidence and no waiver. It was refused on neither before: the old
+    /// predicate keyed on a `hort_(pat|svc)_` prefix or a CliSession
+    /// payload, and the read path never consulted it at all.
+    #[test]
+    fn idp_access_token_is_refused_on_both_paths_without_transport_evidence() {
+        let (snapshot, statuses) = capture(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime builds")
+                .block_on(async {
+                    let mut statuses = Vec::new();
+                    for optional in [false, true] {
+                        let (ctx, idp) = enabled_ctx(prom_handle());
+                        idp.register_token(IDP_TOKEN, sample_claims("kc:transport"));
+                        let route = if optional { "/read" } else { "/protected" };
+                        let trust = trust_for_transport(
+                            crate::middleware::trust::TransportSecurity::Unknown,
+                        );
+                        let response = transport_router(ctx, Some(trust), optional)
+                            .oneshot(
+                                HttpRequest::get(route)
+                                    .header(header::AUTHORIZATION, "Bearer idp-access-token")
+                                    .body(Body::empty())
+                                    .expect("test request builds"),
+                            )
+                            .await
+                            .expect("router answers");
+                        assert_eq!(response.headers()["Upgrade"], "TLS/1.2, HTTP/1.1");
+                        statuses.push(response.status());
+                    }
+                    statuses
+                })
+        });
+        assert_eq!(statuses, [StatusCode::UPGRADE_REQUIRED; 2]);
+        let entries = snapshot.into_vec();
+        for entry in ["require", "optional"] {
+            assert_eq!(
+                find(
+                    &entries,
+                    MetricKind::Counter,
+                    "hort_credential_transport_refusals_total",
+                    &[("entry_point", entry)]
+                ),
+                Some(&DebugValue::Counter(1)),
+                "{entry} must count the refusal"
+            );
+        }
+        assert_eq!(
+            find(
+                &entries,
+                MetricKind::Counter,
+                "hort_auth_attempts_total",
+                &[("result", RESULT_TRANSPORT_REFUSED)]
+            ),
+            Some(&DebugValue::Counter(2)),
+            "a refusal is an auth attempt on both paths"
+        );
+    }
+
+    /// Over `Tls` the same credential is accepted exactly as before, and
+    /// the read path populates the principal.
+    #[test]
+    fn tls_evidence_allows_the_credential_and_populates_the_principal() {
+        for optional in [false, true] {
+            let (status, body) = drive_full_stack(
+                optional,
+                true,
+                WAIVED_PEER,
+                &[("x-forwarded-proto", "https")],
+                bearer(),
+            );
+            assert_eq!(status, StatusCode::OK, "optional={optional}");
+            assert_eq!(body, "Tls/some", "optional={optional}");
+        }
+    }
+
+    /// An anonymous read over plaintext is untouched (ADR 0021): the
+    /// decision runs on the credential-present branches only, so
+    /// `TokenSource::Absent` never reaches it.
+    #[test]
+    fn anonymous_read_over_plaintext_is_served() {
+        let (status, body) = drive_full_stack(true, false, OUTSIDE_PEER, &[], None);
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body, "Unknown/none",
+            "a public read must still be served, with no principal"
+        );
     }
 
-    /// `RequestTrust.public_url` carries `https://…` (operator-pinned
-    /// `HORT_PUBLIC_BASE_URL` OR `X-Forwarded-Proto: https` from a
-    /// trusted proxy, both folded into `public_url` by the trust layer)
-    /// → the gate is satisfied and the request flows through to auth.
+    /// A missing `RequestTrust` extension is refused whatever the unscoped
+    /// flag says — the table's first row. In production this is a
+    /// composition bug, and the fail-closed reading is the point: the
+    /// predicate takes the lookup itself so no call site can forget it.
     #[test]
-    fn pat_token_over_https_proceeds_normally() {
-        let status = tokio::runtime::Builder::new_current_thread()
+    fn absent_trust_refuses_even_with_unscoped_flag() {
+        tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap()
+            .expect("test runtime builds")
             .block_on(async {
-                let (ctx, _idp) = enabled_ctx(prom_handle());
-                let router = router_with_trust(ctx, trust_with_scheme("https"));
-                let resp = router
-                    .oneshot(
-                        HttpRequest::get("/protected")
-                            .header(header::AUTHORIZATION, format!("Bearer {PAT_TOKEN}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                resp.status()
+                for optional in [false, true] {
+                    let (ctx, _) = enabled_ctx(prom_handle());
+                    let ctx = crate::test_support::with_pat_over_http_allowed(&ctx, true);
+                    let route = if optional { "/read" } else { "/protected" };
+                    let response = transport_router(ctx, None, optional)
+                        .oneshot(
+                            HttpRequest::get(route)
+                                .header(header::AUTHORIZATION, "Bearer idp-access-token")
+                                .body(Body::empty())
+                                .expect("test request builds"),
+                        )
+                        .await
+                        .expect("router answers");
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::UPGRADE_REQUIRED,
+                        "optional={optional}"
+                    );
+                }
             });
-        // Validator is unwired → OIDC port rejects → 401 (NOT 426).
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
-    /// `X-Forwarded-Proto: https` from a trusted proxy is folded into
-    /// `RequestTrust.public_url.scheme()` by the trust layer — by the
-    /// time auth sees it, the trust is encoded as the scheme. This
-    /// test pins that contract: a request with the trust-rendered
-    /// `https://` public_url proceeds normally on the PAT path even
-    /// when the literal request URL is HTTP.
+    /// `HORT_BEARER_ALLOW_OVER_HTTP=true` restores today's behaviour on
+    /// both paths: it accepts regardless of evidence, peer or relay. Both
+    /// evidence values a scope cannot rescue are covered — `Plaintext`,
+    /// which no scope waives, and `Unknown` from a peer in no declared
+    /// range — because those are the two rows this flag is the only
+    /// remaining waiver for.
     #[test]
-    fn pat_token_over_http_with_x_forwarded_proto_https_proceeds_normally() {
-        // The trust layer is the single source of truth for "is
-        // this https?". We don't re-evaluate forwarding here. The
-        // contract under test: a `RequestTrust` whose `public_url`
-        // scheme is `https://` satisfies the gate, regardless of the
-        // wire-level transport. (This is the supported deployment
-        // shape: TLS-terminating proxy + plaintext upstream.)
-        let status = tokio::runtime::Builder::new_current_thread()
+    fn unscoped_waiver_accepts_plaintext_and_unknown_on_both_paths() {
+        use crate::middleware::trust::TransportSecurity;
+
+        let (snapshot, statuses) = capture(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime builds")
+                .block_on(async {
+                    let mut statuses = Vec::new();
+                    for optional in [false, true] {
+                        for transport in [TransportSecurity::Plaintext, TransportSecurity::Unknown]
+                        {
+                            let (ctx, idp) = enabled_ctx(prom_handle());
+                            idp.register_token(IDP_TOKEN, sample_claims("kc:unscoped"));
+                            let ctx = crate::test_support::with_pat_over_http_allowed(&ctx, true);
+                            let route = if optional { "/read" } else { "/protected" };
+                            let response = transport_router(
+                                ctx,
+                                Some(trust_for_transport(transport)),
+                                optional,
+                            )
+                            .oneshot(
+                                HttpRequest::get(route)
+                                    .header(header::AUTHORIZATION, "Bearer idp-access-token")
+                                    .body(Body::empty())
+                                    .expect("test request builds"),
+                            )
+                            .await
+                            .expect("router answers");
+                            statuses.push(response.status());
+                        }
+                    }
+                    statuses
+                })
+        });
+        assert_eq!(statuses, [StatusCode::OK; 4]);
+        let entries = snapshot.into_vec();
+        for entry in ["require", "optional"] {
+            assert_eq!(
+                find(
+                    &entries,
+                    MetricKind::Counter,
+                    "hort_credential_transport_waived_total",
+                    &[("entry_point", entry), ("scope", "unscoped")]
+                ),
+                Some(&DebugValue::Counter(2)),
+                "{entry} must count the unscoped waiver apart from an allow"
+            );
+            for evidence in ["plaintext", "unknown"] {
+                assert_eq!(
+                    find(
+                        &entries,
+                        MetricKind::Counter,
+                        "hort_credential_transport_total",
+                        &[("entry_point", entry), ("evidence", evidence)]
+                    ),
+                    Some(&DebugValue::Counter(1)),
+                    "{entry} must still report the evidence it actually derived"
+                );
+            }
+        }
+    }
+
+    /// The declared scope accepts a Bearer AND a Basic carrier on both
+    /// paths, and records no claim that TLS happened: the evidence counter
+    /// still says `unknown` and the waiver is counted under its own scope.
+    #[test]
+    fn declared_waiver_accepts_bearer_and_basic_on_both_paths_without_claiming_tls() {
+        let (snapshot, statuses) = capture(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime builds")
+                .block_on(async {
+                    let mut statuses = Vec::new();
+                    for optional in [false, true] {
+                        for basic in [false, true] {
+                            let (ctx, idp) = enabled_ctx(prom_handle());
+                            idp.register_token(IDP_TOKEN, sample_claims("kc:declared"));
+                            let mut trust = trust_for_transport(
+                                crate::middleware::trust::TransportSecurity::Unknown,
+                            );
+                            trust.tls_requirement_waived = true;
+                            let route = if optional { "/read" } else { "/protected" };
+                            let credential = if basic {
+                                format!(
+                                    "Basic {}",
+                                    base64::engine::general_purpose::STANDARD
+                                        .encode(format!("__token__:{IDP_TOKEN}"))
+                                )
+                            } else {
+                                format!("Bearer {IDP_TOKEN}")
+                            };
+                            let response = transport_router(ctx, Some(trust), optional)
+                                .oneshot(
+                                    HttpRequest::get(route)
+                                        .header(header::AUTHORIZATION, credential)
+                                        .body(Body::empty())
+                                        .expect("test request builds"),
+                                )
+                                .await
+                                .expect("router answers");
+                            statuses.push(response.status());
+                        }
+                    }
+                    statuses
+                })
+        });
+        assert_eq!(statuses, [StatusCode::OK; 4]);
+        let entries = snapshot.into_vec();
+        for entry in ["require", "optional"] {
+            assert_eq!(
+                find(
+                    &entries,
+                    MetricKind::Counter,
+                    "hort_credential_transport_waived_total",
+                    &[("entry_point", entry), ("scope", "declared")]
+                ),
+                Some(&DebugValue::Counter(2)),
+                "{entry} must count the declared waiver, Bearer and Basic alike"
+            );
+            assert_eq!(
+                find(
+                    &entries,
+                    MetricKind::Counter,
+                    "hort_credential_transport_total",
+                    &[("entry_point", entry), ("evidence", "unknown")]
+                ),
+                Some(&DebugValue::Counter(2)),
+                "a waived request is never counted as evidence of TLS"
+            );
+            assert_eq!(
+                find(
+                    &entries,
+                    MetricKind::Counter,
+                    "hort_credential_transport_total",
+                    &[("entry_point", entry), ("evidence", "tls")]
+                ),
+                None,
+                "nothing may record that TLS happened on a waived request"
+            );
+        }
+    }
+
+    /// A refused read audits exactly as any other outcome does: the
+    /// attempt metric, the `client_ip`-carrying `info!` fail2ban reads,
+    /// and the tamper-resistant audit event.
+    #[test]
+    #[tracing_test::traced_test]
+    fn refused_optional_credential_emits_audit_event_and_client_ip_log() {
+        use hort_domain::events::DomainEvent;
+        let (response, batches) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .unwrap()
+            .expect("test runtime builds")
             .block_on(async {
-                let (ctx, _idp) = enabled_ctx(prom_handle());
-                let router = router_with_trust(ctx, trust_with_scheme("https"));
-                let resp = router
+                let (ctx, _, event_store) = enabled_ctx_with_audit(prom_handle());
+                let mut trust =
+                    trust_for_transport(crate::middleware::trust::TransportSecurity::Unknown);
+                trust.client_ip = "203.0.113.42".parse().expect("test client IP parses");
+                let response = transport_router(ctx, Some(trust), true)
                     .oneshot(
-                        // Note: literal scheme on the test request is
-                        // irrelevant — the gate reads `RequestTrust`,
-                        // populated above with `https://`.
-                        HttpRequest::get("/protected")
-                            .header(header::AUTHORIZATION, format!("Bearer {PAT_TOKEN}"))
+                        HttpRequest::get("/read")
+                            .header(header::AUTHORIZATION, "Bearer idp-token")
                             .body(Body::empty())
-                            .unwrap(),
+                            .expect("test request builds"),
                     )
                     .await
-                    .unwrap();
-                resp.status()
+                    .expect("router answers");
+                (response, event_store.appended_batches())
             });
-        assert_ne!(status, StatusCode::UPGRADE_REQUIRED);
-    }
-
-    // -------------------------------------------------------------------
-    // CliSession-JWT-over-HTTP refusal
-    //
-    // The CliSession access token is an Ed25519-signed JWT
-    // (`aud=urn:hort:cli-session`, `token_kind=cli_session`), not an opaque
-    // `hort_cli_*` token, so it does not match the `hort_(pat|svc)_` byte
-    // prefix the opaque-PAT
-    // 426 gate keys on. Without a dedicated check, an
-    // (up-to-admin-capable, ≤15 min) CliSession
-    // bearer would NOT be refused over cleartext HTTP under the secure
-    // default
-    // `HORT_BEARER_ALLOW_OVER_HTTP=false`. The gate therefore refuses a
-    // Bearer whose UNVERIFIED payload carries the CliSession `aud` +
-    // `token_kind` (fail-closed pre-signature peek — we never decode the
-    // credential over the validator on an unprotected wire).
-    // -------------------------------------------------------------------
-
-    /// Build a JWT-shaped string (`header.payload.signature`) whose
-    /// payload carries the supplied `aud` + `token_kind`. The signature
-    /// segment is a placeholder — the gate is a *pre-verification*
-    /// payload peek (it never checks the signature), so a valid signature
-    /// is deliberately NOT required to exercise the refusal path. This
-    /// mirrors a real CliSession JWT's wire shape.
-    fn cli_session_shaped_jwt(aud: &str, token_kind: &str) -> String {
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
-        let payload = URL_SAFE_NO_PAD.encode(format!(
-            r#"{{"iss":"https://hort.example.com","sub":"00000000-0000-0000-0000-000000000001","aud":"{aud}","exp":9999999999,"jti":"00000000-0000-0000-0000-000000000002","token_kind":"{token_kind}","claims":["admin"]}}"#
-        ));
-        // Placeholder signature segment — irrelevant to the pre-verify peek.
-        let sig = URL_SAFE_NO_PAD.encode([0u8; 64]);
-        format!("{header}.{payload}.{sig}")
-    }
-
-    /// A genuine CliSession JWT (correct `aud` + `token_kind`) over
-    /// plaintext HTTP with the secure-default `pat_over_http_allowed =
-    /// false` → 426 Upgrade Required, validator NEVER invoked. This is
-    /// The credential is refused on cleartext just like a `hort_pat_*`
-    /// token.
-    #[test]
-    fn cli_session_jwt_over_http_returns_426_when_flag_unset() {
-        let token = cli_session_shaped_jwt(
-            hort_app::cli_session_signing::CLI_SESSION_AUDIENCE,
-            hort_app::cli_session_signing::CLI_SESSION_TOKEN_KIND,
-        );
-        let (status, body) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (ctx, _idp) = enabled_ctx(prom_handle());
-                let router = router_with_trust(ctx, trust_with_scheme("http"));
-                let resp = router
-                    .oneshot(
-                        HttpRequest::get("/protected")
-                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                let status = resp.status();
-                let body = to_bytes(resp.into_body(), 1024).await.unwrap().to_vec();
-                (status, body)
-            });
-        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
-        let body = String::from_utf8(body).unwrap();
-        assert!(body.contains(PAT_OVER_HTTP_REFUSAL_REASON), "got: {body}");
-    }
-
-    /// The same CliSession JWT over proven-HTTPS → NOT refused (the gate
-    /// only fires on a non-proven-HTTPS wire). Flows through to the auth
-    /// validator (which 401s on the placeholder signature), proving the
-    /// 426 is gated on transport, not on the token shape alone.
-    #[test]
-    fn cli_session_jwt_over_https_proceeds_normally() {
-        let token = cli_session_shaped_jwt(
-            hort_app::cli_session_signing::CLI_SESSION_AUDIENCE,
-            hort_app::cli_session_signing::CLI_SESSION_TOKEN_KIND,
-        );
-        let status = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                let (ctx, _idp) = enabled_ctx(prom_handle());
-                let router = router_with_trust(ctx, trust_with_scheme("https"));
-                let resp = router
-                    .oneshot(
-                        HttpRequest::get("/protected")
-                            .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                            .body(Body::empty())
-                            .unwrap(),
-                    )
-                    .await
-                    .unwrap();
-                resp.status()
-            });
-        assert_ne!(status, StatusCode::UPGRADE_REQUIRED);
-    }
-
-    // ---- pure unit tests on the gate's component fns ----
-
-    #[test]
-    fn looks_like_pat_token_recognises_pat_and_svc_prefixes() {
-        assert!(looks_like_pat_token("hort_pat_anything"));
-        assert!(looks_like_pat_token("hort_svc_anything"));
-    }
-
-    #[test]
-    fn looks_like_pat_token_rejects_oidc_tokens_and_short_inputs() {
-        assert!(!looks_like_pat_token("hort"));
-        assert!(!looks_like_pat_token(""));
-        assert!(!looks_like_pat_token("eyJhbGc.foo.bar")); // OIDC JWT shape
-        assert!(!looks_like_pat_token("hort_xyz_body")); // wrong kind
-        assert!(!looks_like_pat_token("hort-pat-body")); // wrong separator
-                                                         // The `hort_cli_` prefix is dead (CliSession is a JWT now);
-                                                         // the gate no longer keys on it. A `hort_cli_*` shape is treated
-                                                         // like any other unknown opaque token — it is NOT a PAT prefix.
-        assert!(!looks_like_pat_token("hort_cli_anything"));
-    }
-
-    #[test]
-    fn looks_like_cli_session_jwt_matches_only_the_cli_session_family() {
-        // Genuine CliSession-family payload (aud + token_kind both set).
-        let cli = cli_session_shaped_jwt(
-            hort_app::cli_session_signing::CLI_SESSION_AUDIENCE,
-            hort_app::cli_session_signing::CLI_SESSION_TOKEN_KIND,
-        );
-        assert!(looks_like_cli_session_jwt(&cli));
-
-        // Right aud, wrong token_kind → not the CliSession family.
-        let wrong_kind = cli_session_shaped_jwt(
-            hort_app::cli_session_signing::CLI_SESSION_AUDIENCE,
-            "service_account",
-        );
-        assert!(!looks_like_cli_session_jwt(&wrong_kind));
-
-        // CliSession token_kind but a different aud (e.g. an OCI token's
-        // registry-host aud) → not the CliSession family.
-        let wrong_aud = cli_session_shaped_jwt(
-            "registry.example.com",
-            hort_app::cli_session_signing::CLI_SESSION_TOKEN_KIND,
-        );
-        assert!(!looks_like_cli_session_jwt(&wrong_aud));
-
-        // Non-JWT / non-CliSession shapes are not matched.
-        assert!(!looks_like_cli_session_jwt("")); // empty
-        assert!(!looks_like_cli_session_jwt("oidc-tok")); // opaque OIDC mock token
-        assert!(!looks_like_cli_session_jwt("hort_pat_anything")); // PAT shape
-        assert!(!looks_like_cli_session_jwt("a.b")); // too few segments
-        assert!(!looks_like_cli_session_jwt("!!!.@@@.###")); // un-decodable payload
-
-        // A well-formed JWT whose payload is valid JSON but lacks the
-        // discriminator claims (an OIDC-shaped JWT) is not matched.
-        let oidc_shaped = {
-            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-            let h = URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256"}"#);
-            let p = URL_SAFE_NO_PAD.encode(r#"{"iss":"https://kc.example.com","aud":"hort"}"#);
-            let s = URL_SAFE_NO_PAD.encode([0u8; 8]);
-            format!("{h}.{p}.{s}")
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(batches.len(), 1);
+        let DomainEvent::AuthenticationAttempted(attempt) = &batches[0].events[0].event else {
+            panic!("the refusal must append an authentication-attempt event");
         };
-        assert!(!looks_like_cli_session_jwt(&oidc_shaped));
+        assert_eq!(attempt.result, RESULT_TRANSPORT_REFUSED);
+        assert_eq!(attempt.client_ip.to_string(), "203.0.113.42");
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| {
+                line.contains("auth attempt")
+                    && line.contains("203.0.113.42")
+                    && line.contains(RESULT_TRANSPORT_REFUSED)
+            }) {
+                Ok(())
+            } else {
+                Err("the refusal must log client_ip at info level".to_string())
+            }
+        });
+    }
+
+    // -- the precedence rows that are properties of the request ---------
+
+    /// The one row a declared scope reaches, at the boundary: a direct,
+    /// unrelayed peer inside the range is served, and the handler still
+    /// observes `Unknown` — the waiver changed what is accepted, not what
+    /// the server believes about the wire.
+    #[test]
+    fn a_declared_hop_is_waived_at_the_boundary_without_claiming_tls() {
+        for optional in [false, true] {
+            let (status, body) = drive_full_stack(optional, false, WAIVED_PEER, &[], bearer());
+            assert_eq!(status, StatusCode::OK, "optional={optional}");
+            assert_eq!(body, "Unknown/some", "optional={optional}");
+        }
+    }
+
+    /// A relayed request is never waived, asserted for each forwarding
+    /// header name separately. This is the row that closes the
+    /// undeclared-ingress hole: the peer is inside the waived range and
+    /// absent from the trusted-proxy list, so its forwarded scheme is
+    /// ignored and every other condition of the declared row holds.
+    #[test]
+    fn a_relayed_request_from_a_declared_peer_is_refused_per_header_name() {
+        for (name, value) in [
+            ("x-forwarded-for", "203.0.113.9"),
+            ("x-forwarded-proto", "https"),
+            ("forwarded", "proto=https"),
+        ] {
+            for optional in [false, true] {
+                let (status, _) =
+                    drive_full_stack(optional, false, WAIVED_PEER, &[(name, value)], bearer());
+                assert_eq!(
+                    status,
+                    StatusCode::UPGRADE_REQUIRED,
+                    "{name} from an untrusted peer must withdraw the waiver (optional={optional})"
+                );
+            }
+        }
+    }
+
+    /// A peer listed in both variables gets the trusted-proxy behaviour,
+    /// which is the stricter one — asserted with no forwarded scheme
+    /// present, so the refusal is about the peer rather than about
+    /// evidence.
+    #[test]
+    fn a_declared_peer_that_is_also_a_trusted_proxy_is_refused() {
+        for optional in [false, true] {
+            let (status, _) = drive_full_stack(optional, true, WAIVED_PEER, &[], bearer());
+            assert_eq!(
+                status,
+                StatusCode::UPGRADE_REQUIRED,
+                "a trusted proxy is never waived by a scope (optional={optional})"
+            );
+        }
+    }
+
+    /// `Plaintext` is never waived by a scope: a trusted peer honestly
+    /// reporting `proto=http` is evidence that an external client spoke
+    /// cleartext, and an internal declaration must not accept that.
+    #[test]
+    fn a_trusted_peer_reporting_plaintext_inside_the_declared_scope_is_refused() {
+        let (status, _) = drive_full_stack(
+            false,
+            true,
+            WAIVED_PEER,
+            &[("x-forwarded-proto", "http")],
+            bearer(),
+        );
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    }
+
+    /// The waiver matches the raw TCP peer, never the forwarded address:
+    /// an outside peer naming an inside address in `X-Forwarded-For` is
+    /// refused, and so is an outside peer that names nothing.
+    #[test]
+    fn the_declared_scope_is_matched_against_the_raw_peer() {
+        for request_headers in [Vec::new(), vec![("x-forwarded-for", WAIVED_PEER)]] {
+            let (status, _) =
+                drive_full_stack(false, false, OUTSIDE_PEER, &request_headers, bearer());
+            assert_eq!(
+                status,
+                StatusCode::UPGRADE_REQUIRED,
+                "headers={request_headers:?}"
+            );
+        }
+    }
+
+    // -- RFC 7235 §2.1 scheme matching, per extractor -------------------
+    //
+    // `auth-scheme` is a token matched case-insensitively, and `1*SP`
+    // separates it from the credential. All three extractors below reach
+    // that rule through `auth_scheme::strip_auth_scheme`, so each test
+    // asserts the EQUALITY of a non-canonical spelling's outcome with the
+    // canonical one — the property is that the spelling does not matter,
+    // which a pair of independent literals would not catch when the two
+    // diverge.
+
+    /// Every spelling of `Basic` that RFC 7235 §2.1 admits, plus the
+    /// `1*SP` variants, against a canonical-case single-space baseline.
+    fn basic_scheme_spellings(encoded: &str) -> [(String, String); 5] {
+        [
+            ("lower-case".into(), format!("basic {encoded}")),
+            ("upper-case".into(), format!("BASIC {encoded}")),
+            ("mixed-case".into(), format!("bAsIc {encoded}")),
+            ("two spaces".into(), format!("Basic  {encoded}")),
+            ("lower-case + 3 spaces".into(), format!("basic   {encoded}")),
+        ]
+    }
+
+    #[test]
+    fn extract_basic_credentials_is_scheme_case_insensitive_and_1sp() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("__token__:hort_pat_x");
+        let canonical = extract_basic_credentials(&basic_header_req(&format!("Basic {encoded}")));
+        assert_eq!(
+            canonical,
+            BasicCredentialsResult::Ok {
+                username: "__token__".into(),
+                password: "hort_pat_x".into()
+            },
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in basic_scheme_spellings(&encoded) {
+            assert_eq!(
+                extract_basic_credentials(&basic_header_req(&value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_credentials_still_refuses_another_scheme() {
+        // Not a prefix-free "anything goes": a different scheme carries no
+        // Basic credential, whatever its case.
+        for value in [
+            "Digest aGVsbG86d29ybGQ=",
+            "digest aGVsbG86d29ybGQ=",
+            "Bearer tok",
+        ] {
+            assert_eq!(
+                extract_basic_credentials(&basic_header_req(value)),
+                BasicCredentialsResult::Absent,
+                "{value} was accepted as Basic"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_credentials_empty_credential_is_unchanged() {
+        // The scheme-present-but-empty boundary: `Basic ` decodes to an
+        // empty payload with no colon. Pinned as-is — whether a
+        // malformed-but-present credential should be anonymous or a 401 is
+        // a separate question this rule does not touch.
+        for value in ["Basic ", "basic "] {
+            assert_eq!(
+                extract_basic_credentials(&basic_header_req(value)),
+                BasicCredentialsResult::MissingColon,
+                "{value} changed the empty-credential classification"
+            );
+        }
+        // No SP at all is not `credentials` with a payload — absent, as
+        // before.
+        assert_eq!(
+            extract_basic_credentials(&basic_header_req("Basic")),
+            BasicCredentialsResult::Absent
+        );
+    }
+
+    #[test]
+    fn extract_bearer_is_scheme_case_insensitive_and_1sp() {
+        let canonical = extract_bearer(&basic_header_req("Bearer abc.def.ghi"));
+        assert_eq!(
+            canonical.as_deref(),
+            Some("abc.def.ghi"),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in [
+            ("lower-case", "bearer abc.def.ghi"),
+            ("upper-case", "BEARER abc.def.ghi"),
+            ("mixed-case", "bEaReR abc.def.ghi"),
+            ("two spaces", "Bearer  abc.def.ghi"),
+            ("lower-case + 3 spaces", "bearer   abc.def.ghi"),
+        ] {
+            assert_eq!(
+                extract_bearer(&basic_header_req(value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_bearer_still_refuses_another_scheme() {
+        for value in ["Digest abc.def.ghi", "digest abc.def.ghi", "Bearerish tok"] {
+            assert!(
+                extract_bearer(&basic_header_req(value)).is_none(),
+                "{value} was accepted as Bearer"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_bearer_empty_credential_is_unchanged() {
+        // `Bearer ` has no token to validate and stays an absence mode, in
+        // every spelling and with no SP at all.
+        for value in ["Bearer ", "bearer ", "Bearer", "bearer"] {
+            assert!(
+                extract_bearer(&basic_header_req(value)).is_none(),
+                "{value} changed the empty-credential classification"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_password_as_token_is_scheme_case_insensitive_and_1sp() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("__token__:my-jwt");
+        let canonical =
+            extract_basic_password_as_token(&basic_header_req(&format!("Basic {encoded}")));
+        assert_eq!(
+            canonical,
+            BasicAuthResult::Ok("my-jwt".into()),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in basic_scheme_spellings(&encoded) {
+            assert_eq!(
+                extract_basic_password_as_token(&basic_header_req(&value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_password_as_token_still_refuses_another_scheme() {
+        for value in ["Digest aGVsbG86d29ybGQ=", "digest aGVsbG86d29ybGQ="] {
+            assert_eq!(
+                extract_basic_password_as_token(&basic_header_req(value)),
+                BasicAuthResult::Absent,
+                "{value} was accepted as Basic"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_basic_password_as_token_empty_credential_is_unchanged() {
+        for value in ["Basic ", "basic "] {
+            assert_eq!(
+                extract_basic_password_as_token(&basic_header_req(value)),
+                BasicAuthResult::MissingColon,
+                "{value} changed the empty-credential classification"
+            );
+        }
+        assert_eq!(
+            extract_basic_password_as_token(&basic_header_req("Basic")),
+            BasicAuthResult::Absent
+        );
+    }
+
+    /// A request carrying `value` as its raw `Authorization` header.
+    /// Built with `HeaderValue::from_str` rather than a typed scheme so
+    /// the non-canonical spellings reach the extractor verbatim.
+    fn basic_header_req(value: &str) -> Request<Body> {
+        HttpRequest::get("/")
+            .header(header::AUTHORIZATION, value)
+            .body(Body::empty())
+            .unwrap()
     }
 }

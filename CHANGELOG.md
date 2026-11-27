@@ -7,6 +7,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-27
+
+### Breaking changes
+
+- **Credentialed requests now need TLS evidence**, and the waiver is empty by
+  default. The chart's own admin-task CronJobs call the plaintext Service URL,
+  so they answer `426` until either `tlsSidecar.enabled` terminates TLS inside
+  the pod or `tlsNotRequiredFrom` names the callers' range — and that range can
+  only be measured from the refusals the new build logs, never guessed, so plan
+  a two-step rollout (#457).
+- **An enabled `metrics.serviceMonitor` now also requires `tlsSidecar.enabled`
+  and five CA/bearer fields**, and the chart fails to render without them
+  instead of scraping unauthenticated. With the sidecar on, `metrics.bindAddr`
+  must be exactly `127.0.0.1:<service.metricsPort>`; `allowUnspecifiedBind`
+  does not exempt it (#462).
+
+### Added
+
+- The Helm chart can serve HTTPS from the server pod, including health probes and admin-task CronJobs. Provide a certificate covering the bare Service name and its CA bundle, enable `tlsSidecar`, and require HTTPS at the edge (#457).
+
+- A credentialed Prometheus scrape of `/metrics` now has a TLS path: the chart's
+  TLS sidecar serves it on its own `tlsSidecar.metricsHttpsPort`, with the CA
+  and bearer references the chart previously told operators to add by hand
+  (#462).
+
+### Changed
+
+- The worker image now carries Trivy 0.76.2 and osv-scanner 2.7.1, up from
+  0.70.0 and 2.3.8; the native (non-Kubernetes) install and the bundled-tool
+  NOTICE move with it. Both scanners' rulesets advanced over those releases, so
+  an artifact rescanned after the upgrade can earn findings it did not have
+  before (#463).
+
+- A withheld artifact whose scan reached no verdict now records **which** of
+  four origins caused it — an inert backend/format pairing, skipped archive
+  link entries, an empty filesystem report, or an assembled image no backend
+  assessed — on the event trail and the job summary rather than only in the
+  worker log. The stable identifier therefore changes from
+  `no_analyzer_matched` to a per-origin form, so a dashboard or alert matching
+  the old string needs updating (#461).
+
+### Fixed
+
+- The upload-payload metadata cap now applies to verified ingest (hosted PyPI
+  publication, OCI manifest and blob writes, every pull-through) and to pushed
+  signature manifests, so an oversized payload is refused before any content
+  reaches storage instead of being accepted unbounded (#458).
+- A proxied cargo sparse index no longer advertises a version whose upstream
+  `cksum` is missing or malformed; such a version's download was always
+  refused, so resolving to it broke the build (#458).
+- A Maven checksum sidecar for an unresolved `-SNAPSHOT` path now resolves to
+  the same timestamped build the file request resolves to, instead of
+  answering 404 and failing a client with a strict checksum policy (#458).
+- Stored event-chain evidence that cannot be read back now fails the
+  checkpoint cycle terminally (`failed_terminal`, with a `chain_evidence_locus`
+  log field) instead of being retried as a transient outage (#458).
+- An `Authorization` header whose scheme is not spelled in canonical case
+  (`bearer`/`basic`), or which separates scheme and credential with more than
+  one space, is now accepted as the credential it is instead of being treated
+  as no credential at all (#458).
+- A digest-addressed OCI manifest or blob request no longer resolves across
+  image names inside one hort repository: identity is now scoped to the OCI
+  `<name>` it was pushed under, so the same bytes can be held under two names.
+  Rows written by earlier releases keep the name-free path and stay readable;
+  0.19.0 rewrites them (#459).
+- An OCI referrers list now returns only referrers pushed under the image name
+  that was asked for, as the Distribution Spec requires; referrers written by
+  earlier releases carry no name and stay listed under every name until 0.19.0
+  rewrites them (#459).
+- An OCI image index is now accepted only when its child manifests exist under
+  the same image name the index is pushed under, instead of anywhere in the
+  hort repository; a child under a different name answers
+  `MANIFEST_BLOB_UNKNOWN`, and pushing it under the index's own name resolves
+  it (#459).
+- An OCI cross-repository blob mount now reads `from=` as an image namespace
+  (`<repository>/<image name>`) rather than as a bare hort repository key, so a
+  mount between two image names inside one repository works and a blob held
+  only under a different name is no longer mounted; a source written by an
+  earlier release still mounts, and an unmountable source still falls back to a
+  normal upload (#459).
+- An OCI manifest is now accepted only when its config and layer blobs exist
+  under the image name it is pushed under; a blob held only under a different
+  name answers `MANIFEST_BLOB_UNKNOWN`, and uploading or cross-mounting it into
+  that name resolves it (#459).
+- An OCI pull-through for an image name whose bytes another name in the same
+  repository already holds now stores and serves that name's own row, instead
+  of answering from the other name's row and re-fetching from the upstream on
+  every request (#459).
+
+- A `cargo publish` now bounds its metadata JSON at 1 MiB, where no bound
+  applied before, and returns the refusal in cargo's own error envelope so the
+  publisher sees the reason (#458).
+
+### Security
+
+- The TLS requirement above covers credentialed API, OCI and metrics requests
+  and token issuance; anonymous reads are unaffected, and
+  `HORT_BEARER_ALLOW_OVER_HTTP` does not waive token exchange. The edge must
+  overwrite the forwarded scheme header, and the waiver cannot cover a peer
+  inside `HORT_TRUSTED_PROXY_CIDRS` — on Kubernetes the in-cluster hop
+  therefore needs TLS rather than a waiver (#457).
+- Updated `kube` to 4.2.1, resolving RUSTSEC-2026-0600.
+- Discovery now answers 404 instead of 403 for repositories the caller cannot
+  read, matching the response for a missing repository (#458).
+- The deployment hardening guide now states what the event-chain anchor bucket
+  must be provisioned with: S3 Object Lock enabled **and** a bucket default
+  retention in COMPLIANCE mode. Object Lock enabled without a default
+  retention stores every checkpoint mutably, which hort cannot detect —
+  re-check an existing anchor bucket with
+  `aws s3api get-object-lock-configuration` (#458).
+- A token revoked while a validation for it was already in flight is no longer
+  served from the per-replica validation cache for the rest of the cache TTL
+  (#458).
+- A cached federation JWKS is now bound to the issuer identity it was fetched
+  under, so repointing or recreating an OIDC issuer takes effect at once
+  instead of after the JWKS refresh interval (#458).
+
 ## [0.18.0] - 2026-11-21
 
 ### Migration notice
@@ -42,6 +159,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- OCI referrers descriptors now include source annotations and the spec-defined
+  `artifactType` fallback; filtered lists disclose the applied filter (#456).
 - Maven `.jar`/`.war` artifacts are no longer withheld as scan-indeterminate for
   an unreadable embedded dependency declaration — a dependency that resolved
   before no longer starts answering 403. An artifact already withheld clears on
@@ -84,6 +203,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- OCI upload sessions are bound to the writer and the name that opened them.
+  Uploads in flight across the upgrade must be re-initiated (#458).
 - Accepted the informational `unmaintained` advisories for `chrono`
   (RUSTSEC-2026-0543) and `humantime` (RUSTSEC-2026-0542) — neither reports a
   defect, all versions are affected, and no upgrade exists (#448).

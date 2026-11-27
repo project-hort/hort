@@ -15,12 +15,10 @@
 //! why). No hand-rolled `AppContext` wiring either way — `build_mock_ctx`
 //! stays the sole construction path.
 //!
-//! Pin (b) (mount of a `Rejected` source -> 404 `BLOB_UNKNOWN`, no row
-//! minted) is already covered by Item 2's
-//! `cross_mount_rejected_source_returns_404_blob_unknown_no_row_minted` in
-//! `crates/hort-http-oci/src/uploads.rs` — not duplicated here. This file
-//! adds the `ScanIndeterminate` sibling at the handler level (Item 2 only
-//! covered it at the `hort-app` use-case level).
+//! The `Rejected` source fallback is covered by
+//! `cross_mount_rejected_source_falls_through_without_minting_row` in
+//! `crates/hort-http-oci/src/uploads.rs`. This file adds the
+//! `ScanIndeterminate` sibling at the handler level.
 //!
 //! Pin (c) (the OCI cross-repo pull-dedup FOLLOWER trigger) lives in
 //! `crates/hort-http-oci/src/blobs.rs`'s inline test module instead of
@@ -180,6 +178,7 @@ fn mount_of_clean_source_quarantines_target_and_holds_blob_read() {
         let mut src_artifact =
             hort_app::use_cases::test_support::sample_artifact(QuarantineStatus::None);
         src_artifact.repository_id = src_id;
+        src_artifact.path = format!("blobs/nginx/sha256:{hex}");
         src_artifact.sha256_checksum = hash.clone();
         src_artifact.size_bytes = content.len() as i64;
         mocks.artifacts.insert(src_artifact);
@@ -188,7 +187,7 @@ fn mount_of_clean_source_quarantines_target_and_holds_blob_read() {
         let router = router(ctx);
 
         let mount_uri =
-            format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo");
+            format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx");
         let mount_resp = router
             .clone()
             .oneshot(with_principal(
@@ -232,13 +231,10 @@ fn mount_of_clean_source_quarantines_target_and_holds_blob_read() {
     );
 }
 
-/// Pin (b) sibling: mount of a `ScanIndeterminate` source -> the SAME 404
-/// `BLOB_UNKNOWN` / no-row-minted outcome as the `Rejected` case Item 2
-/// already pins at the handler level
-/// (`cross_mount_rejected_source_returns_404_blob_unknown_no_row_minted`
-/// in `uploads.rs`). Added here because that one only covered `Rejected`.
+/// A `ScanIndeterminate` source is unmountable and takes the same
+/// standard-upload fallback as a `Rejected` source. No target row is minted.
 #[test]
-fn mount_of_scan_indeterminate_source_returns_404_blob_unknown_no_row_minted() {
+fn mount_of_scan_indeterminate_source_falls_through_without_minting_row() {
     let content = b"indeterminate mount content for item3 regression".to_vec();
     let hex = {
         use sha2::Digest;
@@ -258,6 +254,7 @@ fn mount_of_scan_indeterminate_source_returns_404_blob_unknown_no_row_minted() {
         let mut src_artifact =
             hort_app::use_cases::test_support::sample_artifact(QuarantineStatus::ScanIndeterminate);
         src_artifact.repository_id = src_id;
+        src_artifact.path = format!("blobs/nginx/sha256:{hex}");
         src_artifact.sha256_checksum = hash.clone();
         src_artifact.size_bytes = content.len() as i64;
         mocks.artifacts.insert(src_artifact);
@@ -265,7 +262,7 @@ fn mount_of_scan_indeterminate_source_returns_404_blob_unknown_no_row_minted() {
 
         let router = router(ctx);
         let mount_uri =
-            format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo");
+            format!("/v2/target-repo/nginx/blobs/uploads/?mount=sha256:{hex}&from=src-repo/nginx");
         let resp = router
             .oneshot(with_principal(
                 Request::post(&mount_uri).body(Body::empty()).unwrap(),
@@ -277,9 +274,8 @@ fn mount_of_scan_indeterminate_source_returns_404_blob_unknown_no_row_minted() {
         (status, body, mocks.artifacts.snapshot_all().len())
     });
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(parsed["errors"][0]["code"], "BLOB_UNKNOWN");
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert!(body.is_empty());
     assert_eq!(
         artifact_count_after, 1,
         "a ScanIndeterminate source must never mint a target-repo row"

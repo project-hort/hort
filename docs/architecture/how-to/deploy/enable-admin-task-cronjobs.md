@@ -109,6 +109,13 @@ Also required (unrelated to the gitops prerequisite, but easy to miss):
 `postgres.admin.existingSecret` must be set — the bootstrap Job mints the
 token under the admin DSN — and CronJob pods need an in-cluster network
 path to the `hort-server` Service.
+With `tlsSidecar.enabled`, also set `extraCaBundle.path` and either
+`extraCaBundle.configMapName` or `extraCaBundle.secretName` to a PEM bundle
+that trusts the Service certificate. The chart mounts the bundle and sets
+`HORT_EXTRA_CA_BUNDLE` on each credentialed CronJob. Without the sidecar,
+the CLI uses the plaintext Service URL; a `tlsNotRequiredFrom` scope can
+waive an unrelayed, untrusted peer only. See
+[`inbound-credential-transport.md`](inbound-credential-transport.md).
 
 ---
 

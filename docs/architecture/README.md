@@ -54,6 +54,7 @@ Start here if you want to know **why** the system looks the way it does.
 - [Install `hort-server` + `hort-worker` on a single Linux host](how-to/deploy/local-bringup.md)
 - [Helm chart — values reference](how-to/deploy/values-reference.md)
 - [Helm chart — edge overlays](how-to/deploy/examples-overlays.md)
+- [Configure inbound credential transport](how-to/deploy/inbound-credential-transport.md)
 - [Install fully sovereign against `registry.hort.rs`](how-to/deploy/self-contained-registry-install.md)
 - [Upgrade a running deployment (and `### Migration notice` releases)](how-to/deploy/upgrade.md)
 - [Provision the two Postgres roles](how-to/deploy/postgres-roles.md)
@@ -87,6 +88,8 @@ Information-oriented, exhaustive, kept in lockstep with the code.
   — domain events external consumers may subscribe to, with payload fields, stream, and stability contract.
 - [npm format — entity reference](reference/npm-format-entities.md)
   — every npm registry entity as hort handles it: stored, derived, or discarded, and why; updated whenever an initiative changes an entity's class.
+- [OCI namespace and identity](reference/oci-namespace-and-identity.md)
+  — what identifies an OCI artifact and which namespace that identity lives in: the wire `<name>` versus hort's configured repository, per-surface keys, and the conformance gap between the decision and the code.
 - [Apply-time linter rows — coverage matrix](reference/apply-time-linter-rows.md)
   — every named gitops apply-time lint row and what it rejects, the retirement trigger for each row that exists because a control is missing, and — separately — where the surfaces with *no* named row are actually validated.
 

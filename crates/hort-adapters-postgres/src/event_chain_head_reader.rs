@@ -60,9 +60,11 @@
 
 use sqlx::{PgPool, Row};
 
-use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::events::{DomainEvent, EventHash, SealedStreamRecord, StreamHead, StreamId};
-use hort_domain::ports::event_chain_head_reader::{EventChainHeadReaderPort, LiveChainSnapshot};
+use hort_domain::ports::event_chain_head_reader::{
+    ChainEvidenceLocus, ChainSnapshotError, CorruptChainEvidence, EventChainHeadReaderPort,
+    LiveChainSnapshot,
+};
 use hort_domain::ports::BoxFuture;
 
 /// The never-deleted audit-meta stream id the `StreamSealed` tombstones
@@ -91,17 +93,34 @@ impl PgEventChainHeadReader {
     }
 }
 
+/// Report that an infrastructure step of the snapshot failed.
+///
+/// The one construction point for the transient class, so each site
+/// names the step and nothing else — and so the classification of a
+/// snapshot failure is a decision taken at the site rather than a
+/// `From` conversion's default. `step` is the step that failed, in the
+/// imperative the message already reads with (`"<step> failed: <cause>"`).
+fn snapshot_unavailable(step: &str, cause: &sqlx::Error) -> ChainSnapshotError {
+    ChainSnapshotError::unavailable(format!("{step} failed: {cause}"))
+}
+
 /// Convert a stored 32-byte `bytea` chain column to the domain
-/// [`EventHash`]. A wrong width is an operational invariant breach (the
-/// schema `CHECK (octet_length(event_hash) = 32)` should make this
-/// unreachable) — surfaced as `Err`, never silently coerced.
-pub(crate) fn to_event_hash(bytes: &[u8], col: &str) -> DomainResult<EventHash> {
+/// [`EventHash`]. A wrong width means the stored chain evidence cannot be
+/// read back (the schema `CHECK (octet_length(event_hash) = 32)` should
+/// make this unreachable) — surfaced as [`CorruptChainEvidence`], never
+/// silently coerced and never as a transient failure: the same bytes
+/// read again are the same width.
+pub(crate) fn to_event_hash(bytes: &[u8], col: &str) -> Result<EventHash, CorruptChainEvidence> {
     let arr: [u8; 32] = bytes.try_into().map_err(|_| {
-        DomainError::Invariant(format!(
-            "{col} is {} bytes, expected 32 (schema CHECK should make this \
-             unreachable)",
-            bytes.len()
-        ))
+        CorruptChainEvidence::new(
+            ChainEvidenceLocus::ChainHashColumn,
+            col,
+            format!(
+                "is {} bytes, expected 32 (schema CHECK should make this \
+                 unreachable)",
+                bytes.len()
+            ),
+        )
     })?;
     Ok(EventHash(arr))
 }
@@ -116,16 +135,22 @@ pub(crate) fn to_event_hash(bytes: &[u8], col: &str) -> DomainResult<EventHash> 
 /// and stays distinct from it.
 ///
 /// A position wider than `bigint` cannot have come out of the column it
-/// is about, so it is an operational invariant breach — surfaced as
-/// `Err`, never silently clamped into a window that would skip seals.
-pub(crate) fn sealed_position_bound(anchored: Option<u64>) -> DomainResult<i64> {
+/// is about, so the signed witness it was recovered from is unreadable as
+/// chain evidence — surfaced as [`CorruptChainEvidence`], never silently
+/// clamped into a window that would skip seals, and never as a transient
+/// failure: the same witness read again yields the same position.
+pub(crate) fn sealed_position_bound(anchored: Option<u64>) -> Result<i64, CorruptChainEvidence> {
     match anchored {
         None => Ok(-1),
         Some(position) => i64::try_from(position).map_err(|_| {
-            DomainError::Invariant(format!(
-                "anchored audit-meta stream position {position} exceeds the \
-                 bigint stream_position column it is compared against"
-            ))
+            CorruptChainEvidence::new(
+                ChainEvidenceLocus::AnchoredRetentionPosition,
+                retention_stream_id(),
+                format!(
+                    "anchored position {position} exceeds the bigint \
+                     stream_position column it is compared against"
+                ),
+            )
         }),
     }
 }
@@ -136,29 +161,51 @@ pub(crate) fn sealed_position_bound(anchored: Option<u64>) -> DomainResult<i64> 
 /// (`serialize_event_data`); deserialize the typed event the same way
 /// the rest of the read path does, then project the two fields the
 /// checkpoint binds. A row that does not deserialize as `StreamSealed`
-/// is an operational corruption (`Err`) — not silently skipped.
+/// is stored evidence that cannot be read back
+/// ([`CorruptChainEvidence`]) — not silently skipped, and not a
+/// transient failure: the same payload decodes the same way every time.
 pub(crate) fn sealed_record_from_row(
     event_data: &serde_json::Value,
-) -> DomainResult<SealedStreamRecord> {
-    let data = event_data.get("data").ok_or_else(|| {
-        DomainError::Invariant("StreamSealed event_data missing 'data' field".into())
-    })?;
+) -> Result<SealedStreamRecord, CorruptChainEvidence> {
+    let payload = |detail: String| {
+        CorruptChainEvidence::new(
+            ChainEvidenceLocus::SealedRecordPayload,
+            retention_stream_id(),
+            detail,
+        )
+    };
+    let data = event_data
+        .get("data")
+        .ok_or_else(|| payload("StreamSealed event_data missing 'data' field".into()))?;
     // `{event_type: data}` is the serde enum envelope the rest of the
     // read path reconstructs (mappers::deserialize_event_data); reuse
     // the exact shape so this adapter and the event store agree.
     let envelope = serde_json::json!({ "StreamSealed": data });
     let event: DomainEvent = serde_json::from_value(envelope)
-        .map_err(|e| DomainError::Invariant(format!("failed to deserialize StreamSealed: {e}")))?;
+        .map_err(|e| payload(format!("failed to deserialize StreamSealed: {e}")))?;
+    sealed_record_from_event(event)
+}
+
+/// Project a decoded audit-meta event into the record the checkpoint
+/// binds.
+///
+/// Split from [`sealed_record_from_row`] so the "this is not a seal"
+/// verdict is reachable on its own: the envelope that function builds is
+/// externally tagged, so only a `StreamSealed` can come back out of it,
+/// and a refusal no test can reach is a refusal nothing holds in place.
+pub(crate) fn sealed_record_from_event(
+    event: DomainEvent,
+) -> Result<SealedStreamRecord, CorruptChainEvidence> {
     match event {
         DomainEvent::StreamSealed(s) => Ok(SealedStreamRecord {
             sealed_stream_id: s.sealed_stream_id,
             final_event_hash: EventHash(s.final_event_hash),
         }),
-        other => Err(DomainError::Invariant(format!(
-            "expected StreamSealed on {}, got {}",
+        other => Err(CorruptChainEvidence::new(
+            ChainEvidenceLocus::SealedRecordEventType,
             retention_stream_id(),
-            other.event_type()
-        ))),
+            format!("expected StreamSealed, got {}", other.event_type()),
+        )),
     }
 }
 
@@ -166,7 +213,7 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
     fn snapshot_live_chain(
         &self,
         anchored_retention_position: Option<u64>,
-    ) -> BoxFuture<'_, DomainResult<LiveChainSnapshot>> {
+    ) -> BoxFuture<'_, Result<LiveChainSnapshot, ChainSnapshotError>> {
         Box::pin(async move {
             // Resolve the window bound before opening the cut: a bound
             // that cannot be expressed is this cycle's failure, not a
@@ -175,14 +222,15 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
 
             // One REPEATABLE READ transaction → a consistent cut.
             // All three reads see the same snapshot.
-            let mut tx =
-                self.pool.begin().await.map_err(|e| {
-                    DomainError::Invariant(format!("begin snapshot tx failed: {e}"))
-                })?;
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| snapshot_unavailable("begin snapshot tx", &e))?;
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| DomainError::Invariant(format!("set repeatable read failed: {e}")))?;
+                .map_err(|e| snapshot_unavailable("set repeatable read", &e))?;
 
             // (1) Per-stream head: the row with the max stream_position
             //     for each stream_id, and that row's event_hash. Same
@@ -197,9 +245,7 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
             )
             .fetch_all(&mut *tx)
             .await
-            .map_err(|e| {
-                DomainError::Invariant(format!("reading live stream heads failed: {e}"))
-            })?;
+            .map_err(|e| snapshot_unavailable("reading live stream heads", &e))?;
 
             let mut heads = Vec::with_capacity(head_rows.len());
             for row in &head_rows {
@@ -219,9 +265,7 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
                 sqlx::query("SELECT COALESCE(MAX(global_position), 0) AS max_gp FROM events")
                     .fetch_one(&mut *tx)
                     .await
-                    .map_err(|e| {
-                        DomainError::Invariant(format!("reading max global_position failed: {e}"))
-                    })?
+                    .map_err(|e| snapshot_unavailable("reading max global_position", &e))?
                     .get("max_gp");
 
             // (3) StreamSealed records on the audit-meta stream (ADR 0004),
@@ -247,9 +291,7 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
             .bind(sealed_after)
             .fetch_all(&mut *tx)
             .await
-            .map_err(|e| {
-                DomainError::Invariant(format!("reading StreamSealed records failed: {e}"))
-            })?;
+            .map_err(|e| snapshot_unavailable("reading StreamSealed records", &e))?;
 
             let mut sealed = Vec::with_capacity(sealed_rows.len());
             for row in &sealed_rows {
@@ -260,7 +302,7 @@ impl EventChainHeadReaderPort for PgEventChainHeadReader {
             // Read-only — commit (no writes; commit releases the snapshot).
             tx.commit()
                 .await
-                .map_err(|e| DomainError::Invariant(format!("commit snapshot tx failed: {e}")))?;
+                .map_err(|e| snapshot_unavailable("commit snapshot tx", &e))?;
 
             Ok(LiveChainSnapshot::new(heads, max_gp as u64, sealed))
         })
@@ -276,6 +318,13 @@ mod tests {
     use uuid::Uuid;
 
     // ---- pure helpers (no DB) ------------------------------------------
+    //
+    // Every refusal below is the stored chain evidence being unreadable,
+    // and each asserts its locus rather than only its message: the locus
+    // is the field an operator alerts on, and it is what tells this
+    // class apart from the store being unreachable. A refusal that
+    // reported the transient class would make tamper evidence
+    // indistinguishable from an S3 or Postgres blip.
 
     #[test]
     fn to_event_hash_accepts_32_bytes() {
@@ -288,7 +337,34 @@ mod tests {
     #[test]
     fn to_event_hash_rejects_wrong_width() {
         let e = to_event_hash(&[0u8; 16], "event_hash").unwrap_err();
-        assert!(e.to_string().contains("expected 32"));
+        assert_eq!(e.locus, ChainEvidenceLocus::ChainHashColumn);
+        assert_eq!(e.subject, "event_hash", "the locus names the column read");
+        assert!(e.detail.contains("expected 32"), "detail={}", e.detail);
+        // The payload locates the datum and never carries it: the bytes
+        // of a corrupt hash column are of no use to an operator reading
+        // a log line, and a log field is no place for them.
+        assert!(
+            e.detail.chars().all(|c| !c.is_control()),
+            "the detail must carry no raw bytes: detail={}",
+            e.detail
+        );
+    }
+
+    #[test]
+    fn an_infrastructure_step_is_the_transient_class_not_corrupt_evidence() {
+        // The six snapshot steps route through one constructor, so the
+        // classification is a decision taken at the site; this pins that
+        // the decision is the transient one and that the message shape
+        // the operator reads is unchanged.
+        let e = snapshot_unavailable("begin snapshot tx", &sqlx::Error::PoolClosed);
+        assert!(
+            e.corrupt_evidence().is_none(),
+            "an unreachable store is not a corrupt-evidence verdict"
+        );
+        assert!(
+            e.to_string().starts_with("begin snapshot tx failed: "),
+            "unexpected message: {e}"
+        );
     }
 
     #[test]
@@ -319,16 +395,53 @@ mod tests {
     fn sealed_record_rejects_missing_data() {
         let bad = serde_json::json!({ "type": "StreamSealed" });
         let e = sealed_record_from_row(&bad).unwrap_err();
-        assert!(e.to_string().contains("missing 'data'"));
+        assert_eq!(e.locus, ChainEvidenceLocus::SealedRecordPayload);
+        assert_eq!(
+            e.subject,
+            retention_stream_id(),
+            "the locus names the stream the unreadable row sits on"
+        );
+        assert!(e.detail.contains("missing 'data'"), "detail={}", e.detail);
     }
 
     #[test]
-    fn sealed_record_rejects_wrong_event_type_payload() {
-        // `data` that does not deserialize as StreamSealed → Err
-        // (operational corruption, not silently skipped).
+    fn sealed_record_rejects_an_undecodable_payload() {
+        // `data` that does not deserialize as StreamSealed → the stored
+        // payload is unreadable, not silently skipped. Same locus as the
+        // missing-`data` case: one stored value, two ways of being
+        // unreadable, and the detail says which.
         let bad = serde_json::json!({ "type": "StreamSealed", "data": { "nope": 1 } });
         let e = sealed_record_from_row(&bad).unwrap_err();
-        assert!(e.to_string().contains("deserialize StreamSealed"));
+        assert_eq!(e.locus, ChainEvidenceLocus::SealedRecordPayload);
+        assert!(
+            e.detail.contains("deserialize StreamSealed"),
+            "detail={}",
+            e.detail
+        );
+    }
+
+    #[test]
+    fn a_row_that_is_not_a_seal_is_refused_by_event_type() {
+        // The envelope `sealed_record_from_row` builds is externally
+        // tagged, so only a `StreamSealed` can come back out of it —
+        // which is why this verdict is asserted on the projection
+        // directly. An audit-meta row holding some other event is an
+        // unreadable seal, not a skippable one: dropping it would leave
+        // a live seal anchored by no checkpoint.
+        let e = sealed_record_from_event(DomainEvent::ScanRequested(
+            hort_domain::events::ScanRequested {
+                artifact_id: Uuid::nil(),
+                scanner: "trivy".into(),
+            },
+        ))
+        .unwrap_err();
+        assert_eq!(e.locus, ChainEvidenceLocus::SealedRecordEventType);
+        assert_eq!(e.subject, retention_stream_id());
+        assert!(
+            e.detail.contains("expected StreamSealed, got "),
+            "detail={}",
+            e.detail
+        );
     }
 
     #[test]
@@ -361,15 +474,17 @@ mod tests {
     }
 
     #[test]
-    fn a_boundary_wider_than_bigint_is_an_invariant_breach() {
+    fn a_boundary_wider_than_bigint_is_corrupt_evidence() {
         // Unreachable from a position that came out of the column, so it
         // is a breach rather than a clamp: clamping down would re-anchor
         // the history and clamping up would window seals away for good.
+        // The datum is the signed witness the position was recovered
+        // from, so re-reading it yields the same position — the
+        // unreadable-evidence class, never the transient one.
         let e = sealed_position_bound(Some(u64::MAX)).unwrap_err();
-        assert!(
-            e.to_string().contains("exceeds the"),
-            "unexpected message: {e}"
-        );
+        assert_eq!(e.locus, ChainEvidenceLocus::AnchoredRetentionPosition);
+        assert_eq!(e.subject, retention_stream_id());
+        assert!(e.detail.contains("exceeds the"), "detail={}", e.detail);
     }
 
     #[test]

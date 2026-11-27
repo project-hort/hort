@@ -10,7 +10,7 @@
 # ---------- Stage 1: builder ----------
 # Digest-pinned (B10/INFRA-8); Dependabot (docker ecosystem) bumps tag+digest.
 # rust:1.100-slim-trixie — the same builder image docker/Dockerfile.{hort-server,worker} pin.
-FROM rust:1.100-slim-trixie@sha256:6f14b2b4b278ec0d50aa1d69541c304ce0f95e0f6268487aa9924af1c2e9aebe AS builder
+FROM rust:1.100-slim-trixie@sha256:3b199fd6db7d709274df56565b8f4003f9e30d7bfcff9d53148c86053b7855e2 AS builder
 
 WORKDIR /src
 
@@ -67,7 +67,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # freshly ingested artifact answers `503 artifact is quarantined`. See
 # RELEASING.md, "Base images: warm the pinned digests before tagging".
 # Digest-pinned (B10/INFRA-8).
-FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS runtime
+FROM debian:trixie-slim@sha256:8aa5a7bf5a1955bddbe7d74fcdd0b91ab30e74362a8b73af672b0481b35b44a0 AS runtime
 
 # Runtime deps: CA roots for outbound TLS (upstream fetch), nothing else.
 RUN apt-get update && \

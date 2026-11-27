@@ -1770,6 +1770,30 @@ async fn select_composite_unassessed_returns_a_released_manifest_with_no_observa
     );
 }
 
+#[tokio::test]
+#[serial(hort_pg_db)]
+async fn select_composite_unassessed_selects_scoped_and_legacy_manifest_paths() {
+    let Some(pool) = admin_pool().await else {
+        return;
+    };
+    let repo = seed_repo(&pool).await;
+    let _policy = seed_repo_scoped_policy(&pool, repo, 24).await;
+    let legacy = seed_manifest(&pool, repo, Some("released")).await;
+    let scoped = seed_artifact_at_path(
+        &pool,
+        repo,
+        Some("released"),
+        &format!("manifests/library/nginx/sha256:{}", "a".repeat(64)),
+    )
+    .await;
+    let rows = PgRescanCandidatesRepository::new(pool.clone())
+        .select_composite_unassessed(1000, Utc::now())
+        .await
+        .expect("select scoped and legacy manifests");
+    let matched = filter_to(&rows, &[legacy, scoped]);
+    assert_eq!(matched.len(), 2);
+}
+
 /// The permissive-default live state is in scope for the same reason it
 /// is in `select_eligible`: a `NULL`-status artifact is downloadable.
 #[tokio::test]

@@ -77,6 +77,7 @@ use hort_domain::entities::mutable_ref::RefTarget;
 use hort_domain::entities::repository::Repository;
 use hort_domain::error::DomainError;
 use hort_domain::events::{ApiActor, RejectionReason};
+use hort_domain::oci::{legacy_oci_artifact_path, OciArtifactRole};
 use hort_domain::ports::constituent_status::TerminalConstituent;
 use hort_domain::ports::format_handler::FormatHandler;
 use hort_domain::types::ContentHash;
@@ -106,7 +107,7 @@ const DEFAULT_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 /// ceiling does not get an unbounded buffer: the read is refused and
 /// the claims are logged as skipped, the same fail-safe posture the rest
 /// of the derivation takes.
-const MANIFEST_PROJECTION_READ_CAP_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MANIFEST_PROJECTION_READ_CAP_BYTES: usize = 16 * 1024 * 1024;
 
 /// Serve an OCI manifest by `(repo_key, name, reference)`.
 ///
@@ -231,7 +232,12 @@ pub(super) async fn serve(
     } else {
         match ctx
             .artifact_use_case
-            .find_visible_by_path(repo_key, &coords.path, actor)
+            .find_visible_by_path_with_fallback(
+                repo_key,
+                &coords.path,
+                &legacy_oci_artifact_path(OciArtifactRole::Manifest, &hash),
+                actor,
+            )
             .await
         {
             Ok((_repo, a)) => a,
@@ -1283,7 +1289,7 @@ pub(super) async fn try_upstream_manifest_pull(
 
 /// Digest-ref branch: the digest is part of the URL. Wrap the entire
 /// fetch + ingest pair in `coalesce_blob` keyed on the digest hex.
-/// Followers re-resolve the artifact row via `find_in_repo_by_hash`
+/// Followers re-resolve the artifact row by requested path
 /// after the leader's `ingest_verified` writes it.
 async fn try_upstream_manifest_pull_by_digest(
     ctx: &Arc<AppContext>,
@@ -1507,10 +1513,8 @@ async fn try_upstream_manifest_pull_by_digest(
         Err(outcome) => return outcome,
     };
 
-    // Post-coalesce read: `find_in_repo_by_hash` recovers the artifact
-    // row the leader's ingest wrote. Per-repo scoped per backlog
-    // post-coalesce-read note; the leader and follower see identical
-    // semantics.
+    // The leader and follower resolve the requested name's row after
+    // coalescing; a follower may need to register that row from CAS.
     finalise_manifest_pull(
         ctx,
         repo,
@@ -1530,8 +1534,8 @@ async fn try_upstream_manifest_pull_by_digest(
 /// Followers join the broadcast and observe the SAME hash; they do NOT
 /// re-run the ingest/tag-write and they never receive the manifest bytes.
 /// Manifest bytes therefore no longer transit Redis (anti-big-key).
-/// Both leader and follower call `find_in_repo_by_hash` after the
-/// coalesce via `finalise_manifest_pull`.
+/// Both leader and follower resolve the requested name's row after
+/// coalescing via `finalise_manifest_pull`.
 ///
 /// The prefetch-on-tag-move trigger fires LEADER-SIDE inside the closure
 /// (it is the only path that holds the manifest bytes — read once from the
@@ -1633,7 +1637,7 @@ async fn try_upstream_manifest_pull_by_tag(
     // Side-effects inside (ingest_verified, ref_use_case.set, the
     // leader-side prefetch trigger) run on the leader exactly once per
     // coalescing window. Followers join via the broadcast, observe the
-    // hash, and recover the artifact row via `find_in_repo_by_hash` —
+    // hash, and recover the requested name's row by path —
     // they never see the manifest bytes.
     let coalesce_result = ctx
         .pull_dedup
@@ -1848,8 +1852,8 @@ async fn try_upstream_manifest_pull_by_tag(
         Err(outcome) => return outcome,
     };
 
-    // Both leader and follower resolve the artifact row via the hash
-    // (`finalise_manifest_pull` → `find_in_repo_by_hash`). The follower
+    // Both leader and follower resolve the requested name's row by path
+    // in `finalise_manifest_pull`. The follower
     // never received the manifest bytes — it has the hash + CAS, which
     // is all it needs. The prefetch trigger already fired leader-side
     // inside the closure above.
@@ -2027,19 +2031,17 @@ async fn follower_media_type_for_hash(ctx: &Arc<AppContext>, content_hash: &Cont
     resolve_media_type(ctx, source.id).await
 }
 
-/// Final post-coalesce step: recover the artifact row via
-/// `find_in_repo_by_hash`. Both leader and
-/// follower take this path; the leader's `ingest_verified` (inside
-/// the closure) wrote the row, the follower reads it.
+/// Final post-coalesce step: recover the requested name's artifact row
+/// via `find_in_repo_by_path`, which hydrates its quarantine deadline.
+/// Both leader and follower take this path; the leader's
+/// `ingest_verified` (inside the closure) wrote the row.
 ///
-/// `DedupKey::blob_by_hash` is cross-repo (ADR 0026), so a follower
-/// that joined a window whose leader ingested into a DIFFERENT repo has
-/// no row in `repo.id` — the lookup returns `None`. The manifest bytes
-/// are already CAS-present and upstream-verified (ADR 0006, the
-/// leader's `ingest_verified` proved the upstream digest); the follower
-/// idempotently registers its OWN per-repo manifest row via
-/// `register_existing_cas_blob` rather than failing closed. Coords are
-/// reconstructed deterministically from `(name, content_hash)` —
+/// A lookup can miss because `DedupKey::blob_by_hash` is cross-repo
+/// (ADR 0026) and the leader ingested into a different repository, or
+/// because this repository only has the bytes under another image name.
+/// In both cases the manifest bytes are already CAS-present and
+/// upstream-verified (ADR 0006). The follower registers its own row via
+/// `register_existing_cas_blob`. Coords are reconstructed from `(name, content_hash)` —
 /// `oci_manifest_coords` is exactly what the leader's closure used, and
 /// the claims derived by [`follower_manifest_bytes`] ride that row's own
 /// transition, so a row minted here carries the same `content_references`
@@ -2063,11 +2065,23 @@ async fn finalise_manifest_pull(
     content_hash: ContentHash,
     _write_tag: bool,
 ) -> UpstreamManifestPullOutcome {
-    match ctx
+    let scoped_path = oci_manifest_coords(name, &content_hash).path;
+    let row = match ctx
         .artifact_use_case
-        .find_in_repo_by_hash(repo.id, &content_hash)
+        .find_in_repo_by_path(repo.id, &scoped_path)
         .await
     {
+        Ok(None) => {
+            ctx.artifact_use_case
+                .find_in_repo_by_path(
+                    repo.id,
+                    &legacy_oci_artifact_path(OciArtifactRole::Manifest, &content_hash),
+                )
+                .await
+        }
+        row => row,
+    };
+    match row {
         Ok(Some(artifact)) => UpstreamManifestPullOutcome::Ingested {
             hash: artifact.sha256_checksum.clone(),
             artifact: Box::new(artifact),
@@ -2107,17 +2121,9 @@ async fn finalise_manifest_pull(
                             "oci_media_type": media_type,
                         }),
                         content_hash: content_hash.clone(),
-                        // Coalesced-follower path is not a seed-import;
-                        // this follower's OWN target-repo row resolves
-                        // its OWN quarantine gate inside the shared
-                        // `register_by_hash_inner` tail (issue #107 Item
-                        // 1) — it is NOT inherited from the leader's
-                        // `ingest_verified`, which only ever gated the
-                        // leader's own (possibly different) repo's row.
-                        // `quarantine_status` is a per-repo-row column;
-                        // before #107 Item 1 this follower row minted
-                        // `None`/immediately-downloadable with no gate at
-                        // all.
+                        // The shared registration tail resolves this row's
+                        // quarantine gate; the leader's row may belong
+                        // to another repository and cannot supply it.
                         seed_import_quarantine_anchor: None,
                         // The follower's manifest claims its config / layer
                         // / index-member bytes exactly as the ingesting
@@ -2156,7 +2162,7 @@ async fn finalise_manifest_pull(
                         reference = %reference,
                         hash = %content_hash,
                         error = %err,
-                        "OCI upstream manifest: cross-repo follower register_existing_cas_blob failed"
+                        "OCI upstream manifest: register_existing_cas_blob failed"
                     );
                     UpstreamManifestPullOutcome::Internal
                 }
@@ -2544,6 +2550,87 @@ mod tests {
             metadata.insert(meta);
         }
         (id, hash)
+    }
+
+    #[test]
+    fn scoped_manifest_digest_get_does_not_cross_names() {
+        use sha2::Digest;
+        let (same_name, other_name, tag_target, stored_path) = run(async {
+            let h = harness();
+            let repo = oci_repo("myrepo");
+            let repo_id = repo.id;
+            h.repositories.insert(repo);
+            let body = b"{}";
+            let hex = hex::encode(sha2::Sha256::digest(body));
+            let (_, hash) = seed_manifest(
+                &h.artifacts,
+                &h.storage,
+                &h.metadata,
+                repo_id,
+                &hex,
+                body,
+                None,
+                QuarantineStatus::None,
+            );
+            let legacy = format!("manifests/sha256:{hex}");
+            let mut artifact = h
+                .artifacts
+                .find_by_path(repo_id, &legacy)
+                .await
+                .unwrap()
+                .unwrap();
+            artifact.path = oci_manifest_coords("library/nginx", &hash).path;
+            h.artifacts.insert(artifact);
+            seed_tag(&h.refs, repo_id, "other/thing", "v1", &hash);
+            let router = manifest_router(h.ctx.clone());
+            let same = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v2/myrepo/library/nginx/manifests/sha256:{hex}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let other = router
+                .clone()
+                .oneshot(
+                    Request::get(format!("/v2/myrepo/other/thing/manifests/sha256:{hex}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let tag = router
+                .oneshot(
+                    Request::get("/v2/myrepo/other/thing/manifests/v1")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            (
+                same.status(),
+                other.status(),
+                tag.status(),
+                h.artifacts
+                    .find_by_path(repo_id, &oci_manifest_coords("library/nginx", &hash).path)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .path,
+            )
+        });
+        assert_eq!(same_name, StatusCode::OK);
+        assert_eq!(other_name, StatusCode::NOT_FOUND);
+        assert_eq!(tag_target, StatusCode::NOT_FOUND);
+        assert_eq!(
+            stored_path,
+            format!(
+                "manifests/library/nginx/sha256:{}",
+                hex::encode(sha2::Sha256::digest(b"{}"))
+            )
+        );
     }
 
     fn seed_tag(
@@ -5531,6 +5618,179 @@ mod tests {
         });
     }
 
+    #[test]
+    fn pull_through_manifest_mints_requested_name_beside_same_hash_row_and_sticks() {
+        use hort_domain::ports::upstream_proxy::ManifestFetch;
+        use sha2::Digest;
+
+        run(async {
+            let (ctx, mocks) = build_mock_ctx(PrometheusBuilder::new().build_recorder().handle());
+            let repo = oci_repo("myrepo");
+            mocks.repositories.insert(repo.clone());
+            seed_upstream_mapping(&mocks, repo.id);
+
+            let media = "application/vnd.oci.image.manifest.v1+json";
+            let content = br#"{"schemaVersion":2,"upstream":"shared"}"#.to_vec();
+            let hex = hex::encode(sha2::Sha256::digest(&content));
+            let hash: ContentHash = hex.parse().unwrap();
+            let digest = format!("sha256:{hex}");
+            let other_path = format!("manifests/dockerhub/library/other/sha256:{hex}");
+            let asked_path = format!("manifests/dockerhub/library/nginx/sha256:{hex}");
+            let mut other = sample_artifact(QuarantineStatus::None);
+            other.repository_id = repo.id;
+            other.path = other_path.clone();
+            other.sha256_checksum = hash.clone();
+            other.size_bytes = content.len() as i64;
+            other.content_type = media.into();
+            let other_id = other.id;
+            mocks.artifacts.insert(other.clone());
+            mocks.storage.insert_content(hash.clone(), content.clone());
+            mocks.upstream_proxy.insert_manifest(
+                UP_PREFIX,
+                "library/other",
+                &digest,
+                ManifestFetch {
+                    bytes: content.clone(),
+                    media_type: media.into(),
+                    declared_digest: Some(digest.clone()),
+                    last_modified: None,
+                },
+            );
+
+            // The other name owns the just-completed coalesce window.
+            let leader = try_upstream_manifest_pull(
+                &ctx,
+                &repo,
+                "dockerhub/library/other",
+                &digest,
+                vec![media.into()],
+            )
+            .await;
+            assert!(matches!(
+                leader,
+                UpstreamManifestPullOutcome::Ingested { .. }
+            ));
+            let follower = finalise_manifest_pull(
+                &ctx,
+                &repo,
+                "dockerhub/library/nginx",
+                &digest,
+                hash,
+                false,
+            )
+            .await;
+            assert!(matches!(
+                follower,
+                UpstreamManifestPullOutcome::Ingested { artifact, .. }
+                    if artifact.path == asked_path
+            ));
+
+            let other_after = mocks
+                .artifacts
+                .find_by_path(repo.id, &other_path)
+                .await
+                .unwrap()
+                .expect("other image row remains at its literal path");
+            let asked_after = mocks
+                .artifacts
+                .find_by_path(repo.id, &asked_path)
+                .await
+                .unwrap()
+                .expect("asked image gets its own row at its literal path");
+            assert_eq!(other_after.id, other_id);
+            assert_eq!(other_after, other);
+            assert_ne!(asked_after.id, other_id);
+            assert_eq!(other_after.path, other_path);
+            assert_eq!(asked_after.path, asked_path);
+
+            let router = manifest_router(ctx);
+            let uri = format!("/v2/myrepo/{UP_PREFIX}{UP_NAME}/manifests/{digest}");
+            for _ in 0..2 {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        Request::get(&uri)
+                            .header(ACCEPT, media)
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(to_bytes(response.into_body(), 1024).await.unwrap(), content);
+            }
+
+            assert_eq!(mocks.upstream_proxy.manifest_fetches(), vec![digest]);
+        });
+    }
+
+    #[test]
+    fn legacy_name_free_manifest_row_satisfies_post_coalesce_read() {
+        use sha2::Digest;
+
+        run(async {
+            let (ctx, mocks) = build_mock_ctx(PrometheusBuilder::new().build_recorder().handle());
+            let repo = oci_repo("myrepo");
+            mocks.repositories.insert(repo.clone());
+            let hex = hex::encode(sha2::Sha256::digest(b"legacy-manifest"));
+            let hash: ContentHash = hex.parse().unwrap();
+            let legacy_path = format!("manifests/sha256:{hex}");
+            let mut legacy = sample_artifact(QuarantineStatus::None);
+            legacy.repository_id = repo.id;
+            legacy.path = legacy_path.clone();
+            legacy.sha256_checksum = hash.clone();
+            let legacy_id = legacy.id;
+            mocks.artifacts.insert(legacy);
+
+            let outcome = finalise_manifest_pull(
+                &ctx,
+                &repo,
+                "dockerhub/library/nginx",
+                &format!("sha256:{hex}"),
+                hash,
+                false,
+            )
+            .await;
+            assert!(matches!(
+                outcome,
+                UpstreamManifestPullOutcome::Ingested { artifact, .. }
+                    if artifact.id == legacy_id && artifact.path == legacy_path
+            ));
+            assert!(mocks
+                .artifacts
+                .find_by_path(
+                    repo.id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}")
+                )
+                .await
+                .unwrap()
+                .is_none());
+        });
+    }
+
+    #[test]
+    fn post_coalesce_manifest_registration_refuses_missing_cas_bytes() {
+        use sha2::Digest;
+
+        run(async {
+            let (ctx, mocks) = build_mock_ctx(PrometheusBuilder::new().build_recorder().handle());
+            let repo = oci_repo("myrepo");
+            mocks.repositories.insert(repo.clone());
+            let hex = hex::encode(sha2::Sha256::digest(b"missing-cas-manifest"));
+            let hash: ContentHash = hex.parse().unwrap();
+            let outcome = finalise_manifest_pull(
+                &ctx,
+                &repo,
+                "dockerhub/library/nginx",
+                &format!("sha256:{hex}"),
+                hash,
+                false,
+            )
+            .await;
+            assert!(matches!(outcome, UpstreamManifestPullOutcome::Internal));
+        });
+    }
+
     /// Tag pull, no local cache, upstream serves the manifest →
     /// 200 + body, AND the tag→digest mapping is written so a
     /// subsequent local resolve hits the cache.
@@ -6008,7 +6268,10 @@ mod tests {
 
             let index_artifact_id = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("pulled-through index must be committed as an artifact")
@@ -6149,7 +6412,10 @@ mod tests {
                 .unwrap();
             let child_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{child_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{child_hex}"),
+                )
                 .await
                 .unwrap();
             (
@@ -6558,12 +6824,18 @@ mod tests {
 
             let config_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("blobs/sha256:{config_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{config_hex}"),
+                )
                 .await
                 .unwrap();
             let layer_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("blobs/sha256:{layer_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{layer_hex}"),
+                )
                 .await
                 .unwrap();
             (status, config_artifact, layer_artifact)
@@ -6660,12 +6932,18 @@ mod tests {
 
             let config_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("blobs/sha256:{config_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{config_hex}"),
+                )
                 .await
                 .unwrap();
             let layer_artifact = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("blobs/sha256:{layer_hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("blobs/dockerhub/library/nginx/sha256:{layer_hex}"),
+                )
                 .await
                 .unwrap();
             (status, config_artifact, layer_artifact)
@@ -6748,7 +7026,10 @@ mod tests {
 
             let manifest_artifact_id = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("pulled-through manifest must be committed as an artifact")
@@ -6865,7 +7146,10 @@ mod tests {
                 .len();
             let index_present = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -6938,7 +7222,10 @@ mod tests {
 
             let index = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("pulled-through index must be committed as an artifact");
@@ -7037,7 +7324,10 @@ mod tests {
                 .len();
             let index_present = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -7107,7 +7397,10 @@ mod tests {
 
             let index = mocks
                 .artifacts
-                .find_by_path(repo_id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    repo_id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .expect("pulled-through index must be committed as an artifact");
@@ -7211,7 +7504,10 @@ mod tests {
                 .len();
             let follower_rows = mocks
                 .artifacts
-                .find_by_path(follower_repo.id, &format!("manifests/sha256:{hex}"))
+                .find_by_path(
+                    follower_repo.id,
+                    &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                )
                 .await
                 .unwrap()
                 .is_some();
@@ -7424,7 +7720,10 @@ mod tests {
             for (label, repo) in [("repo-a", &repo_a), ("repo-b", &repo_b)] {
                 let manifest_id = mocks
                     .artifacts
-                    .find_by_path(repo.id, &format!("manifests/sha256:{hex}"))
+                    .find_by_path(
+                        repo.id,
+                        &format!("manifests/dockerhub/library/nginx/sha256:{hex}"),
+                    )
                     .await
                     .unwrap()
                     .expect("each repo gets its own manifest row")
@@ -8310,7 +8609,7 @@ mod tests {
     // ---------------- finalise_manifest_pull: follower media-type ----------------
 
     /// Drive `finalise_manifest_pull` directly through its cross-repo
-    /// follower branch (`find_in_repo_by_hash(repo) → None`) with the
+    /// follower branch (requested path absent in this repo) with the
     /// leader's row + `oci_media_type` metadata pre-seeded in a DIFFERENT
     /// repo, and return the media-type stamped on the follower's
     /// re-registered row.
@@ -8629,7 +8928,7 @@ mod tests {
             let r2 = h2.await.unwrap();
             // Both callers must see Ingested regardless of leader/
             // follower election — the post-coalesce
-            // `find_in_repo_by_hash` resolves the row the leader's
+            // path lookup resolves the row the leader's
             // ingest wrote.
             assert!(
                 matches!(r1, UpstreamManifestPullOutcome::Ingested { .. }),
@@ -8663,7 +8962,7 @@ mod tests {
     /// tag's metadata key must be a `succeeded_blob` (hash), never a
     /// `succeeded_metadata` (base64 bytes) — manifest bytes no longer
     /// transit the ephemeral store / Redis. A follower joining that
-    /// broadcast resolves the artifact via `find_in_repo_by_hash` with
+    /// broadcast resolves the artifact by path with
     /// only the hash + CAS, no bytes.
     #[test]
     fn tag_pull_broadcasts_hash_not_manifest_bytes() {

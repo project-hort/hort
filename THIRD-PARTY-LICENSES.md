@@ -27,11 +27,11 @@ the result instead.
 | ring | 0.17.14 | Apache-2.0 | https://github.com/briansmith/ring |
 | async-nats | 0.52.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
 | aws-lc-sys | 0.47.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
-| blake3 | 1.8.7 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
-| constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
-| kube-client | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
-| kube-core | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
-| kube | 4.2.0 | Apache-2.0 | https://github.com/kube-rs/kube |
+| blake3 | 1.8.8 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
+| constant_time_eq | 0.6.2 | Apache-2.0 | https://codeberg.org/cesarb/constant_time_eq |
+| kube-client | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
+| kube-core | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
+| kube | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
 | metrics-exporter-prometheus | 0.18.3 | Apache-2.0 | https://github.com/metrics-rs/metrics |
 | pep440_rs | 0.7.3 | Apache-2.0 | https://github.com/konstin/pep440-rs |
 | rpassword | 7.5.5 | Apache-2.0 | https://github.com/conradkleinespel/rpassword |
@@ -116,7 +116,7 @@ the result instead.
 | regex-syntax | 0.8.12 | MIT | https://github.com/rust-lang/regex |
 | regex | 1.13.2 | MIT | https://github.com/rust-lang/regex |
 | serde_plain | 1.0.2 | MIT | https://github.com/mitsuhiko/serde-plain |
-| uuid | 1.29.2 | MIT | https://github.com/uuid-rs/uuid |
+| uuid | 1.29.3 | MIT | https://github.com/uuid-rs/uuid |
 | nom | 7.1.3 | MIT | https://github.com/Geal/nom |
 | tiny_http | 0.12.0 | MIT | https://github.com/tiny-http/tiny-http |
 | float-cmp | 0.10.0 | MIT | https://github.com/mikedilger/float-cmp |
@@ -223,7 +223,7 @@ the result instead.
 | rfc6979 | 0.6.0 | MIT | https://github.com/RustCrypto/signatures |
 | signature | 3.0.0 | MIT | https://github.com/RustCrypto/traits |
 | rand_core | 0.10.1 | MIT | https://github.com/rust-random/rand_core |
-| zeroize | 1.9.1 | MIT | https://github.com/RustCrypto/utils |
+| zeroize | 1.9.2 | MIT | https://github.com/RustCrypto/utils |
 | getrandom | 0.4.2 | MIT | https://github.com/rust-random/getrandom |
 | postcard | 1.1.3 | MIT | https://github.com/jamesmunns/postcard |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
@@ -327,9 +327,9 @@ the result instead.
 | is_terminal_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/is_terminal_polyfill |
 | once_cell_polyfill | 1.70.2 | MIT | https://github.com/polyfill-rs/once_cell_polyfill |
 | serde_spanned | 1.1.3 | MIT | https://github.com/toml-rs/toml |
-| toml | 1.2.1+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml | 1.2.2+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_datetime | 1.1.3+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
-| toml_parser | 1.1.5+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
+| toml_parser | 1.1.6+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | toml_writer | 1.2.0+spec-1.1.0 | MIT | https://github.com/toml-rs/toml |
 | num-conv | 0.2.1 | MIT | https://github.com/jhpratt/num-conv |
 | time-core | 0.1.8 | MIT | https://github.com/time-rs/time |
@@ -357,7 +357,7 @@ the result instead.
 | crc-fast | 1.10.0 | MIT | https://github.com/awesomized/crc-fast-rust |
 | encoding_rs | 0.8.35 | MIT | https://github.com/hsivonen/encoding_rs |
 | utf8_iter | 1.0.4 | MIT | https://github.com/hsivonen/utf8_iter |
-| lru | 0.19.0 | MIT | https://github.com/jeromefroe/lru-rs.git |
+| lru | 0.19.2 | MIT | https://github.com/jeromefroe/lru-rs.git |
 | atoi | 2.0.0 | MIT | https://github.com/pacman82/atoi-rs |
 | darling | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
 | darling_core | 0.23.0 | MIT | https://github.com/TedDriggs/darling |
@@ -420,7 +420,7 @@ the result instead.
 | async-recursion | 1.1.1 | MIT | https://github.com/dcchut/async-recursion |
 | rsa | 0.9.10 | MIT | https://github.com/RustCrypto/RSA |
 | adler2 | 2.0.1 | MIT | https://github.com/oyvindln/adler2 |
-| anyhow | 1.0.104 | MIT | https://github.com/dtolnay/anyhow |
+| anyhow | 1.0.105 | MIT | https://github.com/dtolnay/anyhow |
 | async-trait | 0.1.92 | MIT | https://github.com/dtolnay/async-trait |
 | atomic-waker | 1.1.2 | MIT | https://github.com/smol-rs/atomic-waker |
 | curve25519-dalek-derive | 0.1.1 | MIT | https://github.com/dalek-cryptography/curve25519-dalek |
@@ -3296,7 +3296,7 @@ limitations under the License.
 
 ```
 
-### blake3 1.8.7 — Apache-2.0
+### blake3 1.8.8 — Apache-2.0
 
 Repository: https://github.com/BLAKE3-team/BLAKE3
 
@@ -3377,9 +3377,9 @@ limitations under the License.
 
 ```
 
-### constant_time_eq 0.4.2 — Apache-2.0
+### constant_time_eq 0.6.2 — Apache-2.0
 
-Repository: https://github.com/cesarb/constant_time_eq
+Repository: https://codeberg.org/cesarb/constant_time_eq
 
 ```text
 Apache License
@@ -3458,7 +3458,7 @@ limitations under the License.
 
 ```
 
-### kube-client 4.2.0 — Apache-2.0
+### kube-client 4.2.1 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 
@@ -3539,7 +3539,7 @@ limitations under the License.
 
 ```
 
-### kube-core 4.2.0 — Apache-2.0
+### kube-core 4.2.1 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 
@@ -3620,7 +3620,7 @@ limitations under the License.
 
 ```
 
-### kube 4.2.0 — Apache-2.0
+### kube 4.2.1 — Apache-2.0
 
 Repository: https://github.com/kube-rs/kube
 
@@ -6820,7 +6820,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### uuid 1.29.2 — MIT
+### uuid 1.29.3 — MIT
 
 Repository: https://github.com/uuid-rs/uuid
 
@@ -10276,7 +10276,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### zeroize 1.9.1 — MIT
+### zeroize 1.9.2 — MIT
 
 Repository: https://github.com/RustCrypto/utils
 
@@ -13570,7 +13570,7 @@ SOFTWARE.
 
 ```
 
-### toml 1.2.1+spec-1.1.0 — MIT
+### toml 1.2.2+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -13624,7 +13624,7 @@ SOFTWARE.
 
 ```
 
-### toml_parser 1.1.5+spec-1.1.0 — MIT
+### toml_parser 1.1.6+spec-1.1.0 — MIT
 
 Repository: https://github.com/toml-rs/toml
 
@@ -14399,7 +14399,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### lru 0.19.0 — MIT
+### lru 0.19.2 — MIT
 
 Repository: https://github.com/jeromefroe/lru-rs.git
 
@@ -16131,7 +16131,7 @@ DEALINGS IN THE SOFTWARE.
 
 ```
 
-### anyhow 1.0.104 — MIT
+### anyhow 1.0.105 — MIT
 
 Repository: https://github.com/dtolnay/anyhow
 

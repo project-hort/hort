@@ -3,8 +3,8 @@
 //!
 //! # What this proves, and why it needs a database
 //!
-//! `POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<repo>` is the OCI
-//! Distribution Spec's "link the blob instead of re-uploading it"
+//! `POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<source-repo>/<source-name>`
+//! is the OCI Distribution Spec's "link the blob instead of re-uploading it"
 //! optimisation (§2.3). The spec admits exactly two answers: `201` when the
 //! mount succeeded, `202` when the registry falls back to an ordinary
 //! upload. Anything else leaves the client with nothing to degrade to.
@@ -32,12 +32,12 @@
 //! Postgres event store, artifact repository, metadata repository and
 //! lifecycle, swapped onto a `build_mock_ctx` context through
 //! `with_ingest_use_case`. The remaining ports stay mocks: the repository
-//! lookup, the CAS read and the policy projection are not what is under
-//! test.
+//! and source-artifact lookups, the CAS read and the policy projection are
+//! not what is under test.
 //!
-//! Both halves have to agree on which repositories exist, so the two
-//! `repositories` rows are inserted for real (the `artifacts` foreign key
-//! needs them) **and** seeded into the mock repository under the same ids —
+//! Both halves have to agree on which repositories and source artifacts
+//! exist, so those rows are inserted for real and seeded into the mock
+//! repositories under the same ids —
 //! the same trick `legacy_quarantine_status_fails_closed_real_db` uses.
 //!
 //! The router is `hort_http_oci::uploads::router()` with no auth
@@ -97,7 +97,8 @@ use hort_adapters_postgres::artifact_repo::PgArtifactRepository;
 use hort_adapters_postgres::event_store::PgEventStore;
 use hort_app::event_store_publisher::EventStorePublisher;
 use hort_app::use_cases::ingest_use_case::IngestUseCase;
-use hort_app::use_cases::test_support::sample_repository;
+use hort_app::use_cases::test_support::{sample_artifact, sample_repository};
+use hort_domain::entities::artifact::QuarantineStatus;
 use hort_domain::entities::caller::CallerPrincipal;
 use hort_domain::entities::repository::{Repository, RepositoryFormat};
 use hort_domain::entities::scan_policy::{
@@ -112,8 +113,10 @@ use hort_domain::types::ContentHash;
 use hort_http_core::context::AppContext;
 use hort_http_core::test_support::{build_mock_ctx, with_ingest_use_case, MockPorts};
 
-/// The source repository's key, and the `from=` query parameter.
+/// The source repository's key — the first half of the `from=` namespace.
 const SOURCE_REPO_KEY: &str = "oci-mount-source";
+/// The image name under the source repository — the second half of `from=`.
+const SOURCE_IMAGE_NAME: &str = "library/alpine";
 /// The target repository's key — the `<name>` the mount POSTs into.
 const TARGET_REPO_KEY: &str = "oci-mount-target";
 /// The image name under the target repository.
@@ -177,7 +180,7 @@ async fn insert_repository_row(pool: &PgPool, id: Uuid, key: &str) {
 /// `size_bytes` from. `quarantine_status` is SQL `NULL`, which is the
 /// stored spelling of `QuarantineStatus::None`: a non-terminal source, so
 /// the anti-laundering gate lets the mount through.
-async fn insert_source_blob_row(pool: &PgPool, repository_id: Uuid, hex: &str) {
+async fn insert_source_blob_row(pool: &PgPool, repository_id: Uuid, hex: &str) -> Uuid {
     let id = Uuid::new_v4();
     sqlx::query(
         r#"INSERT INTO public.artifacts (
@@ -192,13 +195,14 @@ async fn insert_source_blob_row(pool: &PgPool, repository_id: Uuid, hex: &str) {
     )
     .bind(id)
     .bind(repository_id)
-    .bind(IMAGE_NAME)
-    .bind(format!("blobs/sha256:{hex}"))
+    .bind(SOURCE_IMAGE_NAME)
+    .bind(format!("blobs/{SOURCE_IMAGE_NAME}/sha256:{hex}"))
     .bind(BLOB.len() as i64)
     .bind(hex)
     .execute(pool)
     .await
     .expect("seed source artifacts row");
+    id
 }
 
 /// A mock `AppContext` whose `IngestUseCase` is composed over the real
@@ -287,7 +291,7 @@ fn test_principal(user_id: Uuid) -> CallerPrincipal {
 async fn mount(ctx: Arc<AppContext>, hex: &str, user_id: Uuid) -> (StatusCode, String) {
     let router = hort_http_oci::uploads::router().with_state(ctx);
     let uri = format!(
-        "/v2/{TARGET_REPO_KEY}/{IMAGE_NAME}/blobs/uploads/?mount=sha256:{hex}&from={SOURCE_REPO_KEY}"
+        "/v2/{TARGET_REPO_KEY}/{IMAGE_NAME}/blobs/uploads/?mount=sha256:{hex}&from={SOURCE_REPO_KEY}/{SOURCE_IMAGE_NAME}"
     );
     let mut req = HttpRequest::post(&uri)
         .body(Body::empty())
@@ -322,7 +326,7 @@ async fn setup_with(
     insert_user_row(pool, user_id).await;
     insert_repository_row(pool, source_id, SOURCE_REPO_KEY).await;
     insert_repository_row(pool, target_id, TARGET_REPO_KEY).await;
-    insert_source_blob_row(pool, source_id, &hex).await;
+    let source_blob_id = insert_source_blob_row(pool, source_id, &hex).await;
 
     let (ctx, mocks) = ctx_with_real_ingest(pool).await;
     mocks
@@ -332,6 +336,17 @@ async fn setup_with(
         .repositories
         .insert(oci_repo(target_id, TARGET_REPO_KEY));
     let hash: ContentHash = hex.parse().expect("valid sha256");
+    let mut source_blob = sample_artifact(QuarantineStatus::None);
+    source_blob.id = source_blob_id;
+    source_blob.repository_id = source_id;
+    source_blob.name = SOURCE_IMAGE_NAME.into();
+    source_blob.name_as_published = SOURCE_IMAGE_NAME.into();
+    source_blob.version = None;
+    source_blob.path = format!("blobs/{SOURCE_IMAGE_NAME}/sha256:{hex}");
+    source_blob.sha256_checksum = hash.clone();
+    source_blob.size_bytes = BLOB.len() as i64;
+    source_blob.content_type = "application/octet-stream".into();
+    mocks.artifacts.insert(source_blob);
     mocks.storage.insert_content(hash, BLOB.to_vec());
     tune(&mocks, target_id);
 
@@ -495,7 +510,7 @@ async fn seed_gate_less_target_row(
     .bind(artifact_id)
     .bind(repository_id)
     .bind(IMAGE_NAME)
-    .bind(format!("blobs/sha256:{hex}"))
+    .bind(format!("blobs/{IMAGE_NAME}/sha256:{hex}"))
     .bind(BLOB.len() as i64)
     .bind(hex)
     .bind(user_id)

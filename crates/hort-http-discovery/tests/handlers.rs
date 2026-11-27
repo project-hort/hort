@@ -308,28 +308,33 @@ async fn list_versions_unknown_repo_returns_404() {
 }
 
 #[tokio::test]
-async fn list_versions_missing_permission_read_returns_403() {
-    // The caller carries a CliSession but no `Read` grant — the use
-    // case ticks `permission_denied` and returns 403.
+async fn list_versions_without_read_cannot_distinguish_present_and_missing_repositories() {
     let repo = npm_repo();
-    let repo_id = repo.id;
     let key = repo.key.clone();
-    // Empty evaluator (no grants).
-    let (ctx, mocks) = ctx_with_rbac(RbacEvaluator::new(Vec::new()));
-    mocks.repositories.insert(repo);
-    let router = build_test_router(ctx);
+    let (present_ctx, present_mocks) = ctx_with_rbac(RbacEvaluator::new(Vec::new()));
+    present_mocks.repositories.insert(repo);
+    let present_router = build_test_router(present_ctx);
+    let (missing_ctx, _missing_mocks) = ctx_with_rbac(RbacEvaluator::new(Vec::new()));
+    let missing_router = build_test_router(missing_ctx);
 
     let url = format!("/api/v1/repositories/{}/discovery/versions/left-pad", key);
-    let mut req = Request::builder()
-        .method(Method::GET)
-        .uri(url)
-        .body(Body::empty())
-        .unwrap();
-    auth_test::inject_optional_principal_some(&mut req, caller_cli_session(&[]));
-    let _ = repo_id;
+    let caller = caller_cli_session(&[]);
+    let request = || {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri(url.as_str())
+            .body(Body::empty())
+            .unwrap();
+        auth_test::inject_optional_principal_some(&mut req, caller.clone());
+        req
+    };
 
-    let resp = router.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let present = present_router.oneshot(request()).await.unwrap();
+    let missing = missing_router.oneshot(request()).await.unwrap();
+    assert_eq!(present.status(), missing.status());
+    let present_body = to_bytes(present.into_body(), 256 * 1024).await.unwrap();
+    let missing_body = to_bytes(missing.into_body(), 256 * 1024).await.unwrap();
+    assert_eq!(present_body, missing_body);
 }
 
 #[tokio::test]

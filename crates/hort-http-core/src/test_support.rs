@@ -108,7 +108,9 @@ use hort_domain::ports::held_set_reader::{
     ConstituentKindSets, HeldBucket, HeldCandidateBucket, HeldCandidateQuery, HeldCandidateRow,
     HeldSetReader,
 };
-use hort_domain::ports::metadata_mirror_store::MetadataMirrorStore;
+use hort_domain::ports::metadata_mirror_store::{
+    body_digest, require_supplied_digest, MetadataMirrorStore,
+};
 use hort_domain::ports::patch_candidate_repository::{
     PatchCandidate, PatchCandidateFilter, PatchCandidateRepository,
 };
@@ -779,14 +781,25 @@ pub fn trust_config_untrusted_peer_fallback() -> TrustConfig {
 /// to assert mirror writes hold the same `Arc<MockMetadataMirror>` and
 /// inspect it via [`MockMetadataMirror::get`] / [`MockMetadataMirror::keys`].
 ///
-/// Any byte string is a valid mirror body, on this double and in
-/// production alike: the production adapters record the body's digest in
-/// a frame header of their own and strip it again on read, so what goes
-/// through `put` is what comes back out of `get`. The one production
-/// outcome a plain `HashMap` cannot express is a body that *fails* its
-/// recorded digest, which is why [`Self::arm_digest_mismatch`] exists —
-/// without it a consumer's fall-through on a refused mirror read has no
-/// way to be driven from here.
+/// What `put` accepts is what `get` serves, so this double round-trips —
+/// and a double that round-trips refuses what production refuses, or a
+/// test standing on its acceptance proves a behaviour no producer can
+/// reach. A mirror body is valid only *paired with its own digest*
+/// (ADR 0026): `put` hashes the bytes it read and runs the port's own
+/// [`require_supplied_digest`], so a mis-stated pair fails here with the
+/// same error both backends return, and nothing is inserted. The frame
+/// header the adapters write ahead of the body and strip again on read
+/// is theirs alone — a `HashMap` keeps the digest as the key's admission
+/// criterion rather than in the bytes — so the bodies themselves still
+/// go in and come back out unchanged.
+///
+/// The one production outcome a plain `HashMap` cannot express is a
+/// stored body that *stops* matching its recorded digest, which is why
+/// [`Self::arm_digest_mismatch`] exists — without it a consumer's
+/// fall-through on a refused mirror **read** has no way to be driven
+/// from here. The two are different arms of the same port: this one
+/// refuses a write that was never honest, that one a read of bytes that
+/// have gone bad since.
 #[derive(Default)]
 pub struct MockMetadataMirror {
     data: Mutex<HashMap<String, Vec<u8>>>,
@@ -867,6 +880,7 @@ impl MetadataMirrorStore for MockMetadataMirror {
         &self,
         key: &str,
         mut body: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
+        supplied: hort_domain::types::ContentHash,
     ) -> BoxFuture<'_, DomainResult<()>> {
         let key = key.to_string();
         Box::pin(async move {
@@ -874,6 +888,12 @@ impl MetadataMirrorStore for MockMetadataMirror {
             tokio::io::AsyncReadExt::read_to_end(&mut body, &mut buf)
                 .await
                 .map_err(|e| DomainError::Invariant(format!("mock mirror read: {e}")))?;
+            // Before the insert, never after it with a rollback: the
+            // filesystem backend never renames the staged file and the
+            // object-store backend never completes the multipart, so a
+            // refused write leaves the key exactly as it was — absent,
+            // or holding the body it already held.
+            require_supplied_digest(body_digest(&buf).as_ref(), &supplied, &key)?;
             self.data.lock().unwrap().insert(key, buf);
             Ok(())
         })
@@ -3225,5 +3245,127 @@ mod uuid_shape_tests {
         ] {
             assert!(!uuid_shaped(clean), "false uuid match in {clean}");
         }
+    }
+}
+
+#[cfg(test)]
+mod mirror_double_tests {
+    use super::{body_digest, MetadataMirrorStore, MockMetadataMirror};
+    use hort_domain::error::DomainError;
+
+    /// A realistic key, so the assertions run over the shape production
+    /// uses rather than a bare string.
+    fn key() -> String {
+        hort_domain::ports::metadata_mirror_store::mirror_key(
+            "npm",
+            "11111111-1111-1111-1111-111111111111",
+            "express",
+        )
+    }
+
+    fn cursor(bytes: &[u8]) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
+        Box::new(std::io::Cursor::new(bytes.to_vec()))
+    }
+
+    async fn read_back(mirror: &MockMetadataMirror, key: &str) -> Option<Vec<u8>> {
+        let mut reader = mirror.get(key).await.expect("get must not fail")?;
+        let mut out = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut out)
+            .await
+            .expect("the double's reader does not fail unless armed");
+        Some(out)
+    }
+
+    /// The pair every real producer supplies still round-trips — the
+    /// refusal below is a refusal of impossible pairs, not a new
+    /// obstacle in front of the fixtures.
+    #[tokio::test]
+    async fn an_honest_pair_round_trips() {
+        let mirror = MockMetadataMirror::default();
+        let body = br#"{"dist-tags":{"latest":"1.0.0"}}"#;
+
+        mirror
+            .put(&key(), cursor(body), body_digest(body))
+            .await
+            .expect("a body paired with its own digest must be accepted");
+
+        assert_eq!(read_back(&mirror, &key()).await.as_deref(), Some(&body[..]));
+    }
+
+    /// **The refusal.** A digest of other bytes is the shape a caller
+    /// that hashed one body and streamed another produces, and no
+    /// production backend commits it — so neither does this double, with
+    /// the port's own error.
+    #[tokio::test]
+    async fn a_mis_stated_pair_is_refused_with_the_ports_error() {
+        let mirror = MockMetadataMirror::default();
+
+        let err = mirror
+            .put(
+                &key(),
+                cursor(b"the bytes that were streamed"),
+                body_digest(b"the bytes the caller hashed"),
+            )
+            .await
+            .expect_err("a mis-stated digest must be refused");
+
+        assert!(
+            matches!(&err, DomainError::Invariant(m) if m.contains("does not hash to")),
+            "the error must be the port's own refusal; got: {err:?}"
+        );
+    }
+
+    /// A refused `put` commits nothing: the check runs before the
+    /// insert, so the key is still absent rather than holding a body no
+    /// `get` should have served.
+    #[tokio::test]
+    async fn a_refused_put_inserts_nothing() {
+        let mirror = MockMetadataMirror::default();
+
+        mirror
+            .put(&key(), cursor(b"body"), body_digest(b"other bytes"))
+            .await
+            .expect_err("refused");
+
+        assert!(
+            mirror.keys().is_empty(),
+            "a refused put must leave the keyspace empty; got {:?}",
+            mirror.keys()
+        );
+        assert!(
+            read_back(&mirror, &key()).await.is_none(),
+            "nothing may be readable under a refused key"
+        );
+    }
+
+    /// A refused overwrite leaves the previous body readable. In
+    /// production the live key is untouched until the commit — the
+    /// staged file is never renamed, the multipart never completed — so
+    /// a double that cleared the key and then refused would show a state
+    /// no backend can reach.
+    #[tokio::test]
+    async fn a_refused_overwrite_leaves_the_previous_body_readable() {
+        let mirror = MockMetadataMirror::default();
+        let committed = b"the body the key already holds";
+
+        mirror
+            .put(&key(), cursor(committed), body_digest(committed))
+            .await
+            .expect("the honest first write is accepted");
+
+        mirror
+            .put(
+                &key(),
+                cursor(b"a replacement"),
+                body_digest(b"not what follows"),
+            )
+            .await
+            .expect_err("refused");
+
+        assert_eq!(
+            read_back(&mirror, &key()).await.as_deref(),
+            Some(&committed[..]),
+            "a refused overwrite must leave the committed body in place"
+        );
     }
 }

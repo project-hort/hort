@@ -1,0 +1,42 @@
+# Exercise every credentialed admin-task CronJob with the plaintext Service path.
+publicBaseUrl: "https://example.com"
+clientIpFromSocketPeer: true
+scheduledTasks:
+  adminTasksEnabled: true
+  noop:
+    enabled: true
+  stagingSweep:
+    enabled: true
+  cronRescanTick:
+    enabled: true
+  advisoryWatchTick:
+    enabled: true
+  eventstoreCheckpoint:
+    enabled: true
+  replaySeenPrune:
+    enabled: true
+  scannerRegistryPrune:
+    enabled: true
+  retentionEvaluate:
+    enabled: true
+  retentionPurge:
+    enabled: true
+  eventstoreArchive:
+    enabled: true
+  serviceAccountRotation:
+    enabled: true
+worker:
+  rotation:
+    publicRegistryHost: "registry.example.com"
+postgres:
+  app:
+    existingSecret: "hort-app-db-secret"
+  admin:
+    existingSecret: "hort-admin-db-secret"
+auth:
+  provider: "oidc"
+  oidc:
+    issuerUrl: "https://idp.example.com"
+    audience: "hort-server"
+storage:
+  backend: filesystem

@@ -59,11 +59,15 @@ use hort_http_core::middleware::auth::AuthenticatedPrincipal;
 ///   GET routes through `extract_optional_principal`, NOT
 ///   `require_principal`, so the 401 is enforced one layer down, not by
 ///   the middleware — read-endpoint pattern, ADR 0013).
-/// - `403 Forbidden` — token-kind denial (PAT / no `token_kind`) OR
-///   `Permission::Read` denial.
-/// - `404 Not Found` — repo key unknown (anti-enumeration; the use case
-///   collapses `repository.find_by_key` `NotFound` to the same
-///   envelope an invisible repo would produce).
+/// - `403 Forbidden` — token-kind denial (PAT / no `token_kind`), and
+///   only that. The gate fires before the repository is resolved, so its
+///   refusal cannot carry whether a repository exists; that precedence is
+///   what makes a `Forbidden` safe here at all.
+/// - `404 Not Found` — an unknown repo key AND an existing repository the
+///   caller may not read, byte-identical. A `Read` denial that answered
+///   `403` would be the 404-vs-403 oracle, which
+///   `docs/architecture/explanation/security.md` rules out: the envelope
+///   for "missing" and for "invisible" is one envelope.
 pub async fn list_versions(
     State(ctx): State<Arc<AppContext>>,
     Path((repo_key, package_name)): Path<(String, String)>,

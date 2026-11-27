@@ -38,22 +38,22 @@
 //!   want to leak the implementation detail.
 //!
 //! Conditionally injected when [`crate::middleware::trust::RequestTrust`]
-//! is present in request extensions AND its `public_url.scheme()` is
-//! `https`:
+//! is present, its `transport` is `TransportSecurity::Tls`, AND its
+//! public origin is `https`:
 //!
 //! - `Strict-Transport-Security: max-age=15552000; includeSubDomains`
 //!
 //! # HSTS posture
 //!
-//! HSTS is never emitted unconditionally: TLS termination is
-//! the operator's reverse-proxy responsibility, and emitting HSTS
-//! unconditionally breaks HTTP-only dev clusters / internal proxies
-//! terminating TLS upstream. The defensible middle
-//! ground: the binary has positive evidence about its scheme via
-//! `RequestTrust::public_url`. When that scheme is `https`, the
-//! deployment IS behind TLS; emit HSTS. When it is `http` (or
-//! `RequestTrust` is absent because the trust layer didn't run on this
-//! path), stay silent.
+//! RFC 6797 §7.2 forbids an HSTS host from sending this header over
+//! non-secure transport. `RequestTrust::transport` supplies the TLS
+//! evidence; `RequestTrust::public_url` supplies the public origin the
+//! client will revisit. Emit only when the evidence is `Tls` and that
+//! origin is `https`. `Unknown`, `Plaintext`, and an absent
+//! `RequestTrust` stay silent. RFC 6797 §8.1 requires user agents to
+//! ignore a header received over insecure transport, so the practical
+//! exposure from the former address-based condition was small. This
+//! condition keeps the server's response consistent with the protocol.
 //!
 //! `includeSubDomains` is included because an artifact registry's
 //! subdomains (per-format hostnames, mirror endpoints) shouldn't fall
@@ -74,7 +74,7 @@ use axum::http::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use axum::middleware::Next;
 use axum::response::Response;
 
-use crate::middleware::trust::RequestTrust;
+use crate::middleware::trust::{RequestTrust, TransportSecurity};
 
 /// `X-Content-Type-Options` header name.
 const X_CONTENT_TYPE_OPTIONS: HeaderName = HeaderName::from_static("x-content-type-options");
@@ -122,8 +122,8 @@ const CSP_DEFAULT: HeaderValue =
 /// reinforces that even shared caches that ignore `no-store` must not
 /// store the body.
 const NO_STORE_PRIVATE: HeaderValue = HeaderValue::from_static("no-store, private");
-/// `Strict-Transport-Security` value emitted when the binary has
-/// positive evidence the public scheme is `https`. 180 days
+/// `Strict-Transport-Security` value emitted for proven TLS and an
+/// `https` public origin. 180 days
 /// (15552000 seconds) plus `includeSubDomains`. No `preload` — that's
 /// operator-explicit.
 const HSTS_VALUE: HeaderValue = HeaderValue::from_static("max-age=15552000; includeSubDomains");
@@ -144,18 +144,13 @@ fn content_type_is_html(response: &Response) -> bool {
         .unwrap_or(false)
 }
 
-/// Returns `true` when the request carries a [`RequestTrust`] extension
-/// whose `public_url` scheme is exactly `"https"`. The trust layer
-/// populates `RequestTrust` on every request that traverses the public
-/// router; absence means either (a) the trust layer didn't run on this
-/// path (test harness, admin internal-only path) or (b) the request
-/// pre-dates layer ordering — both of which mean we have no positive
-/// evidence the connection is TLS, so HSTS stays silent.
-fn public_scheme_is_https(request: &Request) -> bool {
+/// Returns `true` only for TLS evidence and an `https` public origin.
+/// Missing trust context cannot establish either condition.
+fn should_emit_hsts(request: &Request) -> bool {
     request
         .extensions()
         .get::<RequestTrust>()
-        .map(|t| t.public_url.scheme() == "https")
+        .map(|t| t.transport == TransportSecurity::Tls && t.public_url.scheme() == "https")
         .unwrap_or(false)
 }
 
@@ -187,7 +182,7 @@ fn should_emit_no_store(request: &Request) -> bool {
 /// can't unset extensions but reading first means we don't depend on
 /// `Request` being available afterwards).
 pub async fn security_headers_middleware(request: Request, next: Next) -> Response {
-    let emit_hsts = public_scheme_is_https(&request);
+    let emit_hsts = should_emit_hsts(&request);
     let emit_no_store = should_emit_no_store(&request);
     let mut response = next.run(request).await;
     let is_html = content_type_is_html(&response);
@@ -635,23 +630,20 @@ mod tests {
     // them — no positive TLS evidence for any path the trust layer
     // didn't touch.
     //
-    // The HSTS-emission tests below build a separate router that
-    // attaches a tiny `inject_trust(scheme)` layer BEFORE the security-
-    // headers layer, so the inner middleware sees a populated
-    // `RequestTrust` and emits (or doesn't emit) HSTS based on the
-    // pinned scheme. This mirrors how the production composition root
+    // The HSTS tests below build a separate router that injects both
+    // transport evidence and a public origin BEFORE the security-headers
+    // layer. This mirrors how the production composition root
     // wires `request_trust_layer` upstream of `security_headers_middleware`
     // in `build_router`.
 
-    use crate::middleware::trust::RequestTrust;
+    use crate::middleware::trust::{RequestTrust, TransportSecurity};
     use axum::extract::State;
     use std::net::{IpAddr, Ipv4Addr};
 
-    /// Stateful trust-injector middleware. The scheme is carried as
-    /// `State<&'static str>` so the closure can stay `fn`-shaped (axum's
-    /// `from_fn_with_state` is happy with named function pointers).
+    /// Stateful trust-injector middleware. The origin and evidence are
+    /// independent inputs so a pinned address cannot stand in for TLS.
     async fn inject_trust_middleware(
-        State(scheme): State<&'static str>,
+        State((scheme, transport)): State<(&'static str, TransportSecurity)>,
         mut req: Request,
         next: Next,
     ) -> Response {
@@ -659,18 +651,23 @@ mod tests {
         let trust = RequestTrust {
             client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             public_url: url,
+            transport,
+            peer_trusted: false,
+            tls_requirement_waived: false,
         };
         req.extensions_mut().insert(trust);
         next.run(req).await
     }
 
-    fn drive_with_trust(scheme: &'static str, uri: &str) -> Response {
+    fn drive_with_trust(scheme: &'static str, transport: TransportSecurity, uri: &str) -> Response {
         let app = Router::new()
+            .route("/html", get(html_handler))
             .route("/json", get(json_handler))
             .route("/plain", get(plain_text_handler))
+            .route("/admin/foo", get(json_handler))
             .layer(axum::middleware::from_fn(security_headers_middleware))
             .layer(axum::middleware::from_fn_with_state(
-                scheme,
+                (scheme, transport),
                 inject_trust_middleware,
             ));
         tokio::runtime::Builder::new_current_thread()
@@ -678,20 +675,25 @@ mod tests {
             .build()
             .unwrap()
             .block_on(async {
-                app.oneshot(HttpRequest::get(uri).body(Body::empty()).unwrap())
-                    .await
-                    .unwrap()
+                app.oneshot(
+                    HttpRequest::get(uri)
+                        .header("host", "example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
             })
     }
 
-    /// HSTS present when `RequestTrust::public_url` is `https`.
+    /// Both positive TLS evidence and an HTTPS public origin are required.
     #[test]
-    fn injects_hsts_when_request_trust_scheme_is_https() {
-        let resp = drive_with_trust("https", "/json");
+    fn injects_hsts_when_transport_is_tls_and_origin_is_https() {
+        let resp = drive_with_trust("https", TransportSecurity::Tls, "/json");
         assert_eq!(
             header(&resp, &STRICT_TRANSPORT_SECURITY).as_deref(),
             Some("max-age=15552000; includeSubDomains"),
-            "HSTS must be emitted when public_url is https"
+            "HSTS must be emitted for proven TLS and an HTTPS origin"
         );
     }
 
@@ -700,7 +702,7 @@ mod tests {
     /// without updating the CHANGELOG, this test fails.
     #[test]
     fn hsts_value_is_exactly_180_days_with_includesubdomains() {
-        let resp = drive_with_trust("https", "/json");
+        let resp = drive_with_trust("https", TransportSecurity::Tls, "/json");
         assert_eq!(
             resp.headers()
                 .get(&STRICT_TRANSPORT_SECURITY)
@@ -711,17 +713,54 @@ mod tests {
         );
     }
 
-    /// HSTS absent when `RequestTrust::public_url` is `http`. The
-    /// binary has positive evidence the connection is NOT
-    /// behind TLS, so emitting HSTS would be wrong (it'd lock clients
-    /// out the next time they hit the http URL).
+    /// An HTTP public origin has no meaningful HSTS policy, even when
+    /// the trusted proxy reports TLS on this request.
     #[test]
-    fn does_not_inject_hsts_when_request_trust_scheme_is_http() {
-        let resp = drive_with_trust("http", "/json");
+    fn does_not_inject_hsts_when_origin_is_http_despite_tls_evidence() {
+        let resp = drive_with_trust("http", TransportSecurity::Tls, "/json");
         assert!(
             resp.headers().get(&STRICT_TRANSPORT_SECURITY).is_none(),
             "HSTS must not be emitted when public_url is http"
         );
+    }
+
+    #[test]
+    fn does_not_inject_hsts_for_plaintext_with_usable_host() {
+        let resp = drive_with_trust("http", TransportSecurity::Plaintext, "/json");
+        assert!(resp.headers().get(&STRICT_TRANSPORT_SECURITY).is_none());
+    }
+
+    #[test]
+    fn does_not_inject_hsts_for_plaintext_with_https_origin() {
+        let resp = drive_with_trust("https", TransportSecurity::Plaintext, "/json");
+        assert!(resp.headers().get(&STRICT_TRANSPORT_SECURITY).is_none());
+    }
+
+    /// A pinned HTTPS address is still HTTPS when transport is unknown;
+    /// the address alone must not cause the header to be emitted.
+    #[test]
+    fn does_not_inject_hsts_for_https_pinned_origin_without_tls_evidence() {
+        let resp = drive_with_trust("https", TransportSecurity::Unknown, "/json");
+        assert!(resp.headers().get(&STRICT_TRANSPORT_SECURITY).is_none());
+    }
+
+    #[test]
+    fn other_security_headers_are_identical_across_transport_evidence() {
+        for uri in ["/json", "/plain", "/html", "/admin/foo"] {
+            let mut tls = drive_with_trust("https", TransportSecurity::Tls, uri);
+            let unknown = drive_with_trust("https", TransportSecurity::Unknown, uri);
+            assert_eq!(
+                tls.headers_mut().remove(&STRICT_TRANSPORT_SECURITY),
+                Some(HSTS_VALUE),
+                "TLS request must have exactly the expected HSTS value on {uri}"
+            );
+            assert_eq!(
+                tls.headers(),
+                unknown.headers(),
+                "non-HSTS headers differ on {uri}"
+            );
+            assert!(!unknown.headers().contains_key(&SERVER));
+        }
     }
 
     /// HSTS absent when `RequestTrust` extension is missing. Defensive

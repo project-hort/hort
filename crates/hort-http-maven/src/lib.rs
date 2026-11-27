@@ -20,8 +20,8 @@
 //!   generates sidecars on GET).
 //! - **GET/HEAD** content files → exact-path lookup + quarantine gate +
 //!   CAS stream. `maven-metadata.xml` → server-generated via the
-//!   Source → Filter → Builder pipeline ([`serve`]). Checksum-sidecar GET
-//!   → 404 for now (Item 7 wires on-demand generation).
+//!   Source → Filter → Builder pipeline ([`serve`]). A checksum-sidecar GET
+//!   is generated on demand over the same resolved target ([`sidecar`]).
 //!
 //! On-demand sidecar generation (Item 7) and unresolved-SNAPSHOT
 //! resolution + V-level metadata (Item 8) are wired. Pull-through (Item 9)
@@ -286,11 +286,14 @@ async fn serve_metadata_maybe_sidecar(
 /// exact stored path.
 ///
 /// A sidecar GET (`<file>.{sha1,sha256,sha512,md5}`) resolves the SAME
-/// target file and applies the SAME status gate, then returns the digest
-/// of the stored bytes: `.sha256` is the CAS `ContentHash` (free);
-/// `.sha1`/`.sha512`/`.md5` stream the blob through the hasher, memoised in
-/// the Evictable `mavensum:` keyspace ([`sidecar`]). A held target's
-/// sidecar inherits its file's 503 / 403 — the digest is never computed.
+/// target file — through the same single [`resolve_unresolved_snapshot`]
+/// call, so an unresolved `-SNAPSHOT` sidecar lands on the timestamped
+/// build its file request lands on — and applies the SAME status gate,
+/// then returns the digest of the stored bytes: `.sha256` is the CAS
+/// `ContentHash` (free); `.sha1`/`.sha512`/`.md5` stream the blob through
+/// the hasher, memoised in the Evictable `mavensum:` keyspace
+/// ([`sidecar`]). A held target's sidecar inherits its file's 503 / 403 —
+/// the digest is never computed.
 ///
 /// For a real file: `find_visible_by_path` → quarantine gate → CAS stream.
 /// A miss → 404 (hosted; pull-through is Item 9). The caller is threaded
@@ -312,21 +315,34 @@ async fn serve_file(
         return serve_virtual_maven_file(ctx, repo, coords, artifact_path, is_head, actor).await;
     }
 
-    // A `<file>.{sha1,sha256,sha512,md5}` sidecar request → the digest of
-    // the stored `<file>`, computed on demand (design §6). The base path is
-    // the request tail with the sidecar extension stripped from the
-    // filename; the parser already validated the whole tail (the file-shape
-    // branch runs on the sidecar's base coords).
+    // A `<file>.{sha1,sha256,sha512,md5}` sidecar request addresses the digest
+    // of the stored `<file>`, computed on demand (design §6). Split that
+    // suffix off FIRST, without dispatching yet: the sidecar's base path is
+    // the path that names the content file, and it is what the resolver below
+    // must see. The parser already validated the whole tail (the file-shape
+    // branch runs on the sidecar's base coords, so `coords.version` is the
+    // base version either way).
     let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
-    if let (base_filename, Some(algorithm)) = coords::strip_sidecar_ext(filename) {
-        // Rebuild the base path: replace the final filename segment with
-        // its sidecar-stripped form.
-        let base_path = match artifact_path.rsplit_once('/') {
+    let (base_filename, sidecar_algorithm) = coords::strip_sidecar_ext(filename);
+    let sidecar_base_path = sidecar_algorithm.map(|_| {
+        // Rebuild the base path: replace the final filename segment with its
+        // sidecar-stripped form. A file-shape tail always has a directory
+        // part — `parse_download_path` rejects fewer than four segments
+        // (groupId/artifactId/version/filename) — so the second arm is the
+        // compiler's, not a request any route can produce.
+        match artifact_path.rsplit_once('/') {
             Some((dir, _last)) => format!("{dir}/{base_filename}"),
             None => base_filename.to_string(),
-        };
-        return sidecar::serve_sidecar(ctx, repo, &base_path, algorithm, is_head, actor).await;
-    }
+        }
+    });
+    // The path that names the CONTENT file: a sidecar's base, or the request
+    // path itself. Resolving this — never the `.{algorithm}` path — is the
+    // whole point of doing the split first: `resolve_mutable_version` derives
+    // the requested `(classifier, extension)` from the filename, so handed
+    // `…jar.sha1` it asks for extension `sha1`, no stored timestamped build
+    // matches, and the sidecar of an unresolved SNAPSHOT 404s while its file
+    // serves.
+    let content_path = sidecar_base_path.as_deref().unwrap_or(artifact_path);
 
     // An unresolved `foo-X-SNAPSHOT.jar` GET resolves via
     // `resolve_mutable_version` to the latest timestamped build BEFORE the
@@ -339,9 +355,20 @@ async fn serve_file(
     // resolved-but-held build still 503s / 403s). On no match we fall through
     // to the exact-path lookup (which 404s unless a literal `-SNAPSHOT`-named
     // file was stored, e.g. a non-Maven-3 deploy) (design §7).
-    let resolved_path =
-        resolve_unresolved_snapshot(ctx, repo, coords, artifact_path, actor).await?;
-    let lookup_path = resolved_path.as_deref().unwrap_or(artifact_path);
+    //
+    // ONE call, ahead of the branch, and both branches inherit its answer —
+    // which is what makes "the file GET and the sidecar GET resolve the same
+    // target artifact" ([`non_servable_response`], design §11) structural: a
+    // single resolver call cannot resolve two different targets.
+    let resolved_path = resolve_unresolved_snapshot(ctx, repo, coords, content_path, actor).await?;
+    let lookup_path = resolved_path.as_deref().unwrap_or(content_path);
+
+    // Sidecar branch: digest the resolved target. The status gate is the file
+    // GET's own ([`non_servable_response`]), applied before any CAS read, so a
+    // held build's digest is never computed.
+    if let Some(algorithm) = sidecar_algorithm {
+        return sidecar::serve_sidecar(ctx, repo, lookup_path, algorithm, is_head, actor).await;
+    }
 
     // A hosted CAS hit serves straight from local storage. On a miss, a
     // `RepositoryType::Proxy` repo routes the FILE request through the
@@ -455,7 +482,14 @@ async fn serve_virtual_maven_file(
 /// stored timestamped path, or `None` when the request is not an unresolved
 /// snapshot (already concrete / non-snapshot) or no build matches.
 ///
-/// Only runs the (extra) group load when the request filename actually
+/// `content_path` names the CONTENT file — for a checksum-sidecar request
+/// that is the base path, never the `.{algorithm}` path:
+/// `resolve_mutable_version` reads the requested `(classifier, extension)`
+/// off the filename it is handed, so a `…jar.sha1` argument asks for
+/// extension `sha1`, matches no stored timestamped build, and answers
+/// `None` for a request that does have one.
+///
+/// Only runs the (extra) group load when the content filename actually
 /// carries the literal `-SNAPSHOT` token — a release / already-timestamped
 /// path skips the load entirely and falls straight through to the exact-path
 /// lookup. The available timestamped paths come from
@@ -467,7 +501,7 @@ async fn resolve_unresolved_snapshot(
     ctx: &Arc<AppContext>,
     repo: &Repository,
     coords: &ArtifactCoords,
-    artifact_path: &str,
+    content_path: &str,
     actor: Option<&CallerPrincipal>,
 ) -> Result<Option<String>, ApiError> {
     // Cheap pre-filter: only a request whose version segment is a base
@@ -475,14 +509,17 @@ async fn resolve_unresolved_snapshot(
     // can be an unresolved snapshot. (A timestamped file's version segment is
     // still `X-SNAPSHOT` but its filename carries the timestamp, not the
     // literal token — `resolve_mutable_version` would return `None` for it
-    // anyway; this guard just avoids the group load.)
+    // anyway; this guard just avoids the group load.) The sidecar path's
+    // coords are the base coords, so `coords.version` is the base version for
+    // a `.{algorithm}` request too and the filename guard is what keeps a
+    // concrete sidecar off the group load.
     let Some(version) = coords.version.as_deref() else {
         return Ok(None);
     };
     if !version.ends_with("-SNAPSHOT") {
         return Ok(None);
     }
-    let filename = artifact_path.rsplit('/').next().unwrap_or(artifact_path);
+    let filename = content_path.rsplit('/').next().unwrap_or(content_path);
     if !filename.contains("-SNAPSHOT") {
         return Ok(None);
     }
@@ -502,7 +539,7 @@ async fn resolve_unresolved_snapshot(
         .collect();
     let available_refs: Vec<&str> = available.iter().map(String::as_str).collect();
 
-    Ok(MavenFormatHandler.resolve_mutable_version(artifact_path, &available_refs)?)
+    Ok(MavenFormatHandler.resolve_mutable_version(content_path, &available_refs)?)
 }
 
 /// Surface the per-artifact status gate as the non-servable HTTP
@@ -515,10 +552,15 @@ async fn resolve_unresolved_snapshot(
 /// checksum-sidecar GET ([`sidecar::serve_sidecar`]) resolve the same
 /// target artifact and must reach the **same** answer (design §11) — a
 /// quarantined file and its sidecar both 503, a rejected file and its
-/// sidecar both 403. Routing both through one call is what guarantees
-/// it, and it is why the gate runs *before* any CAS read or cache
-/// lookup: the digest of a held version is never computed, so the
-/// sidecar reveals nothing the file's own status response does not.
+/// sidecar both 403. Both halves of that are structural rather than
+/// restated. *The same target*: [`serve_file`] strips the sidecar suffix
+/// before it dispatches and runs [`resolve_unresolved_snapshot`] ONCE on
+/// the path naming the content file, so the two branches cannot resolve
+/// to two different builds of a `-SNAPSHOT`. *The same answer*: both
+/// route through this one call. And it is why the gate runs *before* any
+/// CAS read or cache lookup: the digest of a held version is never
+/// computed, so the sidecar reveals nothing the file's own status
+/// response does not.
 pub(crate) fn non_servable_response(
     artifact: &hort_domain::entities::artifact::Artifact,
     retry_after_floor_secs: std::num::NonZeroU32,

@@ -78,19 +78,132 @@ pub const SPDX_JSON_MEDIA_TYPE: &str = "application/spdx+json";
 /// declares its payload layer with.
 pub const CYCLONEDX_JSON_MEDIA_TYPE: &str = "application/vnd.cyclonedx+json";
 
-/// The `Artifact.path` prefix every OCI **blob** row carries —
-/// `blobs/sha256:<hex>`, the OCI Distribution URL minus its
-/// `/v2/<name>/` head. Manifests and indexes use a `manifests/` prefix
-/// instead, so the two never collide on the `(repository_id, path)`
-/// uniqueness constraint.
-///
-/// Shared rather than spelled out at each site because the prefix is
-/// load-bearing in two directions: the OCI HTTP adapter *writes* it when
-/// it builds blob coords, and `OciFormatHandler::is_provenance_constituent`
-/// *reads* it to decide that a row can never carry its own attestation.
-/// A silent divergence between the two would re-open a terminal
-/// self-rejection on a correctly-signed image's layers.
-pub const OCI_BLOB_PATH_PREFIX: &str = "blobs/sha256:";
+/// Role prefixes for OCI artifact paths. The role leads both the scoped
+/// `role/<name>/sha256:<hex>` path and the legacy `role/sha256:<hex>` path.
+/// Keeping the role first lets a name literally equal to `blobs` or
+/// `manifests` classify by the role it actually carries.
+pub const OCI_BLOB_PATH_PREFIX: &str = "blobs/";
+pub const OCI_MANIFEST_PATH_PREFIX: &str = "manifests/";
+
+/// The role of an OCI artifact row, independent of its image name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OciArtifactRole {
+    Blob,
+    Manifest,
+}
+
+impl OciArtifactRole {
+    /// Prefix shared by scoped and legacy paths for this role.
+    pub const fn prefix(self) -> &'static str {
+        match self {
+            Self::Blob => OCI_BLOB_PATH_PREFIX,
+            Self::Manifest => OCI_MANIFEST_PATH_PREFIX,
+        }
+    }
+}
+
+/// Parsed OCI artifact identity. `None` means the old name-free shape.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ParsedOciArtifactPath<'a> {
+    pub role: OciArtifactRole,
+    pub name: Option<&'a str>,
+    pub digest: &'a str,
+}
+
+/// Build the current, name-scoped identity path for a write.
+pub fn oci_artifact_path(role: OciArtifactRole, name: &str, digest: &ContentHash) -> String {
+    format!("{}{name}/sha256:{}", role.prefix(), digest.as_ref())
+}
+
+/// Build the old name-free identity path for an expand-window read.
+pub fn legacy_oci_artifact_path(role: OciArtifactRole, digest: &ContentHash) -> String {
+    format!("{}sha256:{}", role.prefix(), digest.as_ref())
+}
+
+/// Parse either path shape, validating the role, name, and SHA-256 segment.
+pub fn parse_oci_artifact_path(path: &str) -> Option<ParsedOciArtifactPath<'_>> {
+    let (role, rest) = if let Some(rest) = path.strip_prefix(OCI_BLOB_PATH_PREFIX) {
+        (OciArtifactRole::Blob, rest)
+    } else {
+        (
+            OciArtifactRole::Manifest,
+            path.strip_prefix(OCI_MANIFEST_PATH_PREFIX)?,
+        )
+    };
+    let (name, digest) = match rest.rsplit_once('/') {
+        Some((name, digest)) if valid_oci_path_name(name) => (Some(name), digest),
+        Some(_) => return None,
+        None => (None, rest),
+    };
+    let hex = digest.strip_prefix("sha256:")?;
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return None;
+    }
+    Some(ParsedOciArtifactPath { role, name, digest })
+}
+
+fn valid_oci_path_name(name: &str) -> bool {
+    name.len() <= 256
+        && name.split('/').count() <= 8
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && part.split(['.', '_', '-']).all(|segment| {
+                    !segment.is_empty()
+                        && segment
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                })
+        })
+}
+
+#[cfg(test)]
+mod oci_path_tests {
+    use super::*;
+
+    #[test]
+    fn scoped_and_legacy_paths_round_trip() {
+        let hash: ContentHash = "a".repeat(64).parse().unwrap();
+        for role in [OciArtifactRole::Blob, OciArtifactRole::Manifest] {
+            for name in ["library/nginx", "single", "blobs", "manifests"] {
+                let path = oci_artifact_path(role, name, &hash);
+                assert_eq!(
+                    parse_oci_artifact_path(&path),
+                    Some(ParsedOciArtifactPath {
+                        role,
+                        name: Some(name),
+                        digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    })
+                );
+            }
+            let legacy = legacy_oci_artifact_path(role, &hash);
+            assert_eq!(parse_oci_artifact_path(&legacy).unwrap().name, None);
+        }
+    }
+
+    #[test]
+    fn malformed_paths_do_not_classify() {
+        let hex = "a".repeat(64);
+        for path in [
+            format!("blobs/name/sha512:{hex}"),
+            format!("blobs/foo//bar/sha256:{hex}"),
+            format!("blobs/name/sha256:{}", "A".repeat(64)),
+            format!("blobs/name/sha256:{}", "g".repeat(64)),
+            format!("blobs/name/sha256:{}", "a".repeat(63)),
+            format!("blobs/{}/sha256:{hex}", "a".repeat(257)),
+            format!("blobs/a/b/c/d/e/f/g/h/i/sha256:{hex}"),
+            format!("blobs/name-/sha256:{hex}"),
+            format!("blobs/-name/sha256:{hex}"),
+            format!("blobs/Name/sha256:{hex}"),
+            format!("prefix/blobs/name/sha256:{hex}"),
+        ] {
+            assert_eq!(parse_oci_artifact_path(&path), None, "{path}");
+        }
+    }
+}
 
 /// The `mediaType` of an OCI image index (multi-arch "manifest of manifests"):
 /// `application/vnd.oci.image.index.v1+json`. An index carries a `manifests[]`
@@ -602,12 +715,12 @@ const ROOTFS_TYPE_LAYERS: &str = "layers";
 /// So hort's own decoder inventory does not constrain this set; what governs is
 /// what the scanner opens once handed the layout.
 ///
-/// That makes the set **measured rather than reasoned**. Against Trivy 0.70.0 —
+/// That makes the set **measured rather than reasoned**. Against Trivy 0.76.2 —
 /// the version `docker/Dockerfile.worker` pins — on hand-built two-layer
 /// layouts whose lower layer carried `/etc/os-release` and a dpkg database and
 /// whose upper layer carried a larger one and no OS marker of its own, an upper
 /// layer declaring `tar`, `tar+gzip` or `tar+zstd` composed identically: same
-/// detected OS, same package inventory (measured 2026-10-19). So the upper
+/// detected OS, same package inventory (measured 2026-11-26). So the upper
 /// layer's container did not change what the scanner read out of either layer.
 ///
 /// Measured the same way, the scanner decides by **content** rather than by

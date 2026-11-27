@@ -37,10 +37,6 @@ ephemeralStore:
   redis:
     existingSecret: hort-redis-creds
 
-metrics:
-  serviceMonitor:
-    enabled: true
-
 networkPolicy:
   enabled: true
   ingress:

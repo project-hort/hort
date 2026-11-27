@@ -81,7 +81,7 @@ use std::time::Duration;
 
 use hort_domain::error::{DomainError, DomainResult};
 use hort_domain::ports::scanner::{
-    EvidenceBasis, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
+    EvidenceBasis, NoAnalyzerCause, NotAnalysable, ScanAnalysis, ScanTarget, ScannerPort,
     SCAN_REPORT_TOO_LARGE_MARKER,
 };
 use hort_domain::ports::storage::StoragePort;
@@ -734,7 +734,7 @@ impl ScannerPort for TrivyAdapter {
                              saw is not the whole archive, so this is no verdict",
                         );
                         return Ok(ScanAnalysis::NothingAnalysable(
-                            NotAnalysable::NoAnalyzerMatched,
+                            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::RootfsLinksSkipped),
                         ));
                     }
                     // `fs` targets one artifact whose analyzer either
@@ -753,7 +753,7 @@ impl ScannerPort for TrivyAdapter {
                             "trivy adapter: report carries no analysed target; no verdict"
                         );
                         return Ok(ScanAnalysis::NothingAnalysable(
-                            NotAnalysable::NoAnalyzerMatched,
+                            NotAnalysable::NoAnalyzerMatched(NoAnalyzerCause::FsEmptyReport),
                         ));
                     }
                 }
@@ -1597,7 +1597,9 @@ mod tests {
         .expect("the child exited 0, so the scan itself succeeded");
         assert_eq!(
             analysis,
-            ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched),
+            ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched(
+                NoAnalyzerCause::RootfsLinksSkipped,
+            )),
             "an empty report over a tree whose link entries were skipped is a surface that \
              went unassessed, not a completed fact about the artifact"
         );
@@ -1654,7 +1656,9 @@ mod tests {
                 .expect("the child exited 0, so the scan itself succeeded");
             assert_eq!(
                 analysis,
-                ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched),
+                ScanAnalysis::NothingAnalysable(NotAnalysable::NoAnalyzerMatched(
+                    NoAnalyzerCause::FsEmptyReport
+                )),
                 "report {report} over an fs target must not be read as a clean verdict"
             );
         }

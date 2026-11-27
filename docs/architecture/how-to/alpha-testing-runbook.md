@@ -373,8 +373,8 @@ path (OIDC discovery returns 404 in Track A). Config persists to
 `~/.hort/config.toml`.
 
 **Assertion (§5·A.a):** `auth login` prints `Logged in as <service account>
-(kind=svc_account)` (with an informational warning that the token kind isn't
-`hort_cli_*`/`hort_pat_*` — expected for the svc-token path).
+(kind=svc_account)` (with an informational warning that a service-account token
+is not a human CLI-session JWT or PAT — expected for the svc-token path).
 
 **Assertion (§5·A.b):** `auth status` shows `token_kind: svc_account` +
 `permissions: write, read, delete, admin_task_invoke`. `user_id`/`username`

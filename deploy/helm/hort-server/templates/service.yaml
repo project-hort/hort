@@ -23,11 +23,19 @@ spec:
   ports:
     - name: http
       port: {{ .Values.service.httpPort }}
+      {{- if .Values.tlsSidecar.enabled }}
+      targetPort: https
+      {{- else }}
       targetPort: http
+      {{- end }}
       protocol: TCP
     {{- if .Values.metrics.bindAddr }}
     - name: metrics
       port: {{ .Values.service.metricsPort }}
+      {{- if .Values.tlsSidecar.enabled }}
+      targetPort: metrics-https
+      {{- else }}
       targetPort: metrics
+      {{- end }}
       protocol: TCP
     {{- end }}

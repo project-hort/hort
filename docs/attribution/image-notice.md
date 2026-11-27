@@ -17,14 +17,20 @@ bundled-tool version bump in a Dockerfile updates this file by hand.
 
 | Tool | Version | Upstream project | License (SPDX) |
 | --- | --- | --- | --- |
-| Trivy | 0.70.0 | https://github.com/aquasecurity/trivy | Apache-2.0 |
-| osv-scanner | 2.3.8 | https://github.com/google/osv-scanner | Apache-2.0 |
+| Trivy | 0.76.2 | https://github.com/aquasecurity/trivy | Apache-2.0 |
+| osv-scanner | 2.7.1 | https://github.com/google/osv-scanner | Apache-2.0 |
 | tini | as pinned by `debian:trixie-slim`'s `tini` package (installed via `apt-get install tini`, no separate upstream version pin — see the Dockerfile's Stage 4 comment) | https://github.com/krallin/tini | MIT |
 
 Versions above are pinned by the `TRIVY_VERSION` / `OSV_SCANNER_VERSION` build
 `ARG`s (and their paired `*_SHA256_*` checksum `ARG`s) at the top of
-`docker/Dockerfile.worker`. When those `ARG`s are bumped, update the version
-column here in the same change.
+`docker/Dockerfile.worker`. The version column here must equal those `ARG`s:
+`scripts/check-trivy-version.sh` and `scripts/check-osv-scanner-version.sh`
+compare the two rows above against the Dockerfile (and against the CI
+workflows and the Ansible default that install the same binaries elsewhere),
+so a bump that leaves this table behind fails the pin-sync gate rather than
+shipping a NOTICE that names a version the image does not carry. Reformatting
+a row so the pattern `| <Tool> | <version> |` no longer matches fails the same
+gate, which cannot find a version to compare.
 
 ### Base image contents (`hort-worker` runtime stage)
 

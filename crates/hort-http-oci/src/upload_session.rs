@@ -20,10 +20,11 @@
 //!
 //! # Key-space convention
 //!
-//! `stateful_upload:oci_v2:{session_id}`. The OCI prefix was bumped
-//! from `oci` to `oci_v2` so new postcard-encoded records never share
-//! key-space with legacy bincode-encoded records — the latter expire
-//! via TTL during the deploy window. Other formats (Maven chunked PUT,
+//! `stateful_upload:oci_v3:{session_id}`. The OCI prefix was bumped
+//! from `oci_v2` when the validated name was added to the record;
+//! older records expire via TTL during the deploy window. The earlier
+//! `oci` prefix separated bincode-encoded records from postcard records.
+//! Other formats (Maven chunked PUT,
 //! Git LFS batch transfer) reuse the
 //! `stateful_upload:{format}:{session_id}` layout via [`session_key`]
 //! with their own format token; they were never on the bincode path so
@@ -53,8 +54,8 @@
 //! field tags. Adding, removing, or reordering fields on
 //! [`UploadSessionRecord`] is a breaking wire-format change. The
 //! migration strategy is **drain-via-TTL**: bump the
-//! [`session_key`] prefix (currently `stateful_upload:oci_v2:`) to
-//! `oci_v3:` etc. on the next breaking change, and let in-flight
+//! [`session_key`] prefix (currently `stateful_upload:oci_v3:`) to
+//! `oci_v4:` etc. on the next breaking change, and let in-flight
 //! sessions expire via the session max-age
 //! ([`OCI_SESSION_MAX_AGE_SECS`]).  No dual-format reader exists; old
 //! keys are unreachable from new code.
@@ -126,9 +127,8 @@ pub const OCI_CAP_RETRY_AFTER_SECS: i64 = 15;
 /// Shape is `stateful_upload:{token}:{session_id}` where `{token}`
 /// is the value of [`format_token`] applied to `format`.
 ///
-/// The OCI token is `oci_v2` (not `oci`) so legacy bincode-encoded
-/// records never enter the postcard decoder's path. See [`format_token`]
-/// for the per-format mapping.
+/// The OCI token is `oci_v3` so records without a bound route name
+/// stay outside the decoder's path. See [`format_token`] for the mapping.
 pub fn session_key(format: &str, session_id: Uuid) -> String {
     let token = format_token(format);
     format!("stateful_upload:{token}:{session_id}")
@@ -140,12 +140,12 @@ pub fn session_key(format: &str, session_id: Uuid) -> String {
 /// The indirection exists because the OCI session record's wire format
 /// changed from `bincode 2.0` to `postcard` and the key-space had to
 /// fork so old records do not meet the new decoder. Future wire-format
-/// breaks bump the suffix again (`oci_v3`, …); other formats follow the
+/// breaks bump the suffix again (`oci_v4`, …); other formats follow the
 /// same rule when they migrate. Logical format strings (`"oci"`,
 /// `"maven"`) stay stable — only the key-space token changes.
 pub fn format_token(format: &str) -> &str {
     match format {
-        "oci" => "oci_v2",
+        "oci" => "oci_v3",
         // Other formats have not (yet) had a wire-format break —
         // the bare format name doubles as the key-space token.
         other => other,
@@ -173,12 +173,10 @@ pub fn format_token(format: &str) -> &str {
 /// version counter is opaque from the caller's point of view and lives
 /// beside the record on the backend.
 ///
-/// `principal_id_bytes` allows finalize / cleanup paths to release the
-/// per-`(repo, principal)` live-session set member without re-querying
-/// the originating request. Sessions are max-age-bounded; a deployment
-/// that introduces this field handles the transient deploy-window
-/// decode failures via the existing `Invariant` mapping — the session
-/// set naturally age-prunes even when a few sessions skip the release.
+/// `principal_id_bytes` binds the session to the opening user and also
+/// releases that user's per-`(repo, principal)` live-session set member.
+/// The session UUID is not a secret; authorization must compare this
+/// identity and the route name before changing or releasing a session.
 ///
 /// # Wire-format invariant
 ///
@@ -186,7 +184,7 @@ pub fn format_token(format: &str) -> &str {
 /// tags. Reordering, adding, or removing fields is a breaking
 /// change. The drain-via-TTL migration covers the bincode → postcard
 /// switch; future schema breaks MUST bump the [`session_key`] prefix
-/// the same way (`oci_v3`, …) and let in-flight sessions expire under
+/// the same way (`oci_v4`, …) and let in-flight sessions expire under
 /// the legacy prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UploadSessionRecord {
@@ -202,10 +200,28 @@ pub(crate) struct UploadSessionRecord {
     /// with `version: old + 1` so subsequent PATCHes see the mirror
     /// that matches the store's new counter.
     pub version: u64,
-    /// The principal that opened the session. Used by finalize /
-    /// cleanup paths to release the per-`(repo, principal)` live-session
-    /// set member.
+    /// The opening user id, used both for authorization and to release
+    /// the per-`(repo, principal)` live-session set member.
     pub principal_id_bytes: [u8; 16],
+    /// Validated route name from the initiating POST.
+    pub name: String,
+}
+
+#[derive(Clone, Copy)]
+struct SessionBinding<'a> {
+    repo_id: Uuid,
+    principal_id: Uuid,
+    name: &'a str,
+}
+
+impl<'a> SessionBinding<'a> {
+    fn new(repo_id: Uuid, principal_id: Uuid, name: &'a str) -> Self {
+        Self {
+            repo_id,
+            principal_id,
+            name,
+        }
+    }
 }
 
 impl UploadSessionRecord {
@@ -223,6 +239,7 @@ impl UploadSessionRecord {
         created_at_unix_millis: i64,
         version: u64,
         principal_id: Uuid,
+        name: &str,
     ) -> Self {
         Self {
             repository_id_bytes: *repository_id.as_bytes(),
@@ -230,6 +247,7 @@ impl UploadSessionRecord {
             created_at_unix_millis,
             version,
             principal_id_bytes: *principal_id.as_bytes(),
+            name: name.to_owned(),
         }
     }
 
@@ -240,8 +258,16 @@ impl UploadSessionRecord {
         repository_id: Uuid,
         created_at_unix_millis: i64,
         principal_id: Uuid,
+        name: &str,
     ) -> Self {
-        Self::new(repository_id, 0, created_at_unix_millis, 1, principal_id)
+        Self::new(
+            repository_id,
+            0,
+            created_at_unix_millis,
+            1,
+            principal_id,
+            name,
+        )
     }
 
     /// Logical view of the repository id.
@@ -252,6 +278,15 @@ impl UploadSessionRecord {
     /// Logical view of the principal id.
     pub(crate) fn principal_id(&self) -> Uuid {
         Uuid::from_bytes(self.principal_id_bytes)
+    }
+
+    /// A session UUID is public in Location headers; all three bindings
+    /// must match before mutation. The principal also keys cap release,
+    /// which only runs after this authorization check succeeds.
+    fn matches_binding(&self, binding: SessionBinding<'_>) -> bool {
+        self.repository_id() == binding.repo_id
+            && self.principal_id() == binding.principal_id
+            && self.name == binding.name
     }
 }
 
@@ -275,7 +310,7 @@ pub(crate) fn encode_record(record: &UploadSessionRecord) -> Result<Bytes, Domai
 /// only possible if an adapter stored bytes that weren't produced by
 /// [`encode_record`] (corruption or manual operator poke). Legacy
 /// bincode-encoded records are unreachable from this function: the
-/// `oci_v2` key-prefix keeps them in a disjoint key-space until they
+/// `oci_v3` key-prefix keeps them in a disjoint key-space until they
 /// expire via the 1-hour session TTL.
 #[allow(dead_code)]
 pub(crate) fn decode_record(bytes: &[u8]) -> Result<UploadSessionRecord, DomainError> {
@@ -331,16 +366,13 @@ pub enum InitiateResult {
 /// Initiate a three-phase OCI blob upload.
 ///
 /// Generates a fresh random v4 `session_id`, writes an empty
-/// `UploadSessionRecord` under `stateful_upload:oci_v2:<session_id>` via
+/// `UploadSessionRecord` under `stateful_upload:oci_v3:<session_id>` via
 /// [`EphemeralStore::put_if_absent`], emits the `created` count on
 /// `hort_stateful_upload_sessions_total`, and returns the session id for
 /// the handler to serve in the `Location` header.
 ///
-/// `_actor` is accepted for API parity with the PATCH/PUT handlers
-/// (which use it on causation/audit events); initiate does not persist
-/// an event until finalize, so the actor stays unused here. The
-/// signature is part of the public contract and the PUT/PATCH handlers
-/// carry the actor through to `add_member` / `register_by_hash`.
+/// The authenticated user id and validated route name bind the session.
+/// Both are checked on PATCH, PUT, and DELETE before session mutation.
 ///
 /// On `put_if_absent` returning `Ok(false)` (key already present —
 /// cosmically unlikely under random v4 UUIDs) we surface a
@@ -356,6 +388,7 @@ pub enum InitiateResult {
 pub async fn initiate(
     ctx: &AppContext,
     repo_id: Uuid,
+    name: &str,
     actor: ApiActor,
     max_sessions_per_principal: u32,
     session_max_age: Duration,
@@ -363,6 +396,7 @@ pub async fn initiate(
     initiate_inner(
         ctx,
         repo_id,
+        name,
         actor,
         max_sessions_per_principal,
         session_max_age,
@@ -382,6 +416,7 @@ pub async fn initiate(
 async fn initiate_inner(
     ctx: &AppContext,
     repo_id: Uuid,
+    name: &str,
     actor: ApiActor,
     max_sessions_per_principal: u32,
     session_max_age: Duration,
@@ -463,8 +498,12 @@ async fn initiate_inner(
         }
     }
 
-    let record =
-        UploadSessionRecord::new_initial(repo_id, Utc::now().timestamp_millis(), principal_id);
+    let record = UploadSessionRecord::new_initial(
+        repo_id,
+        Utc::now().timestamp_millis(),
+        principal_id,
+        name,
+    );
     let bytes = encode_record(&record).map_err(AppError::from)?;
     let key = session_key("oci", session_id);
 
@@ -615,7 +654,7 @@ impl ContentRange {
 /// NOT emit — the catalog reserves `created`/`aborted`/`finalized` and
 /// a per-chunk `progressed` variant would inflate cardinality without
 /// useful operator signal.
-#[tracing::instrument(skip(ctx, stream), fields(repository_id = %repo_id))]
+#[tracing::instrument(skip(ctx, stream, actor, name), fields(repository_id = %repo_id))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_chunk(
     ctx: &AppContext,
@@ -626,6 +665,8 @@ pub(crate) async fn append_chunk(
     max_bytes: u64,
     repo_id: Uuid,
     session_max_age: Duration,
+    actor: ApiActor,
+    name: &str,
 ) -> AppResult<UploadSessionRecord> {
     let key = session_key("oci", session_id);
     let result = append_chunk_core(
@@ -636,8 +677,8 @@ pub(crate) async fn append_chunk(
         stream,
         Some(body_length),
         max_bytes,
-        repo_id,
         session_max_age,
+        SessionBinding::new(repo_id, actor.user_id, name),
     )
     .await;
     emit_abort_on_err(ctx, repo_id, &result).await;
@@ -650,7 +691,8 @@ pub(crate) async fn append_chunk(
 /// bounded by the cap headroom the staging write reserves inside
 /// [`append_chunk_core`]; the actual bytes landed are authoritative (no
 /// declared length to cross-check).
-#[tracing::instrument(skip(ctx, stream), fields(repository_id = %repo_id))]
+#[tracing::instrument(skip(ctx, stream, actor, name), fields(repository_id = %repo_id))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn append_chunk_streaming(
     ctx: &AppContext,
     session_id: Uuid,
@@ -659,6 +701,8 @@ pub(crate) async fn append_chunk_streaming(
     max_bytes: u64,
     repo_id: Uuid,
     session_max_age: Duration,
+    actor: ApiActor,
+    name: &str,
 ) -> AppResult<UploadSessionRecord> {
     let key = session_key("oci", session_id);
     let result = append_chunk_core(
@@ -669,8 +713,8 @@ pub(crate) async fn append_chunk_streaming(
         stream,
         None,
         max_bytes,
-        repo_id,
         session_max_age,
+        SessionBinding::new(repo_id, actor.user_id, name),
     )
     .await;
     emit_abort_on_err(ctx, repo_id, &result).await;
@@ -706,8 +750,8 @@ async fn append_chunk_core(
     stream: Box<dyn AsyncRead + Send + Unpin>,
     body_length: Option<u64>,
     max_bytes: u64,
-    repo_id: Uuid,
     session_max_age: Duration,
+    binding: SessionBinding<'_>,
 ) -> AppResult<UploadSessionRecord> {
     // --- Cheap pre-I/O check when the client supplied an explicit range.
     // A width-vs-body-length mismatch fails loud here before we touch
@@ -734,15 +778,9 @@ async fn append_chunk_core(
         }))?;
     let record = decode_record(&stored).map_err(AppError::from)?;
 
-    // --- Tenant isolation — anti-enumeration: surface as NotFound
+    // --- Session binding — anti-enumeration: surface as NotFound
     // (same envelope the "session doesn't exist" branch produced).
-    if record.repository_id() != repo_id {
-        tracing::info!(
-            session_id = %session_id,
-            requested_repo = %repo_id,
-            session_repo = %record.repository_id(),
-            "OCI upload PATCH rejected: session belongs to a different repository"
-        );
+    if !record.matches_binding(binding) {
         return Err(AppError::Domain(DomainError::NotFound {
             entity: "OciUploadSession",
             id: session_id.to_string(),
@@ -902,7 +940,7 @@ async fn cas_bytes_received(
     let next = UploadSessionRecord {
         bytes_received: bytes,
         version: from.version + 1,
-        ..*from
+        ..from.clone()
     };
     let encoded = encode_record(&next).map_err(AppError::from)?;
     let outcome = ctx
@@ -1081,8 +1119,8 @@ async fn finalize_core(
 ) -> AppResult<IngestOutcome> {
     let key = session_key("oci", session_id);
 
-    // --- Tenant isolation (early). Same envelope shape as PATCH: load
-    // the session, decode, match repo; mismatch → anti-enumeration
+    // --- Session binding (early). Same envelope shape as PATCH: load
+    // the session, decode, match repo, principal and name; mismatch → anti-enumeration
     // `NotFound { OciUploadSession }` which the handler maps to 404
     // `BLOB_UPLOAD_UNKNOWN`. Surfacing the check here — before any
     // optional trailing-body append — keeps the PUT isolation story
@@ -1099,13 +1137,7 @@ async fn finalize_core(
             id: session_id.to_string(),
         }))?;
     let initial_record = decode_record(&initial).map_err(AppError::from)?;
-    if initial_record.repository_id() != repo_id {
-        tracing::info!(
-            session_id = %session_id,
-            requested_repo = %repo_id,
-            session_repo = %initial_record.repository_id(),
-            "OCI upload PUT rejected: session belongs to a different repository"
-        );
+    if !initial_record.matches_binding(SessionBinding::new(repo_id, actor.user_id, name)) {
         return Err(AppError::Domain(DomainError::NotFound {
             entity: "OciUploadSession",
             id: session_id.to_string(),
@@ -1140,6 +1172,8 @@ async fn finalize_core(
                     max_bytes,
                     repo_id,
                     session_max_age,
+                    actor.clone(),
+                    name,
                 )
                 .await?;
             }
@@ -1152,6 +1186,8 @@ async fn finalize_core(
                     max_bytes,
                     repo_id,
                     session_max_age,
+                    actor.clone(),
+                    name,
                 )
                 .await?;
             }
@@ -1331,8 +1367,8 @@ async fn cleanup_session_and_staging(
 /// well-behaved client an immediate slot release rather than waiting
 /// for the session to age out.
 ///
-/// Tenant isolation mirrors PATCH / PUT: a session bound to a different
-/// repository surfaces as anti-enumeration `NotFound { OciUploadSession }`
+/// Session binding mirrors PATCH / PUT: a session bound to a different
+/// repository, principal or name surfaces as anti-enumeration `NotFound { OciUploadSession }`
 /// (→ 404 `BLOB_UPLOAD_UNKNOWN`), never leaking that a session for that
 /// UUID exists elsewhere. A missing / TTL-expired session is likewise
 /// `NotFound`. `#[tracing::instrument]` without `err` — the handler
@@ -1343,6 +1379,8 @@ pub async fn cancel(
     session_id: Uuid,
     repo_id: Uuid,
     session_max_age: Duration,
+    actor: ApiActor,
+    name: &str,
 ) -> AppResult<()> {
     let key = session_key("oci", session_id);
     let stored = ctx
@@ -1355,13 +1393,7 @@ pub async fn cancel(
             id: session_id.to_string(),
         }))?;
     let record = decode_record(&stored).map_err(AppError::from)?;
-    if record.repository_id() != repo_id {
-        tracing::info!(
-            session_id = %session_id,
-            requested_repo = %repo_id,
-            session_repo = %record.repository_id(),
-            "OCI upload DELETE rejected: session belongs to a different repository"
-        );
+    if !record.matches_binding(SessionBinding::new(repo_id, actor.user_id, name)) {
         return Err(AppError::Domain(DomainError::NotFound {
             entity: "OciUploadSession",
             id: session_id.to_string(),
@@ -1413,7 +1445,7 @@ mod tests {
 
     fn api_actor() -> ApiActor {
         ApiActor {
-            user_id: Uuid::new_v4(),
+            user_id: synthetic_principal_id(),
         }
     }
 
@@ -1647,15 +1679,13 @@ mod tests {
     // -------------------- session_key --------------------
 
     #[test]
-    fn session_key_has_stateful_upload_oci_v2_prefix() {
-        // The OCI session-key prefix was bumped from
-        // `stateful_upload:oci:` to `stateful_upload:oci_v2:` so
-        // legacy bincode-encoded records never enter the postcard
-        // decoder's path. Old keys expire via the 1-hour
-        // `OCI_SESSION_TTL`; no dual-format reader exists.
+    fn session_key_has_stateful_upload_oci_v3_prefix() {
+        // The current prefix keeps records without a bound name
+        // outside the decoder's lookup path. Older keys expire via
+        // the session TTL; no dual-format reader exists.
         let sid = Uuid::new_v4();
         let key = session_key("oci", sid);
-        assert!(key.starts_with("stateful_upload:oci_v2:"));
+        assert!(key.starts_with("stateful_upload:oci_v3:"));
         assert!(!key.starts_with("stateful_upload:oci:"));
         assert!(key.ends_with(&sid.to_string()));
     }
@@ -1690,7 +1720,14 @@ mod tests {
         let principal = Uuid::new_v4();
         // Seed non-trivial values so the round-trip proves every field
         // survives encode/decode.
-        let record = UploadSessionRecord::new(repo, 12_345, 1_700_000_000_000, 7, principal);
+        let record = UploadSessionRecord::new(
+            repo,
+            12_345,
+            1_700_000_000_000,
+            7,
+            principal,
+            "library/nginx",
+        );
         let bytes = encode_record(&record).unwrap();
         let decoded = decode_record(&bytes).unwrap();
         assert_eq!(decoded, record);
@@ -1712,6 +1749,7 @@ mod tests {
             created_at_unix_millis: i64::MIN,
             version: u64::MAX,
             principal_id_bytes: [0x00; 16],
+            name: "library/nginx".into(),
         };
         let bytes = encode_record(&record).unwrap();
         let decoded = decode_record(&bytes).unwrap();
@@ -1720,16 +1758,16 @@ mod tests {
 
     #[test]
     fn old_prefix_records_are_invisible_to_new_decoder_path() {
-        // Drain-via-TTL migration assertion.
-        // A record stored under the LEGACY prefix
-        // (`stateful_upload:oci:{session_id}`) is unreachable from
-        // the new code path, which queries the V2 prefix
-        // (`stateful_upload:oci_v2:{session_id}`). The old key
-        // expires via the 1-hour session TTL; the new code never
-        // attempts to decode it. This test asserts the key-space
-        // separation directly: no bytes are shared, no dual-format
-        // reader is wired up, and a hostile or stale entry under
-        // the old prefix is a `None` result on the new lookup.
+        // Both previous layouts stay under old prefixes until TTL expiry.
+        // The current decoder only looks up v3 records with a bound name.
+        #[derive(Serialize)]
+        struct PreviousRecord {
+            repository_id_bytes: [u8; 16],
+            bytes_received: u64,
+            created_at_unix_millis: i64,
+            version: u64,
+            principal_id_bytes: [u8; 16],
+        }
         run(async {
             let handle = PrometheusBuilder::new().build_recorder().handle();
             let (ctx, _mocks) = build_mock_ctx(handle);
@@ -1744,11 +1782,30 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            let previous_key = format!("stateful_upload:oci_v2:{sid}");
+            let previous = PreviousRecord {
+                repository_id_bytes: *Uuid::new_v4().as_bytes(),
+                bytes_received: 0,
+                created_at_unix_millis: 1_700_000_000_000,
+                version: 1,
+                principal_id_bytes: *Uuid::new_v4().as_bytes(),
+            };
+            let previous_bytes = postcard::to_allocvec(&previous).unwrap();
+            ctx.ephemeral_durable
+                .put(
+                    &previous_key,
+                    Bytes::from(previous_bytes.clone()),
+                    OCI_SESSION_TTL,
+                )
+                .await
+                .unwrap();
+            assert!(decode_record(&previous_bytes).is_err());
             // The new code-path key for the same session id is
             // distinct and resolves to `None`.
             let new_key = session_key("oci", sid);
             assert_ne!(legacy_key, new_key);
-            assert!(new_key.contains(":oci_v2:"));
+            assert_ne!(previous_key, new_key);
+            assert!(new_key.contains(":oci_v3:"));
             assert!(ctx.ephemeral_durable.get(&new_key).await.unwrap().is_none());
         });
     }
@@ -1759,7 +1816,8 @@ mod tests {
         // must match.
         let repo = Uuid::new_v4();
         let principal = Uuid::new_v4();
-        let record = UploadSessionRecord::new_initial(repo, 1_700_000_000_000, principal);
+        let record =
+            UploadSessionRecord::new_initial(repo, 1_700_000_000_000, principal, "library/nginx");
         assert_eq!(record.version, 1);
         assert_eq!(record.bytes_received, 0);
         assert_eq!(record.repository_id(), repo);
@@ -1811,7 +1869,15 @@ mod tests {
             mocks.repositories.insert(repo);
 
             let outcome = unwrap_created(
-                initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP, TEST_MAX_AGE).await,
+                initiate(
+                    &ctx,
+                    repo_id,
+                    "library/nginx",
+                    api_actor(),
+                    TEST_HIGH_CAP,
+                    TEST_MAX_AGE,
+                )
+                .await,
             );
             assert_eq!(outcome.initial_version, 1);
 
@@ -1849,7 +1915,15 @@ mod tests {
                 mocks.repositories.insert(repo);
 
                 unwrap_created(
-                    initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP, TEST_MAX_AGE).await,
+                    initiate(
+                        &ctx,
+                        repo_id,
+                        "library/nginx",
+                        api_actor(),
+                        TEST_HIGH_CAP,
+                        TEST_MAX_AGE,
+                    )
+                    .await,
                 )
             })
         });
@@ -1882,6 +1956,7 @@ mod tests {
                 initiate(
                     &ctx,
                     Uuid::new_v4(),
+                    "library/nginx",
                     api_actor(),
                     TEST_HIGH_CAP,
                     TEST_MAX_AGE,
@@ -1919,6 +1994,7 @@ mod tests {
                 initiate(
                     &ctx,
                     Uuid::new_v4(),
+                    "library/nginx",
                     api_actor(),
                     TEST_HIGH_CAP,
                     TEST_MAX_AGE,
@@ -1954,6 +2030,7 @@ mod tests {
                 initiate(
                     &ctx,
                     Uuid::new_v4(),
+                    "library/nginx",
                     api_actor(),
                     TEST_HIGH_CAP,
                     TEST_MAX_AGE,
@@ -1994,7 +2071,15 @@ mod tests {
                 repo.key = "myrepo".into();
                 mocks.repositories.insert(repo);
                 unwrap_created(
-                    initiate(&ctx, repo_id, api_actor(), TEST_HIGH_CAP, TEST_MAX_AGE).await,
+                    initiate(
+                        &ctx,
+                        repo_id,
+                        "library/nginx",
+                        api_actor(),
+                        TEST_HIGH_CAP,
+                        TEST_MAX_AGE,
+                    )
+                    .await,
                 )
             })
         });
@@ -2033,9 +2118,16 @@ mod tests {
         let mut created = 0usize;
         let mut rejected = 0usize;
         for _ in 0..n {
-            match initiate(ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                .await
-                .unwrap()
+            match initiate(
+                ctx,
+                repo_id,
+                "library/nginx",
+                actor.clone(),
+                cap,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap()
             {
                 InitiateResult::Created(_) => created += 1,
                 InitiateResult::CapExceeded => rejected += 1,
@@ -2065,7 +2157,7 @@ mod tests {
             assert_eq!(created, cap as usize);
             assert_eq!(rejected, 0);
             // The next attempt must be rejected with CapExceeded.
-            let next = initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+            let next = initiate(&ctx, repo_id, "library/nginx", actor, cap, TEST_MAX_AGE)
                 .await
                 .unwrap();
             assert!(
@@ -2096,7 +2188,7 @@ mod tests {
                 // Fill the cap then attempt once more to force a
                 // single rejection.
                 let _ = open_n_sessions(&ctx, repo_id, &actor, cap, cap as usize).await;
-                let _ = initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+                let _ = initiate(&ctx, repo_id, "library/nginx", actor, cap, TEST_MAX_AGE)
                     .await
                     .unwrap();
             })
@@ -2134,7 +2226,7 @@ mod tests {
                 mocks.repositories.insert(repo);
                 let actor = principal_actor(Uuid::new_v4());
                 let _ = open_n_sessions(&ctx, repo_id, &actor, 1, 1).await;
-                let _ = initiate(&ctx, repo_id, actor, 1, TEST_MAX_AGE)
+                let _ = initiate(&ctx, repo_id, "library/nginx", actor, 1, TEST_MAX_AGE)
                     .await
                     .unwrap();
             })
@@ -2180,16 +2272,30 @@ mod tests {
             let cap: u32 = 2;
 
             // Fill the cap.
-            let s1 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                .await
-                .unwrap()
+            let s1 = match initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                actor.clone(),
+                cap,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap()
             {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
             };
-            let _s2 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                .await
-                .unwrap()
+            let _s2 = match initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                actor.clone(),
+                cap,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap()
             {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
@@ -2197,9 +2303,16 @@ mod tests {
 
             // Cap reached — next is rejected.
             assert!(matches!(
-                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                    .await
-                    .unwrap(),
+                initiate(
+                    &ctx,
+                    repo_id,
+                    "library/nginx",
+                    actor.clone(),
+                    cap,
+                    TEST_MAX_AGE
+                )
+                .await
+                .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
@@ -2220,6 +2333,8 @@ mod tests {
                 10 * 1024 * 1024,
                 repo_id,
                 TEST_MAX_AGE,
+                actor.clone(),
+                "library/nginx",
             )
             .await
             .expect("append_chunk must succeed");
@@ -2238,7 +2353,7 @@ mod tests {
             .expect("finalize must succeed and free a cap slot");
 
             // After freeing one slot, a fresh initiate must succeed.
-            let next = initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+            let next = initiate(&ctx, repo_id, "library/nginx", actor, cap, TEST_MAX_AGE)
                 .await
                 .unwrap();
             assert!(
@@ -2267,18 +2382,32 @@ mod tests {
             let cap: u32 = 1;
 
             // Fill the cap.
-            let s1 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                .await
-                .unwrap()
+            let s1 = match initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                actor.clone(),
+                cap,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap()
             {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
             };
             // Cap is full — next initiate is rejected.
             assert!(matches!(
-                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                    .await
-                    .unwrap(),
+                initiate(
+                    &ctx,
+                    repo_id,
+                    "library/nginx",
+                    actor.clone(),
+                    cap,
+                    TEST_MAX_AGE
+                )
+                .await
+                .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
@@ -2294,6 +2423,8 @@ mod tests {
                 10 * 1024 * 1024,
                 repo_id,
                 TEST_MAX_AGE,
+                actor.clone(),
+                "library/nginx",
             )
             .await
             .unwrap();
@@ -2318,7 +2449,7 @@ mod tests {
 
             // After the Conflict-path cleanup, the cap slot is free
             // again — the next initiate must succeed.
-            let next = initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+            let next = initiate(&ctx, repo_id, "library/nginx", actor, cap, TEST_MAX_AGE)
                 .await
                 .unwrap();
             assert!(
@@ -2345,14 +2476,14 @@ mod tests {
             // A fills its cap.
             let _ = open_n_sessions(&ctx, repo_id, &actor_a, cap, cap as usize).await;
             assert!(matches!(
-                initiate(&ctx, repo_id, actor_a, cap, TEST_MAX_AGE)
+                initiate(&ctx, repo_id, "library/nginx", actor_a, cap, TEST_MAX_AGE)
                     .await
                     .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
             // B is unaffected.
-            let result = initiate(&ctx, repo_id, actor_b, cap, TEST_MAX_AGE)
+            let result = initiate(&ctx, repo_id, "library/nginx", actor_b, cap, TEST_MAX_AGE)
                 .await
                 .unwrap();
             assert!(
@@ -2382,14 +2513,21 @@ mod tests {
             // Fill cap on repo X.
             let _ = open_n_sessions(&ctx, repo_x_id, &actor, cap, cap as usize).await;
             assert!(matches!(
-                initiate(&ctx, repo_x_id, actor.clone(), cap, TEST_MAX_AGE)
-                    .await
-                    .unwrap(),
+                initiate(
+                    &ctx,
+                    repo_x_id,
+                    "library/nginx",
+                    actor.clone(),
+                    cap,
+                    TEST_MAX_AGE
+                )
+                .await
+                .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
             // Same principal in repo Y is unaffected.
-            let result = initiate(&ctx, repo_y_id, actor, cap, TEST_MAX_AGE)
+            let result = initiate(&ctx, repo_y_id, "library/nginx", actor, cap, TEST_MAX_AGE)
                 .await
                 .unwrap();
             assert!(
@@ -2453,7 +2591,7 @@ mod tests {
                 let mut c = 0;
                 let mut r = 0;
                 for _ in 0..cap {
-                    match initiate(&ctx, repo_id, actor.clone(), cap, short)
+                    match initiate(&ctx, repo_id, "library/nginx", actor.clone(), cap, short)
                         .await
                         .unwrap()
                     {
@@ -2469,7 +2607,7 @@ mod tests {
             let _ = principal_id; // (cap state observed behaviourally below)
                                   // Cap is full — a fresh admit is rejected right now.
             assert!(matches!(
-                initiate(&ctx, repo_id, actor.clone(), cap, short)
+                initiate(&ctx, repo_id, "library/nginx", actor.clone(), cap, short)
                     .await
                     .unwrap(),
                 InitiateResult::CapExceeded
@@ -2480,7 +2618,9 @@ mod tests {
 
             // The next admit prunes ALL aged-out members and succeeds —
             // the abandoned-session leak is reclaimed on the next admit.
-            let next = initiate(&ctx, repo_id, actor, cap, short).await.unwrap();
+            let next = initiate(&ctx, repo_id, "library/nginx", actor, cap, short)
+                .await
+                .unwrap();
             assert!(
                 matches!(next, InitiateResult::Created(_)),
                 "aged-out abandoned sessions must be reclaimed on the next admit"
@@ -2514,7 +2654,7 @@ mod tests {
             let mut saw_rejection = false;
             for _ in 0..cap * 4 {
                 if let InitiateResult::CapExceeded =
-                    initiate(&ctx, repo_id, actor.clone(), cap, short)
+                    initiate(&ctx, repo_id, "library/nginx", actor.clone(), cap, short)
                         .await
                         .unwrap()
                 {
@@ -2530,7 +2670,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(60)).await;
 
             // Admits succeed again: the cap was NOT permanently pinned.
-            let after = initiate(&ctx, repo_id, actor, cap, short).await.unwrap();
+            let after = initiate(&ctx, repo_id, "library/nginx", actor, cap, short)
+                .await
+                .unwrap();
             assert!(
                 matches!(after, InitiateResult::Created(_)),
                 "after the abandoned members age out, admits must succeed again — \
@@ -2559,9 +2701,16 @@ mod tests {
             let cap: u32 = 1;
 
             // Fill the cap, PATCH a byte so staging exists.
-            let sid = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                .await
-                .unwrap()
+            let sid = match initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                actor.clone(),
+                cap,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap()
             {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
@@ -2576,6 +2725,8 @@ mod tests {
                 10 * 1024 * 1024,
                 repo_id,
                 TEST_MAX_AGE,
+                actor.clone(),
+                "library/nginx",
             )
             .await
             .unwrap();
@@ -2585,14 +2736,30 @@ mod tests {
             );
             // Cap full — next initiate rejected.
             assert!(matches!(
-                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                    .await
-                    .unwrap(),
+                initiate(
+                    &ctx,
+                    repo_id,
+                    "library/nginx",
+                    actor.clone(),
+                    cap,
+                    TEST_MAX_AGE
+                )
+                .await
+                .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
             // Cancel — releases exactly one member, drops session + staging.
-            cancel(&ctx, sid, repo_id, TEST_MAX_AGE).await.unwrap();
+            cancel(
+                &ctx,
+                sid,
+                repo_id,
+                TEST_MAX_AGE,
+                actor.clone(),
+                "library/nginx",
+            )
+            .await
+            .unwrap();
             assert!(
                 !cap_set_present(&ctx, repo_id, principal_id).await,
                 "cancel must release the set member, leaving the set with none"
@@ -2612,7 +2779,7 @@ mod tests {
 
             // Slot is free again.
             assert!(matches!(
-                initiate(&ctx, repo_id, actor, cap, TEST_MAX_AGE)
+                initiate(&ctx, repo_id, "library/nginx", actor, cap, TEST_MAX_AGE)
                     .await
                     .unwrap(),
                 InitiateResult::Created(_)
@@ -2625,9 +2792,16 @@ mod tests {
         run(async {
             let handle = PrometheusBuilder::new().build_recorder().handle();
             let (ctx, _mocks) = build_mock_ctx(handle);
-            let err = cancel(&ctx, Uuid::new_v4(), Uuid::new_v4(), TEST_MAX_AGE)
-                .await
-                .expect_err("unknown session must error");
+            let err = cancel(
+                &ctx,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                TEST_MAX_AGE,
+                api_actor(),
+                "library/nginx",
+            )
+            .await
+            .expect_err("unknown session must error");
             assert!(matches!(
                 err,
                 AppError::Domain(DomainError::NotFound {
@@ -2650,9 +2824,16 @@ mod tests {
             let sid = Uuid::new_v4();
             seed_session(&ctx, sid, repo_a, 0, 1).await;
 
-            let err = cancel(&ctx, sid, repo_b, TEST_MAX_AGE)
-                .await
-                .expect_err("tenant mismatch must error");
+            let err = cancel(
+                &ctx,
+                sid,
+                repo_b,
+                TEST_MAX_AGE,
+                api_actor(),
+                "library/nginx",
+            )
+            .await
+            .expect_err("tenant mismatch must error");
             assert!(matches!(
                 err,
                 AppError::Domain(DomainError::NotFound {
@@ -2692,25 +2873,46 @@ mod tests {
             let cap: u32 = 2;
 
             // Open two sessions — the cap is now full.
-            let s1 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                .await
-                .unwrap()
+            let s1 = match initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                actor.clone(),
+                cap,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap()
             {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
             };
-            let s2 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                .await
-                .unwrap()
+            let s2 = match initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                actor.clone(),
+                cap,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap()
             {
                 InitiateResult::Created(o) => o.session_id,
                 _ => panic!(),
             };
             assert!(cap_set_present(&ctx, repo_id, principal_id).await);
             assert!(matches!(
-                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                    .await
-                    .unwrap(),
+                initiate(
+                    &ctx,
+                    repo_id,
+                    "library/nginx",
+                    actor.clone(),
+                    cap,
+                    TEST_MAX_AGE
+                )
+                .await
+                .unwrap(),
                 InitiateResult::CapExceeded
             ));
 
@@ -2728,6 +2930,8 @@ mod tests {
                 10 * 1024 * 1024,
                 repo_id,
                 TEST_MAX_AGE,
+                actor.clone(),
+                "library/nginx",
             )
             .await
             .unwrap();
@@ -2744,41 +2948,85 @@ mod tests {
             )
             .await
             .unwrap();
-            let s3 = match initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                .await
-                .unwrap()
+            let s3 = match initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                actor.clone(),
+                cap,
+                TEST_MAX_AGE,
+            )
+            .await
+            .unwrap()
             {
                 InitiateResult::Created(o) => o.session_id,
                 other => panic!("finalize must free exactly one slot, got {other:?}"),
             };
             assert!(
                 matches!(
-                    initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                        .await
-                        .unwrap(),
+                    initiate(
+                        &ctx,
+                        repo_id,
+                        "library/nginx",
+                        actor.clone(),
+                        cap,
+                        TEST_MAX_AGE
+                    )
+                    .await
+                    .unwrap(),
                     InitiateResult::CapExceeded
                 ),
                 "finalize must free EXACTLY one slot — cap is full again (s2 + s3)"
             );
 
             // Cancel s2 (the last of the original pair) — one slot reopens.
-            cancel(&ctx, s2, repo_id, TEST_MAX_AGE).await.unwrap();
+            cancel(
+                &ctx,
+                s2,
+                repo_id,
+                TEST_MAX_AGE,
+                actor.clone(),
+                "library/nginx",
+            )
+            .await
+            .unwrap();
             assert!(matches!(
-                initiate(&ctx, repo_id, actor.clone(), cap, TEST_MAX_AGE)
-                    .await
-                    .unwrap(),
+                initiate(
+                    &ctx,
+                    repo_id,
+                    "library/nginx",
+                    actor.clone(),
+                    cap,
+                    TEST_MAX_AGE
+                )
+                .await
+                .unwrap(),
                 InitiateResult::Created(_)
             ));
 
             // Re-cancel s1 (finalized, row gone) and s2 (already
             // cancelled) — both surface NotFound; neither underflows the
             // set. s3 is still live, so the set key must persist.
-            cancel(&ctx, s1, repo_id, TEST_MAX_AGE)
-                .await
-                .expect_err("re-cancel of a finalized session is NotFound (row gone)");
-            cancel(&ctx, s2, repo_id, TEST_MAX_AGE)
-                .await
-                .expect_err("re-cancel of a cancelled session is NotFound (row gone)");
+            cancel(
+                &ctx,
+                s1,
+                repo_id,
+                TEST_MAX_AGE,
+                actor.clone(),
+                "library/nginx",
+            )
+            .await
+            .expect_err("re-cancel of a finalized session is NotFound (row gone)");
+            cancel(
+                &ctx,
+                s2,
+                repo_id,
+                TEST_MAX_AGE,
+                actor.clone(),
+                "library/nginx",
+            )
+            .await
+            .expect_err("re-cancel of a cancelled session is NotFound (row gone)");
             let _ = s3;
             assert!(
                 cap_set_present(&ctx, repo_id, principal_id).await,
@@ -2810,7 +3058,7 @@ mod tests {
                 repo.key = "myrepo".into();
                 mocks.repositories.insert(repo);
                 let actor = principal_actor(Uuid::new_v4());
-                let _ = initiate(&ctx, repo_id, actor, 4, TEST_MAX_AGE)
+                let _ = initiate(&ctx, repo_id, "library/nginx", actor, 4, TEST_MAX_AGE)
                     .await
                     .unwrap();
             })
@@ -2859,7 +3107,15 @@ mod tests {
                     let ctx_ref = ctx.clone();
                     let actor_clone = actor.clone();
                     handles.push(tokio::spawn(async move {
-                        initiate(&ctx_ref, repo_id, actor_clone, cap, TEST_MAX_AGE).await
+                        initiate(
+                            &ctx_ref,
+                            repo_id,
+                            "library/nginx",
+                            actor_clone,
+                            cap,
+                            TEST_MAX_AGE,
+                        )
+                        .await
                     }));
                 }
                 let mut created = 0usize;
@@ -2923,6 +3179,7 @@ mod tests {
             1_700_000_000_000,
             version,
             synthetic_principal_id(),
+            "library/nginx",
         );
         let bytes = encode_record(&record).unwrap();
         let key = session_key("oci", session_id);
@@ -2963,6 +3220,8 @@ mod tests {
                 1_000_000,
                 repo_id,
                 TEST_MAX_AGE,
+                api_actor(),
+                "library/nginx",
             )
             .await
             .expect("streaming append must succeed without Content-Length");
@@ -3011,6 +3270,8 @@ mod tests {
                 16,
                 repo_id,
                 TEST_MAX_AGE,
+                api_actor(),
+                "library/nginx",
             )
             .await
             .expect_err("a streaming body over the cap must be rejected");
@@ -3058,6 +3319,8 @@ mod tests {
                 1_000_000,
                 repo_id,
                 TEST_MAX_AGE,
+                api_actor(),
+                "library/nginx",
             )
             .await
             .expect("happy-path append must succeed");
@@ -3098,6 +3361,8 @@ mod tests {
                     1_000_000,
                     Uuid::new_v4(),
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
             })
@@ -3147,6 +3412,8 @@ mod tests {
                     1_000_000,
                     repo_b_id,
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
             })
@@ -3197,6 +3464,8 @@ mod tests {
                     1_000_000,
                     repo_id,
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
             })
@@ -3241,6 +3510,8 @@ mod tests {
                     1_000_000,
                     repo_id,
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
             })
@@ -3282,6 +3553,8 @@ mod tests {
                     100,
                     repo_id,
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
             })
@@ -3324,6 +3597,7 @@ mod tests {
                     1_700_000_000_000,
                     1,
                     synthetic_principal_id(),
+                    "library/nginx",
                 );
                 let bytes = encode_record(&record).unwrap();
                 let key = session_key("oci", session_id);
@@ -3342,6 +3616,8 @@ mod tests {
                     1_000_000,
                     repo_id,
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
             })
@@ -3391,6 +3667,8 @@ mod tests {
                 1_000_000,
                 repo_id,
                 TEST_MAX_AGE,
+                api_actor(),
+                "library/nginx",
             )
             .await
             .expect_err("a short read must not be reported as progress");
@@ -3439,6 +3717,8 @@ mod tests {
                 1_000_000,
                 repo_id,
                 TEST_MAX_AGE,
+                api_actor(),
+                "library/nginx",
             )
             .await
             .expect("the winning PATCH must succeed");
@@ -3462,6 +3742,8 @@ mod tests {
                 1_000_000,
                 repo_id,
                 TEST_MAX_AGE,
+                api_actor(),
+                "library/nginx",
             )
             .await
             .expect_err("the losing PATCH must be rejected");
@@ -3513,6 +3795,8 @@ mod tests {
                     MAX_BYTES,
                     repo_id,
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
                 .expect_err("a short-read PATCH must always fail");
@@ -3585,6 +3869,8 @@ mod tests {
                         1_000_000,
                         repo_id,
                         TEST_MAX_AGE,
+                        api_actor(),
+                        "library/nginx",
                     )
                     .await
                 }));
@@ -3647,6 +3933,8 @@ mod tests {
                     1_000_000,
                     Uuid::new_v4(),
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
             })
@@ -3693,6 +3981,8 @@ mod tests {
                     1_000_000,
                     repo_id,
                     TEST_MAX_AGE,
+                    api_actor(),
+                    "library/nginx",
                 )
                 .await
                 .unwrap();
@@ -3758,6 +4048,8 @@ mod tests {
             10 * 1024 * 1024,
             repo_id,
             TEST_MAX_AGE,
+            api_actor(),
+            "library/nginx",
         )
         .await
         .unwrap();
@@ -3796,6 +4088,10 @@ mod tests {
             // Artifact row exists in the mock with the expected size.
             assert_eq!(outcome.artifact.size_bytes as usize, content.len());
             assert_eq!(outcome.artifact.sha256_checksum, hash);
+            assert_eq!(
+                outcome.artifact.path,
+                format!("blobs/library/nginx/sha256:{}", hash.as_ref())
+            );
 
             // Session row is gone.
             let key = session_key("oci", session_id);
@@ -3806,6 +4102,169 @@ mod tests {
                 .bytes_for(session_id)
                 .is_none());
         });
+    }
+
+    async fn binding_refusal_preserves_owner_session(wrong_user: bool) {
+        let handle = PrometheusBuilder::new().build_recorder().handle();
+        let (ctx, mocks) = build_mock_ctx(handle);
+        let mut repo = sample_repository();
+        repo.format = hort_domain::entities::repository::RepositoryFormat::Oci;
+        let repo_id = repo.id;
+        mocks.repositories.insert(repo);
+
+        let owner = principal_actor(Uuid::new_v4());
+        let intruder = if wrong_user {
+            principal_actor(Uuid::new_v4())
+        } else {
+            owner.clone()
+        };
+        let wrong_name = if wrong_user {
+            "library/nginx"
+        } else {
+            "other/image"
+        };
+        let session_id = unwrap_created(
+            initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                owner.clone(),
+                1,
+                TEST_MAX_AGE,
+            )
+            .await,
+        )
+        .session_id;
+        let before =
+            upload_session_cap::live_member_count(&ctx, CAP_FORMAT, repo_id, owner.user_id).await;
+        assert_eq!(before, 1);
+        let key = session_key("oci", session_id);
+        let record_before = ctx.ephemeral_durable.get(&key).await.unwrap().unwrap();
+        let digest: ContentHash = sha256_hex(b"x").parse().unwrap();
+
+        let patch = append_chunk(
+            &ctx,
+            session_id,
+            Some(ContentRange { start: 0, end: 0 }),
+            cursor_of(b"x"),
+            1,
+            1_000,
+            repo_id,
+            TEST_MAX_AGE,
+            intruder.clone(),
+            wrong_name,
+        )
+        .await;
+        let put = finalize(
+            &ctx,
+            session_id,
+            digest.clone(),
+            None,
+            intruder.clone(),
+            repo_id,
+            wrong_name,
+            1_000,
+            TEST_MAX_AGE,
+        )
+        .await;
+        let delete = cancel(
+            &ctx,
+            session_id,
+            repo_id,
+            TEST_MAX_AGE,
+            intruder,
+            wrong_name,
+        )
+        .await;
+        for refusal in [patch.map(|_| ()), put.map(|_| ()), delete] {
+            assert!(matches!(
+                refusal,
+                Err(AppError::Domain(DomainError::NotFound {
+                    entity: "OciUploadSession",
+                    ..
+                }))
+            ));
+            assert_eq!(
+                ctx.ephemeral_durable.get(&key).await.unwrap().unwrap(),
+                record_before
+            );
+            assert_eq!(
+                upload_session_cap::live_member_count(&ctx, CAP_FORMAT, repo_id, owner.user_id)
+                    .await,
+                before
+            );
+        }
+
+        // A fresh actor value for the same user models a refreshed token.
+        let refreshed_actor = principal_actor(owner.user_id);
+        append_chunk(
+            &ctx,
+            session_id,
+            Some(ContentRange { start: 0, end: 0 }),
+            cursor_of(b"x"),
+            1,
+            1_000,
+            repo_id,
+            TEST_MAX_AGE,
+            refreshed_actor.clone(),
+            "library/nginx",
+        )
+        .await
+        .unwrap();
+        finalize(
+            &ctx,
+            session_id,
+            digest,
+            None,
+            refreshed_actor.clone(),
+            repo_id,
+            "library/nginx",
+            1_000,
+            TEST_MAX_AGE,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            upload_session_cap::live_member_count(&ctx, CAP_FORMAT, repo_id, owner.user_id).await,
+            0
+        );
+
+        let next = unwrap_created(
+            initiate(
+                &ctx,
+                repo_id,
+                "library/nginx",
+                refreshed_actor.clone(),
+                1,
+                TEST_MAX_AGE,
+            )
+            .await,
+        )
+        .session_id;
+        cancel(
+            &ctx,
+            next,
+            repo_id,
+            TEST_MAX_AGE,
+            refreshed_actor,
+            "library/nginx",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            upload_session_cap::live_member_count(&ctx, CAP_FORMAT, repo_id, owner.user_id).await,
+            0
+        );
+    }
+
+    #[test]
+    fn foreign_user_cannot_mutate_or_release_session() {
+        run(binding_refusal_preserves_owner_session(true));
+    }
+
+    #[test]
+    fn foreign_name_cannot_mutate_or_release_session() {
+        run(binding_refusal_preserves_owner_session(false));
     }
 
     #[test]
@@ -3831,7 +4290,7 @@ mod tests {
                 None,
                 api_actor(),
                 other_repo,
-                "x",
+                "library/nginx",
                 10 * 1024 * 1024,
                 TEST_MAX_AGE,
             )
@@ -4134,7 +4593,7 @@ mod tests {
                 None,
                 api_actor(),
                 repo_id,
-                "x",
+                "library/nginx",
                 10 * 1024 * 1024,
                 TEST_MAX_AGE,
             )

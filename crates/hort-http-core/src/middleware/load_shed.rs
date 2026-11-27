@@ -415,6 +415,9 @@ mod tests {
         RequestTrust {
             client_ip: ip.parse().unwrap(),
             public_url: url::Url::parse("http://hort-server/").unwrap(),
+            transport: crate::middleware::trust::TransportSecurity::Unknown,
+            peer_trusted: false,
+            tls_requirement_waived: false,
         }
     }
 

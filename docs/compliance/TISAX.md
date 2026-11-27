@@ -212,10 +212,12 @@ section names *what* to do and *why* it matters for the assessment.
 
 ### 3.1 Hardened deployment
 
-- **Terminate TLS at the edge and require https.** hort speaks plain
-  HTTP; TLS and HSTS are the reverse proxy's job. Set `publicBaseUrl` to
-  the edge https URL (or populate `trustedProxyCidrs` for an in-cluster
-  TLS-terminating proxy). Keep `requireHttps: true`.
+- **Terminate TLS at the edge and report its scheme.** hort speaks plain
+  HTTP; the reverse proxy terminates TLS and must overwrite `Forwarded` and
+  `X-Forwarded-Proto`. Set `publicBaseUrl` to the edge https URL and
+  `trustedProxyCidrs` to the immediate proxy's source ranges. Hort emits HSTS
+  only for TLS evidence and an https public URL. Keep `requireHttps: true`
+  as a boot configuration check, never as evidence for a request.
 - **Do not reintroduce insecure-TLS knobs.** Trust internal CAs via
   `HORT_EXTRA_CA_BUNDLE` only, sourced from an RBAC-restricted
   `ClusterTrustBundle` — treat it as an auth-critical asset (it can
@@ -342,8 +344,10 @@ owns them within the assessed scope:
 - **Personnel security** — screening, training, awareness, joiner/mover/
   leaver processes. The IdP and HR processes own identity lifecycle; hort
   only consumes the resulting claims.
-- **TLS termination, HSTS, and edge DDoS** — the reverse proxy's job;
-  hort's per-IP rate limiting absorbs small-scale abuse only.
+- **TLS termination and edge DDoS** — the reverse proxy's job;
+  hort's per-IP rate limiting absorbs small-scale abuse only. The proxy may
+  also set HSTS; hort conditionally emits it from request evidence and the
+  public URL.
 - **A full SIEM / log-correlation platform** — hort emits durable events
   and structured logs; correlation, alerting, and long-term storage are
   the operator's log pipeline.

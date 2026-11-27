@@ -60,6 +60,19 @@
 //!    also pass through. Contrast `BearerOnly` (item 2), where the same
 //!    fall-through validates a directly-presented native token.
 //!
+//! # Transport
+//!
+//! A credential presented on `/v2/*` is refused `426` — the
+//! Distribution-Spec `DENIED` envelope with `Upgrade: TLS/1.2, HTTP/1.1`
+//! and no `WWW-Authenticate` ([`refuse_credential_transport`]) — unless
+//! this request carries positive evidence of TLS or falls inside a peer
+//! range on which the operator waived the requirement. The decision is
+//! `hort_http_core`'s single `credential_transport_verdict`, so this
+//! plane cannot drift from the hosted-format one, and it runs on the
+//! credential-present branch only: item 1's anonymous pass-through and
+//! anonymous-write challenge are unchanged. `/v2/auth` is path-skipped
+//! here and makes the same decision for itself (`v2_auth.rs`).
+//!
 //! hort DOES mint OCI tokens: `/v2/auth` issues a short-lived Ed25519 JWT
 //! (Entry 7) that this middleware verifies on `/v2/*`. IdP bearers
 //! (Keycloak) remain supported via the (2)/(3) fall-through, as do
@@ -77,10 +90,16 @@ use axum::response::{IntoResponse, Response};
 use hort_app::use_cases::oci_token_exchange_use_case::OciVerifyOutcome;
 use hort_domain::entities::caller::CallerPrincipal;
 
+use hort_http_core::auth_scheme::{strip_auth_scheme, AuthScheme};
 use hort_http_core::context::{AppContext, AuthContext};
 use hort_http_core::middleware::auth::{
     mint_authenticated_principal_for_format_middleware, AuthenticatedPrincipal,
 };
+use hort_http_core::middleware::credential_transport::{
+    credential_transport_verdict, record_credential_transport, record_credential_transport_verdict,
+    CredentialEntryPoint, CredentialTransportVerdict,
+};
+use hort_http_core::middleware::trust::RequestTrust;
 
 use crate::error::OciError;
 use crate::v2_auth::{path_to_scope, V2_AUTH_PATH};
@@ -134,10 +153,7 @@ pub async fn oci_bearer_auth(
     // caller. `None` only on a router with no trust layer (the
     // standalone-router tests), which disarms the lockout rather than
     // mis-attributing it.
-    let client_ip = req
-        .extensions()
-        .get::<hort_http_core::middleware::trust::RequestTrust>()
-        .map(|t| t.client_ip);
+    let client_ip = req.extensions().get::<RequestTrust>().map(|t| t.client_ip);
 
     // Resolve a token from `Authorization`. Bearer or Basic-as-JWT
     // both supply the same string; absent → anonymous pass-through.
@@ -176,6 +192,26 @@ pub async fn oci_bearer_auth(
             None
         }
         Some(token) => {
+            let trust = req.extensions().get::<RequestTrust>();
+            record_credential_transport(
+                CredentialEntryPoint::OciConsume,
+                trust.map(|trust| trust.transport),
+            );
+
+            // Decide before the verify entrypoint: a presented credential
+            // must not reach a validator on a transport this server has no
+            // evidence of TLS for and no operator waiver covers. The
+            // decision is the one shared predicate, so the OCI plane and
+            // the hosted-format plane cannot drift apart on what counts as
+            // evidence. It runs on this branch only — a credential-less
+            // `/v2/*` read stays anonymous-by-default (ADR 0021) and a
+            // credential-less write keeps the challenge the arm above emits.
+            let verdict = credential_transport_verdict(trust, ctx.pat_over_http_allowed);
+            record_credential_transport_verdict(CredentialEntryPoint::OciConsume, verdict);
+            if let CredentialTransportVerdict::Refused(reason) = verdict {
+                return refuse_credential_transport(reason, trust);
+            }
+
             // Single consume-side verify entrypoint. The middleware
             // maps the typed `OciVerifyOutcome` returned by
             // `OciTokenExchangeUseCase::verify_inbound` without ever
@@ -284,18 +320,22 @@ fn is_non_safe_method(method: &axum::http::Method) -> bool {
 ///
 /// Returns `None` for missing / malformed / non-Bearer-non-Basic
 /// headers — every absence mode collapses to "no token".
+///
+/// Both scheme tokens are matched by
+/// [`hort_http_core::auth_scheme::strip_auth_scheme`], which folds ASCII
+/// case and the `1*SP` separator per RFC 7235 §2.1.
 fn extract_token(req: &Request<Body>) -> Option<String> {
     use base64::Engine as _;
 
     let header_val = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
-    if let Some(rest) = header_val.strip_prefix("Bearer ") {
+    if let Some(rest) = strip_auth_scheme(header_val, AuthScheme::Bearer) {
         let token = rest.trim();
         if token.is_empty() {
             return None;
         }
         return Some(token.to_string());
     }
-    if let Some(encoded) = header_val.strip_prefix("Basic ") {
+    if let Some(encoded) = strip_auth_scheme(header_val, AuthScheme::Basic) {
         let decoded = base64::engine::general_purpose::STANDARD
             .decode(encoded.trim())
             .ok()?;
@@ -370,6 +410,51 @@ pub(crate) fn unauthorized_response(
             .headers_mut()
             .insert(header::WWW_AUTHENTICATE, value);
     }
+    response.headers_mut().insert(
+        "Docker-Distribution-API-Version",
+        axum::http::HeaderValue::from_static("registry/2.0"),
+    );
+    response
+}
+
+/// The `/v2/*` refusal for a credential travelling on a transport with no
+/// evidence of TLS: `426` in the Distribution-Spec error envelope, with
+/// the `Upgrade` header the status requires (set by
+/// [`OciError::into_response`]) and the API-version header every `/v2/*`
+/// auth response carries.
+///
+/// Shared by both OCI credential boundaries — [`oci_bearer_auth`] and the
+/// `/v2/auth` mint — so the two answer a refused transport with the same
+/// bytes. The decision itself stays at each surface: that is where the
+/// entry-point label and its metric belong, and where a reader looks for
+/// the boundary.
+///
+/// **No `WWW-Authenticate`, deliberately.** The mode awareness of
+/// [`unauthorized_response`] exists to avoid advertising a challenge the
+/// client cannot satisfy, and on a refused transport both of its arms are
+/// exactly that: a `Bearer realm` pointing at `/v2/auth` answers `426` on
+/// the same hop, and a `Basic` challenge asks the client to send the same
+/// secret over the same cleartext. A credential is not what is missing
+/// here, so advertising how to present one would loop a
+/// challenge-following client against an unchanged answer.
+///
+/// The `warn!` carries the evidence actually derived and whether the peer
+/// was a trusted proxy — the two facts that separate "terminate TLS in
+/// front" from "your proxy is not overwriting the forwarded scheme" from
+/// "declare this hop".
+pub(crate) fn refuse_credential_transport(reason: &str, trust: Option<&RequestTrust>) -> Response {
+    tracing::warn!(
+        reason,
+        evidence = ?trust.map(|t| t.transport),
+        peer_trusted = ?trust.map(|t| t.peer_trusted),
+        "credential transport refused on the OCI plane — terminate TLS in front, have the \
+         proxy send X-Forwarded-Proto and list it in HORT_TRUSTED_PROXY_CIDRS, or declare the \
+         plaintext hop with HORT_TLS_NOT_REQUIRED_FROM"
+    );
+    let mut response = OciError::TransportUnproven {
+        reason: reason.to_string(),
+    }
+    .into_response();
     response.headers_mut().insert(
         "Docker-Distribution-API-Version",
         axum::http::HeaderValue::from_static("registry/2.0"),
@@ -520,9 +605,6 @@ mod tests {
     use hort_app::oci_token_signing::OciTokenSigningKey;
     use hort_app::rbac::RbacEvaluator;
     use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
-    use hort_app::use_cases::oci_token_exchange_use_case::{
-        OciTokenExchangeConfig, OciTokenExchangeUseCase,
-    };
     use hort_app::use_cases::pat_cache::{PatCache, SystemClock};
     use hort_app::use_cases::pat_validation_use_case::{PatLockoutConfig, PatValidationUseCase};
     use hort_app::use_cases::test_support::MockIdentityProvider;
@@ -533,13 +615,14 @@ mod tests {
     use hort_domain::ports::api_token_repository::ApiTokenRepository;
     use hort_domain::ports::ephemeral_store::EphemeralStore;
     use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims};
-    use hort_domain::ports::repository_repository::RepositoryRepository;
     use hort_domain::ports::user_repository::UserRepository;
     use hort_domain::ports::BoxFuture;
     use hort_domain::types::{Page, PageRequest};
 
+    use crate::test_authz::with_native_oci_tokens;
+    use hort_http_core::middleware::trust::TransportSecurity;
     use hort_http_core::test_support::{
-        build_mock_ctx, with_auth, with_oci_signing_key, with_oci_token_exchange,
+        build_mock_ctx, with_auth, with_oci_signing_key, with_pat_over_http_allowed,
     };
 
     fn run<F, T>(f: F) -> T
@@ -580,62 +663,302 @@ mod tests {
         (StatusCode::OK, axum::Json(body)).into_response()
     }
 
-    fn build_test_router(ctx: &Arc<AppContext>) -> Router {
-        Router::new()
-            .route("/v2/probe", get(echo_principal_handler))
-            .layer(from_fn_with_state(ctx.clone(), oci_bearer_auth))
-            .with_state(ctx.clone())
+    /// A `RequestTrust` carrying `transport`, with a caller address and
+    /// no waiver of any kind.
+    ///
+    /// `peer_trusted` follows the evidence: positive evidence only ever
+    /// comes from a trusted peer's forwarded scheme (`trust.rs`), so a
+    /// `Tls` fixture with an untrusted peer would be a state the
+    /// derivation cannot produce.
+    fn trust_with(transport: TransportSecurity) -> RequestTrust {
+        RequestTrust {
+            client_ip: "203.0.113.7".parse().expect("test client address parses"),
+            public_url: url::Url::parse("https://hort.example.com/").expect("test URL parses"),
+            transport,
+            peer_trusted: matches!(transport, TransportSecurity::Tls),
+            tls_requirement_waived: false,
+        }
     }
 
-    /// Wire BOTH the OCI signing key AND a real `OciTokenExchangeUseCase`
-    /// (carrying the same key + a config `jwt_audience`) onto the ctx.
-    /// The consume-side verify path gates on `ctx.oci_token_exchange`
-    /// (it holds the key and the authoritative `aud`), so tests that
-    /// exercise inbound-JWT verification must wire it. The
-    /// verify path never touches PAT/RBAC, but the constructor needs
-    /// collaborators; mock handles from `build_mock_ctx` suffice.
-    fn with_native_oci_tokens(
-        ctx: &Arc<AppContext>,
-        mocks: &hort_http_core::test_support::MockPorts,
-        signing_key: Arc<OciTokenSigningKey>,
-        jwt_audience: &str,
-    ) -> Arc<AppContext> {
-        let users: Arc<dyn UserRepository> = mocks.users.clone();
-        let tokens: Arc<dyn ApiTokenRepository> = mocks.api_tokens.clone();
-        let ephemeral: Arc<dyn EphemeralStore> = mocks.ephemeral_durable.clone();
-        let pat_cache = Arc::new(PatCache::new(8, Duration::from_secs(60)));
-        let pat_validation = Arc::new(PatValidationUseCase::new(
-            tokens,
-            users.clone(),
-            ephemeral,
-            pat_cache,
-            Arc::new(SystemClock),
-            PatLockoutConfig::DEFAULT,
+    /// The `/v2/*` probe router under an explicit [`RequestTrust`].
+    ///
+    /// Every test that presents a credential needs one: the credential
+    /// boundary refuses a request with no trust extension, which is the
+    /// table's first row and not a harness detail to paper over. Pass
+    /// `None` to drive that row deliberately.
+    fn build_test_router_with_trust(ctx: &Arc<AppContext>, trust: Option<RequestTrust>) -> Router {
+        let router = Router::new()
+            .route("/v2/probe", get(echo_principal_handler))
+            .layer(from_fn_with_state(ctx.clone(), oci_bearer_auth))
+            .with_state(ctx.clone());
+        match trust {
+            Some(trust) => router.layer(axum::Extension(trust)),
+            None => router,
+        }
+    }
+
+    /// The probe router with positive evidence of TLS — the posture every
+    /// real deployment of these flows runs in, so a test about something
+    /// *other* than the transport is not silently testing the refusal.
+    fn build_test_router(ctx: &Arc<AppContext>) -> Router {
+        build_test_router_with_trust(ctx, Some(trust_with(TransportSecurity::Tls)))
+    }
+
+    // -- the credential-transport boundary on `/v2/*` ------------------
+    //
+    // The decision is `hort_http_core`'s `credential_transport_verdict`
+    // and its precedence table is specified there, so these tests pin
+    // what this *surface* does with each verdict rather than re-deriving
+    // the table: that a refusal answers in the Distribution-Spec envelope
+    // before the verify entrypoint, that the two waiver instruments reach
+    // this plane, and that the anonymous paths are untouched.
+
+    /// `GET /v2/probe` with a Bearer credential under `trust`, returning
+    /// the status, whether a `WWW-Authenticate` challenge came back, and
+    /// the rendered metrics.
+    ///
+    /// Drives the real middleware over the real envelope; the
+    /// `Prometheus` recorder is local to the call so a count is this
+    /// request's. The challenge is reported as presence rather than
+    /// value: every case here asserts there is none, and the one
+    /// test that reads the header's bytes builds its own request.
+    fn consume_with_trust(
+        unscoped_waiver: bool,
+        trust: Option<RequestTrust>,
+    ) -> (StatusCode, bool, String) {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (status, challenged) = metrics::with_local_recorder(&recorder, || {
+            run(async {
+                let ctx = enabled_auth_ctx_with_token("valid-jwt");
+                let ctx = with_pat_over_http_allowed(&ctx, unscoped_waiver);
+                let resp = build_test_router_with_trust(&ctx, trust)
+                    .oneshot(
+                        HttpRequest::get("/v2/probe")
+                            .header(header::AUTHORIZATION, "Bearer valid-jwt")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                (
+                    resp.status(),
+                    resp.headers().contains_key(header::WWW_AUTHENTICATE),
+                )
+            })
+        });
+        (status, challenged, handle.render())
+    }
+
+    /// Positive evidence is the accept case, and it is counted as
+    /// evidence rather than as a waiver.
+    #[test]
+    fn oci_consume_accepts_a_credential_on_proven_tls() {
+        let (status, _, metrics) =
+            consume_with_trust(false, Some(trust_with(TransportSecurity::Tls)));
+        assert_eq!(status, StatusCode::OK);
+        assert!(metrics.contains(
+            "hort_credential_transport_total{entry_point=\"oci_consume\",evidence=\"tls\"} 1"
         ));
-        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(
-            Vec::new(),
-        )));
-        let repo_access = Arc::new(
-            hort_app::use_cases::repository_access::RepositoryAccessUseCase::new(
-                mocks.repositories.clone() as Arc<dyn RepositoryRepository>,
-                hort_app::use_cases::repository_access::RbacAccess::Enabled(rbac.clone()),
-                true,
+        assert!(
+            !metrics.contains("hort_credential_transport_refusals_total"),
+            "a proven transport is not a refusal: {metrics}"
+        );
+        assert!(
+            !metrics.contains("hort_credential_transport_waived_total"),
+            "evidence is not a waiver: {metrics}"
+        );
+    }
+
+    /// The three refusing shapes this surface can be in, each named: no
+    /// trust extension at all, positive evidence of cleartext, and a
+    /// trusted peer that reported nothing. A scope cannot rescue any of
+    /// them, so each fixture carries `tls_requirement_waived: true` —
+    /// otherwise the row would pass because the fixture declared no
+    /// waiver rather than because the predicate refused one.
+    #[test]
+    fn oci_consume_refuses_a_credential_without_evidence_or_waiver() {
+        for (name, trust) in [
+            ("no RequestTrust on the router", None),
+            (
+                "Plaintext, scope declared",
+                Some(RequestTrust {
+                    tls_requirement_waived: true,
+                    ..trust_with(TransportSecurity::Plaintext)
+                }),
             ),
+            (
+                "Unknown from a trusted proxy, scope declared",
+                Some(RequestTrust {
+                    peer_trusted: true,
+                    tls_requirement_waived: true,
+                    ..trust_with(TransportSecurity::Unknown)
+                }),
+            ),
+            (
+                "Unknown, no waiver",
+                Some(trust_with(TransportSecurity::Unknown)),
+            ),
+        ] {
+            let (status, challenged, metrics) = consume_with_trust(false, trust);
+            assert_eq!(
+                status,
+                StatusCode::UPGRADE_REQUIRED,
+                "{name} must be refused 426, not served or 401'd"
+            );
+            assert!(
+                !challenged,
+                "{name}: a refused transport advertises no challenge the client \
+                 could satisfy"
+            );
+            assert!(
+                metrics.contains(
+                    "hort_credential_transport_refusals_total{entry_point=\"oci_consume\"} 1"
+                ),
+                "{name} must be counted as a refusal: {metrics}"
+            );
+            assert!(
+                !metrics.contains("hort_oci_auth_verify_total"),
+                "{name} must be refused BEFORE the verify entrypoint — a verify \
+                 metric means the credential reached the validator: {metrics}"
+            );
+        }
+    }
+
+    /// The refusal's wire shape: the Distribution-Spec `errors` envelope
+    /// the subtree already uses, the `Upgrade` RFC 9110 §15.6.7 requires,
+    /// the API-version header every `/v2/*` auth response carries, and
+    /// the same reason literal the hosted-format plane sends.
+    #[test]
+    fn oci_consume_refusal_is_the_distribution_spec_envelope_with_upgrade() {
+        let (status, body, upgrade, api, www) = run(async {
+            let ctx = enabled_auth_ctx_with_token("valid-jwt");
+            let resp =
+                build_test_router_with_trust(&ctx, Some(trust_with(TransportSecurity::Unknown)))
+                    .oneshot(
+                        HttpRequest::get("/v2/probe")
+                            .header(header::AUTHORIZATION, "Bearer valid-jwt")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            let status = resp.status();
+            let header_str = |name: &str| {
+                resp.headers()
+                    .get(name)
+                    .map(|v| v.to_str().unwrap().to_string())
+            };
+            let upgrade = header_str("upgrade");
+            let api = header_str("Docker-Distribution-API-Version");
+            let www = header_str("www-authenticate");
+            let bytes = to_bytes(resp.into_body(), 4 * 1024).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            (status, body, upgrade, api, www)
+        });
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(upgrade.as_deref(), Some("TLS/1.2, HTTP/1.1"));
+        assert_eq!(api.as_deref(), Some("registry/2.0"));
+        assert_eq!(www, None);
+        let errors = body["errors"].as_array().expect("errors array");
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["code"], "DENIED");
+        assert_eq!(errors[0]["message"], "credential transport refused");
+        assert!(errors[0]["detail"].is_null());
+    }
+
+    /// Both waiver instruments reach this plane, each counted under its
+    /// own scope — and a declared waiver leaves the evidence it found
+    /// alone, so "how much of my traffic has no TLS evidence" survives
+    /// the waiver.
+    #[test]
+    fn oci_consume_serves_a_waived_credential_and_counts_the_scope() {
+        let declared = consume_with_trust(
+            false,
+            Some(RequestTrust {
+                tls_requirement_waived: true,
+                ..trust_with(TransportSecurity::Unknown)
+            }),
         );
-        let cfg = OciTokenExchangeConfig::new(
-            "https://hort.example.com/v2/auth".to_string(),
-            jwt_audience.to_string(),
+        assert_eq!(declared.0, StatusCode::OK);
+        assert!(
+            declared.2.contains(
+                "hort_credential_transport_waived_total{entry_point=\"oci_consume\",scope=\"declared\"} 1"
+            ),
+            "{}",
+            declared.2
         );
-        let exchange = Arc::new(OciTokenExchangeUseCase::new(
-            pat_validation,
-            users,
-            rbac,
-            repo_access,
-            signing_key.clone(),
-            cfg,
-        ));
-        let ctx = with_oci_signing_key(ctx, Some(signing_key));
-        with_oci_token_exchange(&ctx, Some(exchange))
+        assert!(
+            declared.2.contains(
+                "hort_credential_transport_total{entry_point=\"oci_consume\",evidence=\"unknown\"} 1"
+            ),
+            "a declared waiver must not restate the evidence as tls: {}",
+            declared.2
+        );
+
+        // The unscoped flag restores today's behaviour from any peer and
+        // regardless of evidence — the absent-evidence case a plaintext
+        // deployment actually produces, AND positive evidence of
+        // cleartext, which no scope can waive.
+        for evidence in [TransportSecurity::Unknown, TransportSecurity::Plaintext] {
+            let unscoped = consume_with_trust(true, Some(trust_with(evidence)));
+            assert_eq!(unscoped.0, StatusCode::OK, "unscoped waiver, {evidence:?}");
+            assert!(
+                unscoped.2.contains(
+                    "hort_credential_transport_waived_total{entry_point=\"oci_consume\",scope=\"unscoped\"} 1"
+                ),
+                "unscoped waiver, {evidence:?}: {}",
+                unscoped.2
+            );
+        }
+    }
+
+    /// The anonymous paths are outside the decision entirely: a safe
+    /// `/v2/*` read over cleartext still serves (ADR 0021), and an
+    /// anonymous write still gets its own challenge rather than a `426`.
+    /// Neither emits a transport metric, because neither presents or
+    /// receives a credential.
+    #[test]
+    fn an_anonymous_v2_request_over_cleartext_is_untouched() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (read, write) = metrics::with_local_recorder(&recorder, || {
+            run(async {
+                let ctx = enabled_auth_ctx_with_token("valid-jwt");
+                let trust = trust_with(TransportSecurity::Plaintext);
+                let read = build_test_router_with_trust(&ctx, Some(trust.clone()))
+                    .oneshot(HttpRequest::get("/v2/probe").body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status();
+                let write = build_write_test_router_with_trust(&ctx, trust)
+                    .oneshot(
+                        HttpRequest::post("/v2/myrepo/library/nginx/blobs/uploads/")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status();
+                (read, write)
+            })
+        });
+        assert_eq!(
+            read,
+            StatusCode::OK,
+            "an anonymous public read is unaffected"
+        );
+        assert_eq!(
+            write,
+            StatusCode::UNAUTHORIZED,
+            "an anonymous write keeps its challenge instead of a transport refusal"
+        );
+        let rendered = handle.render();
+        assert!(
+            !rendered.contains("hort_credential_transport"),
+            "an anonymous request neither presents nor receives a credential, so \
+             it is not a credential surface at all: {rendered}"
+        );
     }
 
     /// Build an enabled-auth ctx whose IdP recognises one fixture
@@ -895,11 +1218,15 @@ mod tests {
                     ..PatLockoutConfig::DEFAULT
                 },
             );
+            // Proven transport, so this test stays about lockout
+            // attribution: with no evidence the credential would be
+            // refused before the validator runs and no failure would be
+            // booked at all.
             let trust = RequestTrust {
                 client_ip: client,
-                public_url: url::Url::parse("https://hort.example.com/").unwrap(),
+                ..trust_with(TransportSecurity::Tls)
             };
-            let router = build_test_router(&ctx).layer(axum::Extension(trust));
+            let router = build_test_router_with_trust(&ctx, Some(trust));
             for _ in 0..2 {
                 let resp = router
                     .clone()
@@ -1205,6 +1532,109 @@ mod tests {
 
         let absent = HttpRequest::get("/v2/probe").body(Body::empty()).unwrap();
         assert!(extract_token(&absent).is_none());
+    }
+
+    // -------------------- 5a. RFC 7235 §2.1 scheme matching ------------
+    //
+    // `auth-scheme` is a token matched case-insensitively and `1*SP`
+    // separates it from the credential; `extract_token` reaches both
+    // through `hort_http_core::auth_scheme::strip_auth_scheme`. Each
+    // assertion below is an EQUALITY against the canonical-case
+    // single-space outcome — the property is that the spelling does not
+    // matter, which two independent literals would not catch when the two
+    // diverge.
+
+    /// A `/v2/*` request carrying `value` as its raw `Authorization`
+    /// header, so a non-canonical spelling reaches `extract_token`
+    /// verbatim.
+    fn auth_header_req(value: &str) -> Request<Body> {
+        HttpRequest::get("/v2/probe")
+            .header(header::AUTHORIZATION, value)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn extract_token_bearer_is_scheme_case_insensitive_and_1sp() {
+        let canonical = extract_token(&auth_header_req("Bearer abc.def.ghi"));
+        assert_eq!(
+            canonical.as_deref(),
+            Some("abc.def.ghi"),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in [
+            ("lower-case", "bearer abc.def.ghi"),
+            ("upper-case", "BEARER abc.def.ghi"),
+            ("mixed-case", "bEaReR abc.def.ghi"),
+            ("two spaces", "Bearer  abc.def.ghi"),
+            ("lower-case + 3 spaces", "bearer   abc.def.ghi"),
+        ] {
+            assert_eq!(
+                extract_token(&auth_header_req(value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_token_basic_is_scheme_case_insensitive_and_1sp() {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode("alice:eyJjbGFpbXMK");
+        let canonical = extract_token(&auth_header_req(&format!("Basic {encoded}")));
+        assert_eq!(
+            canonical.as_deref(),
+            Some("eyJjbGFpbXMK"),
+            "baseline must be the accepted outcome or the equalities below prove nothing"
+        );
+        for (label, value) in [
+            ("lower-case", format!("basic {encoded}")),
+            ("upper-case", format!("BASIC {encoded}")),
+            ("mixed-case", format!("bAsIc {encoded}")),
+            ("two spaces", format!("Basic  {encoded}")),
+            ("lower-case + 3 spaces", format!("basic   {encoded}")),
+        ] {
+            assert_eq!(
+                extract_token(&auth_header_req(&value)),
+                canonical,
+                "{label} disagrees with the canonical-case single-space spelling"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_token_still_refuses_an_unsupported_scheme() {
+        // Not a prefix-free "anything goes": neither branch claims a
+        // scheme that is not its own, in any case.
+        for value in [
+            "Digest abc.def.ghi",
+            "digest abc.def.ghi",
+            "Negotiate abc.def.ghi",
+            "Bearerish abc.def.ghi",
+            "Basicish aGVsbG86d29ybGQ=",
+        ] {
+            assert!(
+                extract_token(&auth_header_req(value)).is_none(),
+                "{value} was accepted as a credential"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_token_empty_credential_is_unchanged() {
+        // Scheme present, nothing after it: still an absence mode on both
+        // branches, in every spelling and with no SP at all. Whether a
+        // malformed-but-present credential should instead be a 401 is a
+        // separate question this rule does not touch.
+        for value in [
+            "Bearer ", "bearer ", "Bearer", "bearer", "Basic ", "basic ", "Basic", "basic",
+        ] {
+            assert!(
+                extract_token(&auth_header_req(value)).is_none(),
+                "{value} changed the empty-credential classification"
+            );
+        }
     }
 
     // -------------------- Bearer challenge selector ----------
@@ -1870,7 +2300,12 @@ mod tests {
     /// set is irrelevant to those tests); the routes exist so a
     /// *credentialed* write — or an anonymous write under `Disabled`, which
     /// forwards — can reach the handler.
-    fn build_write_test_router(ctx: &Arc<AppContext>) -> Router {
+    /// The `/v2/*` write-verb router under an explicit [`RequestTrust`].
+    ///
+    /// Unlike [`build_test_router_with_trust`] there is no trust-less
+    /// form: the no-extension row is a property of the decision and is
+    /// pinned once, on the read router, rather than a second time here.
+    fn build_write_test_router_with_trust(ctx: &Arc<AppContext>, trust: RequestTrust) -> Router {
         use axum::routing::{post, put};
         Router::new()
             .route(
@@ -1883,6 +2318,11 @@ mod tests {
             )
             .layer(from_fn_with_state(ctx.clone(), oci_bearer_auth))
             .with_state(ctx.clone())
+            .layer(axum::Extension(trust))
+    }
+
+    fn build_write_test_router(ctx: &Arc<AppContext>) -> Router {
+        build_write_test_router_with_trust(ctx, trust_with(TransportSecurity::Tls))
     }
 
     /// `is_non_safe_method` classifies exactly the write verbs; the safe

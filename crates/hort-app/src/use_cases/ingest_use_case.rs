@@ -893,11 +893,24 @@ impl IngestUseCase {
     /// the error themselves so the counter exit point stays a single
     /// unified site per entry method.
     ///
-    /// Shared by [`Self::ingest`] and [`Self::register_by_hash`]: both
-    /// paths MUST reject oversized payloads before doing any storage or
-    /// event work, so the cap is enforced uniformly regardless of
-    /// whether the caller is streaming bytes or registering a
-    /// pre-existing CAS object by hash.
+    /// The rule is about a **field**, not a list of methods: every
+    /// entry point that accepts a `payload_metadata` and writes it into
+    /// `ArtifactIngested.metadata` plus the `artifact_metadata`
+    /// projection row calls this BEFORE doing any storage or event
+    /// work. That is [`Self::ingest_direct`], [`Self::ingest_verified`],
+    /// [`Self::ingest_signature_manifest`] and
+    /// [`Self::register_by_hash`] — the last of which
+    /// [`Self::register_existing_cas_blob`] delegates to, so it reaches
+    /// the cap through one mechanism rather than a second check of its
+    /// own.
+    ///
+    /// Censusing the field's writers is what makes the enforcement
+    /// uniform, and naming methods instead is what broke it: stated as
+    /// "shared by `ingest` and `register_by_hash`", the sentence was
+    /// true of those two and false of the field, because
+    /// `ingest_verified` and `ingest_signature_manifest` passed a
+    /// `payload_metadata` straight through with no layer of the
+    /// three-layer model bounding it.
     fn enforce_metadata_cap(
         &self,
         handler: &dyn FormatHandler,
@@ -1446,6 +1459,73 @@ impl IngestUseCase {
         stream: Box<dyn AsyncRead + Send + Unpin>,
         handler: &dyn FormatHandler,
     ) -> AppResult<IngestOutcome> {
+        // Upload-payload metadata cap (`Self::enforce_metadata_cap`).
+        // Above the `match` so one site covers `ProtocolNative` and all
+        // three `UpstreamPublished` algorithms: the cap bounds a field,
+        // and which digest verifies the bytes beside it is not a
+        // property of that field. Here it also lands before
+        // `storage.put` and before any event is built, which is what
+        // the cap is for.
+        //
+        // No layer of the three-layer model used to reach this path. An
+        // over-cap payload was accepted, and one past the event store's
+        // 64 KB bound was spilled to CAS by `resolve_metadata_decision`
+        // rather than refused — so a client-authored payload (PyPI's
+        // hosted publication harvests one from the upload's multipart
+        // fields) got an unbounded CAS write and the operator's
+        // configured cap said nothing about it.
+        //
+        // The serialised bytes the helper returns are discarded: nothing
+        // downstream re-serialises from this scope.
+        // `ingest_with_verification` hands `ingest_inner` a
+        // `MetadataDecision::Inline` holding the `Value` itself, and the
+        // one arm that does serialise
+        // (`resolve_metadata_decision`'s spill) serialises the `Value`
+        // it owns.
+        let (cap_repository_id, cap_format, cap_payload_metadata) = match &request {
+            VerifiedIngestRequest::ProtocolNative {
+                repository_id,
+                coords,
+                payload_metadata,
+                ..
+            }
+            | VerifiedIngestRequest::UpstreamPublished {
+                repository_id,
+                coords,
+                payload_metadata,
+                ..
+            } => (repository_id, &coords.format, payload_metadata),
+        };
+        if let Err(cap_err) = self.enforce_metadata_cap(handler, cap_payload_metadata) {
+            // Classified here, in this entry point's own
+            // `hort_ingest_total` shape: the counter and nothing else,
+            // which is all `ingest_with_verification`'s unified exit
+            // emits on any verified-ingest path (no duration and no size
+            // histogram). The label is set directly rather than run
+            // through `classify_ingest_error`, which maps a
+            // `DomainError::Validation` to `validation_error` and would
+            // leave `metadata_too_large` unable to fire.
+            //
+            // One repository lookup for a bounded `repository` label,
+            // the same trade `ingest_direct`'s cap rejection makes: a
+            // cap miss is a deterministic request-shape decision, so the
+            // extra read is paid only on the refusal.
+            let repo_key = self
+                .repositories
+                .find_by_id(*cap_repository_id)
+                .await
+                .ok()
+                .map(|r| r.key);
+            metrics::counter!(
+                "hort_ingest_total",
+                labels::FORMAT => cap_format.to_string(),
+                labels::REPOSITORY => self.repo_label(repo_key.as_deref()),
+                labels::RESULT => IngestResult::MetadataTooLarge.as_str(),
+            )
+            .increment(1);
+            return Err(cap_err);
+        }
+
         match request {
             VerifiedIngestRequest::ProtocolNative {
                 repository_id,
@@ -1607,8 +1687,15 @@ impl IngestUseCase {
     /// `content_references` row is the claim that keeps bytes alive and
     /// nothing re-derives a tree edge for an artifact that committed
     /// without one.
+    ///
+    /// `handler` is here for one reason: it is what
+    /// [`Self::enforce_metadata_cap`] resolves this format's effective
+    /// `payload_metadata` cap from. The narrow path consults the handler
+    /// for nothing else — no strategy dispatch, no summary extraction —
+    /// but it does write the field, and a writer of the field enforces
+    /// the cap on it.
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, payload_metadata, claimed_edges, stream))]
+    #[tracing::instrument(skip(self, payload_metadata, claimed_edges, stream, handler))]
     pub async fn ingest_signature_manifest(
         &self,
         repository_id: Uuid,
@@ -1620,7 +1707,34 @@ impl IngestUseCase {
         subject_content_hash: Option<ContentHash>,
         claimed_edges: &[ContentReferenceClaim],
         stream: Box<dyn AsyncRead + Send + Unpin>,
+        handler: &dyn FormatHandler,
     ) -> AppResult<IngestOutcome> {
+        // 0. Upload-payload metadata cap (`Self::enforce_metadata_cap`),
+        //    before the CAS put below. This method writes
+        //    `payload_metadata` into `ArtifactIngested.metadata` and the
+        //    `artifact_metadata` row itself, which makes it one of the
+        //    field's writers and so subject to the cap like every other.
+        //
+        //    Before the put, specifically, because this path builds its
+        //    event by hand and has no rollback: an over-cap payload
+        //    reached `commit_transition_with_enqueues`, was refused there
+        //    by the event store's own 64 KB bound, and left the
+        //    already-stored manifest bytes in CAS with no row
+        //    referencing them. The caller saw the same refusal either
+        //    way; the orphan is the difference.
+        //
+        //    No `hort_ingest_total` tick. This method emits that counter
+        //    on no exit path, success included, so a cap-only emission
+        //    would make every sample it ever produced a failure and an
+        //    error-rate panel read 100%. The refusal is observable in
+        //    the `metadata-too-large` log line
+        //    `enforce_metadata_cap` writes.
+        //
+        //    The serialised bytes are discarded: the payload rides the
+        //    event and the projection row as a `Value` and nothing here
+        //    re-serialises it.
+        self.enforce_metadata_cap(handler, &payload_metadata)?;
+
         // 1. Store the manifest bytes in CAS. `put` returns the SHA-256 of
         //    what actually arrived.
         let put_result = self
@@ -2207,10 +2321,26 @@ impl IngestUseCase {
             }
         }
 
-        // For verified ingest, we don't dispatch via the metadata
-        // strategy / cap / split machinery — verified flows are
-        // pull-through and direct upload paths whose payload metadata
-        // is compact. Pass `Inline` strategy and the original payload.
+        // Verified ingest does not run the handler's
+        // `metadata_strategy()` dispatch: it passes `Inline` and the
+        // original payload, and the split it still gets is the
+        // cap-driven one in `resolve_metadata_decision` — whose
+        // `Inline` arm spills whatever will not fit an event. So the
+        // declared inline threshold (npm's, say) is not consulted here
+        // and the event cap is the inline budget instead. That is a
+        // choice about where bytes live and nothing a reader can
+        // observe: `ArtifactUseCase::load_full_metadata` follows a
+        // `metadata_blob` reference transparently.
+        //
+        // The *cap* is a different matter and is NOT skipped —
+        // `Self::ingest_verified` enforces it before this call, because
+        // it bounds a field this path writes and the admission decision
+        // cannot be left to the strategy dispatch this path declines to
+        // run. A verified caller's payload is usually a two-field
+        // derived object or `Value::Null`, but PyPI's hosted
+        // publication harvests its payload from the upload's multipart
+        // fields, so "verified flows carry compact metadata" is not a
+        // premise the cap may rest on.
         let metadata_decision = MetadataDecision::Inline(payload_metadata.clone());
         let had_payload_metadata = !matches!(payload_metadata, serde_json::Value::Null);
 
@@ -8161,9 +8291,22 @@ mod tests {
     /// `target_bytes - 10` filler `a`s, producing a serialised string of
     /// exactly `target_bytes`.
     fn req_with_metadata_bytes(repo_id: Uuid, target_bytes: usize) -> DirectIngestRequest {
-        // `to_string()` on a Value serialises without whitespace. The
-        // wrapper `{"pad":""}` is 10 bytes; add (target - 10) `a`s inside
-        // the string to hit the exact byte count.
+        DirectIngestRequest {
+            payload_metadata: pad_metadata_to(target_bytes),
+            ..req(repo_id)
+        }
+    }
+
+    /// A `payload_metadata` value whose serialised form is exactly
+    /// `target_bytes` bytes — the unit every cap boundary test is stated
+    /// in, for whichever entry point writes the field.
+    ///
+    /// `to_string()` on a `Value` serialises without whitespace, so the
+    /// wrapper `{"pad":""}` is 10 bytes and (target - 10) filler `a`s
+    /// inside the string hit the exact count. The assertion makes a
+    /// harness slip a failure here rather than an off-by-one in whichever
+    /// boundary the caller meant to sit on.
+    fn pad_metadata_to(target_bytes: usize) -> serde_json::Value {
         assert!(target_bytes >= 10, "cap test requires at least 10 bytes");
         let filler = "a".repeat(target_bytes - 10);
         let value = serde_json::json!({ "pad": filler });
@@ -8172,10 +8315,7 @@ mod tests {
             actual, target_bytes,
             "test harness wrong — generated {actual} bytes, wanted {target_bytes}"
         );
-        DirectIngestRequest {
-            payload_metadata: value,
-            ..req(repo_id)
-        }
+        value
     }
 
     #[test]
@@ -8325,6 +8465,357 @@ mod tests {
 
             assert_eq!(storage.put_call_count(), 0);
             assert_eq!(lifecycle.committed_transitions().len(), 0);
+        });
+    }
+
+    // -- Metadata-cap enforcement: the other writers of the field ----------------
+    //
+    // `payload_metadata` is written into `ArtifactIngested.metadata` and
+    // the `artifact_metadata` projection row by four entry points, and the
+    // cap is a property of that field rather than of the method that
+    // happens to carry it. The `ingest_direct` tests above and the
+    // `register_by_hash` ones further down cover two of them; these cover
+    // `ingest_verified` and `ingest_signature_manifest`, which had no
+    // check at all — an over-cap payload was accepted on both, and on the
+    // verified path a payload past the event store's 64 KB bound was
+    // spilled to CAS by `resolve_metadata_decision` instead of refused, so
+    // nothing bounded a client-authored payload at any of the three
+    // layers.
+
+    /// `ingest_verified` refuses a payload one byte past the effective cap
+    /// before `storage.put` and before any event is built, and classifies
+    /// the refusal as `metadata_too_large` on `hort_ingest_total` — the
+    /// same label `ingest_direct` and `register_by_hash` produce.
+    ///
+    /// The put-count and transition-count assertions are what make this
+    /// test about the cap rather than about any refusal: the pre-fix path
+    /// *also* failed for a sufficiently large payload, but only after the
+    /// bytes were already in CAS.
+    #[test]
+    fn ingest_verified_payload_metadata_one_byte_over_cap_is_rejected() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let repo_key = repo.key.clone();
+        let content: &[u8] = b"hello world";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+
+        let mut caps = HashMap::new();
+        caps.insert("pypi".to_string(), 128);
+
+        let snap = capture_metrics(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, artifacts, _events, lifecycle, storage, repos) =
+                    make_use_case_with_caps(true, caps);
+                repos.insert(repo);
+
+                // Handler-declared max is deliberately permissive (10 MB,
+                // above the 64 KB event cap as every real handler's is) so
+                // the operator override is the bound under test.
+                let handler = StubFormatHandler::new("pypi").with_max_bytes(10 * 1024 * 1024);
+
+                let req = VerifiedIngestRequest::ProtocolNative {
+                    repository_id: repo_id,
+                    coords: sample_coords(),
+                    content_type: "application/octet-stream".into(),
+                    actor: api_actor(),
+                    payload_metadata: pad_metadata_to(129),
+                    upstream_digest,
+                    upstream_published_at: None,
+                    trust_upstream_publish_time: false,
+                };
+
+                let err = uc
+                    .ingest_verified(req, &[], content_stream(content), &handler)
+                    .await
+                    .expect_err("one-byte-over payload must be rejected");
+
+                assert!(
+                    matches!(err, AppError::Domain(DomainError::Validation(_))),
+                    "expected Domain(Validation) — the shape the two already-capped \
+                     entry points produce, got {err:?}"
+                );
+                assert!(err.to_string().contains("metadata"));
+
+                // No CAS object: the refusal is ahead of `storage.put`,
+                // which is the whole difference from the event store's own
+                // 64 KB refusal downstream of it.
+                assert_eq!(
+                    storage.put_call_count(),
+                    0,
+                    "storage.put must not run on cap rejection"
+                );
+                // No artifact row, read from the repository rather than
+                // inferred: the lifecycle mock persists the row, so an
+                // empty transition list and an absent row are two
+                // statements about the same commit and both are cheap.
+                assert_eq!(
+                    lifecycle.committed_transitions().len(),
+                    0,
+                    "no lifecycle commit on cap rejection"
+                );
+                assert!(
+                    artifacts
+                        .find_by_path(repo_id, &sample_coords().path)
+                        .await
+                        .expect("repository read must succeed")
+                        .is_none(),
+                    "no artifact row may exist after a cap rejection"
+                );
+            });
+        });
+
+        let entries = snap.into_vec();
+        assert_counter(
+            &entries,
+            "hort_ingest_total",
+            &[
+                ("format", "pypi"),
+                ("repository", repo_key.as_str()),
+                ("result", "metadata_too_large"),
+            ],
+            1,
+        );
+        // The same regression guard the `ingest_direct` cap test carries:
+        // routed through `classify_ingest_error` the `DomainError::Validation`
+        // becomes `validation_error` and `metadata_too_large` never fires.
+        assert!(
+            find_metric(
+                &entries,
+                MetricKind::Counter,
+                "hort_ingest_total",
+                &[("result", "validation_error")],
+            )
+            .is_none(),
+            "validation_error counter ticked — cap rejection leaked into classify_ingest_error"
+        );
+        // `ingest_with_verification`'s unified exit emits the counter and
+        // nothing else on every verified-ingest path, so the cap rejection
+        // emits the counter and nothing else too. Pinned so a later edit
+        // that adds a histogram here has to add it to the success path as
+        // well, rather than leaving the two exits emitting different sets.
+        assert_metric_absent(&entries, "hort_ingest_duration_seconds");
+        assert_metric_absent(&entries, "hort_ingest_size_bytes");
+    }
+
+    /// The cap sits above `ingest_verified`'s `match request`, so it
+    /// covers every algorithm arm and not just the SHA-256 one both
+    /// request variants route to. Asserted on `UpstreamPublished(Sha512)`
+    /// — the arm that reaches `ingest_verified_sha512`, a different
+    /// function — so moving the check down into one arm fails here.
+    #[test]
+    fn ingest_verified_cap_covers_the_sha512_arm_too() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let upstream_checksum =
+            UpstreamPublishedChecksum::new(HashAlgorithm::Sha512, sha512_of(content)).unwrap();
+
+        let mut caps = HashMap::new();
+        caps.insert("pypi".to_string(), 128);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) =
+                make_use_case_with_caps(true, caps);
+            repos.insert(repo);
+            let handler = StubFormatHandler::new("pypi").with_max_bytes(10 * 1024 * 1024);
+
+            let req = VerifiedIngestRequest::UpstreamPublished {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: pad_metadata_to(129),
+                upstream_checksum,
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let err = uc
+                .ingest_verified(req, &[], content_stream(content), &handler)
+                .await
+                .expect_err("the sha512 arm must reject an over-cap payload too");
+            assert!(matches!(err, AppError::Domain(DomainError::Validation(_))));
+            assert_eq!(storage.put_call_count(), 0);
+            assert_eq!(lifecycle.committed_transitions().len(), 0);
+        });
+    }
+
+    /// The honest path is untouched: a payload at exactly the cap still
+    /// ingests through `ingest_verified`, reaching storage and the
+    /// lifecycle commit.
+    #[test]
+    fn ingest_verified_payload_metadata_at_cap_is_accepted() {
+        let repo = pypi_repository();
+        let repo_id = repo.id;
+        let content: &[u8] = b"hello world";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+
+        let mut caps = HashMap::new();
+        caps.insert("pypi".to_string(), 128);
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, _artifacts, _events, lifecycle, storage, repos) =
+                make_use_case_with_caps(true, caps);
+            repos.insert(repo);
+            let handler = StubFormatHandler::new("pypi").with_max_bytes(10 * 1024 * 1024);
+
+            let req = VerifiedIngestRequest::ProtocolNative {
+                repository_id: repo_id,
+                coords: sample_coords(),
+                content_type: "application/octet-stream".into(),
+                actor: api_actor(),
+                payload_metadata: pad_metadata_to(128),
+                upstream_digest: upstream_digest.clone(),
+                upstream_published_at: None,
+                trust_upstream_publish_time: false,
+            };
+
+            let outcome = uc
+                .ingest_verified(req, &[], content_stream(content), &handler)
+                .await
+                .expect("at-cap payload must still ingest");
+
+            assert_eq!(outcome.artifact.sha256_checksum, upstream_digest);
+            // Reached the pipeline rather than merely "not returned Err":
+            // one content put, one commit.
+            assert_eq!(storage.put_call_count(), 1);
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1);
+            assert_eq!(transitions[0].0.id, outcome.artifact.id);
+        });
+    }
+
+    /// `ingest_signature_manifest` refuses an over-cap payload before the
+    /// CAS put. This path builds its `ArtifactIngested` by hand and has no
+    /// rollback, so without the check an over-cap payload reached the
+    /// commit, was refused by the event store's 64 KB bound, and left the
+    /// stored manifest bytes unreferenced.
+    #[test]
+    fn ingest_signature_manifest_payload_metadata_over_cap_is_rejected_before_the_put() {
+        let content: &[u8] = b"cosign bundle referrer manifest bytes";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+
+        let snap = capture_metrics(|| {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let (uc, lifecycle, storage, repos, _projections, jobs, artifacts, refs) =
+                    sig_make_use_case();
+                let repo = oci_repo();
+                let repo_id = repo.id;
+                repos.insert(repo);
+
+                // The handler-declared layer is the bound here —
+                // `sig_make_use_case` configures no operator override, and
+                // the cap resolution falls through to the handler exactly
+                // as it does for a format with no `HORT_METADATA_*` entry.
+                let handler = StubFormatHandler::new("oci").with_max_bytes(128);
+
+                let err = uc
+                    .ingest_signature_manifest(
+                        repo_id,
+                        oci_coords(),
+                        "application/vnd.oci.image.manifest.v1+json".into(),
+                        sample_actor(),
+                        pad_metadata_to(129),
+                        upstream_digest,
+                        None,
+                        &[],
+                        content_stream(content),
+                        &handler,
+                    )
+                    .await
+                    .expect_err("one-byte-over payload must be rejected");
+
+                assert!(
+                    matches!(err, AppError::Domain(DomainError::Validation(_))),
+                    "expected Domain(Validation) — the shape the already-capped \
+                     entry points produce, got {err:?}"
+                );
+                assert!(err.to_string().contains("metadata"));
+
+                // No orphan: the manifest bytes never reached CAS.
+                assert_eq!(
+                    storage.put_call_count(),
+                    0,
+                    "storage.put must not run on cap rejection — a put here with no \
+                     commit behind it is the unreferenced blob this check exists to \
+                     prevent"
+                );
+                assert!(
+                    lifecycle.committed_transitions().is_empty(),
+                    "no lifecycle commit on cap rejection"
+                );
+                assert!(
+                    artifacts
+                        .find_by_path(repo_id, &oci_coords().path)
+                        .await
+                        .expect("repository read must succeed")
+                        .is_none(),
+                    "no artifact row may exist after a cap rejection"
+                );
+                // Nothing downstream of the commit ran either.
+                assert!(jobs.enqueue_calls().is_empty());
+                assert_eq!(refs.entry_count(), 0);
+            });
+        });
+
+        // This entry point emits `hort_ingest_total` on NO exit path,
+        // success included, so the cap refusal emits none either: a
+        // counter whose only samples were failures would make every
+        // error-rate panel over it read 100%. Pinned here so adding the
+        // label means adding the success tick beside it.
+        assert_metric_absent(&snap.into_vec(), "hort_ingest_total");
+    }
+
+    /// The honest path is untouched on the signature side too: a payload
+    /// at exactly the cap still ingests, reaching storage and the commit.
+    #[test]
+    fn ingest_signature_manifest_payload_metadata_at_cap_is_accepted() {
+        let content: &[u8] = b"cosign bundle referrer manifest bytes";
+        let upstream_digest: ContentHash = sha256_of(content).parse().unwrap();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uc, lifecycle, storage, repos, _projections, _jobs, _artifacts, _refs) =
+                sig_make_use_case();
+            let repo = oci_repo();
+            let repo_id = repo.id;
+            repos.insert(repo);
+            let handler = StubFormatHandler::new("oci").with_max_bytes(128);
+
+            let payload = pad_metadata_to(128);
+            let outcome = uc
+                .ingest_signature_manifest(
+                    repo_id,
+                    oci_coords(),
+                    "application/vnd.oci.image.manifest.v1+json".into(),
+                    sample_actor(),
+                    payload.clone(),
+                    upstream_digest.clone(),
+                    None,
+                    &[],
+                    content_stream(content),
+                    &handler,
+                )
+                .await
+                .expect("at-cap payload must still ingest");
+
+            assert_eq!(outcome.artifact.sha256_checksum, upstream_digest);
+            assert_eq!(storage.put_call_count(), 1);
+            let transitions = lifecycle.committed_transitions();
+            assert_eq!(transitions.len(), 1);
+            // The admitted payload is what the write carries, verbatim:
+            // the cap bounds the field, it does not edit it.
+            let kinds: Vec<&str> = transitions[0]
+                .1
+                .events
+                .iter()
+                .map(|e| e.event.event_type())
+                .collect();
+            assert_eq!(kinds, vec!["ArtifactIngested"]);
+            assert_eq!(
+                transitions[0].2.as_ref().map(|m| &m.metadata),
+                Some(&payload),
+                "the admitted payload rides the `artifact_metadata` projection row unchanged"
+            );
         });
     }
 
@@ -19063,6 +19554,7 @@ mod tests {
                     None,
                     &[], // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
+                    &sig_handler(),
                 )
                 .await
                 .expect("signature-manifest ingest must succeed");
@@ -19153,6 +19645,7 @@ mod tests {
                         metadata: serde_json::json!({}),
                     }],
                     content_stream(content),
+                    &sig_handler(),
                 )
                 .await
                 .expect("signature-manifest ingest must succeed");
@@ -19219,6 +19712,7 @@ mod tests {
                         metadata: serde_json::json!({}),
                     }],
                     content_stream(content),
+                    &sig_handler(),
                 )
                 .await
                 .expect_err("a failed subject claim must fail the ingest");
@@ -19272,6 +19766,7 @@ mod tests {
                     upstream_digest,
                     None, &[], // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
+                    &sig_handler(),
                 )
                 .await
                 .expect("ingest must succeed");
@@ -19335,6 +19830,7 @@ mod tests {
                     None,
                     &[], // no subject in scope — the S3 hook is a no-op here
                     content_stream(content),
+                    &sig_handler(),
                 )
                 .await
                 .expect_err("a declared-digest mismatch must be rejected");
@@ -19395,6 +19891,7 @@ mod tests {
                 Some(subject_hash),
                 &[],
                 content_stream(content),
+                &sig_handler(),
             )
             .await
             .expect("signature-manifest ingest must succeed");
@@ -19483,6 +19980,7 @@ mod tests {
                     Some(subject_hash),
                     &[],
                     content_stream(content),
+                    &sig_handler(),
                 )
                 .await
                 .expect("an unresolvable subject is a no-op, not an ingest error");
@@ -19530,6 +20028,7 @@ mod tests {
                     Some(subject_hash),
                     &[],
                     content_stream(content),
+                    &sig_handler(),
                 )
                 .await
                 .expect("a best-effort enqueue failure must NOT fail the ingest");
@@ -19549,6 +20048,16 @@ mod tests {
     /// ProvenanceMode would BOTH fire on the generic path; the narrow path
     /// must suppress them. Hands back the lifecycle + jobs + artifacts
     /// mocks.
+    /// The `FormatHandler` the signature-manifest tests hand
+    /// `ingest_signature_manifest` — `format_key = "oci"` to match
+    /// [`oci_coords`], and a permissive declared max so these tests
+    /// exercise the narrow path rather than its metadata cap. The
+    /// cap's own boundary tests pin an explicit operator override
+    /// instead.
+    fn sig_handler() -> StubFormatHandler {
+        StubFormatHandler::new("oci").with_max_bytes(10 * 1024 * 1024)
+    }
+
     #[allow(clippy::type_complexity)]
     fn sig_make_use_case() -> (
         IngestUseCase,

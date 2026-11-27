@@ -492,7 +492,12 @@ mod tests {
 
     use hort_http_core::context::AuthContext;
     use hort_http_core::middleware::auth::test_support::inject_principal;
-    use hort_http_core::test_support::{build_mock_ctx as build_base_ctx, with_auth};
+    use hort_http_core::middleware::trust::TrustConfig;
+    use hort_http_core::test_support::{
+        build_mock_ctx as build_base_ctx, with_auth, with_trust_config,
+    };
+
+    use std::net::SocketAddr;
 
     /// Build a `GET /metrics` request carrying a pre-validated principal
     /// in the `AuthenticatedPrincipal` extension slot — the shape
@@ -520,11 +525,12 @@ mod tests {
         req
     }
 
+    /// The path the seeded PyPI artifact is served at.
+    const PYPI_FIXTURE_PATH: &str = "/pypi/pypi-test/simple/pkg/pkg-1.0.tar.gz";
+
     /// Seed a `pypi-test` repository + one downloadable artifact onto the
     /// shared mock context, so PyPI routes have something to serve.
-    fn build_mock_ctx(handle: metrics_exporter_prometheus::PrometheusHandle) -> Arc<AppContext> {
-        let (ctx, mocks) = build_base_ctx(handle);
-
+    fn seed_pypi_fixture(mocks: &hort_http_core::test_support::MockPorts) {
         let mut repo = sample_repository();
         repo.key = "pypi-test".to_string();
         mocks.repositories.insert(repo.clone());
@@ -537,8 +543,190 @@ mod tests {
         mocks
             .storage
             .insert_content(artifact.sha256_checksum.clone(), b"payload".to_vec());
+    }
 
+    fn build_mock_ctx(handle: metrics_exporter_prometheus::PrometheusHandle) -> Arc<AppContext> {
+        let (ctx, mocks) = build_base_ctx(handle);
+        seed_pypi_fixture(&mocks);
         ctx
+    }
+
+    /// An `AuthContext::Enabled` context whose `scrape-token` resolves to
+    /// a principal holding a global `read_metrics` grant — the scraper
+    /// service-account shape the metrics listener is built for.
+    fn scrape_ctx(handle: metrics_exporter_prometheus::PrometheusHandle) -> Arc<AppContext> {
+        use hort_app::rbac::RbacEvaluator;
+        use hort_app::use_cases::authenticate_use_case::AuthenticateUseCase;
+        use hort_app::use_cases::test_support::MockIdentityProvider;
+        use hort_domain::entities::managed_by::ManagedBy;
+        use hort_domain::entities::rbac::{
+            ClaimMapping, GrantSubject, Permission, PermissionGrant,
+        };
+        use hort_domain::ports::identity_provider::{IdentityProvider, IdpClaims};
+        use hort_domain::ports::user_repository::UserRepository;
+
+        let (base, mocks) = build_base_ctx(handle);
+        seed_pypi_fixture(&mocks);
+        let idp = Arc::new(MockIdentityProvider::new());
+        idp.register_token(
+            "scrape-token",
+            IdpClaims {
+                subject: "scrape-subject".into(),
+                username: "scraper".into(),
+                email: "scraper@example.com".into(),
+                groups: vec!["scrape-group".into()],
+                issued_at: Utc::now(),
+            },
+        );
+        let authenticate = Arc::new(AuthenticateUseCase::new(
+            idp as Arc<dyn IdentityProvider>,
+            mocks.users as Arc<dyn UserRepository>,
+            vec![ClaimMapping {
+                id: Uuid::new_v4(),
+                idp_group: "scrape-group".into(),
+                claim: "scraper".into(),
+                managed_by: ManagedBy::Local,
+                managed_by_digest: None,
+            }],
+        ));
+        let grant = PermissionGrant {
+            id: Uuid::new_v4(),
+            subject: GrantSubject::Claims(vec!["scraper".into()]),
+            repository_id: None,
+            permission: Permission::ReadMetrics,
+            created_at: Utc::now(),
+            managed_by: ManagedBy::Local,
+            managed_by_digest: None,
+        };
+        let rbac = Arc::new(arc_swap::ArcSwap::from_pointee(RbacEvaluator::new(vec![
+            grant,
+        ])));
+        with_auth(
+            &base,
+            AuthContext::Enabled {
+                authenticate,
+                rbac,
+                issuer_url: None,
+            },
+        )
+    }
+
+    /// `GET /metrics` from a loopback peer carrying the scrape token,
+    /// against a router whose `ctx` is the caller's.
+    fn loopback_scrape(
+        ctx: Arc<AppContext>,
+    ) -> impl std::future::Future<Output = axum::response::Response> {
+        let request = Request::get("/metrics")
+            .header(axum::http::header::AUTHORIZATION, "Bearer scrape-token")
+            .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                40000,
+            ))))
+            .body(Body::empty())
+            .unwrap();
+        let router = build_admin_router(ctx);
+        async move { router.oneshot(request).await.unwrap() }
+    }
+
+    /// The scrape presents a credential, so the admin listener's
+    /// `require_principal` applies the transport decision to it like any
+    /// other surface. A sidecar scrape over loopback has no TLS evidence,
+    /// so the deployment declares that hop — the shape the chart's
+    /// metrics listener needs — and the scrape is served while the
+    /// evidence it reports stays `unknown`.
+    #[test]
+    fn admin_listener_scrape_records_metrics_transport_evidence() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let body = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let ctx = with_trust_config(
+                        &scrape_ctx(handle),
+                        TrustConfig::default().with_tls_not_required_from(vec!["127.0.0.1/32"
+                            .parse()
+                            .expect("loopback CIDR parses")]),
+                    );
+                    let response = loopback_scrape(ctx).await;
+                    assert_eq!(response.status(), StatusCode::OK);
+                    String::from_utf8(
+                        to_bytes(response.into_body(), 64 * 1024)
+                            .await
+                            .unwrap()
+                            .to_vec(),
+                    )
+                    .unwrap()
+                })
+        });
+        assert!(
+            body.contains(
+                "hort_credential_transport_total{entry_point=\"metrics\",evidence=\"unknown\"}"
+            ),
+            "admin scrape did not observe credential transport: {body}"
+        );
+        assert!(
+            body.contains(
+                "hort_credential_transport_waived_total{entry_point=\"metrics\",scope=\"declared\"}"
+            ),
+            "a waived scrape must be counted apart from an allowed one: {body}"
+        );
+    }
+
+    /// The same scrape with no declared hop is refused `426` before
+    /// `render_metrics` runs. This is a behaviour change for a plaintext
+    /// metrics listener: the declared waiver above is what a deployment
+    /// that cannot put TLS in front of it uses instead.
+    #[test]
+    fn admin_listener_scrape_without_evidence_or_waiver_is_refused() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let status = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async { loopback_scrape(scrape_ctx(handle)).await.status() })
+        });
+        assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    }
+
+    /// ADR 0021: a public read is still served over an unproven transport,
+    /// on a real serving endpoint, through the real router, with
+    /// authentication **enabled**. The credential-transport decision runs
+    /// on the credential-present branches only, so the request that
+    /// presents nothing is untouched — this is the blast-radius statement
+    /// the refusal rests on, and it is asserted here rather than only at
+    /// the middleware because the read path's layer is attached by the
+    /// router's method dispatch.
+    #[test]
+    fn anonymous_read_over_plaintext_is_served_by_the_real_router() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let status = metrics::with_local_recorder(&recorder, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    build_router(scrape_ctx(handle))
+                        .oneshot(
+                            Request::get(PYPI_FIXTURE_PATH)
+                                .extension(axum::extract::ConnectInfo(SocketAddr::from((
+                                    [203, 0, 113, 7],
+                                    40000,
+                                ))))
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap()
+                        .status()
+                })
+        });
+        assert_eq!(status, StatusCode::OK);
     }
 
     /// End-to-end wiring check: drive a PyPI request through the real main
@@ -564,11 +752,7 @@ mod tests {
 
                     let response = router
                         .clone()
-                        .oneshot(
-                            Request::get("/pypi/pypi-test/simple/pkg/pkg-1.0.tar.gz")
-                                .body(Body::empty())
-                                .unwrap(),
-                        )
+                        .oneshot(Request::get(PYPI_FIXTURE_PATH).body(Body::empty()).unwrap())
                         .await
                         .unwrap();
                     assert_eq!(response.status(), StatusCode::OK);
@@ -1398,11 +1582,7 @@ mod tests {
 
                     let get_res = router
                         .clone()
-                        .oneshot(
-                            Request::get("/pypi/pypi-test/simple/pkg/pkg-1.0.tar.gz")
-                                .body(Body::empty())
-                                .unwrap(),
-                        )
+                        .oneshot(Request::get(PYPI_FIXTURE_PATH).body(Body::empty()).unwrap())
                         .await
                         .unwrap();
 

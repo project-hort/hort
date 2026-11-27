@@ -64,7 +64,7 @@ for the full rationale behind each control.
 | Two-role Postgres | `HORT_DATABASE_URL` (split by role; chart injects this canonical name, binary falls back to bare `DATABASE_URL`) | `postgres.app.existingSecret` + `postgres.admin.existingSecret` | (required) | (no default) |
 | Concurrency cap | `HORT_MAX_INFLIGHT` | `http.maxInflight` | `0` (binary default) | `512` |
 | Per-IP concurrency cap | `HORT_MAX_INFLIGHT_PER_IP` | `http.maxInflightPerIp` | `0` (binary default) | `32` |
-| API bind | `HORT_API_BIND` | `api.bindAddr` | `0.0.0.0:8080` | `127.0.0.1:8080` |
+| API bind | `HORT_API_BIND` | `api.bindAddr` (overridden by `tlsSidecar.enabled`) | `0.0.0.0:8080` | `127.0.0.1:8080` |
 | Require HTTPS | `HORT_REQUIRE_HTTPS` | `requireHttps` | `true` | `false` |
 | Public base URL | `HORT_PUBLIC_BASE_URL` | `publicBaseUrl` | (required) | (no default) |
 | Secret file root | `HORT_SECRETS_FILE_ROOT` | `secrets.fileRoot` | `/etc/hort-server/secrets` | (none) |
@@ -86,9 +86,8 @@ Four caveats:
   disabled path. There is no `basic` provider value.
 - `HORT_TRUSTED_PROXY_CIDRS` is
   exposed as `trustedProxyCidrs`. It predates the HTTPS hardening, which
-  made it a
-  precondition for `HORT_REQUIRE_HTTPS=true` to start without an
-  `https://` `publicBaseUrl`. It is also the **sole** input to client-IP
+  made it a way for `HORT_REQUIRE_HTTPS=true` to start with an explicit
+  `http://` `publicBaseUrl`. It is also the **sole** input to client-IP
   attribution: with it empty, every request is attributed to its TCP
   peer, which in a Kubernetes install is the ingress or LB for every
   caller — collapsing the PAT brute-force lockout, the auth-failure
@@ -200,8 +199,8 @@ image:
 - **Default:** `""` (chart fails install — schema rule 1)
 - **Required:** yes
 - **Description:** Canonical URL the operator's edge terminates as.
-  Drives `Strict-Transport-Security` emission
-  (HSTS only fires when this URL's scheme is `https`) and the OCI
+  Qualifies `Strict-Transport-Security` emission together with per-request
+  TLS evidence (HSTS needs both) and drives the OCI
   `WWW-Authenticate: Bearer realm=...` value.
 - **Example:** `https://hort.example.com`
 - **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HTTPS-only realm + upstream URL scheme, HSTS.
@@ -231,11 +230,11 @@ image:
 - **Default:** `true`
 - **Required:** no
 - **Description:** Maps to `HORT_REQUIRE_HTTPS`. When `true`, the binary
-  refuses to start unless **either** `publicBaseUrl` is `https://...`
-  **or** `trustedProxyCidrs` is non-empty (positive evidence of a
-  TLS-terminating proxy in front). The AND-condition is deliberate:
-  only the "neither pinned nor proxied" case fails. The chart default
-  diverges from the binary default (`false`) on the principle that
+  refuses to start if `publicBaseUrl` is explicitly `http://...` and
+  `trustedProxyCidrs` is empty. The binary also permits an unset
+  base URL; the chart schema requires `publicBaseUrl` for chart installs.
+  This is configuration consistency, never request TLS evidence. The chart
+  default diverges from the binary default (`false`) on the principle that
   production charts ship with the security gate enabled.
 - **Example:** `false`
 - **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HSTS + bind-default + `HORT_REQUIRE_HTTPS`.
@@ -287,6 +286,23 @@ image:
   > after any custom `proxy_set_header` / header-rewrite config) and
   > watch for the `trusted peer with missing X-Forwarded-For` WARN.
 - **See also:** [`security-hardening-checklist.md`](./security-hardening-checklist.md) — HSTS, rightmost-untrusted `X-Forwarded-For`.
+
+### `tlsSidecar`
+
+- **Default:** `enabled: false`; existing plaintext Service behavior is preserved.
+- **When enabled:** supply `secretName` for a TLS Secret with `tls.crt` and
+  `tls.key`. nginx listens at `httpsPort` (default `8443`) and the Service
+  still exposes `service.httpPort` (default `8080`) but targets nginx. The
+  chart forces `HORT_API_BIND=127.0.0.1:<service.httpPort>` and adds
+  `127.0.0.1/32` to the trusted proxy list. `api.bindAddr` is ignored in
+  this mode. The edge's source range still belongs in `trustedProxyCidrs`
+  so the client IP can be resolved from the appended `X-Forwarded-For` chain.
+  An operator-managed `networkPolicy.ingress` must allow `httpsPort`.
+- **Operator obligations:** provide and rotate a certificate valid for the
+  Service DNS name used by in-cluster clients, restart the Deployment after
+  replacing the Secret, configure the edge to redirect or refuse plaintext
+  clients, and make its `X-Forwarded-For` identify the real client. See
+  [`inbound-credential-transport.md`](./inbound-credential-transport.md).
 
 ### `auth`
 
@@ -493,6 +509,17 @@ is the recipe. `bindAddr` controls whether that listener binds at all:
 `bindAddr` to be non-empty (the ServiceMonitor scrapes the dedicated
 metrics Service port). The chart fails `helm template` / `helm
 install` with an explicit message if these conditions are not met.
+
+> **Migration note: enabling `tlsSidecar` on an install with a
+> non-loopback `metrics.bindAddr` is a two-part change — make both parts
+> in one edit.** Part one is required by the chart itself: `bindAddr`
+> must move to `127.0.0.1:<metricsPort>` (the render-time refusal in
+> `templates/deployment.yaml` enforces this). Part two is not enforced
+> by the chart and is easy to miss: once the sidecar is enabled, the
+> Service's `metrics` port serves TLS instead of plaintext, so whatever
+> scrapes it needs reconfiguring for `https`, a trusted CA, and a bearer
+> carrying `read_metrics`. Fixing only part one renders successfully and
+> silently drops the scrape.
 
 The rendered ServiceMonitor carries **no** authentication — the chart
 cannot guess your token-issuance mechanism, so it does not invent one.

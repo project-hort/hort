@@ -937,21 +937,36 @@ pub struct AppContext {
     /// `Arc<dyn ApiTokenCacheInvalidator>` and the validator wires
     /// the same `Arc<PatCache>`).
     pub pat_cache: Option<Arc<PatCache>>,
-    /// Operator opt-in to allow PAT
-    /// authentication over plaintext HTTP. Default `false`; when
-    /// `false`, the [`crate::middleware::auth::require_principal`]
-    /// layer emits `426 Upgrade Required` on a `Bearer hort_<kind>_<body>`
-    /// token whose request path lacks TLS evidence
-    /// (`!RequestTrust.public_url.scheme() == "https"` AND no
-    /// `X-Forwarded-Proto: https` from a trusted peer). Wired from
-    /// `HORT_BEARER_ALLOW_OVER_HTTP` at boot. The
-    /// gate also covers CliSession-family JWTs, not just PAT-shaped
-    /// tokens — hence the bearer-scoped knob name.
+    /// The **unscoped** operator waiver of the credential-transport
+    /// requirement, wired from `HORT_BEARER_ALLOW_OVER_HTTP` at boot.
+    /// Default `false`.
+    ///
+    /// It is passed to
+    /// [`credential_transport_verdict`](crate::middleware::credential_transport::credential_transport_verdict),
+    /// which accepts a presented credential regardless of evidence, peer
+    /// or relay when it is set. With it unset, both non-OCI entry points
+    /// answer `426 Upgrade Required` for **any** presented credential —
+    /// an IdP access token as much as a native one — on a request with
+    /// neither TLS evidence nor a declared hop. The knob keeps its
+    /// bearer-scoped name for operator continuity; its subject is no
+    /// longer a token shape.
+    ///
+    /// **One surface does not read it: the token endpoint.**
+    /// `handlers::exchange` passes the unscoped argument pinned off,
+    /// because RFC 6749 §3.2 requires the authorization server to
+    /// require TLS on the token endpoint, so that refusal is not the
+    /// operator's to waive without naming a scope. The field is wired
+    /// onto the context exactly as it is everywhere else — the asymmetry
+    /// is at that one call site, not in how the flag reaches here.
+    ///
+    /// The scoped alternative is `HORT_TLS_NOT_REQUIRED_FROM`, which
+    /// waives the requirement for a declared peer range and reaches
+    /// `RequestTrust::tls_requirement_waived`. Neither waiver asserts
+    /// that TLS happened: evidence stays what was derived.
     ///
     /// This is a **transport** flag, not a trust-knob — see
-    /// `CLAUDE.md` anti-pattern: "no `*_INSECURE_TLS`". Setting
-    /// this to `true` emits `tracing::warn!("HORT_BEARER_ALLOW_OVER_HTTP
-    /// active — bearer auth without TLS")` ONCE at boot and sets the
+    /// `CLAUDE.md` anti-pattern: "no `*_INSECURE_TLS`". Setting it to
+    /// `true` emits one `tracing::warn!` at boot and sets the
     /// `hort_unsafe_config_active{kind="pat_over_http"} = 1` gauge so
     /// the misconfig is visible on every dashboard.
     pub pat_over_http_allowed: bool,

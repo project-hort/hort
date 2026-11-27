@@ -804,6 +804,12 @@ mod tests {
     use hort_http_core::test_support::{build_mock_ctx, read_mirror, MockPorts};
 
     use hort_domain::error::DomainResult;
+    // The digest a mirror seed supplies with its body, taken from the
+    // port that refuses a pair that does not agree. The production
+    // caller supplies the digest of exactly the bytes it streams, so a
+    // fixture seeding the mirror supplies it too — from the same
+    // definition, not from a local re-type of it.
+    use hort_domain::ports::metadata_mirror_store::body_digest;
 
     use super::*;
 
@@ -1284,7 +1290,11 @@ mod tests {
         let mkey = mirror_key("npm", &mapping_id.to_string(), "express");
         mocks
             .metadata_mirror
-            .put(&mkey, Box::new(std::io::Cursor::new(raw.to_vec())))
+            .put(
+                &mkey,
+                Box::new(std::io::Cursor::new(raw.to_vec())),
+                body_digest(raw),
+            )
             .await
             .unwrap();
 
@@ -1341,7 +1351,11 @@ mod tests {
         let mkey = mirror_key("npm", &mapping_id.to_string(), "express");
         mocks
             .metadata_mirror
-            .put(&mkey, Box::new(std::io::Cursor::new(raw.to_vec())))
+            .put(
+                &mkey,
+                Box::new(std::io::Cursor::new(raw.to_vec())),
+                body_digest(raw),
+            )
             .await
             .unwrap();
         // The body no longer hashes to the digest recorded with it.

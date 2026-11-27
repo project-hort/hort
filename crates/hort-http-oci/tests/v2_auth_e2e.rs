@@ -61,8 +61,10 @@ use hort_app::use_cases::pat_validation_use_case::{
     PAT_LOCKOUT_BY_IP_COUNTER_PREFIX, PAT_LOCKOUT_BY_IP_FLAG_PREFIX,
 };
 use hort_domain::ports::ephemeral_store::EphemeralStore;
-use hort_http_core::context::AuthContext;
-use hort_http_core::middleware::trust::{request_trust_layer, TrustConfig};
+use hort_http_core::context::{AppContext, AuthContext};
+use hort_http_core::middleware::trust::{
+    request_trust_layer, RequestTrust, TransportSecurity, TrustConfig,
+};
 use hort_http_core::test_support::{
     build_mock_ctx, with_api_token_use_case, with_auth, with_oci_public_base_url,
     with_oci_signing_key, with_oci_token_exchange,
@@ -84,6 +86,15 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 #[derive(Default)]
 struct InMemoryApiTokenRepo {
     by_prefix: Mutex<Vec<ApiToken>>,
+    /// How many times the validator's hot-path lookup ran.
+    ///
+    /// "The credential was refused before it was validated" has no wire
+    /// representation — a refusal and a rejection are different status
+    /// codes but neither says whether the PAT was looked up. This counter
+    /// is the observable: `PatValidationUseCase` cannot reach a verdict
+    /// on a `hort_pat_*` plaintext without resolving its prefix here, so
+    /// zero lookups means no validator ran.
+    prefix_lookups: std::sync::atomic::AtomicUsize,
 }
 
 impl InMemoryApiTokenRepo {
@@ -94,6 +105,11 @@ impl InMemoryApiTokenRepo {
     fn seed(&self, token: ApiToken) {
         self.by_prefix.lock().unwrap().push(token);
     }
+
+    fn prefix_lookups(&self) -> usize {
+        self.prefix_lookups
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 impl ApiTokenRepository for InMemoryApiTokenRepo {
@@ -103,6 +119,8 @@ impl ApiTokenRepository for InMemoryApiTokenRepo {
     }
 
     fn find_by_prefix(&self, prefix: &str) -> BoxFuture<'_, DomainResult<Option<ApiToken>>> {
+        self.prefix_lookups
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Snapshot the row eagerly so the returned future doesn't
         // carry a borrow of `prefix`.
         let result = self
@@ -153,7 +171,7 @@ impl ApiTokenRepository for InMemoryApiTokenRepo {
 // ===========================================================================
 
 struct Harness {
-    ctx: Arc<hort_http_core::context::AppContext>,
+    ctx: Arc<AppContext>,
     /// The plaintext PAT the test uses on the `/v2/auth` Basic header.
     plaintext_pat: String,
     /// The repo key the test issues scopes against.
@@ -168,6 +186,9 @@ struct Harness {
     /// `PatValidationError` arm, lockout included, so the bucket key is
     /// the only observable.
     ephemeral_durable: Arc<MeteredEphemeralStore<InMemoryEphemeralStore>>,
+    /// The token repository the PAT validator reads. Held so a test can
+    /// assert that a refused credential reached no validator at all.
+    token_repo: Arc<InMemoryApiTokenRepo>,
 }
 
 /// Build a fully-wired `AppContext` with native tokens enabled, an
@@ -252,11 +273,8 @@ fn build_harness_with_lockout(lockout: PatLockoutConfig) -> Harness {
         issued_via: IssuedVia::HttpMint,
     };
 
-    let token_repo: Arc<dyn ApiTokenRepository> = {
-        let repo = Arc::new(InMemoryApiTokenRepo::new());
-        repo.seed(token);
-        repo
-    };
+    let token_repo = Arc::new(InMemoryApiTokenRepo::new());
+    token_repo.seed(token);
 
     // -- 4. Build the PAT validator FIRST — it threads into both the
     //       AuthenticateUseCase (so Bearer/Basic-PAT shapes route
@@ -266,7 +284,7 @@ fn build_harness_with_lockout(lockout: PatLockoutConfig) -> Harness {
     let users_for_auth: Arc<dyn UserRepository> = mocks.users.clone();
     let pat_cache = Arc::new(PatCache::new(16, Duration::from_secs(300)));
     let pat_validation_uc = Arc::new(PatValidationUseCase::new(
-        token_repo.clone(),
+        token_repo.clone() as Arc<dyn ApiTokenRepository>,
         users_for_auth.clone(),
         // PAT validation writes to `pat-attempt:` /
         // `pat-attempt-counter:` keyspaces, registered as Durable.
@@ -355,6 +373,7 @@ fn build_harness_with_lockout(lockout: PatLockoutConfig) -> Harness {
         repo_key: "myrepo".into(),
         image_name: "library/nginx".into(),
         ephemeral_durable: mocks.ephemeral_durable.clone(),
+        token_repo,
     }
 }
 
@@ -364,6 +383,31 @@ fn build_harness_with_lockout(lockout: PatLockoutConfig) -> Harness {
 /// admin path doesn't use it.
 fn test_helpers_dummy_token_repo() -> impl ApiTokenRepository {
     InMemoryApiTokenRepo::new()
+}
+
+/// The production OCI router under positive evidence of TLS.
+///
+/// Both OCI credential boundaries refuse a presented *or issued*
+/// credential on a transport with no evidence and no operator waiver, and
+/// a bare `oneshot` carries no `RequestTrust` at all — which is the
+/// refusing row, not a harness detail. So every flow test below runs the
+/// posture a documented deployment runs: a trusted TLS-terminating proxy
+/// in front. The tests that are *about* the transport decision build
+/// their own trust instead, and
+/// [`router_behind_trusted_proxy`] drives the real trust layer.
+fn router_over_tls(ctx: &Arc<AppContext>) -> axum::Router {
+    let trust = RequestTrust {
+        client_ip: "203.0.113.7".parse().expect("test client address parses"),
+        public_url: "https://hort.example.com/"
+            .parse()
+            .expect("test URL parses"),
+        transport: TransportSecurity::Tls,
+        peer_trusted: true,
+        tls_requirement_waived: false,
+    };
+    oci_routes_with_config(&OciHttpConfig::default(), ctx.clone())
+        .with_state(ctx.clone())
+        .layer(axum::Extension(trust))
 }
 
 fn run<F, T>(f: F) -> T
@@ -396,8 +440,7 @@ where
 fn step1_invalid_bearer_emits_bearer_challenge_to_v2_auth() {
     let (status, www) = run(async {
         let h = build_harness();
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let path = format!("/v2/{}/{}/manifests/v1", h.repo_key, h.image_name);
         let resp = router
             .oneshot(
@@ -464,8 +507,7 @@ fn step2_v2_auth_with_valid_pat_mints_jwt() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let resp = router
             .oneshot(
                 Request::get("/v2/auth?service=hort.example.com")
@@ -534,7 +576,7 @@ fn step2b_v2_auth_mints_under_disabled_auth_through_real_router() {
             "/v2/auth?service=hort.example.com&scope=repository:{}:pull",
             h.repo_key
         );
-        let router = oci_routes_with_config(&OciHttpConfig::default(), ctx.clone()).with_state(ctx);
+        let router = router_over_tls(&ctx);
         let resp = router
             .oneshot(
                 Request::get(&uri)
@@ -578,27 +620,36 @@ fn step2b_v2_auth_mints_under_disabled_auth_through_real_router() {
 fn step3_v2_auth_without_credentials_mints_anonymous_token() {
     // No `Authorization`, no `scope=` — a bare anonymous ping. Must be a
     // 200 with a JWT (empty `access[]`), NOT a 401 challenge.
-    let (status, www, body_json) = run(async {
-        let h = build_harness();
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
-        let resp = router
-            .oneshot(
-                Request::get("/v2/auth?service=hort.example.com")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let status = resp.status();
-        let www = resp
-            .headers()
-            .get(header::WWW_AUTHENTICATE)
-            .map(|v| v.to_str().unwrap().to_string());
-        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        (status, www, body_json)
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let metric_handle = recorder.handle();
+    let (status, www, body_json) = metrics::with_local_recorder(&recorder, || {
+        run(async {
+            let h = build_harness();
+            let router = router_over_tls(&h.ctx);
+            let resp = router
+                .oneshot(
+                    Request::get("/v2/auth?service=hort.example.com")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let www = resp
+                .headers()
+                .get(header::WWW_AUTHENTICATE)
+                .map(|v| v.to_str().unwrap().to_string());
+            let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+            let body_json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            (status, www, body_json)
+        })
     });
+    // An anonymous mint is still a credential surface — the response is
+    // a bearer — so it is observed, under the evidence this router
+    // actually carries.
+    assert!(metric_handle
+        .render()
+        .contains("hort_credential_transport_total{entry_point=\"oci_mint\",evidence=\"tls\"} 1"));
     assert_eq!(
         status,
         StatusCode::OK,
@@ -629,8 +680,7 @@ fn step3b_v2_auth_anonymous_public_repo_scope_mints_token() {
             "/v2/auth?service=hort.example.com&scope=repository:{}:pull",
             h.repo_key
         );
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let resp = router
             .oneshot(Request::get(&uri).body(Body::empty()).unwrap())
             .await
@@ -666,8 +716,7 @@ fn v2_auth_service_mismatch_returns_400_unsupported_envelope() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let resp = router
             .oneshot(
                 // Configured aud is `hort.example.com`; the client sends a
@@ -727,8 +776,7 @@ fn f28_v2_auth_matching_service_still_mints_200() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let resp = router
             .oneshot(
                 // Mixed-case echo of the configured `hort.example.com` —
@@ -761,8 +809,7 @@ fn f28_v2_auth_matching_service_still_mints_200() {
 fn step4_minted_jwt_passes_oci_auth_gate_on_subsequent_request() {
     let final_status = run(async {
         let h = build_harness();
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
 
         // First, mint the JWT via /v2/auth (no scope — see step2 note).
         let creds = format!("oauth2:{}", h.plaintext_pat);
@@ -815,8 +862,7 @@ fn step4_minted_jwt_passes_oci_auth_gate_on_subsequent_request() {
 fn step5_docker_login_dance_end_to_end_via_oneshot() {
     run(async {
         let h = build_harness();
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
 
         // ---- (a) Manifest GET with an invalid bearer → 401 + Bearer
         //         challenge (production OCI dispatcher admits anonymous
@@ -926,8 +972,7 @@ fn v2_auth_single_scope_mints_200_with_granted_pull() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let resp = router
             .oneshot(
                 Request::get("/v2/auth?service=hort.example.com&scope=repository:myrepo:pull")
@@ -977,8 +1022,7 @@ fn v2_auth_full_image_name_scope_resolves_and_grants_pull() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         // repo key is "myrepo"; the image segment "library/nginx" rides
         // the tail. The scope carries the FULL Distribution-Spec name.
         let resp = router
@@ -1035,8 +1079,7 @@ fn v2_auth_repeated_scope_mints_200() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let resp = router
             .oneshot(
                 Request::get(
@@ -1083,8 +1126,7 @@ fn v2_auth_malformed_scope_returns_400_invalid_scope() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let resp = router
             .oneshot(
                 Request::get("/v2/auth?service=hort.example.com&scope=not-a-valid-scope")
@@ -1125,8 +1167,7 @@ fn v2_auth_scope_on_visible_repo_without_permission_excludes_push() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let resp = router
             .oneshot(
                 Request::get("/v2/auth?service=hort.example.com&scope=repository:myrepo:push")
@@ -1183,8 +1224,7 @@ fn v2_auth_too_many_scopes_returns_400() {
         let h = build_harness();
         let creds = format!("oauth2:{}", h.plaintext_pat);
         let basic = base64::engine::general_purpose::STANDARD.encode(creds);
-        let router =
-            oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone()).with_state(h.ctx);
+        let router = router_over_tls(&h.ctx);
         let mut qs = String::from("/v2/auth?service=hort.example.com");
         for i in 0..=MAX_SCOPES {
             // MAX_SCOPES + 1 entries
@@ -1305,6 +1345,12 @@ async fn v2_auth_through_proxy(
             Request::get("/v2/auth?service=hort.example.com")
                 .header(header::AUTHORIZATION, format!("Basic {basic}"))
                 .header("x-forwarded-for", forwarded_for)
+                // The same trusted proxy that supplies the client chain
+                // reports the scheme it terminated. Without it the mint
+                // is refused for want of transport evidence and no
+                // credential reaches the validator, so neither test
+                // below would observe a lockout at all.
+                .header("x-forwarded-proto", "https")
                 .extension(axum::extract::ConnectInfo(
                     PROXY_PEER.parse::<std::net::SocketAddr>().unwrap(),
                 ))
@@ -1431,4 +1477,337 @@ fn v2_auth_lockout_engages_only_at_the_configured_failure_count() {
             "the third failure must trip the configured threshold"
         );
     });
+}
+
+// ===========================================================================
+// The mint's credential-transport boundary.
+//
+// `/v2/auth` is one of the two surfaces in the system that ISSUE a
+// credential, and the only one whose response is a credential on a request
+// that presented none. The position this handler states, and these tests
+// pin, is that a mint requires evidence of TLS or an operator waiver
+// either way: the refusal protects a secret that does not exist yet, so
+// keying it on what the caller sent would leave the surface that creates a
+// secret out of nothing as the one with no transport rule.
+//
+// What each test proves is the thing the wire cannot show on its own —
+// that the refusal lands BEFORE the PAT is looked up and BEFORE anything
+// is minted — plus the two waiver instruments, and the envelope shape.
+// The precedence table itself is specified and pinned at the predicate in
+// `hort-http-core`; these are about this surface's use of it.
+// ===========================================================================
+
+/// What one `/v2/auth` request observed, beyond its status code.
+struct MintOutcome {
+    status: StatusCode,
+    body: serde_json::Value,
+    www_authenticate: Option<String>,
+    metrics: String,
+    /// PAT prefix lookups the validator ran during the request.
+    prefix_lookups: usize,
+}
+
+/// `GET /v2/auth` under an explicit trust, with an optional Basic
+/// credential and an optional unscoped waiver.
+///
+/// Builds its own harness **inside** the runtime, as every test here
+/// must: `build_harness` constructs an in-memory ephemeral store whose
+/// background timer needs a reactor.
+fn mint_under_trust(
+    unscoped_waiver: bool,
+    trust: Option<RequestTrust>,
+    with_credential: bool,
+) -> MintOutcome {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let (status, body, www_authenticate, prefix_lookups) =
+        metrics::with_local_recorder(&recorder, || {
+            run(async {
+                let h = build_harness();
+                let ctx = if unscoped_waiver {
+                    hort_http_core::test_support::with_pat_over_http_allowed(&h.ctx, true)
+                } else {
+                    h.ctx.clone()
+                };
+                let router = {
+                    let base = oci_routes_with_config(&OciHttpConfig::default(), ctx.clone())
+                        .with_state(ctx);
+                    match trust {
+                        Some(trust) => base.layer(axum::Extension(trust)),
+                        None => base,
+                    }
+                };
+                let mut request = Request::get("/v2/auth?service=hort.example.com");
+                if with_credential {
+                    let basic = base64::engine::general_purpose::STANDARD
+                        .encode(format!("oauth2:{}", h.plaintext_pat));
+                    request = request.header(header::AUTHORIZATION, format!("Basic {basic}"));
+                }
+                let resp = router
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let www = resp
+                    .headers()
+                    .get(header::WWW_AUTHENTICATE)
+                    .map(|v| v.to_str().unwrap().to_string());
+                let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                (status, body, www, h.token_repo.prefix_lookups())
+            })
+        });
+    MintOutcome {
+        status,
+        body,
+        www_authenticate,
+        metrics: handle.render(),
+        prefix_lookups,
+    }
+}
+
+/// A `RequestTrust` with no evidence and no waiver — the shape an
+/// undeclared plaintext hop produces.
+fn trust_without_evidence() -> RequestTrust {
+    RequestTrust {
+        client_ip: "203.0.113.7".parse().expect("test client address parses"),
+        public_url: "https://hort.example.com/"
+            .parse()
+            .expect("test URL parses"),
+        transport: TransportSecurity::Unknown,
+        peer_trusted: false,
+        tls_requirement_waived: false,
+    }
+}
+
+/// A presented PAT on an unproven transport is refused before it is
+/// validated and before anything is minted. Both halves are asserted:
+/// the status alone cannot distinguish "refused the transport" from
+/// "validated the PAT and then refused".
+#[test]
+fn a_credentialed_mint_on_an_unproven_transport_is_refused_before_validate_and_mint() {
+    let outcome = mint_under_trust(false, Some(trust_without_evidence()), true);
+
+    assert_eq!(
+        outcome.status,
+        StatusCode::UPGRADE_REQUIRED,
+        "{}",
+        outcome.body
+    );
+    assert_eq!(
+        outcome.prefix_lookups, 0,
+        "the PAT reached the validator: a refusal that happens after \
+         validation has already spent an Argon2id verify on a credential it \
+         was never going to accept"
+    );
+    assert!(
+        !outcome.metrics.contains("hort_oci_v2_auth_total"),
+        "the mint path ran: `/v2/auth` must be refused before either \
+         `exchange` call, so no token is minted: {}",
+        outcome.metrics
+    );
+    assert!(
+        outcome
+            .metrics
+            .contains("hort_credential_transport_refusals_total{entry_point=\"oci_mint\"} 1"),
+        "{}",
+        outcome.metrics
+    );
+    assert_eq!(
+        outcome.www_authenticate, None,
+        "a refused transport advertises no challenge: the client cannot \
+         satisfy one, and `/v2/auth` is exactly where a Bearer realm would \
+         send it"
+    );
+    assert!(
+        outcome.body["token"].is_null() && outcome.body["access_token"].is_null(),
+        "the refusal body carries no credential: {}",
+        outcome.body
+    );
+}
+
+/// The stated anonymous-mint position, on the wire: a mint with no
+/// credential presented is refused on the same terms, because the
+/// response would still be a bearer this server signed.
+#[test]
+fn an_anonymous_mint_on_an_unproven_transport_is_refused_too() {
+    let outcome = mint_under_trust(false, Some(trust_without_evidence()), false);
+    assert_eq!(
+        outcome.status,
+        StatusCode::UPGRADE_REQUIRED,
+        "an anonymous mint is still an issuance: {}",
+        outcome.body
+    );
+    assert!(
+        !outcome.metrics.contains("hort_oci_v2_auth_total"),
+        "no anonymous token may be minted onto an unproven transport: {}",
+        outcome.metrics
+    );
+    assert!(
+        outcome
+            .metrics
+            .contains("hort_credential_transport_refusals_total{entry_point=\"oci_mint\"} 1"),
+        "{}",
+        outcome.metrics
+    );
+}
+
+/// The refusing shapes a scope cannot rescue, each named: no trust
+/// extension at all, positive evidence of cleartext, and a trusted proxy
+/// that reported nothing. Each fixture declares a waiver, so a row passes
+/// because the predicate refused one and not because the fixture forgot
+/// to offer it.
+#[test]
+fn the_mint_refuses_the_shapes_no_scope_can_rescue() {
+    for (name, trust) in [
+        ("no RequestTrust on the router", None),
+        (
+            "Plaintext, scope declared",
+            Some(RequestTrust {
+                transport: TransportSecurity::Plaintext,
+                tls_requirement_waived: true,
+                ..trust_without_evidence()
+            }),
+        ),
+        (
+            "Unknown from a trusted proxy, scope declared",
+            Some(RequestTrust {
+                peer_trusted: true,
+                tls_requirement_waived: true,
+                ..trust_without_evidence()
+            }),
+        ),
+    ] {
+        let outcome = mint_under_trust(false, trust, true);
+        assert_eq!(
+            outcome.status,
+            StatusCode::UPGRADE_REQUIRED,
+            "{name} must be refused: {}",
+            outcome.body
+        );
+        assert_eq!(
+            outcome.prefix_lookups, 0,
+            "{name}: the PAT reached the validator"
+        );
+        assert!(
+            !outcome.metrics.contains("hort_oci_v2_auth_total"),
+            "{name}: the mint path ran: {}",
+            outcome.metrics
+        );
+    }
+}
+
+/// The refusal's wire shape on the mint: the Distribution-Spec envelope,
+/// the `Upgrade` RFC 9110 §15.6.7 requires, the API-version header, and
+/// the same reason literal the hosted-format plane sends.
+#[test]
+fn the_mint_refusal_is_the_distribution_spec_envelope_with_upgrade() {
+    let (status, body, upgrade, api) = run(async {
+        let h = build_harness();
+        let router = oci_routes_with_config(&OciHttpConfig::default(), h.ctx.clone())
+            .with_state(h.ctx.clone())
+            .layer(axum::Extension(trust_without_evidence()));
+        let resp = router
+            .oneshot(
+                Request::get("/v2/auth?service=hort.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let header_str = |name: &str| {
+            resp.headers()
+                .get(name)
+                .map(|v| v.to_str().unwrap().to_string())
+        };
+        let upgrade = header_str("upgrade");
+        let api = header_str("Docker-Distribution-API-Version");
+        let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        (status, body, upgrade, api)
+    });
+    assert_eq!(status, StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(upgrade.as_deref(), Some("TLS/1.2, HTTP/1.1"));
+    assert_eq!(api.as_deref(), Some("registry/2.0"));
+    let errors = body["errors"].as_array().expect("errors array");
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["code"], "DENIED");
+    assert_eq!(errors[0]["message"], "credential transport refused");
+    assert!(errors[0]["detail"].is_null());
+}
+
+/// A declared waiver mints, and the evidence stays what was derived: a
+/// waived mint reports `unknown`, not `tls`, so an operator can still see
+/// how much of their token traffic has no TLS evidence behind it.
+#[test]
+fn a_declared_waiver_mints_and_leaves_the_evidence_alone() {
+    let waived = RequestTrust {
+        tls_requirement_waived: true,
+        ..trust_without_evidence()
+    };
+    let outcome = mint_under_trust(false, Some(waived), true);
+    assert_eq!(outcome.status, StatusCode::OK, "{}", outcome.body);
+    assert_eq!(
+        outcome.body["token"].as_str().map(|t| t.split('.').count()),
+        Some(3),
+        "a waived mint still mints: {}",
+        outcome.body
+    );
+    assert_eq!(
+        outcome.prefix_lookups, 1,
+        "the PAT was validated on the accepted path"
+    );
+    assert!(
+        outcome.metrics.contains(
+            "hort_credential_transport_waived_total{entry_point=\"oci_mint\",scope=\"declared\"} 1"
+        ),
+        "{}",
+        outcome.metrics
+    );
+    assert!(
+        outcome.metrics.contains(
+            "hort_credential_transport_total{entry_point=\"oci_mint\",evidence=\"unknown\"} 1"
+        ),
+        "a declared waiver must not restate the evidence as tls: {}",
+        outcome.metrics
+    );
+}
+
+/// `HORT_BEARER_ALLOW_OVER_HTTP=true` restores today's behaviour on this
+/// surface. The design deliberately gives the unscoped flag to the OCI
+/// mint and withholds it from `/api/v1/auth/exchange`, so this is the
+/// asymmetry's OCI half. It also reaches positive evidence of cleartext,
+/// which no scope can waive.
+#[test]
+fn the_unscoped_waiver_restores_the_mint_over_plaintext() {
+    for (name, trust) in [
+        (
+            // What a plaintext deployment actually produces: nobody
+            // reported a scheme, so there is no evidence either way.
+            "Unknown",
+            trust_without_evidence(),
+        ),
+        (
+            // Positive evidence of cleartext, which no scope can waive —
+            // the blunt instrument reaches it and that is the difference
+            // between the two.
+            "Plaintext from a trusted peer",
+            RequestTrust {
+                transport: TransportSecurity::Plaintext,
+                peer_trusted: true,
+                ..trust_without_evidence()
+            },
+        ),
+    ] {
+        let outcome = mint_under_trust(true, Some(trust), true);
+        assert_eq!(outcome.status, StatusCode::OK, "{name}: {}", outcome.body);
+        assert!(
+            outcome.metrics.contains(
+                "hort_credential_transport_waived_total{entry_point=\"oci_mint\",scope=\"unscoped\"} 1"
+            ),
+            "{name}: {}",
+            outcome.metrics
+        );
+    }
 }

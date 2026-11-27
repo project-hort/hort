@@ -329,6 +329,18 @@ realised members differ from the original ADR 0005 sketch
   logical-path constructor — `parse_download_path`'s inverse — so every write
   site and the read lookup produce the same stored path. Maven: GAV + filename
   ⇄ `{group-path}/{artifact}/{version}/{filename}`.
+
+  **The format's namespace scopes artifact identity, not only its refs.** The
+  logical path therefore carries the normalised name, which is why every
+  implementer embeds it: cargo `crates/{name}/{version}/…`, npm
+  `{name}/-/{filename}`, PyPI `{name}/{filename}`, Maven the GAV path. The
+  namespace concept itself is domain-level — `MutableRef` is keyed
+  `(repository_id, namespace, ref_name)` and binds `namespace` per format —
+  and a handler that scopes its refs by name while leaving its artifact
+  identity scoped only by the repository makes two artifacts in different
+  namespaces resolve as one. See [OCI namespace and
+  identity](../reference/oci-namespace-and-identity.md) for the one format
+  where that happened and what it cost.
 - **`resolve_mutable_version`.** Resolves a mutable (re-deployable) version
   request to the concrete immutable stored path among the group's members. Maven
   SNAPSHOT is the only v1 implementer: a request for the base

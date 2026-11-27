@@ -34,7 +34,7 @@ hort_systemd_oci_signing_key_file: "{{ hort_systemd_key_dir }}/oci-signing.pem"
 # v1.x binary fails every scan (artifacts then quarantine forever). The lockstep
 # is enforced by scripts/check-osv-scanner-version.sh. Verify release tags at
 # https://github.com/google/osv-scanner/releases
-hort_systemd_osv_version: "2.3.8"
+hort_systemd_osv_version: "2.7.1"
 #
 # trivy is installed UNPINNED from the aquasecurity apt repo: that repo's
 # "generic" suite is rolling-latest-only (it serves a single version), so a
