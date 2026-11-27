@@ -27,8 +27,8 @@ the result instead.
 | ring | 0.17.14 | Apache-2.0 | https://github.com/briansmith/ring |
 | async-nats | 0.52.0 | Apache-2.0 | https://github.com/nats-io/nats.rs |
 | aws-lc-sys | 0.47.0 | Apache-2.0 | https://github.com/aws/aws-lc-rs |
-| blake3 | 1.8.7 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
-| constant_time_eq | 0.4.2 | Apache-2.0 | https://github.com/cesarb/constant_time_eq |
+| blake3 | 1.8.8 | Apache-2.0 | https://github.com/BLAKE3-team/BLAKE3 |
+| constant_time_eq | 0.6.2 | Apache-2.0 | https://codeberg.org/cesarb/constant_time_eq |
 | kube-client | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
 | kube-core | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
 | kube | 4.2.1 | Apache-2.0 | https://github.com/kube-rs/kube |
@@ -3296,7 +3296,7 @@ limitations under the License.
 
 ```
 
-### blake3 1.8.7 — Apache-2.0
+### blake3 1.8.8 — Apache-2.0
 
 Repository: https://github.com/BLAKE3-team/BLAKE3
 
@@ -3377,9 +3377,9 @@ limitations under the License.
 
 ```
 
-### constant_time_eq 0.4.2 — Apache-2.0
+### constant_time_eq 0.6.2 — Apache-2.0
 
-Repository: https://github.com/cesarb/constant_time_eq
+Repository: https://codeberg.org/cesarb/constant_time_eq
 
 ```text
 Apache License
