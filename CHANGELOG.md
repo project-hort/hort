@@ -9,15 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.18.1] - 2026-11-27
 
+### Breaking changes
+
+- **Credentialed requests now need TLS evidence**, and the waiver is empty by
+  default. The chart's own admin-task CronJobs call the plaintext Service URL,
+  so they answer `426` until either `tlsSidecar.enabled` terminates TLS inside
+  the pod or `tlsNotRequiredFrom` names the callers' range — and that range can
+  only be measured from the refusals the new build logs, never guessed, so plan
+  a two-step rollout (#457).
+- **An enabled `metrics.serviceMonitor` now also requires `tlsSidecar.enabled`
+  and five CA/bearer fields**, and the chart fails to render without them
+  instead of scraping unauthenticated. With the sidecar on, `metrics.bindAddr`
+  must be exactly `127.0.0.1:<service.metricsPort>`; `allowUnspecifiedBind`
+  does not exempt it (#462).
+
 ### Added
 
 - The Helm chart can serve HTTPS from the server pod, including health probes and admin-task CronJobs. Provide a certificate covering the bare Service name and its CA bundle, enable `tlsSidecar`, and require HTTPS at the edge (#457).
 
 - A credentialed Prometheus scrape of `/metrics` now has a TLS path: the chart's
-  TLS sidecar serves it on its own `tlsSidecar.metricsHttpsPort`. With the
-  sidecar enabled, `metrics.bindAddr` must be `127.0.0.1:<service.metricsPort>`
-  and an enabled `metrics.serviceMonitor` now requires the CA and bearer Secret
-  references it previously told operators to add by hand (#462).
+  TLS sidecar serves it on its own `tlsSidecar.metricsHttpsPort`, with the CA
+  and bearer references the chart previously told operators to add by hand
+  (#462).
 
 ### Changed
 
@@ -89,8 +102,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
-- Credentialed API, OCI and metrics requests, and token issuance, now return `426` without TLS evidence or an applicable waiver; anonymous reads are unaffected. `HORT_BEARER_ALLOW_OVER_HTTP` does not waive token exchange.
-  The edge must overwrite the forwarded scheme header, and `HORT_TLS_NOT_REQUIRED_FROM` cannot waive a peer that is inside `HORT_TRUSTED_PROXY_CIDRS` — on Kubernetes that means the in-cluster hop needs TLS rather than a waiver (#457).
+- The TLS requirement above covers credentialed API, OCI and metrics requests
+  and token issuance; anonymous reads are unaffected, and
+  `HORT_BEARER_ALLOW_OVER_HTTP` does not waive token exchange. The edge must
+  overwrite the forwarded scheme header, and the waiver cannot cover a peer
+  inside `HORT_TRUSTED_PROXY_CIDRS` — on Kubernetes the in-cluster hop
+  therefore needs TLS rather than a waiver (#457).
 - Updated `kube` to 4.2.1, resolving RUSTSEC-2026-0600.
 - Discovery now answers 404 instead of 403 for repositories the caller cannot
   read, matching the response for a missing repository (#458).
