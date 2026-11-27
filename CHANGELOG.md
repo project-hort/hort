@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-11-27
+
 ### Added
 
 - The Helm chart can serve HTTPS from the server pod, including health probes and admin-task CronJobs. Provide a certificate covering the bare Service name and its CA bundle, enable `tlsSidecar`, and require HTTPS at the edge (#457).
