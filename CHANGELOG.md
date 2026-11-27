@@ -37,10 +37,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- The TLS sidecar now serves a rotated certificate without a Deployment
-  rollout; it previously kept presenting the replaced one until the pod was
-  restarted, while reporting ready (#462).
-
 - The upload-payload metadata cap now applies to verified ingest (hosted PyPI
   publication, OCI manifest and blob writes, every pull-through) and to pushed
   signature manifests, so an oversized payload is refused before any content
@@ -87,10 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of answering from the other name's row and re-fetching from the upstream on
   every request (#459).
 
-- A `cargo publish` whose metadata JSON exceeds 64 KiB is no longer refused:
-  the bound is now 1 MiB, which admits crates with long READMEs that were
-  previously rejected outright, and the refusal is returned in cargo's own
-  error envelope so the publisher actually sees the reason (#458).
+- A `cargo publish` now bounds its metadata JSON at 1 MiB, where no bound
+  applied before, and returns the refusal in cargo's own error envelope so the
+  publisher sees the reason (#458).
 
 ### Security
 
