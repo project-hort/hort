@@ -71,11 +71,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   image names inside one hort repository: identity is now scoped to the OCI
   `<name>` it was pushed under, so the same bytes can be held under two names.
   Rows written by earlier releases keep the name-free path and stay readable;
-  they are rewritten in a later release (#459).
+  0.19.0 rewrites them (#459).
 - An OCI referrers list now returns only referrers pushed under the image name
   that was asked for, as the Distribution Spec requires; referrers written by
-  earlier releases carry no name and stay listed under every name until they
-  are rewritten (#459).
+  earlier releases carry no name and stay listed under every name until 0.19.0
+  rewrites them (#459).
 - An OCI image index is now accepted only when its child manifests exist under
   the same image name the index is pushed under, instead of anywhere in the
   hort repository; a child under a different name answers
