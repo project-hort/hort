@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-advisory-osv"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-checkpoint-anchor"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-ephemeral-memory"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "bytes",
  "dashmap",
@@ -2405,7 +2405,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-ephemeral-redis"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2421,7 +2421,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-kubernetes"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "base64 0.23.1",
  "chrono",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-oidc"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "axum",
  "axum-server",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-postgres"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "chrono",
  "hort-adapters-storage",
@@ -2492,7 +2492,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-provenance-cosign-key"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "hort-domain",
  "p256 0.14.0",
@@ -2504,7 +2504,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-provenance-sigstore"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "aws-lc-rs",
  "base64 0.23.1",
@@ -2528,7 +2528,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-scanner-osv"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "bytes",
  "cvss",
@@ -2544,7 +2544,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-scanner-trivy"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "bytes",
  "flate2",
@@ -2562,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-secrets"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "hort-domain",
  "metrics",
@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-storage"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "bytes",
  "futures",
@@ -2600,7 +2600,7 @@ dependencies = [
 
 [[package]]
 name = "hort-adapters-upstream-http"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "hort-app"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -2678,11 +2678,11 @@ dependencies = [
 
 [[package]]
 name = "hort-attribution"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 
 [[package]]
 name = "hort-cli"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "hort-config"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "chrono",
  "hort-domain",
@@ -2731,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "hort-domain"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -2753,7 +2753,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2777,7 +2777,7 @@ dependencies = [
 
 [[package]]
 name = "hort-formats-upstream"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "bytes",
  "chrono",
@@ -2796,7 +2796,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-admin-security"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2818,7 +2818,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-admin-tasks"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2840,7 +2840,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-cargo"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2873,7 +2873,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-core"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2908,7 +2908,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-discovery"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-events"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -2951,7 +2951,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-maven"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2982,7 +2982,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-npm"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3018,7 +3018,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-oci"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3057,7 +3057,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-pypi"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -3092,7 +3092,7 @@ dependencies = [
 
 [[package]]
 name = "hort-http-subscriptions"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
@@ -3113,11 +3113,11 @@ dependencies = [
 
 [[package]]
 name = "hort-net-egress"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 
 [[package]]
 name = "hort-notifier-nats"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "async-nats",
  "bytes",
@@ -3136,7 +3136,7 @@ dependencies = [
 
 [[package]]
 name = "hort-notifier-webhook"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "chrono",
  "hex",
@@ -3160,14 +3160,14 @@ dependencies = [
 
 [[package]]
 name = "hort-secret-file"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "tempfile",
 ]
 
 [[package]]
 name = "hort-server"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -3235,7 +3235,7 @@ dependencies = [
 
 [[package]]
 name = "hort-worker"
-version = "0.18.1-dev"
+version = "0.18.1-beta.2"
 dependencies = [
  "anyhow",
  "arc-swap",
